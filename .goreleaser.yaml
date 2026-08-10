@@ -1,0 +1,130 @@
+# GoReleaser config for the `ronja` CLI.
+#
+# It RUNS here, in the monorepo, but PUBLISHES to the public mirror
+# github.com/ronjatech/ronja-cli — the release target below is pinned
+# explicitly rather than inferred from the git remote. The mirror is where
+# this directory is synced to on a production `vX.Y.Z` tag, and where it sits at the
+# repository ROOT, which is what makes the module path
+# github.com/ronjatech/ronja-cli resolve for `go install ...@latest`.
+#
+# Publishing runs from the private monorepo on purpose: it needs a credential
+# that can write to another repository, and the mirror is public — a release
+# secret stored there would be a write-capable credential in a world-readable
+# repo. See .github/workflows/cli_release.yml.
+#
+# The monorepo is the source of truth. Never edit the mirror by hand — a sync
+# overwrites it.
+version: 2
+
+project_name: ronja
+
+before:
+  hooks:
+    - go mod download
+    # The mirror is a snapshot, so this is the last gate before a binary is
+    # published under a version number. Cheap: three dependencies, no backend.
+    - go test ./...
+
+builds:
+  - id: ronja
+    # ./cmd/ronja, not the module root. `go install` names a binary after the
+    # last element of the PACKAGE path, and the module is `ronja-cli` — the
+    # root would produce a binary called `ronja-cli` and every documented
+    # `ronja ...` invocation would be command-not-found. Same invariant the
+    # cli_test.yml "Install produces a binary named `ronja`" step asserts.
+    main: ./cmd/ronja
+    binary: ronja
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      # Stamps `ronja --version`. Without this the released binary reports
+      # "dev" (the default in internal/commands/root.go), so a bug report
+      # cannot be tied to a release.
+      - -s -w -X github.com/ronjatech/ronja-cli/internal/commands.Version={{ .Version }}
+
+archives:
+  - id: ronja
+    formats:
+      - tar.gz
+    name_template: "ronja_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - NOTICE
+
+checksum:
+  name_template: checksums.txt
+
+# A CASK, not a formula. GoReleaser's `brews:` (formula) key is fully
+# deprecated as of v2.16 — a Homebrew formula is meant to BUILD from source,
+# and using one to drop a pre-built binary was always a hack. Casks are how
+# Homebrew expects pre-compiled binaries to arrive.
+#
+# Consequence worth knowing: casks are macOS-ONLY. Homebrew on Linux does not
+# support them, so `brew` is the macOS install path and Linux/CI users take
+# `go install` or the release tarball. Both are documented in README.md.
+homebrew_casks:
+  - name: ronja
+    binaries:
+      - ronja
+    # Never point the tap at a prerelease. The tap has exactly ONE cask file,
+    # so publishing an `-rc` build would overwrite it and hand every
+    # `brew install ronjatech/tap/ronja` user a release candidate until the
+    # next stable version replaced it. `auto` skips the upload when the
+    # version carries a prerelease suffix; the cask is still generated
+    # locally, so the build is still fully exercised.
+    skip_upload: auto
+    repository:
+      owner: ronjatech
+      name: homebrew-tap
+      branch: main
+      # A token with contents:write on ronjatech/homebrew-tap. Distinct from
+      # the workflow's GITHUB_TOKEN, which is scoped to THIS repo and cannot
+      # push to another one.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: https://ronja.tech
+    description: Command-line access to Ronja — sign in, then work against the API over plain HTTP
+    # No `license:` here on purpose: a cask has no license stanza (that is a
+    # formula field), so the key validates but renders nothing. The licence
+    # travels in the archive as LICENSE + NOTICE.
+    hooks:
+      post:
+        # These binaries are not signed with a Developer ID or notarized, and
+        # unlike a formula, a cask install DOES set the Gatekeeper quarantine
+        # bit. Without this hook macOS refuses to run the binary and reports it
+        # as "damaged", which looks like a corrupt download rather than a
+        # signing gap. Removing the bit here is Homebrew's documented escape
+        # hatch for an unsigned cask in a third-party tap.
+        #
+        # Note for later: unsigned casks are being removed from Homebrew's
+        # OFFICIAL taps in September 2026. That does not affect our own tap,
+        # but signing + notarization is the prerequisite if we ever want
+        # homebrew-cask to carry this.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/ronja"]
+          end
+
+release:
+  github:
+    owner: ronjatech
+    name: ronja-cli
+  # Mark `-rc`/`-beta` builds as prereleases on GitHub. The default is false,
+  # which would show a release candidate as the repo's "Latest release" — the
+  # thing anyone landing on the releases page downloads by hand.
+  prerelease: auto
+
+changelog:
+  # The mirror receives one squashed snapshot commit per release, so a
+  # git-derived changelog would read "Release v0.26.2" and nothing else.
+  # Release notes are written by hand, or generated from the monorepo.
+  disable: true

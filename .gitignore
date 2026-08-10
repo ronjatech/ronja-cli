@@ -1,0 +1,6 @@
+# GoReleaser build output. Ignored here and, because this directory is synced
+# to the public mirror, in the mirror repo where the release actually runs.
+dist/
+
+# `go build -o ronja ./cmd/ronja` per README — a local binary, never committed.
+/ronja

@@ -1,0 +1,847 @@
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/config"
+	"github.com/ronjatech/ronja-cli/internal/wfdir"
+)
+
+// The command-level test harness.
+//
+// The wfdir tests cover the folder model in isolation; these cover what the
+// COMMANDS do with it — which is where the interesting failures live, because
+// they are the layer that decides what to write, what to record as the baseline,
+// and what to refuse. A fake instance is the only way to exercise that: the
+// bugs worth catching (a baseline claiming a file that is not on disk, a drift
+// note overwritten by another) are invisible to a unit test of either half.
+//
+// Three things every test needs, and they are all here rather than repeated:
+// a fake Ronja to answer the three workflow reads, an isolated HOME so nothing
+// touches the developer's real credential store, and a way to capture the JSON
+// a command prints to os.Stdout.
+//
+// Kept deliberately small and additive: Phase 3's push/validate/test commands
+// need exactly this shape plus more routes on fakeInstance.
+
+// fakeInstance is a Ronja instance serving the workflow read surface.
+//
+// Rows are keyed by id. Drafts are keyed by the LIVE workflow's id — matching
+// GET :id/draft, which answers with the caller's own draft of that workflow —
+// and the endpoint answers 200 with a JSON `null` body when there is none,
+// because that is what the real one does and the CLI's nil-pointer decode is
+// built around it.
+type fakeInstance struct {
+	t *testing.T
+
+	workflows map[string]*api.Workflow
+	files     map[string][]api.WorkflowFile
+	// draftOf maps a live workflow id to the id of the caller's open draft.
+	draftOf map[string]string
+
+	// Failure injection, so the degradation paths are testable. Each is a
+	// status code to answer with instead of the real response; 0 is off.
+	failDraft int
+	failFiles int
+	// failPut maps a file path to the status a PUT of it should answer with,
+	// which is how the mid-push failure case is staged.
+	failPut map[string]int
+	// failDelete is failPut for DELETE — the way to stage a rejected deletion
+	// that is not the entrypoint rule modelled below.
+	failDelete map[string]int
+	// failPatch is the status PUT :id (the metadata patch) answers with, which
+	// stages a push that has written every file and then falls over.
+	failPatch int
+	// failCommit is the status POST :id/commit answers with; 0 is success.
+	// 400 is the shape that matters — it is the server's needs-review
+	// rejection, and the one publish falls back to a review request on.
+	failCommit int
+
+	// --- runs -------------------------------------------------------------
+	// runScript is what GET /workflow/run/:id answers with, in order; the LAST
+	// entry repeats forever. That is what makes both terminal cases and the
+	// never-terminating one (a script ending on a running entry) expressible
+	// without a second knob.
+	runScript []api.RunResponse
+	runPolls  int
+	// runRequests records every POST :id/run as (workflowID, parameterValues),
+	// which is how the gate/--write-live refusals are pinned: they must make
+	// ZERO of these.
+	runRequests []recordedRun
+	// failRun is the status POST :id/run answers with, carrying failRunMessage
+	// as the server's `error` field — the shape of the credit kill-stop and of
+	// the gate refusal the CLI preflights.
+	failRun        int
+	failRunMessage string
+	// failRunGets makes the next N run polls fail with a 500, so the transient-
+	// failure tolerance is testable without a flaky network.
+	failRunGets int
+	// onPoll, when set, runs after each run poll has been answered.
+	//
+	// It exists for the Ctrl-C test, which must not raise SIGINT until the
+	// command has actually reached the poll loop — and therefore installed its
+	// interrupt handler. Reading runPolls from the test goroutine to find that
+	// out would be a data race; a hook called from the handler, closing a
+	// channel the test waits on, is the same knowledge with a happens-before
+	// edge attached.
+	onPoll func()
+
+	// tableNames answers GET /feature/model/:id, the best-effort name lookup
+	// behind the --write-live refusal. failTableLookup makes it fail instead.
+	tableNames      map[string]string
+	failTableLookup int
+
+	// validate is what POST /workflow/validate answers with. Nil means clean,
+	// which is what most tests want: the validate gate is not the subject.
+	validate *api.ValidateResult
+	// validated records every validate request body, so a test can assert what
+	// the CLI told the server about the candidate — the parameters especially,
+	// which the folder does not hold and has to fetch.
+	validated []api.ValidateInput
+	// saveWarnings maps a file path to the soft warnings its PUT returns.
+	saveWarnings map[string][]string
+	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
+	// ordinary user), mirroring sherlock's downward-counting scale.
+	privilegeLevel int
+
+	// What the fake was asked to do, for assertions.
+	created      []api.CreateWorkflowInput
+	committed    []string
+	publishedIDs []string
+	discardedIDs []string
+	// deletedWorkflows records every DELETE /workflow/:id — the whole-row
+	// removal `discard --delete-workflow` performs, which must never happen
+	// without it.
+	deletedWorkflows  []string
+	reviewRequested   []string
+	titlePatches      map[string]string
+	parameterPatches  map[string]*[]api.WorkflowParameter
+	entrypointPatches map[string]string
+	nextID            int
+
+	server *httptest.Server
+	// Requests records every request served as "METHOD /path", in order — the
+	// cheapest way to assert that a command did NOT make a round trip it
+	// should have avoided, and that it made the ones it did in the right
+	// order (push writes the entrypoint first).
+	Requests []string
+}
+
+// fakeEntrypointStarter mirrors rworkflow's defaultEntrypointStarter — the
+// placeholder the server writes into the entrypoint when a workflow is created.
+const fakeEntrypointStarter = "# Write your workflow here.\n"
+
+// recordedRun is one POST :id/run the fake served.
+type recordedRun struct {
+	WorkflowID      string
+	ParameterValues map[string]any
+}
+
+func newFakeInstance(t *testing.T) *fakeInstance {
+	t.Helper()
+	f := &fakeInstance{
+		t:                 t,
+		workflows:         map[string]*api.Workflow{},
+		files:             map[string][]api.WorkflowFile{},
+		draftOf:           map[string]string{},
+		failPut:           map[string]int{},
+		failDelete:        map[string]int{},
+		saveWarnings:      map[string][]string{},
+		titlePatches:      map[string]string{},
+		parameterPatches:  map[string]*[]api.WorkflowParameter{},
+		entrypointPatches: map[string]string{},
+		tableNames:        map[string]string{},
+		privilegeLevel:    50,
+	}
+	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+func (f *fakeInstance) URL() string { return f.server.URL }
+
+// testTenantID is the organization every fake instance reports from /me. Tests
+// build binding keys with testKey rather than repeating it.
+const testTenantID = "ten-test"
+
+// Key is the (instance, organization) a folder bound against this fake is
+// stored under, in both ronja.json and the local baseline.
+func (f *fakeInstance) Key() wfdir.InstanceKey {
+	return wfdir.InstanceKey{URL: f.server.URL, TenantID: testTenantID}
+}
+
+// AddWorkflow registers a row and its files, filling in the fields every
+// command reads so a test only has to state what it is actually about.
+func (f *fakeInstance) AddWorkflow(wf *api.Workflow, files ...api.WorkflowFile) *api.Workflow {
+	f.t.Helper()
+	if wf.Title == "" {
+		wf.Title = "Monthly report"
+	}
+	if wf.Entrypoint == "" {
+		wf.Entrypoint = "main.py"
+	}
+	if wf.FeatureID == "" {
+		wf.FeatureID = "feat-1"
+	}
+	if wf.UpdatedAt.IsZero() {
+		wf.UpdatedAt = time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	}
+	for i := range files {
+		if files[i].UpdatedAt.IsZero() {
+			files[i].UpdatedAt = wf.UpdatedAt
+		}
+	}
+	f.workflows[wf.ID] = wf
+	f.files[wf.ID] = files
+	return wf
+}
+
+// AddDraft registers a draft of a live workflow, wired up the way the server
+// does it: ParentWorkflowID points at the live row, and GET <live>/draft
+// returns it.
+func (f *fakeInstance) AddDraft(liveID, draftID string, files ...api.WorkflowFile) *api.Workflow {
+	f.t.Helper()
+	live := f.workflows[liveID]
+	if live == nil {
+		f.t.Fatalf("AddDraft: no live workflow %s", liveID)
+	}
+	draft := f.AddWorkflow(&api.Workflow{
+		ID:               draftID,
+		ParentWorkflowID: liveID,
+		Lifecycle:        api.LifecycleDraft,
+		Title:            live.Title,
+		Entrypoint:       live.Entrypoint,
+		FeatureID:        live.FeatureID,
+		UpdatedAt:        live.UpdatedAt.Add(time.Hour),
+	}, files...)
+	f.draftOf[liveID] = draftID
+	return draft
+}
+
+func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
+	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
+
+	if r.URL.Path == "/api/v2/authentication/me" {
+		writeJSON(w, map[string]any{
+			"user": map[string]any{"id": "usr-1", "email": "dev@example.com"},
+			"role": map[string]any{"name": "user", "privilegeLevel": f.privilegeLevel},
+			// A workflow folder's binding is keyed by organization, so the wf
+			// commands ask for it whenever the credential came from the
+			// environment — which is how every test here signs in.
+			"tenant": map[string]any{"id": testTenantID, "name": "Test Org"},
+		})
+		return
+	}
+	// The best-effort table-name lookup behind the --write-live refusal. A
+	// different route prefix entirely (/feature/model), which is the point: it
+	// is a second surface a scope-limited token may not reach, and the CLI has
+	// to survive it failing.
+	if tableID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/model/"); ok {
+		if f.failTableLookup != 0 {
+			http.Error(w, `{"error":"no"}`, f.failTableLookup)
+			return
+		}
+		name, known := f.tableNames[tableID]
+		if !known {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{"id": tableID, "name": name})
+		return
+	}
+	if f.serveWrites(w, r) {
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/v2/workflow/")
+
+	// GET /workflow/run/:runID — the poll. Checked before the switch below,
+	// whose default branch would otherwise read "run/<id>" as a workflow id.
+	if runID, ok := strings.CutPrefix(path, "run/"); ok {
+		f.serveRunPoll(w, runID)
+		return
+	}
+
+	switch {
+	case strings.HasSuffix(path, "/draft"):
+		id := strings.TrimSuffix(path, "/draft")
+		if f.failDraft != 0 {
+			http.Error(w, `{"error":"boom"}`, f.failDraft)
+			return
+		}
+		draftID, ok := f.draftOf[id]
+		if !ok {
+			// The shape that matters: 200 with a null body, not a 404.
+			writeJSON(w, nil)
+			return
+		}
+		writeJSON(w, f.workflows[draftID])
+
+	case strings.Contains(path, "/files/"):
+		// GET one file by path. Only the push's timed-out-PUT reconciliation
+		// reads a single file — everything else wants the whole set — and 404
+		// for a path the row does not hold is the answer it acts on.
+		id, filePath, _ := strings.Cut(path, "/files/")
+		for _, file := range f.files[id] {
+			if file.Path == filePath {
+				writeJSON(w, file)
+				return
+			}
+		}
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+
+	case strings.HasSuffix(path, "/files"):
+		id := strings.TrimSuffix(path, "/files")
+		if f.failFiles != 0 {
+			http.Error(w, `{"error":"boom"}`, f.failFiles)
+			return
+		}
+		if _, ok := f.workflows[id]; !ok {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		files := f.files[id]
+		if files == nil {
+			files = []api.WorkflowFile{}
+		}
+		writeJSON(w, files)
+
+	default:
+		wf, ok := f.workflows[path]
+		if !ok {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		writeJSON(w, wf)
+	}
+}
+
+// serveWrites handles everything that CHANGES something, plus validate.
+// Reports whether it answered, so the read surface above stays as it was.
+//
+// The lifecycle verbs are modelled rather than stubbed — checkout copies the
+// live files into a new draft row, commit moves them onto the parent and
+// deletes the draft — because the push/publish/discard tests are about the
+// state machine, and a fake that answered 200 to everything would let a
+// command that checks out twice, or publishes the wrong row, pass.
+func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool {
+	path := strings.TrimPrefix(r.URL.Path, "/api/v2/")
+
+	// DELETE /workflow/:id — whole-row soft delete. Matched before the file
+	// routes below, which carry a /files/ segment this one never has.
+	if r.Method == http.MethodDelete && strings.HasPrefix(path, "workflow/") &&
+		!strings.Contains(path, "/files/") {
+		id := strings.TrimPrefix(path, "workflow/")
+		if _, ok := f.workflows[id]; !ok {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return true
+		}
+		f.deletedWorkflows = append(f.deletedWorkflows, id)
+		delete(f.workflows, id)
+		delete(f.files, id)
+		writeJSON(w, map[string]any{"workflowID": id, "markedForDeletion": true})
+		return true
+	}
+
+	// POST /workflow — create.
+	if r.Method == "POST" && (path == "workflow" || path == "workflow/") {
+		var in api.CreateWorkflowInput
+		decodeBody(f.t, r, &in)
+		f.created = append(f.created, in)
+		f.nextID++
+		id := fmt.Sprintf("wf-new-%d", f.nextID)
+		entrypoint := in.Entrypoint
+		if entrypoint == "" {
+			entrypoint = "main.py"
+		}
+		created := f.AddWorkflow(&api.Workflow{
+			ID:         id,
+			Lifecycle:  api.LifecycleDraft,
+			Title:      in.Title,
+			Entrypoint: entrypoint,
+			FeatureID:  in.FeatureID,
+			Parameters: in.Parameters,
+			Hidden:     true,
+		}, api.WorkflowFile{
+			// Mirrors rworkflow.Add (store.go): the entrypoint file is SEEDED
+			// inside the create transaction, because the file-tree panel and
+			// the entrypoint integrity check in Commit both rely on there
+			// always being a file matching Entrypoint. A brand-new workflow is
+			// therefore not empty — which is the whole reason `wf push` cannot
+			// assume it is.
+			WorkflowID: id, Path: entrypoint, Content: fakeEntrypointStarter,
+		})
+		writeJSON(w, created)
+		return true
+	}
+	if r.Method == "POST" && path == "workflow/validate" {
+		var in api.ValidateInput
+		decodeBody(f.t, r, &in)
+		f.validated = append(f.validated, in)
+		result := f.validate
+		if result == nil {
+			result = &api.ValidateResult{Findings: []api.ValidateFinding{}}
+		}
+		writeJSON(w, result)
+		return true
+	}
+	// POST /workflow/draft/:id/request-review — note the governance prefix.
+	if r.Method == "POST" && strings.HasPrefix(path, "workflow/draft/") && strings.HasSuffix(path, "/request-review") {
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "workflow/draft/"), "/request-review")
+		f.reviewRequested = append(f.reviewRequested, id)
+		writeJSON(w, nil)
+		return true
+	}
+
+	rest, ok := strings.CutPrefix(path, "workflow/")
+	if !ok {
+		return false
+	}
+	id, action, _ := strings.Cut(rest, "/")
+
+	// File writes: PUT/DELETE workflow/:id/files/*path.
+	if filePath, isFile := strings.CutPrefix(action, "files/"); isFile {
+		switch r.Method {
+		case "PUT":
+			if status := f.failPut[filePath]; status != 0 {
+				http.Error(w, `{"error":"`+filePath+` is not acceptable"}`, status)
+				return true
+			}
+			var in struct {
+				Content string `json:"content"`
+			}
+			decodeBody(f.t, r, &in)
+			f.putFile(id, filePath, in.Content)
+			writeJSON(w, map[string]any{
+				"id": "file-" + filePath, "workflowID": id, "path": filePath,
+				"content": in.Content, "warnings": f.saveWarnings[filePath],
+			})
+			return true
+		case "DELETE":
+			if status := f.failDelete[filePath]; status != 0 {
+				http.Error(w, `{"error":"`+filePath+` cannot be removed"}`, status)
+				return true
+			}
+			if wf := f.workflows[id]; wf != nil && wf.Entrypoint == filePath {
+				// Mirrors the server: the file the row NAMES as its entrypoint
+				// cannot be deleted. Note that it is the row's current
+				// entrypoint, not the one it was created with — which is what
+				// makes a rename possible at all, and what the push's
+				// PUT → patch → DELETE ordering depends on.
+				http.Error(w, `{"error":"cannot delete the entrypoint file"}`, http.StatusBadRequest)
+				return true
+			}
+			f.deleteFile(id, filePath)
+			writeJSON(w, map[string]any{})
+			return true
+		}
+	}
+
+	if r.Method == "PUT" && action == "" {
+		var patch api.WorkflowPatch
+		decodeBody(f.t, r, &patch)
+		if f.failPatch != 0 {
+			http.Error(w, `{"error":"boom"}`, f.failPatch)
+			return true
+		}
+		wf := f.workflows[id]
+		if wf == nil {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return true
+		}
+		if patch.Entrypoint != "" && patch.Entrypoint != wf.Entrypoint {
+			// Mirrors rworkflow's Update (store.go): an entrypoint the workflow
+			// holds no file for is refused, because a run of it would fail
+			// immediately. This is the rule the push's ordering exists for, so
+			// modelling it is what makes the ordering test mean something.
+			if _, ok := f.FileContents(id)[patch.Entrypoint]; !ok {
+				http.Error(w, `{"error":"entrypoint file `+patch.Entrypoint+` does not exist in this workflow — upsert it before setting the entrypoint"}`,
+					http.StatusBadRequest)
+				return true
+			}
+			wf.Entrypoint = patch.Entrypoint
+			f.entrypointPatches[id] = patch.Entrypoint
+		}
+		if patch.Title != "" {
+			wf.Title = patch.Title
+			f.titlePatches[id] = patch.Title
+		}
+		// Mirrors the server's optional.V semantics: an ABSENT key leaves the
+		// declaration alone, an explicit list (including []) replaces it. The
+		// recorded pointer is what lets a test tell "never patched" from
+		// "patched to none" — the distinction the whole feature turns on.
+		if patch.Parameters != nil {
+			wf.Parameters = *patch.Parameters
+			f.parameterPatches[id] = patch.Parameters
+		}
+		writeJSON(w, nil)
+		return true
+	}
+	if r.Method != "POST" {
+		return false
+	}
+
+	switch action {
+	case "run":
+		var in struct {
+			ParameterValues map[string]any `json:"parameterValues"`
+		}
+		decodeBody(f.t, r, &in)
+		f.runRequests = append(f.runRequests, recordedRun{WorkflowID: id, ParameterValues: in.ParameterValues})
+		if f.failRun != 0 {
+			http.Error(w, `{"error":"`+f.failRunMessage+`"}`, f.failRun)
+			return true
+		}
+		// Mirrors the real endpoint: the run row comes back IMMEDIATELY at
+		// status running, and everything else is learned by polling.
+		writeJSON(w, api.WorkflowRun{
+			ID: "run-1", WorkflowID: id, Status: api.RunStatusRunning,
+			ParameterValues: in.ParameterValues,
+			ExecutedAt:      time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC),
+		})
+		return true
+	case "checkout":
+		if _, exists := f.draftOf[id]; exists {
+			f.t.Errorf("checkout called for %s, which already has a draft", id)
+		}
+		f.nextID++
+		draft := f.AddDraft(id, fmt.Sprintf("draft-%d", f.nextID), append([]api.WorkflowFile(nil), f.files[id]...)...)
+		// Mirrors rworkflow's buildDraftFromParent (store_draft.go): a checkout
+		// copies the parent's PARAMETERS as well as its files. Without this the
+		// fake produces a draft declaring none, and the CLI's parameter drift
+		// guard fires on a difference the real server never creates.
+		if parent := f.workflows[id]; parent != nil {
+			draft.Parameters = append([]api.WorkflowParameter(nil), parent.Parameters...)
+		}
+		writeJSON(w, draft)
+		return true
+	case "commit":
+		if f.failCommit != 0 {
+			http.Error(w, `{"error":"admin required to commit a shared workflow draft"}`, f.failCommit)
+			return true
+		}
+		f.committed = append(f.committed, id)
+		draft := f.workflows[id]
+		if draft != nil && draft.ParentWorkflowID != "" {
+			parent := draft.ParentWorkflowID
+			f.files[parent] = f.files[id]
+			f.workflows[parent].Title = draft.Title
+			delete(f.draftOf, parent)
+			delete(f.workflows, id)
+		}
+		writeJSON(w, nil)
+		return true
+	case "publish":
+		f.publishedIDs = append(f.publishedIDs, id)
+		if wf := f.workflows[id]; wf != nil {
+			wf.Lifecycle = api.LifecycleLive
+			wf.Hidden = false
+		}
+		writeJSON(w, nil)
+		return true
+	case "discard":
+		f.discardedIDs = append(f.discardedIDs, id)
+		if draft := f.workflows[id]; draft != nil && draft.ParentWorkflowID != "" {
+			delete(f.draftOf, draft.ParentWorkflowID)
+		}
+		delete(f.workflows, id)
+		delete(f.files, id)
+		writeJSON(w, nil)
+		return true
+	}
+	return false
+}
+
+// serveRunPoll answers one GET /workflow/run/:runID from the script, advancing
+// through it and repeating the last entry forever.
+//
+// Repeating rather than exhausting is what lets one mechanism express both "it
+// finishes on the third poll" and "it never finishes" — the latter being the
+// only way to test the timeout path.
+func (f *fakeInstance) serveRunPoll(w http.ResponseWriter, runID string) {
+	if f.onPoll != nil {
+		defer f.onPoll()
+	}
+	if f.failRunGets > 0 {
+		f.failRunGets--
+		http.Error(w, `{"error":"instance is restarting"}`, http.StatusBadGateway)
+		return
+	}
+	if len(f.runScript) == 0 {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	i := f.runPolls
+	if i >= len(f.runScript) {
+		i = len(f.runScript) - 1
+	}
+	f.runPolls++
+	resp := f.runScript[i]
+	resp.ID = runID
+	if resp.Steps == nil {
+		resp.Steps = []api.StepDTO{}
+	}
+	writeJSON(w, resp)
+}
+
+// putFile writes one file and moves the ROW's updatedAt with it, the way the
+// server does: UpsertFile re-derives the workflow's binding columns in the same
+// transaction, so a file write is a row write. That is what makes "which row
+// did the baseline's timestamp come from" observable.
+func (f *fakeInstance) putFile(id, path, content string) {
+	if wf := f.workflows[id]; wf != nil {
+		wf.UpdatedAt = wf.UpdatedAt.Add(time.Minute)
+	}
+	for i := range f.files[id] {
+		if f.files[id][i].Path == path {
+			f.files[id][i].Content = content
+			return
+		}
+	}
+	f.files[id] = append(f.files[id], api.WorkflowFile{
+		WorkflowID: id, Path: path, Content: content,
+		UpdatedAt: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+	})
+}
+
+func (f *fakeInstance) deleteFile(id, path string) {
+	kept := f.files[id][:0]
+	for _, file := range f.files[id] {
+		if file.Path != path {
+			kept = append(kept, file)
+		}
+	}
+	f.files[id] = kept
+}
+
+// FileContents flattens one row's files for assertions.
+func (f *fakeInstance) FileContents(id string) map[string]string {
+	out := map[string]string{}
+	for _, file := range f.files[id] {
+		out[file.Path] = file.Content
+	}
+	return out
+}
+
+func decodeBody(t *testing.T, r *http.Request, out any) {
+	t.Helper()
+	if err := json.NewDecoder(r.Body).Decode(out); err != nil {
+		t.Fatalf("decode %s %s body: %v", r.Method, r.URL.Path, err)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// runCLI executes one `ronja ...` invocation against a fake instance from a
+// working directory, returning whatever it printed on stdout.
+//
+// The whole command tree is rebuilt per call because the global flags are
+// package vars bound by the root command — reusing one would carry --json from
+// a previous test into the next.
+func runCLI(t *testing.T, workdir string, args ...string) (string, error) {
+	t.Helper()
+	t.Chdir(workdir)
+
+	stdout, restore := captureStdout(t)
+	root := newRootCmd()
+	root.SetArgs(args)
+	// Cobra's own output goes to the test log, not the captured stdout, so a
+	// usage dump cannot be mistaken for a command's JSON.
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	err := root.Execute()
+
+	return restore(stdout), err
+}
+
+// failOnceWithATimeout makes the NEXT request to one method+path die on a
+// deadline instead of reaching the fake, and lets everything after it through.
+//
+// A timeout is the one write failure a workflow push goes and asks the server
+// about, so it is the only way into the reconcile — and the branch a mistake
+// there turns into silent data loss. The alternatives were to wait a real
+// 120-second deadline out or to leave it untested.
+//
+// Faked at the TRANSPORT rather than by a slow handler for two reasons: it costs
+// no wall time, and the fake never sees the request at all, which is exactly the
+// case being modelled — a write that timed out and did NOT land. `fired` is held
+// across clients so the retry a test makes afterwards is an ordinary push.
+func failOnceWithATimeout(t *testing.T, method, path string) {
+	t.Helper()
+	transport := &timeoutOnce{method: method, path: path}
+	previous := newClient
+	newClient = func(baseURL, token string) *api.Client {
+		client := previous(baseURL, token)
+		transport.base = client.HTTP.Transport
+		client.HTTP.Transport = transport
+		return client
+	}
+	t.Cleanup(func() { newClient = previous })
+}
+
+type timeoutOnce struct {
+	base   http.RoundTripper
+	method string
+	path   string
+	fired  bool
+}
+
+func (t *timeoutOnce) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !t.fired && req.Method == t.method && req.URL.Path == t.path {
+		t.fired = true
+		// http.Client wraps this in a *url.Error, which is what api.IsTimeout
+		// unwraps — the same shape a per-request deadline produces.
+		return nil, context.DeadlineExceeded
+	}
+	if t.base == nil {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+	return t.base.RoundTrip(req)
+}
+
+// signIn points the CLI at a fake instance with a credential in an isolated
+// config dir, the way an actual login would leave things.
+//
+// RONJA_URL and RONJA_TOKEN rather than a seeded config.json: they are the
+// documented agent/CI path, they outrank the file, and they leave nothing for a
+// test ordering accident to inherit.
+func signIn(t *testing.T, f *fakeInstance) {
+	t.Helper()
+	signInTo(t, f.URL())
+}
+
+// signInTo is signIn for a server that is not a fakeInstance — the `api` and
+// `query` tests serve their own, because neither command has anything to do
+// with the workflow surface fakeInstance models.
+func signInTo(t *testing.T, url string) {
+	t.Helper()
+	t.Setenv("RONJA_CONFIG_DIR", t.TempDir())
+	t.Setenv("RONJA_URL", url)
+	t.Setenv("RONJA_TOKEN", "test-token")
+}
+
+// signOut is signIn without a credential: a resolvable instance the caller has
+// no token for, which is a state `wf status` is required to survive.
+//
+// The config dir is fresh AND empty, so there is genuinely no profile to fall
+// back on. Clearing RONJA_TOKEN alone does not sign you out — a stored profile
+// would supply both a token and an organization, which is the opposite of the
+// state these tests mean to create.
+func signOut(t *testing.T, f *fakeInstance) {
+	t.Helper()
+	t.Setenv("RONJA_CONFIG_DIR", t.TempDir())
+	t.Setenv("RONJA_URL", f.URL())
+	t.Setenv("RONJA_TOKEN", "")
+	t.Setenv("RONJA_PROFILE", "")
+}
+
+// writeProfile seeds one profile into the isolated config dir, for the tests
+// that need a stored ORGANIZATION rather than an environment credential — an
+// environment token deliberately carries none. An empty token leaves the
+// profile signed out, which is a legitimate state: the organization is still
+// what a folder's binding is keyed by.
+func writeProfile(t *testing.T, name, url, tenantID, token string) {
+	t.Helper()
+	dir := os.Getenv("RONJA_CONFIG_DIR")
+	if dir == "" {
+		t.Fatal("writeProfile needs an isolated RONJA_CONFIG_DIR — call signIn or signOut first")
+	}
+	f := &config.File{
+		Current: name,
+		Profiles: map[string]*config.Profile{
+			name: {URL: url, TenantID: tenantID, Token: token},
+		},
+	}
+	body, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		t.Fatalf("encode profile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, config.FileName), body, 0o600); err != nil {
+		t.Fatalf("write %s: %v", config.FileName, err)
+	}
+}
+
+// captureStdout swaps os.Stdout for a temp FILE rather than a pipe: a pipe
+// whose buffer fills deadlocks the command under test, and these commands print
+// unbounded file lists.
+func captureStdout(t *testing.T) (*os.File, func(*os.File) string) {
+	t.Helper()
+	tmp, err := os.CreateTemp(t.TempDir(), "stdout-*")
+	if err != nil {
+		t.Fatalf("create capture file: %v", err)
+	}
+	saved := os.Stdout
+	os.Stdout = tmp
+	return tmp, func(f *os.File) string {
+		os.Stdout = saved
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			t.Fatalf("rewind capture file: %v", err)
+		}
+		body, err := io.ReadAll(f)
+		if err != nil {
+			t.Fatalf("read capture file: %v", err)
+		}
+		f.Close()
+		return string(body)
+	}
+}
+
+// decodeJSON parses a --json payload into a generic map, failing the test with
+// the raw output when it is not JSON at all (which is how a command that
+// printed a human report instead announces itself).
+func decodeJSON(t *testing.T, out string) map[string]any {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("output is not JSON (%v):\n%s", err, out)
+	}
+	return payload
+}
+
+// marshalJSON renders a value as JSON so two of them can be compared as text.
+// Used where the assertion is "this was not rewritten": a string diff names the
+// field that moved, where reflect.DeepEqual only says false.
+func marshalJSON(t *testing.T, v any) string {
+	t.Helper()
+	body, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("encode %T: %v", v, err)
+	}
+	return string(body)
+}
+
+// readFile is os.ReadFile with the test's error handling.
+func readFile(t *testing.T, parts ...string) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(parts...))
+	if err != nil {
+		t.Fatalf("read %s: %v", filepath.Join(parts...), err)
+	}
+	return string(body)
+}
+
+// currentProfile reads the stored current-profile name back off disk, for the
+// tests that assert a command changed it — or, more often, that a refused one
+// did not.
+func currentProfile(t *testing.T) string {
+	t.Helper()
+	f, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	return f.Current
+}
