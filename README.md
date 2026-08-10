@@ -278,13 +278,23 @@ Environments → production) — not to the repository-level secrets:
 
 | Name | Kind | Value |
 | --- | --- | --- |
-| `RONJA_CLI_DEPLOY_APP_ID` | Environment **variable** | the App's numeric ID (not sensitive) |
-| `RONJA_CLI_DEPLOY_APP_PRIVATE_KEY` | Environment **secret** | the generated `.pem`, pasted whole |
+| `CLI_DEPLOY_APP_ID` | Environment **variable** | the App's numeric ID (not sensitive) |
+| `CLI_DEPLOY_APP_PRIVATE_KEY` | Environment **secret** | the generated `.pem`, pasted whole |
 
 The job declares `environment: production` to reach them, matching
 `releaser_prod.yml`. Scoping them there keeps the private key — which can mint
 write tokens for two public repos — reachable only from a job that opts in,
 rather than from every workflow in this repository.
+
+⚠️ The names must **not** start with `RONJA_`. `releaser_dev.yml` /
+`releaser_prod.yml` sweep every `RONJA_*` var and secret visible on the
+`production` environment into the deployed workload's container env — that
+prefix means *application config*. Named `RONJA_CLI_DEPLOY_APP_PRIVATE_KEY`
+this key was both shipped into the running production workload and, being a
+multi-line PEM, broke the sweep's line-based `$GITHUB_ENV` write and failed
+the entire backend deploy with `Invalid format '***'`. The sweep now uses the
+heredoc form so a multi-line value can no longer break it, but the naming rule
+stands on its own: a CI-only credential never takes the `RONJA_` prefix.
 
 ⚠️ The two halves of that must move together. An environment secret read by a
 job with no `environment:` line resolves to the **empty string** rather than
