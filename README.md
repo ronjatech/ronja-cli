@@ -104,8 +104,8 @@ Or take a binary from the
 [releases](https://github.com/ronjatech/ronja-cli/releases) — `darwin` and
 `linux`, `amd64` and `arm64`.
 
-Both of the first two need `$(go env GOPATH)/bin` (or Homebrew's bin) on your
-`PATH`:
+Homebrew puts it somewhere already on your `PATH`. After `go install` it lands
+in the Go bin directory, which often is not:
 
 ```bash
 export PATH="$PATH:$(go env GOPATH)/bin"   # add to ~/.zshrc to persist
@@ -184,6 +184,29 @@ version (Go modules require a bare `vX.Y.Z` tag at a repository root), then
 runs [GoReleaser](.goreleaser.yaml) — tests, four cross-compiled targets, a
 GitHub Release on the mirror, and the Homebrew cask pushed to
 `ronjatech/homebrew-tap`.
+
+### When a release fails part-way
+
+The mirror is tagged before GoReleaser publishes, because a GitHub Release
+attaches to a tag ref and `go install ...@vX.Y.Z` resolves the module by
+fetching the repo at that tag. So a failure *after* the tag push leaves the
+version claimed, and the "Refuse to republish" guard then blocks a re-run at
+that same version.
+
+**That guard is deliberate — releases are immutable.** Re-running into a
+half-published version is how you get a tag whose assets do not match its
+source, and a `brew` user with a checksum that does not verify. The intended
+recovery is to fix the cause and cut the next patch version.
+
+If the failure was transient and nothing was published, the version can be
+reclaimed by deleting the tag, the release, and the sync commit:
+
+```bash
+gh release delete vX.Y.Z --repo ronjatech/ronja-cli --cleanup-tag --yes
+```
+
+Check the tap too (`ronjatech/homebrew-tap`) — if the cask was already
+pushed, the version is not reclaimable and you want the next patch instead.
 
 ### Testing a change to this pipeline
 

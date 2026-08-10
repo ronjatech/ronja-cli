@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/spf13/cobra"
 )
@@ -26,10 +27,52 @@ import (
 // differently-worded line printed underneath it by Execute.
 var errAlreadyReported = errors.New("already reported")
 
-// Version is stamped at build time:
+// Version is stamped at build time by the release pipeline:
 //
 //	go install -ldflags "-X github.com/ronjatech/ronja-cli/internal/commands.Version=$(git describe --tags)" ./cmd/ronja
+//
+// It stays "dev" for a plain `go build` from a checkout, and resolveVersion
+// recovers the real one for `go install ...@version`.
 var Version = "dev"
+
+// resolveVersion reports the version to display.
+//
+// The ldflags stamp above only reaches binaries the release pipeline builds —
+// the Homebrew cask and the release tarballs. A user who installs the
+// documented way for every non-macOS platform,
+//
+//	go install github.com/ronjatech/ronja-cli/cmd/ronja@latest
+//
+// compiles from source with no stamp at all, so `ronja --version` reported
+// "dev" for a real published release and a bug report could not say which one.
+// Go records the module version it resolved in the build info, so read it back
+// rather than leaving that install path unable to identify itself.
+//
+// Only consulted when the stamp is absent, so a pipeline build always wins.
+func resolveVersion() string {
+	return resolveVersionFrom(Version, debug.ReadBuildInfo)
+}
+
+// resolveVersionFrom is the testable half of resolveVersion.
+//
+// Split out because the case that matters cannot be reached from a test
+// otherwise: build info is a property of how the BINARY was produced, so a
+// `go test` binary always reports "(devel)" and can never exercise the
+// published-module branch. Verifying that branch for real would mean
+// publishing a release to see what it prints, which is a slow way to find out
+// that a two-line function is wrong.
+func resolveVersionFrom(stamp string, read func() (*debug.BuildInfo, bool)) string {
+	if stamp != "dev" {
+		return stamp
+	}
+	info, ok := read()
+	// "(devel)" is what a local `go build` reports; it is no more useful than
+	// "dev" and less recognisable, so keep ours.
+	if !ok || info == nil || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return stamp
+	}
+	return info.Main.Version
+}
 
 // Global flags. Kept on package vars because cobra binds them once at the root
 // and every subcommand reads the same resolved values.
@@ -122,7 +165,7 @@ same time:
 
 For scripts and agents, RONJA_URL and RONJA_TOKEN override the stored
 credentials entirely and never touch disk.`,
-		Version:       Version,
+		Version:       resolveVersion(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

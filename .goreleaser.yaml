@@ -48,7 +48,14 @@ builds:
       # Stamps `ronja --version`. Without this the released binary reports
       # "dev" (the default in internal/commands/root.go), so a bug report
       # cannot be tied to a release.
-      - -s -w -X github.com/ronjatech/ronja-cli/internal/commands.Version={{ .Version }}
+      #
+      # `.Tag`, NOT `.Version`: .Version strips the leading v, and the other
+      # install path cannot be made to match it — a `go install` binary reads
+      # its version from Go's build info, which always carries the v. Stamping
+      # .Version here would make the same release answer `0.26.2` from brew
+      # and `v0.26.2` from go install. Archive NAMES keep .Version below,
+      # where dropping the v is the convention.
+      - -s -w -X github.com/ronjatech/ronja-cli/internal/commands.Version={{ .Tag }}
 
 archives:
   - id: ronja
