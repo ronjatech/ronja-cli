@@ -396,6 +396,19 @@ The token is minted at collection rather than at approval, so no bearer
 credential is ever stored server-side. Backend detail is in migration
 `000481_cli_auth_requests.up.sql` and `backend/resource/rcliauth/`.
 
+Approval is gated at `USR_USERRO` **plus** an assertion that the caller is a
+*user* principal (`sherlock.CurrentActor(ctx).Kind == ActorKindUser`) with a
+non-empty tenant. Gating it at `USR_ADMIN` — the bar for the raw `POST /token`
+mint — would have made the CLI admin-only; a PAT is safe at the lower bar
+because it carries its bound user's live role and so can never exceed them. A
+plain `api_token` is refused outright, because `Who()` is then the token id
+rather than a row in `users`.
+
+> ⚠️ **Approving is therefore not session-only.** A PAT holder can drive the
+> whole handshake headlessly and mint fresh, independently-revocable *child*
+> PATs. This is accepted — but note revoking the parent does **not** revoke the
+> children.
+
 The PAT is **full access but time-bounded — 90 days**. Full access is right
 because a PAT never exceeds its bound user's live role (and `/api/v2/authentication`
 requires the `admin` scope, so a *scoped* token could not even call `/me`); the
@@ -963,6 +976,14 @@ These are load-bearing for the agent use case — please keep them true:
 - **Non-zero exit on failure**, with the reason on stderr.
 - **`RONJA_URL` / `RONJA_TOKEN` outrank the credential file**, so a CI job never
   inherits whoever last logged in on that machine.
+- **Enumeration and path-checking must share one folder `Kind`.** The local walk
+  (`Enumerate`) and the local-path validator (`CheckLocalPaths`) both take the
+  `wfdir.Kind` as a single threaded value, because the `Kind` decides which
+  directories are never synced (`node_modules` / `dist` / `build` for a data
+  app). Let those two disagree and the baseline records a file the walk will
+  never see again — a phantom deletion that the *next* push applies server-side.
+  This is why `LoadManifest(root, kind)` refuses the other kind outright: the two
+  folder types are indistinguishable by shape, so nothing else would catch it.
 
 ## Layout
 
