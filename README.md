@@ -794,7 +794,7 @@ The verbs:
 | `validate` | posts the folder to `POST /workflow/validate`. Persists nothing; works before the workflow exists | `--json` |
 | `push` | validates, ensures a draft (`checkout`, or `POST /workflow` on a first push), syncs files | `--no-validate`, `--force` |
 | `test` | runs the draft and polls to completion | `--param k=v`, `--write-live`, `--stale-ok`, `--timeout`, `--logs` |
-| `publish` | publishes a parentless draft, commits an attached one, or submits it for review | `--no-request-review` |
+| `publish` | publishes a parentless draft, commits an attached one, or submits it for review | `--no-request-review`, `--overwrite-remote` |
 | `discard` | deletes your draft; the live workflow and your local files are untouched. A workflow that has never been published *is* its draft, so removing it needs `--delete-workflow` (a soft delete — it sits in the trash for 30 days) | `--yes`, `--delete-workflow` |
 
 Four behaviours are deliberate and easy to undo by accident:
@@ -809,7 +809,12 @@ Four behaviours are deliberate and easy to undo by accident:
   summary; so does a title or entrypoint someone renamed there, when the
   manifest disagrees with it. `--force` overwrites. A folder whose baseline
   predates metadata tracking is guarded on files only, not retroactively
-  refused.
+  refused. That check is LOCAL and happens once, so each *file* write carries a
+  server-side precondition of its own — see "Two editors, one workflow" below.
+  The metadata patch does **not**: `PUT /workflow/:id` takes no precondition, so
+  the title/entrypoint/parameters half of this guard is the local drift check
+  alone, and a rename landing between that check and the patch still wins
+  silently.
 - **`--write-live` on test, and no y/N prompt.** A draft checked out from a live
   workflow inherits its output tables, and there is no test sandbox, so running
   it replaces a production table. A prompt would get muscle-memoried; a flag
@@ -822,6 +827,128 @@ Four behaviours are deliberate and easy to undo by accident:
 - **Exit zero means the thing finished.** `validate` exits non-zero on error
   findings, `test` only on a successful run. Ctrl-C during `test` stops the
   waiting, not the run — it is caught explicitly so the person is told that.
+
+### Two editors, one workflow
+
+The drift guard above is a local comparison against a file listing read a few
+requests earlier, so it cannot see a change that lands *while* the push is
+running — and two agents driving `wf` at once is now an ordinary thing to have
+happen. Two server-side compare-and-swap layers close that window. Neither is a
+lock, and neither makes an overwrite impossible: they make it **explicit**.
+
+**`ronja app` has neither of them.** Everything in this section is workflows
+only: `PUT /dataapp/:id/files/*path` takes no `baseSha256`, and `app publish`
+has no `--overwrite-remote`. A data-app folder is guarded by the local drift
+check alone, so a change landing while a push is running still wins silently.
+
+- **Every file write carries a precondition.** `push` sends `baseSha256` with
+  each `PUT` and `DELETE` — the sha256 the local baseline recorded the server as
+  holding — and the server checks it inside that write's own transaction. A path
+  the baseline has never seen asserts the **empty string**, which means "this
+  file must not exist yet". A mismatch is an HTTP **409**: the write is rolled
+  back, the file keeps the other person's content, and the push stops naming the
+  file. Nothing is retried and nothing escalates to `--force` for you — the
+  whole value of the refusal is that a human decides what happens to the change
+  it just protected.
+
+  Two cases send **no** precondition, and they are really one case: the drift
+  guard was already bypassed, so the baseline demonstrably does not describe the
+  row, and a precondition built from it could only refuse a difference the push
+  was told to proceed past. Those are `--force` — whose entire meaning is
+  "overwrite the remote with what I have", so a 409 there would be the flag
+  refusing itself — and a workflow this push just **created**, which has no
+  baseline at all and whose create *seeds* a starter file at the entrypoint
+  inside its own transaction, so "must not exist" would refuse a workflow the
+  CLI made seconds earlier. Resuming a crashed first push is that same seed one
+  command later, and is suppressed with it.
+
+- **`publish` refuses to commit onto a parent that moved.** A draft records
+  which committed version it was forked from. If somebody has published a new
+  version since, the commit is refused with a 409 and **nothing is written** —
+  your draft is completely intact, it simply was not applied. The refusal names
+  the current version and, when the server can tell, the files that changed.
+
+  The good way out is to look at what they did and re-apply your work on top of
+  it: `ronja wf discard`, then clone again. `--overwrite-remote` is the other
+  way, and the name is deliberately unpleasant. It reads the current head from
+  `GET :id/versions` (element 0, or the workflow's own id when it has never been
+  versioned), confirms that exact id back to the server, and commits over their
+  version. **It never loops.** A third commit landing between reading the head
+  and confirming it produces a fresh refusal rather than a second attempt: an
+  override authorises discarding the version you were *shown*, not whatever
+  happens to be there by the time the request arrives.
+
+  The version id is read from the API and never scraped out of the 409's text.
+  The HTTP error body is the flat app-wide `{"error": "…"}` shape with no
+  structured payload, and a client that regexes an id out of prose starts
+  overwriting the wrong version the day somebody rewords the message.
+
+  A 409 is deliberately kept out of publish's needs-review fallback, which is
+  keyed on a **400**. Filing a review request for a draft built on stale code
+  would report a publish that never happened as a successful one.
+
+Under `--json`, a publish that overwrote something carries
+`overwroteVersionID`. It is absent on every ordinary publish, which is what
+makes its presence meaningful: it is the record that somebody else's work was
+discarded, and by which version.
+
+**A conflict is machine-readable on both commands**, because an agent driving
+the CLI has to tell "somebody committed first, re-apply and try again" from
+"you may not do this at all" — and both are a non-zero exit with prose on
+stderr.
+
+- `publish --json` extends its `outcome` vocabulary with a third value,
+  `conflict`, and emits the payload **even though the command fails** (`error`
+  carries the server's message verbatim). The other two values,
+  `published` and `submitted_for_review`, are unchanged and still ride a zero
+  exit; `conflict` is the only one that does not. A caller that knows only the
+  original two still behaves correctly — the exit code is non-zero and the
+  outcome is simply not one it recognises.
+- `push --json` carries `conflict: true` when a file precondition is what
+  stopped it. The rest of the payload still describes what *did* land, which is
+  the state the draft is now in.
+
+Do not branch on the `error` text on either command. It is the server's prose,
+it names versions and files precisely so a human can read it, and it is
+reworded whenever that reads better.
+
+**Status, push and publish print a link.** A successful `push` reports the
+draft's page and a successful `publish` the live workflow's, in the same
+key-value column as the ids above it; `status` reports the **workflow** the
+folder is bound to, whoever has a draft open — and only when it actually
+reached the server, so a signed-out or unbound status has no `URL:` line at
+all:
+
+```
+  Draft:    workflow-def
+  Target:   Acme on https://api.acme.ronja.tech
+  URL:      https://acme.ronja.tech/workflows/workflow-def?org=tenant-acme
+```
+
+The link is whatever the **server** returned on the response the command
+already holds — the CLI never assembles one. The instance URL a profile records
+is the *API* origin, and a deployment puts the backend on `api.*` and the
+frontend on `app.*`; in local dev the backend serves no frontend routes at all.
+So a locally-built link points at a host that serves no pages, which is the bug
+this replaced (the server had the same one from its own side, now fixed in
+`backend/lib/deeplink`).
+
+The `?org=` on the end is the server's doing too. No frontend route carries an
+organization — the selected one is a cookie — so the link names the org the
+resource lives in, and a reader who opens it while signed into a different one
+is asked whether to switch rather than shown a resource-not-found page. It is a
+hint and nothing more: it grants no access, and the app never acts on it without
+a click. A response built on a context with no tenant degrades to a param-less
+link (still a working link for a single-org reader), so a `URL:` line without
+one is not a bug.
+
+An instance with no frontend origin configured returns no `url`, and then there
+is simply no `URL:` line — no warning and no failure, because there is nothing
+the reader could act on. That is the ordinary state of a plain dev box. Under
+`--json` nothing extra is printed and the payload is unchanged — including
+`status`, whose `url` key has always meant the *instance*, not the page. A
+script that wants the link reads it off the API response, which is where this
+came from: `ronja api /api/v2/workflow/<id> --jq .url`.
 
 There is deliberately no `wf list` and no `wf delete`: discovery stays on HTTP.
 `discard` is a sync verb rather than a resource one — it operates on the loop's
@@ -917,11 +1044,13 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   check does catch is what stops a bundle existing at all: syntax errors, and
   imports that resolve to nothing (a typo'd path, a file you have not pushed).
 - **There is no `app test`, and `app validate` means something different.**
-  A data app has nothing to run headlessly; `status` prints its `/apps/<id>` URL
-  instead. And `wf validate` can check a candidate before the workflow exists,
-  because `POST /workflow/validate` persists nothing — data apps have no such
-  endpoint, so `app validate` compiles the draft that is already on the server,
-  and warns when your folder holds changes you have not pushed.
+  A data app has nothing to run headlessly; `status` prints the app's URL as the
+  server returned it instead — and no link at all when it never reached the
+  server, or when the instance has no frontend origin (see the `URL:` note under
+  the verbs below). And `wf validate` can check a candidate before the workflow
+  exists, because `POST /workflow/validate` persists nothing — data apps have
+  no such endpoint, so `app validate` compiles the draft that is already on the
+  server, and warns when your folder holds changes you have not pushed.
 
 ### The verbs
 
@@ -934,6 +1063,22 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
 | `validate` | recompiles your draft and reports diagnostics | `--json` |
 | `publish` | commits the draft, or submits it for review. Refuses a draft that does not compile | `--no-request-review` |
 | `discard` | deletes your draft; the live app and your local files are untouched | `--yes`, `--delete-app` |
+
+`status`, `push` and `publish` print a `URL:` line the same way `wf` does and
+for the same reasons — see the note in the workflow section, including why an
+absent link is silent. Two details are specific to apps: `push` reports the
+**draft** it wrote to while `status` and `publish` report the **app** itself,
+and `status` only knows the link when it actually reached the server, so a
+signed-out or unbound status has no `URL:` line.
+
+⚠️ One thing is *not* the same as `wf`: the `--json` payloads of `app status`
+and `app publish` **did** change. Both carry an `appURL` field, and both used to
+derive it locally — so it was always present, and always pointing at the API
+host. It is now the server's link, and therefore **absent** when the instance
+has no frontend origin configured, or (for `status`) when the remote read never
+happened. `ronja app publish --json | jq -r .appURL` goes from a wrong string to
+`null` on such an instance. `app push` is unchanged: its link rides the human
+report only, exactly like `wf`'s.
 
 An app that has never been published *is* a draft, with no live version behind
 it, so discarding it would delete the app. That is refused unless you pass
@@ -970,6 +1115,11 @@ These are load-bearing for the agent use case — please keep them true:
   precisely because it describes nothing and so cannot drift. A subcommand that
   names a route, a resource kind or a field is the wrapper this rules out. See
   "Transport is not a wrapper" above.
+- **A link a report prints comes from the server.** Which page a resource has,
+  and which origin serves it, are the backend's to answer (`lib/deeplink`); the
+  CLI prints the `url` off a response and prints nothing when there is none. It
+  never templates a route and never falls back to the instance URL — that is
+  the *API* origin, and a link built from it lands on a host serving no pages.
 - **Never prompt without a TTY.** A missing input must be an error, not a hang.
 - **`--json` on everything**, and only ever on stdout. Human narration goes to
   stderr so `--json` output stays a single parseable object.

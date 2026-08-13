@@ -14,9 +14,18 @@ import (
 // contract for anything scripting the CLI: "submitted_for_review" is a
 // SUCCESSFUL publish attempt that landed nothing, and treating it as "published"
 // is the mistake this vocabulary exists to prevent.
+//
+// "conflict" is the one value that rides on a NON-ZERO exit, and it is the
+// whole reason the vocabulary was extended rather than left at two: without it
+// the only machine-readable difference between "somebody committed first" and
+// "you may not commit at all" is substring-matching the server's prose on
+// stderr — the exact fragility HeadVersionID refuses to accept from the 409
+// body. A caller that does not know the value still behaves correctly: the exit
+// code is non-zero and `outcome` is simply not one of the two it recognises.
 const (
 	outcomePublished          = "published"
 	outcomeSubmittedForReview = "submitted_for_review"
+	outcomeConflict           = "conflict"
 )
 
 // scopeOrganization is the feature scope that makes a workflow shared, mirrored
@@ -32,7 +41,7 @@ const scopeOrganization = "organization"
 // actually happened was "an admin now has a review request" is the kind of lie
 // people discover a week later.
 func newWorkflowPublishCmd() *cobra.Command {
-	var noRequestReview bool
+	var opts publishOptions
 	cmd := &cobra.Command{
 		Use:   "publish",
 		Short: "Publish your draft, or submit it for review",
@@ -48,6 +57,11 @@ What happens depends on the workflow:
 --no-request-review turns the last case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
 
+The commit is refused when somebody else has published a new version of the
+workflow since your draft was created — nothing is written and your draft is
+untouched. Review what they changed and re-apply your work on top of it, or
+re-run with --overwrite-remote to commit over their version deliberately.
+
 Push first: publish sends what is already on the server, and warns when the
 folder has local changes that are not in the draft.`,
 		Args: cobra.NoArgs,
@@ -60,20 +74,41 @@ folder has local changes that are not in the draft.`,
 			if err != nil {
 				return err
 			}
-			result, err := runPublish(cmd.Context(), f, noRequestReview)
-			if err != nil {
-				return err
+			result, err := runPublish(cmd.Context(), f, opts)
+			// Emitted even on failure, exactly like `wf push`: a refusal that
+			// carries a result is one the caller has to be able to READ, and
+			// the conflict refusal is the whole reason. Returning only the
+			// error left `--json` with empty stdout and nothing but stderr
+			// prose to tell a conflict from a permission failure.
+			if result != nil {
+				if flagJSON {
+					if emitErr := emitJSON(result); emitErr != nil {
+						return emitErr
+					}
+				} else {
+					printPublishReport(result)
+				}
 			}
-			if flagJSON {
-				return emitJSON(result)
-			}
-			printPublishReport(result)
-			return nil
+			return err
 		},
 	}
-	cmd.Flags().BoolVar(&noRequestReview, "no-request-review", false,
+	cmd.Flags().BoolVar(&opts.NoRequestReview, "no-request-review", false,
 		"fail instead of submitting the draft for admin review")
+	cmd.Flags().BoolVar(&opts.OverwriteRemote, "overwrite-remote", false,
+		"commit even though someone published a new version since your draft was created, discarding their changes")
 	return cmd
+}
+
+// publishOptions are the two ways a publish can be told to depart from its
+// default, both of them refusals turned into actions.
+type publishOptions struct {
+	NoRequestReview bool
+	// OverwriteRemote authorizes committing over a version of the parent that
+	// landed after this draft was created — a deliberately unpleasant name for
+	// a deliberately unpleasant thing. It resolves the current head and
+	// confirms it explicitly; it never loops, so a version that lands while
+	// this is running produces a fresh refusal rather than a second attempt.
+	OverwriteRemote bool
 }
 
 type publishResult struct {
@@ -83,12 +118,32 @@ type publishResult struct {
 	// Detail is a human sentence about what actually happened — which parent
 	// was committed to, or why the review route was taken.
 	Detail string `json:"detail,omitempty"`
+	// Error is the server's refusal, verbatim, on a publish that landed
+	// nothing. It is prose and must not be branched on — `outcome` is the
+	// machine-readable half — but it is the only place the server's own
+	// account of the conflict (which version, which files) survives into the
+	// --json payload.
+	Error string `json:"error,omitempty"`
 	// Target names the instance and organization this landed in. See
 	// describeTarget.
 	Target string `json:"target,omitempty"`
+	// OverwroteVersionID names the committed version this publish deliberately
+	// wrote over, and is set ONLY on the --overwrite-remote path. Absent on
+	// every ordinary publish, which is what makes its presence meaningful to
+	// anything scripting the CLI: it is the record that somebody else's work
+	// was discarded, and by which version id.
+	OverwroteVersionID string `json:"overwroteVersionID,omitempty"`
+	// URL is the frontend page for the now-live workflow, as the SERVER
+	// reported it, and is rendered by the human report only — see pushResult.URL
+	// for why it stays out of the --json payload.
+	//
+	// Set on a PUBLISH and not on a review request, matching `app publish`:
+	// a draft submitted for review put nothing live, and the honest close there
+	// is "an admin must approve it", not a link to what has not changed.
+	URL string `json:"-"`
 }
 
-func runPublish(ctx context.Context, f *folder, noRequestReview bool) (*publishResult, error) {
+func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishResult, error) {
 	client := api.New(f.Resolved.URL, f.Resolved.Token)
 	parent, draft, err := resolveDraft(ctx, client, f, "nothing to publish")
 	if err != nil {
@@ -118,6 +173,9 @@ func runPublish(ctx context.Context, f *folder, noRequestReview bool) (*publishR
 		}
 		result.Outcome = outcomePublished
 		result.Detail = "the workflow is now live"
+		// The draft's own page: publishing a parentless draft promotes that row
+		// in place, so its id — and its link — survive the publish.
+		result.URL = draft.URL
 		noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, draft.ID))
 		return result, nil
 	}
@@ -127,7 +185,7 @@ func runPublish(ctx context.Context, f *folder, noRequestReview bool) (*publishR
 	// than by trying a commit and reading the rejection prose. Matching on an
 	// error message is how a client silently starts doing the wrong thing the
 	// day someone rewords it.
-	if !noRequestReview && parent.FeatureScope == scopeOrganization {
+	if !opts.NoRequestReview && parent.FeatureScope == scopeOrganization {
 		admin, err := callerIsAdmin(ctx, client)
 		if err != nil {
 			// Fall through to the commit attempt: the 400 fallback below still
@@ -144,18 +202,33 @@ func runPublish(ctx context.Context, f *folder, noRequestReview bool) (*publishR
 		}
 	}
 
-	commitErr := client.CommitWorkflowDraft(ctx, draft.ID)
+	commitErr := client.CommitWorkflowDraft(ctx, draft.ID, "")
 	if commitErr == nil {
 		result.Outcome = outcomePublished
 		result.Detail = fmt.Sprintf("committed to %q", parent.Title)
+		// The PARENT's page, not the draft's: the draft is gone the moment it
+		// commits, and what the reader wants to look at is what went live.
+		result.URL = parent.URL
 		noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, parent.ID))
 		return result, nil
+	}
+
+	// A 409 is the optimistic-concurrency refusal — somebody published a new
+	// version of the parent after this draft was seeded — and it is checked
+	// FIRST so it can never fall into the needs-review branch below. That
+	// branch's `!= 400` already excludes it, and this ordering is what keeps
+	// that true if the condition is ever widened: turning "your draft is based
+	// on stale code" into "an admin will review it" would file a review request
+	// for a draft that still needs reconciling, and report a publish that never
+	// happened as a successful one.
+	if api.StatusOf(commitErr) == api.StatusConflict {
+		return resolveCommitConflict(ctx, client, f, parent, draft, result, opts, commitErr)
 	}
 
 	// The race the up-front routing cannot close: the feature was shared, or
 	// the caller's role changed, between the read above and the commit. A 400
 	// on an org-scoped parent is the server's needs-review rejection.
-	if noRequestReview || parent.FeatureScope != scopeOrganization || api.StatusOf(commitErr) != 400 {
+	if opts.NoRequestReview || parent.FeatureScope != scopeOrganization || api.StatusOf(commitErr) != 400 {
 		return nil, fmt.Errorf("commit %s: %w", draft.ID, commitErr)
 	}
 	fmt.Fprintf(os.Stderr, "  Note: the commit was refused (%v) — submitting the draft for review instead.\n", commitErr)
@@ -165,6 +238,69 @@ func runPublish(ctx context.Context, f *folder, noRequestReview bool) (*publishR
 	}
 	result.Outcome = outcomeSubmittedForReview
 	result.Detail = fmt.Sprintf("the commit was refused (%v), so the draft was submitted for review", commitErr)
+	return result, nil
+}
+
+// resolveCommitConflict handles the one refusal that is about somebody else's
+// work rather than about permission: the parent moved after this draft was
+// created, so committing would discard a version nobody here has seen.
+//
+// Nothing was written when this is reached — the CAS runs inside the commit's
+// own transaction, under the parent's row lock — so the draft is fully intact
+// either way, and the only question is whether the author wants to overwrite.
+func resolveCommitConflict(ctx context.Context, client *api.Client, f *folder,
+	parent, draft *api.Workflow, result *publishResult, opts publishOptions, commitErr error) (*publishResult, error) {
+
+	// conflict finishes the result as the machine-readable refusal it is, and
+	// hands back both halves: the caller prints the payload and then fails.
+	conflict := func(err error) (*publishResult, error) {
+		result.Outcome = outcomeConflict
+		result.Error = err.Error()
+		return result, err
+	}
+
+	if !opts.OverwriteRemote {
+		// The server's own message names the current version and, when it can
+		// tell, the files that changed — so it is passed through rather than
+		// paraphrased into something less specific.
+		fmt.Fprintf(os.Stderr, "  Conflict: %q has been published to since your draft was created — nothing was committed, and your draft is intact.\n", parent.Title)
+		fmt.Fprintf(os.Stderr, "  %v\n", commitErr)
+		fmt.Fprintf(os.Stderr, "  Re-apply your change on top of theirs (`ronja wf discard` then `ronja wf clone %s`), or re-run with --overwrite-remote to commit over their version.\n", parent.ID)
+		return conflict(fmt.Errorf("commit %s: %w", draft.ID, commitErr))
+	}
+
+	// The head is READ, never scraped out of the 409's prose: the HTTP error
+	// body is the flat app-wide {"error": "<message>"} shape with no structured
+	// payload, and a regex over prose starts overwriting the wrong version the
+	// day somebody rewords it.
+	head, err := client.HeadVersionID(ctx, parent.ID)
+	if err != nil {
+		return nil, fmt.Errorf("the commit of %s was refused (%v), and reading the current version of %s in order to overwrite it failed too: %w",
+			draft.ID, commitErr, parent.ID, err)
+	}
+	fmt.Fprintf(os.Stderr, "  --overwrite-remote: committing over version %s of %q, discarding what it changed.\n", head, parent.Title)
+
+	if err := client.CommitWorkflowDraft(ctx, draft.ID, head); err != nil {
+		// A SECOND 409 means a third commit landed between the read above and
+		// this write. Deliberately not retried: an override authorizes
+		// overwriting the version it was shown, not whatever happens to be
+		// there by the time the request arrives — and a loop would authorize
+		// every one of them.
+		if api.StatusOf(err) == api.StatusConflict {
+			// Still a conflict, and reported as one: a third commit landing
+			// mid-override is the same "somebody got there first" the caller
+			// has to be able to tell from a permission failure.
+			return conflict(fmt.Errorf("commit %s: %s moved again while this was running — version %s is no longer the current one, so nothing was committed and your draft is intact; re-run to see where it is now: %w",
+				draft.ID, parent.ID, head, err))
+		}
+		return nil, fmt.Errorf("commit %s over version %s: %w", draft.ID, head, err)
+	}
+
+	result.Outcome = outcomePublished
+	result.OverwroteVersionID = head
+	result.Detail = fmt.Sprintf("committed to %q, overwriting version %s that was published after your draft was created", parent.Title, head)
+	result.URL = parent.URL
+	noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, parent.ID))
 	return result, nil
 }
 
@@ -291,6 +427,11 @@ func printPublishReport(r *publishResult) {
 	switch r.Outcome {
 	case outcomeSubmittedForReview:
 		fmt.Fprintf(out, "  Submitted for review — an admin must approve it.\n")
+	case outcomeConflict:
+		// The actionable narration is already on stderr, where it was written
+		// as it happened. This line exists so the report cannot say
+		// "Published." about a publish that landed nothing.
+		fmt.Fprintf(out, "  Not published — the workflow moved on since your draft was created.\n")
 	default:
 		fmt.Fprintf(out, "  Published.\n")
 	}
@@ -302,4 +443,5 @@ func printPublishReport(r *publishResult) {
 	if r.Target != "" {
 		fmt.Fprintf(out, "  Target:   %s\n", r.Target)
 	}
+	printResourceURL(out, reportKeyWidth, r.URL)
 }

@@ -78,7 +78,7 @@ With --json, one object carrying all of the above.`,
 				}
 			}
 
-			report.Remote = remoteStatus(cmd.Context(), resolved, f)
+			report.Remote, report.WorkflowURL = remoteStatus(cmd.Context(), resolved, f)
 
 			if flagJSON {
 				return emitJSON(report)
@@ -107,13 +107,27 @@ type statusReport struct {
 	// organization, with no way to tell which applies — the signed-out case.
 	// Distinct from Bound so a caller does not read "not bound" and conclude a
 	// push would create a new workflow.
-	Ambiguous  bool            `json:"ambiguous,omitempty"`
-	WorkflowID string          `json:"workflowID,omitempty"`
-	FeatureID  string          `json:"featureID,omitempty"`
-	Local      wfdir.Diff      `json:"local"`
-	Skipped    []wfdir.Skipped `json:"skipped,omitempty"`
-	Baseline   *baselineReport `json:"baseline,omitempty"`
-	Remote     *remoteReport   `json:"remote"`
+	Ambiguous  bool   `json:"ambiguous,omitempty"`
+	WorkflowID string `json:"workflowID,omitempty"`
+	FeatureID  string `json:"featureID,omitempty"`
+	// WorkflowURL is where a human looks at the workflow, as the SERVER reported
+	// it on the row — never templated from the instance URL, which is the API
+	// origin (see printResourceURL).
+	//
+	// A fact the REMOTE half establishes, so it is empty whenever that half was
+	// not reached at all: signed out, unbound, or unreachable. Guessing there
+	// would mean guessing at both the origin and the row.
+	//
+	// Rendered by the human report ONLY, like the same link on push and publish:
+	// this struct's `url` key already means the INSTANCE origin, and a second
+	// url under another name is a shape change to something scripts parse. A
+	// caller that wants the page reads it off the API response the CLI got it
+	// from (`ronja api /api/v2/workflow/<id> --jq .url`).
+	WorkflowURL string          `json:"-"`
+	Local       wfdir.Diff      `json:"local"`
+	Skipped     []wfdir.Skipped `json:"skipped,omitempty"`
+	Baseline    *baselineReport `json:"baseline,omitempty"`
+	Remote      *remoteReport   `json:"remote"`
 }
 
 type baselineReport struct {
@@ -185,7 +199,14 @@ type comparedReport struct {
 // Same principle as `ronja context`'s optional /llms.txt fetch: a failed
 // optional read prints a note and the command still delivers what it can. The
 // local half of a status is worth having on a plane.
-func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) *remoteReport {
+//
+// The second return is the workflow's frontend page, which belongs to the
+// top-level report rather than to this block — but only the remote read can
+// produce it, since the link is the SERVER's to give (see printResourceURL).
+// Returned alongside instead of added to remoteReport so the --json shape stays
+// exactly as callers already find it; "" whenever the remote half was not
+// reached, which prints as nothing at all.
+func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*remoteReport, string) {
 	out := &remoteReport{}
 	// Bound to several organizations here, and signed out, so which binding
 	// applies is genuinely unknown. Reported rather than guessed: picking one
@@ -193,19 +214,19 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) *re
 	if f.BindingErr != nil {
 		out.NotCheckedReason = fmt.Sprintf("%s on %s — sign in (`ronja login`), or pass --profile to say which one",
 			f.BindingErr, resolved.URL)
-		return out
+		return out, ""
 	}
 	if !f.Bound {
 		out.NotCheckedReason = fmt.Sprintf("this folder is not bound to %s yet — the first push will create the binding", resolved.URL)
-		return out
+		return out, ""
 	}
 	if resolved.Token == "" {
 		out.NotCheckedReason = fmt.Sprintf("not signed in to %s — run `ronja login --url %s`", resolved.URL, resolved.URL)
-		return out
+		return out, ""
 	}
 	if f.Binding.WorkflowID == "" {
 		out.NotCheckedReason = "no workflow exists on this instance yet — the first push will create it"
-		return out
+		return out, ""
 	}
 
 	client := api.New(resolved.URL, resolved.Token)
@@ -215,16 +236,23 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) *re
 			out.Checked = true
 			out.Problem = fmt.Sprintf("binding broken: workflow %s no longer exists on %s (or you lost access to it)",
 				f.Binding.WorkflowID, resolved.URL)
-			return out
+			return out, ""
 		}
 		out.NotCheckedReason = fmt.Sprintf("could not read workflow %s: %v", f.Binding.WorkflowID, err)
-		return out
+		return out, ""
 	}
 	out.Checked = true
 	out.Lifecycle = wf.Lifecycle
+	// The WORKFLOW's page, not the draft's: this is the row the binding names
+	// and the one a reader means by "the workflow", whoever has a draft open.
+	pageURL := wf.URL
 	if err := refuseUnclonable(wf); err != nil {
+		// Reported WITH the link: an archived or proposed row is exactly the
+		// case whose fix is "go and look at it in the web UI", and the link is
+		// still the server's own — a VERSION row, which has no page, comes back
+		// with no url at all rather than one this could have invented.
 		out.Problem = "binding broken: " + err.Error()
-		return out
+		return out, pageURL
 	}
 
 	// The row a push would target: your draft if you have one, else the live
@@ -249,7 +277,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) *re
 	files, err := client.ListWorkflowFiles(ctx, target.ID)
 	if err != nil {
 		out.note("could not read remote files: %v", err)
-		return out
+		return out, pageURL
 	}
 	out.ComparedAgainst = &comparedReport{ID: target.ID, Lifecycle: target.Lifecycle}
 	baseline := f.State.For(f.Key)
@@ -271,7 +299,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) *re
 		out.note("baseline came from %s (%s); comparing against %s (%s)",
 			baseline.SourceID, baseline.SourceLifecycle, target.ID, target.Lifecycle)
 	}
-	return out
+	return out, pageURL
 }
 
 // formatTime renders an optional timestamp, or "" when absent.
@@ -309,6 +337,7 @@ func printStatus(r *statusReport) {
 	if r.ManagesParameters {
 		fmt.Fprintf(out, "  Parameters: %s\n", r.Parameters)
 	}
+	printResourceURL(out, statusKeyWidth, r.WorkflowURL)
 
 	fmt.Fprintf(out, "\n  Local changes\n")
 	if !r.Local.Dirty() {

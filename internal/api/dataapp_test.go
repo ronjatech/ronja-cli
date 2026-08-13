@@ -47,7 +47,8 @@ const dataAppFixture = `{
   "markedForDeletionAt": null,
   "createdBy": "user-1",
   "createdAt": "2026-08-01T08:00:00Z",
-  "updatedAt": "2026-08-04T10:30:00Z"
+  "updatedAt": "2026-08-04T10:30:00Z",
+  "url": "https://app.example.test/apps/data_app-abc"
 }`
 
 func TestGetDataAppDecodesEveryMirroredField(t *testing.T) {
@@ -114,6 +115,14 @@ func TestGetDataAppDecodesEveryMirroredField(t *testing.T) {
 	// back ordered — which is what makes SameAccess a comparison of meaning.
 	if len(app.AllowedTableIDs) != 2 || app.AllowedTableIDs[0] != "table-1" {
 		t.Errorf("allowedTableIDs = %v, want them sorted", app.AllowedTableIDs)
+	}
+
+	// Stamped by the SERVER (DataAppView) on a FRONTEND origin, which is not
+	// the API origin this client was pointed at — the whole reason the CLI
+	// reads it instead of templating one. Absent on an instance with no
+	// configured frontend origin, which reads as "" and prints nothing.
+	if app.URL != "https://app.example.test/apps/data_app-abc" {
+		t.Errorf("url = %q", app.URL)
 	}
 
 	// IdentityID is what a manifest binding records: the parent, since a draft's

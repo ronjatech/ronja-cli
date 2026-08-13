@@ -112,9 +112,27 @@ type pushResult struct {
 	// describes what DID happen before it stopped, which is the state the
 	// draft is now in.
 	Error string `json:"error,omitempty"`
+	// Conflict reports that what stopped this push was a file precondition
+	// refusing — somebody wrote to the draft between the listing this push
+	// compared against and its own write.
+	//
+	// It exists because Error is PROSE. A caller that has to tell "somebody
+	// got there first, re-read and re-apply" from "this file was rejected" has
+	// otherwise only substring-matching to do it with, and that breaks the day
+	// the server rewords a message. Same reason publish reports
+	// outcome:"conflict".
+	Conflict bool `json:"conflict"`
 	// Target names the instance and organization this push landed in, so a
 	// mistake is visible where it happens rather than only from a later status.
 	Target string `json:"target,omitempty"`
+	// URL is the frontend page for the draft this push wrote to, as the SERVER
+	// reported it, and is rendered by the human report only.
+	//
+	// Deliberately NOT in the --json payload: this shape is a contract for
+	// anything scripting the CLI, and a caller that wants the link machine-
+	// readably reads it straight off the API response (`ronja api
+	// /api/v2/workflow/<id> --jq .url`), which is where it comes from anyway.
+	URL string `json:"-"`
 }
 
 // newClient builds the client a push talks to. A package var, not a call to
@@ -212,6 +230,10 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return nil, err
 	}
 	result.DraftID = target.ID
+	// Recorded here rather than at the end, so every success path reports the
+	// same link — including the up-to-date one, which returns before the
+	// closing re-read. Both describe one row, and a row's page cannot move.
+	result.URL = target.URL
 	if target.SubmittedForReviewAt != nil {
 		result.DraftUnderReview = true
 		fmt.Fprintf(os.Stderr, "  Warning: draft %s has already been submitted for review — this push changes what the admin is reviewing.\n",
@@ -235,10 +257,18 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// the server is older than this push, so there is nothing anyone could have
 	// changed underneath it.
 	baselineClean := false
+	preconditions := filePreconditions{}
 	if !result.Created {
-		baselineClean, err = checkDrift(f, target, remoteFiles, opts.Force)
+		verdict, err := checkDrift(f, target, remoteFiles, opts.Force)
 		if err != nil {
 			return nil, err
+		}
+		baselineClean = verdict.BaselineClean
+		// Server-side preconditions are armed EXACTLY where the drift guard
+		// vouched for the baseline, and suppressed everywhere it was bypassed.
+		// See filePreconditions for why that equivalence is the whole rule.
+		if !verdict.Bypassed {
+			preconditions = filePreconditions{Armed: true, Hashes: f.State.For(f.Key).Hashes()}
 		}
 	}
 
@@ -264,7 +294,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// the workflow's shape against, a half-finished sync still has a coherent
 	// entrypoint — and the metadata patch below cannot name an entrypoint the
 	// row holds no file for.
-	warnings, err := putFiles(ctx, client, target.ID, entrypoint, local, remoteFiles, landed, result)
+	warnings, err := putFiles(ctx, client, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
 	result.Warnings = append(result.Warnings, warnings...)
 	if err != nil {
 		return stop(err)
@@ -288,7 +318,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	}
 
 	// 8. Deletions last.
-	warnings, err = deleteFiles(ctx, client, target.ID, local, remoteFiles, landed, result)
+	warnings, err = deleteFiles(ctx, client, target.ID, local, remoteFiles, landed, preconditions, result)
 	result.Warnings = append(result.Warnings, warnings...)
 	if err != nil {
 		return stop(err)
@@ -625,6 +655,27 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 	return draft, nil
 }
 
+// driftVerdict is what the drift guard decided, and it carries two independent
+// answers because two later steps need different halves of it.
+type driftVerdict struct {
+	// BaselineClean reports an EXISTING baseline that already described the
+	// server exactly. Only that answer lets a push with nothing to write leave
+	// the baseline alone: a forced push past real drift, or one with no
+	// baseline at all, has a baseline to record even when it writes nothing.
+	BaselineClean bool
+	// Bypassed reports that this push is not to be held to the baseline —
+	// --force, or the CLI's own half-finished first push. It is what
+	// suppresses the server-side preconditions.
+	//
+	// --force sets it unconditionally, including when the baseline turned out
+	// to be clean and nothing needed bypassing. The flag's meaning is
+	// "overwrite the remote with what I have", and it does not become
+	// conditional on what the drift check happened to see one request earlier:
+	// a precondition armed on a clean baseline refuses precisely the mid-push
+	// race --force exists to proceed past, with advice to run --force.
+	Bypassed bool
+}
+
 // checkDrift refuses a push that would overwrite server-side changes made since
 // the last sync.
 //
@@ -635,11 +686,11 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 // colleague renaming the workflow in the web builder used to be reverted
 // without a word.
 //
-// Reports whether the baseline was CLEAN — an existing baseline that already
-// described the server exactly. Only that answer lets a push with nothing to
-// write leave the baseline alone: a forced push past real drift, or one with no
-// baseline at all, has a baseline to record even when it writes nothing.
-func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force bool) (bool, error) {
+// It is a check at ONE INSTANT — the moment the file list was read — which is
+// why the writes that follow carry their own per-file preconditions: those
+// close the window between this comparison and the byte that overwrites
+// something, which nothing local can see.
+func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force bool) (driftVerdict, error) {
 	baseline := f.State.For(f.Key)
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
@@ -648,12 +699,20 @@ func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force
 	drift := wfdir.DiffHashes(remoteHashes, baseline.Hashes())
 	meta := metadataDriftOf(baseline, target, metadataPatch(f.Manifest, target))
 	if !drift.Dirty() && len(meta) == 0 {
-		return baseline != nil, nil
+		// Bypassed still tracks --force here, even though nothing needed
+		// bypassing: it is what suppresses the per-file preconditions, and
+		// --force means "overwrite the remote with what I have" whether or not
+		// the baseline happened to be clean when this check ran. Reporting
+		// false would arm preconditions in exactly the window the flag exists
+		// to override — a remote that moved AFTER this comparison read it —
+		// and answer it with a 409 whose advice is to run --force, which is
+		// what the caller just did.
+		return driftVerdict{BaselineClean: baseline != nil, Bypassed: force}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s that changed on the server since your last sync.\n",
 			describeDrifted(drift, meta))
-		return false, nil
+		return driftVerdict{Bypassed: true}, nil
 	}
 	if baseline == nil {
 		// A first push that died between recording the binding and writing the
@@ -667,13 +726,104 @@ func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force
 		// entrypoint. A colleague's folder from git names a live workflow, or a
 		// draft with a file set someone actually built, and still refuses.
 		if isUntouchedFirstPush(target, remote) {
-			return false, nil
+			return driftVerdict{Bypassed: true}, nil
 		}
-		return false, fmt.Errorf("this folder has no sync baseline for %s, and the workflow already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the workflow into a fresh folder to get one, or push --force to overwrite the remote files with what you have here",
+		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the workflow already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the workflow into a fresh folder to get one, or push --force to overwrite the remote files with what you have here",
 			f.Resolved.URL, len(remote))
 	}
-	return false, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja wf status` to see the detail, or push --force to overwrite",
+	return driftVerdict{}, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja wf status` to see the detail, or push --force to overwrite",
 		driftSummary(drift, meta))
+}
+
+// filePreconditions is the compare-and-swap guard a push attaches to each file
+// write: the sha256 the server is asserted to hold right now, checked INSIDE
+// the write's own transaction and refused with a 409 when it does not match.
+//
+// The hashes are the local sync baseline's — what the last sync recorded the
+// server as holding — which is the same thing checkDrift compares against. That
+// is deliberate: the drift guard answers the question once, from a file listing
+// read a few requests earlier, and these answer it again at the instant of each
+// write. The window between them is small and entirely real, and it is exactly
+// the one two agents editing one workflow fall into.
+//
+// Armed is FALSE in the two cases the drift guard was bypassed, and suppressing
+// them is not a weakening — in both, a precondition built from the baseline
+// could only ever produce a 409 for a difference the push was already told to
+// proceed past:
+//
+//   - --force. Forcing means "overwrite the remote with what I have". Sending
+//     the baseline's hashes would 409 in precisely the case --force exists to
+//     override, which is a flag that no longer does anything. That holds
+//     whether or not the drift check found anything: on a CLEAN baseline the
+//     only difference a precondition could still catch is one that landed
+//     after the check read the listing, which is the same race, arriving a
+//     little later.
+//   - a workflow this push CREATED. There is no baseline at all, and the create
+//     SEEDS a starter file at the entrypoint inside its own transaction — so
+//     "" (must-not-exist) for that path would 409 on a workflow the CLI made
+//     seconds earlier. This is the same reason the drift guard itself is
+//     skipped for a fresh create and for the crashed-first-push resume that
+//     isUntouchedFirstPush recognises.
+type filePreconditions struct {
+	Armed  bool
+	Hashes map[string]string
+}
+
+// ForWrite returns the baseSha256 a PUT should assert, or nil for none.
+//
+// A path the baseline has never seen asserts "" — the file must NOT exist yet.
+// That is the right assertion for a write: the folder believes it is creating
+// this file, and a row that already holds one at that path is a change nobody
+// here has seen.
+func (p filePreconditions) ForWrite(path string) *string {
+	if !p.Armed {
+		return nil
+	}
+	hash := p.Hashes[path]
+	return &hash
+}
+
+// ForDelete returns the baseSha256 a DELETE should assert, or nil for none.
+//
+// Unlike ForWrite it sends NOTHING for a path the baseline does not know,
+// rather than "": asserting that the file you are deleting does not exist is a
+// contradiction, and a precondition that can only ever fail is worse than
+// having none. The drift guard already refuses that state — a remote file the
+// baseline never recorded is drift — so this is a guard against a contradiction
+// rather than a hole anyone can reach.
+func (p filePreconditions) ForDelete(path string) *string {
+	if !p.Armed {
+		return nil
+	}
+	hash, known := p.Hashes[path]
+	if !known {
+		return nil
+	}
+	return &hash
+}
+
+// noteFileConflict explains a 409 on a file write in the terms the author has
+// to act in. It never retries and never escalates to --force on their behalf:
+// the whole value of the refusal is that a human decides what happens to the
+// change it just protected.
+//
+// A DELETE gets its own wording because its 409 has TWO causes the CLI cannot
+// tell apart — the file's content moved, or somebody deleted it first — and
+// only the first leaves anything on the server. "It was NOT deleted" covers
+// both but reads as "the file is still there", which is a claim this code is in
+// no position to make: separating the two means parsing the server's prose,
+// which is the fragility this whole feature refuses. So the delete note reports
+// what it actually knows — that this push did not do it — and leads with the
+// remedy that covers the already-gone case for free, since the next push reads
+// a listing without the file and does not try to delete it at all.
+func noteFileConflict(verb, path string) {
+	if verb == "deleted" {
+		fmt.Fprintf(os.Stderr, "  Conflict: %s is not what your last sync recorded — somebody changed or removed it while this push was running, so this push did not delete it.\n", path)
+		fmt.Fprintf(os.Stderr, "  Run `ronja wf push` again: if they deleted it too, the retry simply moves on. Otherwise `ronja wf status` shows what moved, and push --force overwrites.\n")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  Conflict: %s changed on the server while this push was running — it was NOT %s.\n", path, verb)
+	fmt.Fprintf(os.Stderr, "  Run `ronja wf status` to see what moved, clone the workflow into a fresh folder to re-apply your change on top of it, or push --force to overwrite.\n")
 }
 
 // metadataDrift is one metadata field that moved on the server since the last
@@ -805,7 +955,7 @@ func joinAnd(parts []string) string {
 // holding only what was already acknowledged and gains an entry per successful
 // write, so it describes the folder's honest position whether the sync finishes
 // or stops.
-func putFiles(ctx context.Context, client *api.Client, targetID, entrypoint string, local, remote, landed map[string]string, result *pushResult) ([]string, error) {
+func putFiles(ctx context.Context, client *api.Client, targetID, entrypoint string, local, remote, landed map[string]string, pre filePreconditions, result *pushResult) ([]string, error) {
 	var warnings []string
 
 	order := []string{}
@@ -822,8 +972,17 @@ func putFiles(ctx context.Context, client *api.Client, targetID, entrypoint stri
 			result.Unchanged++
 			continue
 		}
-		saved, err := client.PutWorkflowFile(ctx, targetID, path, local[path])
+		saved, err := client.PutWorkflowFile(ctx, targetID, path, local[path], pre.ForWrite(path))
 		if err != nil {
+			// A 409 is the precondition refusing: the file moved between the
+			// listing this push compared against and this write. Nothing
+			// landed, nothing is reconciled, and the author is told what to do
+			// — never retried and never escalated to --force automatically.
+			if api.StatusOf(err) == api.StatusConflict {
+				result.Conflict = true
+				noteFileConflict("overwritten", path)
+				return warnings, fmt.Errorf("push %s: %w", path, err)
+			}
 			// A PUT that TIMED OUT may still have committed: the deadline was
 			// ours, the transaction was the server's. A rejection is different —
 			// the server considered the write and refused it, and the file
@@ -883,7 +1042,7 @@ func reconcileTimedOutPut(ctx context.Context, client *api.Client, targetID, pat
 // baseline-recording `landed`, which no longer describes the whole row: a forced
 // push past a colleague's added file must still delete it, since that is what
 // forcing the folder onto the row means.
-func deleteFiles(ctx context.Context, client *api.Client, targetID string, local, remote, landed map[string]string, result *pushResult) ([]string, error) {
+func deleteFiles(ctx context.Context, client *api.Client, targetID string, local, remote, landed map[string]string, pre filePreconditions, result *pushResult) ([]string, error) {
 	var warnings []string
 
 	deletions := []string{}
@@ -894,11 +1053,15 @@ func deleteFiles(ctx context.Context, client *api.Client, targetID string, local
 	}
 	sort.Strings(deletions)
 	for _, path := range deletions {
-		deleted, err := client.DeleteWorkflowFile(ctx, targetID, path)
+		deleted, err := client.DeleteWorkflowFile(ctx, targetID, path, pre.ForDelete(path))
 		if err != nil {
 			// Includes the server's refusal to delete the file the row still
 			// names as its entrypoint, whose remedy (point "entrypoint" in
 			// ronja.json at a file you are keeping) is its message to give.
+			if api.StatusOf(err) == api.StatusConflict {
+				result.Conflict = true
+				noteFileConflict("deleted", path)
+			}
 			return warnings, fmt.Errorf("delete %s: %w", path, err)
 		}
 		delete(landed, path)
@@ -935,6 +1098,7 @@ func printPushReport(r *pushResult) {
 
 	if r.UpToDate {
 		fmt.Fprintf(out, "  Up to date — the draft %s already holds this folder.\n", r.DraftID)
+		printResourceURL(out, reportKeyWidth, r.URL)
 		return
 	}
 
@@ -966,5 +1130,6 @@ func printPushReport(r *pushResult) {
 	if r.Bindings != nil {
 		fmt.Fprintf(out, "  Bindings: %s\n", describeBindings(*r.Bindings))
 	}
+	printResourceURL(out, reportKeyWidth, r.URL)
 	fmt.Fprintf(out, "\n  Next: ronja wf publish\n")
 }

@@ -60,7 +60,8 @@ const workflowFixture = `{
   "drafterUserID": "user-1",
   "drafterKind": "user",
   "createdAt": "2026-07-01T08:00:00Z",
-  "updatedAt": "2026-07-28T10:30:00Z"
+  "updatedAt": "2026-07-28T10:30:00Z",
+  "url": "https://app.example.test/workflows/wf-abc"
 }`
 
 func TestGetWorkflowDecodesEveryMirroredField(t *testing.T) {
@@ -110,6 +111,10 @@ func TestGetWorkflowDecodesEveryMirroredField(t *testing.T) {
 		{"CodexIDs[0]", wf.CodexIDs[0], "cdx-1"},
 		{"QuerySecretIDs[0]", wf.QuerySecretIDs[0], "sec-3"},
 		{"PipPackages[0]", wf.PipPackages[0], "requests==2.31.0"},
+		// Stamped by the SERVER (WorkflowView) on a FRONTEND origin, which is
+		// not the API origin this client was pointed at — the whole reason the
+		// CLI reads it instead of templating one.
+		{"URL", wf.URL, "https://app.example.test/workflows/wf-abc"},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -151,6 +156,11 @@ func TestGetWorkflowNormalizesAbsentSlices(t *testing.T) {
 	wf, err := client.GetWorkflow(context.Background(), "wf-1")
 	if err != nil {
 		t.Fatalf("get: %v", err)
+	}
+	// `url` is omitempty server-side: an instance with no configured frontend
+	// origin sends none, and "" is what the CLI must read that as — silently.
+	if wf.URL != "" {
+		t.Errorf("URL = %q, want empty for a response carrying no url", wf.URL)
 	}
 	if wf.OutputTableIDs == nil || len(wf.OutputTableIDs) != 0 {
 		t.Errorf("OutputTableIDs = %v, want empty non-nil", wf.OutputTableIDs)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -98,7 +99,7 @@ func TestPutWorkflowFileSendsContentAndReadsWarnings(t *testing.T) {
 		  "warnings":["secret sec-1 was filtered out"]}`))
 	})
 
-	saved, err := client.PutWorkflowFile(context.Background(), "wf-1", "lib/helpers.py", "X = 1")
+	saved, err := client.PutWorkflowFile(context.Background(), "wf-1", "lib/helpers.py", "X = 1", nil)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestPutHonoursAShorterCallerDeadlineAndReportsItAsATimeout(t *testing.T) {
 	defer cancel()
 
 	started := time.Now()
-	if _, err := client.PutWorkflowFile(ctx, "wf-1", "main.py", "x"); err == nil {
+	if _, err := client.PutWorkflowFile(ctx, "wf-1", "main.py", "x", nil); err == nil {
 		t.Fatal("a request that outlived its deadline came back clean")
 	} else if !IsTimeout(err) {
 		t.Errorf("IsTimeout(%v) = false — the caller cannot tell a deadline from a refusal", err)
@@ -179,7 +180,7 @@ func TestIsTimeoutIgnoresAServerRefusal(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"nope"}`, http.StatusBadRequest)
 	})
-	_, err := client.PutWorkflowFile(context.Background(), "wf-1", "main.py", "x")
+	_, err := client.PutWorkflowFile(context.Background(), "wf-1", "main.py", "x", nil)
 	if err == nil {
 		t.Fatal("a 400 came back clean")
 	}
@@ -194,7 +195,7 @@ func TestDeleteWorkflowFileReadsWarnings(t *testing.T) {
 		gotMethod, gotPath = r.Method, r.URL.Path
 		w.Write([]byte(`{"warnings":["the last reference to secret sec-1 is gone"]}`))
 	})
-	deleted, err := client.DeleteWorkflowFile(context.Background(), "wf-1", "lib/old.py")
+	deleted, err := client.DeleteWorkflowFile(context.Background(), "wf-1", "lib/old.py", nil)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -220,7 +221,7 @@ func TestLifecycleVerbsHitTheirRoutes(t *testing.T) {
 			return err
 		}, "/api/v2/workflow/wf-1/checkout"},
 		{"commit", func(c *Client) error {
-			return c.CommitWorkflowDraft(context.Background(), "draft-1")
+			return c.CommitWorkflowDraft(context.Background(), "draft-1", "")
 		}, "/api/v2/workflow/draft-1/commit"},
 		{"publish", func(c *Client) error {
 			return c.PublishWorkflowDraft(context.Background(), "draft-1")
@@ -302,5 +303,140 @@ func TestCreateAndUpdateWorkflow(t *testing.T) {
 	}
 	if !(WorkflowPatch{}).Empty() || (WorkflowPatch{Entrypoint: "run.py"}).Empty() {
 		t.Error("Empty() does not describe the patch it is asked about")
+	}
+}
+
+// --- optimistic concurrency --------------------------------------------------
+
+// The precondition's THREE states have to survive the encoder distinctly, and
+// the raw body is what is asserted rather than a decoded struct: the whole
+// hazard is that a *string collapsing to a string makes "no precondition" and
+// "must not exist" the same bytes, and no decode of the sender's own type can
+// see that.
+func TestPutWorkflowFileEncodesThePreconditionsThreeStates(t *testing.T) {
+	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	empty := ""
+	for _, tc := range []struct {
+		name string
+		want string
+		base *string
+	}{
+		{"absent", `{"content":"X = 1"}`, nil},
+		{"must not exist", `{"content":"X = 1","baseSha256":""}`, &empty},
+		{"digest", `{"content":"X = 1","baseSha256":"` + digest + `"}`, &digest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got string
+			client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				got = string(body)
+				w.Write([]byte(`{"id":"file-1","workflowID":"wf-1","path":"lib/helpers.py","content":"X = 1"}`))
+			})
+			if _, err := client.PutWorkflowFile(context.Background(), "wf-1", "lib/helpers.py", "X = 1", tc.base); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("body = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// The two routes whose body is OPTIONAL send genuinely nothing when they have
+// nothing to say. That is not cosmetic: the previous shape of both was bodyless,
+// and `{}` is a different request for a server that distinguishes an absent
+// field from a zero one.
+func TestOptionalBodiesAreOmittedEntirely(t *testing.T) {
+	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, tc := range []struct {
+		name string
+		call func(*Client) error
+		want string
+	}{
+		{"delete without a precondition", func(c *Client) error {
+			_, err := c.DeleteWorkflowFile(context.Background(), "wf-1", "old.py", nil)
+			return err
+		}, ""},
+		{"delete with one", func(c *Client) error {
+			_, err := c.DeleteWorkflowFile(context.Background(), "wf-1", "old.py", &digest)
+			return err
+		}, `{"baseSha256":"` + digest + `"}`},
+		{"commit without a confirmation", func(c *Client) error {
+			return c.CommitWorkflowDraft(context.Background(), "draft-1", "")
+		}, ""},
+		{"commit with one", func(c *Client) error {
+			return c.CommitWorkflowDraft(context.Background(), "draft-1", "ver-9")
+		}, `{"confirmHeadVersionID":"ver-9"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got string
+			client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				got = string(body)
+				w.Write([]byte(`{}`))
+			})
+			if err := tc.call(client); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if got != tc.want {
+				t.Errorf("body = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The head is element ZERO of the versions listing, and an EMPTY listing means
+// the workflow has never been versioned — in which case the live row itself is
+// the anchor rworkflow.resolveHeadVersionID falls back to. Getting the second
+// half wrong sends "" as a confirmation, which the server reads as "no
+// override" and refuses all over again.
+func TestHeadVersionIDReadsElementZeroAndFallsBackToTheWorkflowID(t *testing.T) {
+	var gotPath string
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Write([]byte(`[{"id":"ver-3","committedAt":"2026-07-28T12:00:00Z"},
+		                {"id":"ver-2","committedAt":"2026-07-28T11:00:00Z"}]`))
+	})
+	head, err := client.HeadVersionID(context.Background(), "wf-1")
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if gotPath != "/api/v2/workflow/wf-1/versions" {
+		t.Errorf("path = %s", gotPath)
+	}
+	if head != "ver-3" {
+		t.Errorf("head = %s, want the newest version ver-3", head)
+	}
+
+	unversioned := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
+	head, err = unversioned.HeadVersionID(context.Background(), "wf-1")
+	if err != nil {
+		t.Fatalf("head of an unversioned workflow: %v", err)
+	}
+	if head != "wf-1" {
+		t.Errorf("head = %q, want the workflow's own id — an unversioned workflow IS its own anchor", head)
+	}
+}
+
+// StatusConflict is a wire contract in the same sense the lifecycle strings
+// are: two commands branch on it, and one of them must keep it out of a
+// fallback keyed on 400.
+func TestConflictIsReportedAsItsOwnStatus(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"main.py changed since you last read it"}`, StatusConflict)
+	})
+	_, err := client.PutWorkflowFile(context.Background(), "wf-1", "main.py", "x", nil)
+	if err == nil {
+		t.Fatal("a 409 came back clean")
+	}
+	if StatusOf(err) != StatusConflict || StatusOf(err) == 400 {
+		t.Errorf("status = %d, want %d", StatusOf(err), StatusConflict)
+	}
+	// The server's prose is the only detail a 409 carries — there is no
+	// structured payload — so it has to survive into the error.
+	if !strings.Contains(err.Error(), "changed since you last read it") {
+		t.Errorf("error = %v, want the server's own message", err)
 	}
 }

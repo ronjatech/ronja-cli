@@ -12,6 +12,7 @@ package api
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"strings"
 )
@@ -224,6 +225,51 @@ func (c *Client) CheckoutWorkflow(ctx context.Context, id string) (*Workflow, er
 	return &out, nil
 }
 
+// StatusConflict is the status both optimistic-concurrency refusals answer
+// with — a file whose stored content is not what the write asserted, and a
+// commit whose parent has moved since the draft was seeded.
+//
+// An alias for net/http's constant rather than a second spelling of 409: named
+// because the CLI branches on it in two commands and the branch is load-bearing
+// — a 409 must never be routed into `wf publish`'s needs-review fallback, which
+// is keyed on 400 — but the VALUE has one definition.
+const StatusConflict = http.StatusConflict
+
+// putWorkflowFileInput is the body of PUT /workflow/:id/files/*path, mirroring
+// the anonymous input struct on that route in
+// backend/api/v2/workflow/handler.go.
+//
+// BaseSha256 is a POINTER for the reason the server's is: the field has THREE
+// meanings and a plain string carries two.
+//
+//	nil          no precondition — the write always applies (previous behaviour)
+//	Ptr("")      assert the file does NOT exist yet (a create that must not clobber)
+//	Ptr(<64 hex>) assert the stored content hashes to exactly this
+//
+// The digest is sha256 over the raw bytes, lowercase hex — the same function
+// wfdir.Hash computes, which is what lets the CLI send its local sync
+// baseline's hashes as preconditions. The server's rworkflow.ContentSHA256
+// names wfdir.Hash in its own doc comment as the thing it must match; changing
+// either without the other turns every push into a 409 storm.
+//
+// omitempty keeps the wire bytes of an unconditional write byte-identical to
+// what the CLI sent before preconditions existed.
+type putWorkflowFileInput struct {
+	Content    string  `json:"content"`
+	BaseSha256 *string `json:"baseSha256,omitempty"`
+}
+
+// deleteWorkflowFileInput is the OPTIONAL body of DELETE
+// /workflow/:id/files/*path — same three-state pointer as the PUT above.
+//
+// The route accepted no body at all until preconditions existed, and gt decodes
+// an empty body to the zero value, so a bodyless DELETE still means "no
+// precondition". DeleteWorkflowFile therefore sends no body rather than `{}`
+// when it has nothing to assert.
+type deleteWorkflowFileInput struct {
+	BaseSha256 *string `json:"baseSha256,omitempty"`
+}
+
 // PutWorkflowFile creates or replaces one file.
 //
 // This is the hard-validating path: unreachable `{{ ref }}` / `{{ write }}` /
@@ -231,14 +277,16 @@ func (c *Client) CheckoutWorkflow(ctx context.Context, id string) (*Workflow, er
 // file keeps its previous content. Secrets are the soft tier and come back as
 // Warnings instead.
 //
+// baseSha256 is the optional compare-and-swap precondition described on
+// putWorkflowFileInput. A failed precondition is a 409, and the write is rolled
+// back — the file certainly keeps its previous content, exactly like a 400.
+//
 // The other SLOW call: every save re-derives the workflow's binding columns in
 // the same transaction, so a file write is a row write with marker resolution
 // attached — not something to hold to a read's deadline.
-func (c *Client) PutWorkflowFile(ctx context.Context, id, path, content string) (*FileSaveResponse, error) {
+func (c *Client) PutWorkflowFile(ctx context.Context, id, path, content string, baseSha256 *string) (*FileSaveResponse, error) {
 	var out FileSaveResponse
-	body := struct {
-		Content string `json:"content"`
-	}{Content: content}
+	body := putWorkflowFileInput{Content: content, BaseSha256: baseSha256}
 	if err := c.doSlow(ctx, "PUT", workflowFilePath(id, path), body, &out); err != nil {
 		return nil, err
 	}
@@ -263,17 +311,92 @@ func (c *Client) GetWorkflowFile(ctx context.Context, id, path string) (*Workflo
 // DeleteWorkflowFile removes one file from a draft. The server refuses to
 // delete the entrypoint; its message is passed through rather than second-
 // guessed, because the remedy (change the entrypoint first) is its to state.
-func (c *Client) DeleteWorkflowFile(ctx context.Context, id, path string) (*FileDeleteResponse, error) {
+//
+// baseSha256 asserts what is being deleted, and nil sends NO BODY AT ALL rather
+// than `{}` — the route took none before preconditions existed, and an
+// unconditional delete has no reason to start sending one.
+func (c *Client) DeleteWorkflowFile(ctx context.Context, id, path string, baseSha256 *string) (*FileDeleteResponse, error) {
 	var out FileDeleteResponse
-	if err := c.Do(ctx, "DELETE", workflowFilePath(id, path), nil, &out); err != nil {
+	var body any
+	if baseSha256 != nil {
+		body = deleteWorkflowFileInput{BaseSha256: baseSha256}
+	}
+	if err := c.Do(ctx, "DELETE", workflowFilePath(id, path), body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
+// CommitDraftInput is the OPTIONAL body of POST /workflow/:id/commit, mirroring
+// rworkflow.CommitDraftInput (backend/resource/rworkflow/model.go).
+//
+// An empty body is the normal case and means "no override": the commit then
+// requires the parent to still be at the version this draft was seeded from,
+// and is refused with a 409 when it is not.
+//
+// ConfirmHeadVersionID acknowledges the specific committed version this commit
+// will OVERWRITE. It must equal the head AT COMMIT TIME, not merely be
+// non-empty — a caller who learns the head, deliberates, and commits while a
+// third version lands gets another 409. That re-refusal is the feature, which
+// is why nothing here retries.
+type CommitDraftInput struct {
+	ConfirmHeadVersionID string `json:"confirmHeadVersionID,omitempty"`
+}
+
 // CommitWorkflowDraft applies a draft onto its parent. Takes the DRAFT id.
-func (c *Client) CommitWorkflowDraft(ctx context.Context, draftID string) error {
-	return c.Do(ctx, "POST", "workflow/"+url.PathEscape(draftID)+"/commit", nil, nil)
+//
+// confirmHeadVersionID is empty for an ordinary commit, which sends no body at
+// all — the shape this route took before the CAS existed. Supply it only after
+// a 409 has named the version being overwritten, and only on a deliberate
+// override (`wf publish --overwrite-remote`).
+func (c *Client) CommitWorkflowDraft(ctx context.Context, draftID, confirmHeadVersionID string) error {
+	var body any
+	if confirmHeadVersionID != "" {
+		body = CommitDraftInput{ConfirmHeadVersionID: confirmHeadVersionID}
+	}
+	return c.Do(ctx, "POST", "workflow/"+url.PathEscape(draftID)+"/commit", body, nil)
+}
+
+// ListWorkflowVersions reads a workflow's committed version history, newest
+// first — the server orders it (committed_at DESC, id DESC), which is the SAME
+// total order rworkflow.resolveHeadVersionID resolves the head by, so element 0
+// is the head rather than merely a recent version.
+//
+// It lives on the write side, like GetWorkflowFile, because it exists for the
+// write side: the only caller is the commit CAS override, which needs the id of
+// the version it is about to overwrite. The route answers a bare JSON array of
+// rows and stamps no `url` on them (it is a LIST route), so treat these as
+// identity and timing only.
+func (c *Client) ListWorkflowVersions(ctx context.Context, parentID string) ([]Workflow, error) {
+	var out []Workflow
+	if err := c.Do(ctx, "GET", "workflow/"+url.PathEscape(parentID)+"/versions", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// HeadVersionID resolves the CAS anchor for a live workflow: the id of its most
+// recently committed version, or — when it has never been versioned — the
+// workflow's OWN id.
+//
+// The parent-id fallback is not a guess. It mirrors
+// rworkflow.resolveHeadVersionID exactly: an unversioned workflow's drafts are
+// seeded from the live row itself, so the live row IS the anchor, and sending
+// anything else as confirmHeadVersionID would be refused.
+//
+// Deliberately NOT parsed out of the 409 message. The HTTP error body is the
+// flat app-wide `{"error": "<prose>"}` shape with no structured payload, and a
+// client that regexes an id out of prose starts silently overwriting the wrong
+// version the day somebody rewords it.
+func (c *Client) HeadVersionID(ctx context.Context, parentID string) (string, error) {
+	versions, err := c.ListWorkflowVersions(ctx, parentID)
+	if err != nil {
+		return "", err
+	}
+	if len(versions) == 0 {
+		return parentID, nil
+	}
+	return versions[0].ID, nil
 }
 
 // PublishWorkflowDraft takes a PARENTLESS draft live. Takes the draft's own id,

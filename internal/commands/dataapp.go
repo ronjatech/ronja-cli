@@ -392,12 +392,3 @@ func missingFrom(ids, other []string) []string {
 	sort.Strings(out)
 	return out
 }
-
-// appURL is where a human looks at the app. Reported by status and by a
-// successful publish, because "it worked" is worth one clickable line.
-func appURL(instanceURL, appID string) string {
-	if instanceURL == "" || appID == "" {
-		return ""
-	}
-	return strings.TrimRight(instanceURL, "/") + "/apps/" + appID
-}

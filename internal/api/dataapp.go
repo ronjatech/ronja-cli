@@ -71,6 +71,12 @@ type DataApp struct {
 	CreatedBy string    `json:"createdBy"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+
+	// URL is the absolute frontend /apps/<id> page, stamped by the SERVER
+	// (api/v2/dataapp.DataAppView) on the single-row routes. Never built here —
+	// see the same field on Workflow for why, and for why an empty value is
+	// normal, silent, and must not be filled in with a guess.
+	URL string `json:"url,omitempty"`
 }
 
 // DataAppAccess is a data app's capability surface: what its bundle may reach.

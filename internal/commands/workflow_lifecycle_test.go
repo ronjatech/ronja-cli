@@ -782,3 +782,261 @@ func TestDiscardDeleteWorkflowRefusesALiveWorkflow(t *testing.T) {
 		t.Errorf("a live workflow must never be deleted, got %v", f.deletedWorkflows)
 	}
 }
+
+// --- commit CAS --------------------------------------------------------------
+
+// stagedDraft is the state every commit-CAS test starts from: a live workflow,
+// a folder cloned from it, and a pushed draft ready to commit.
+func stagedDraft(t *testing.T, f *fakeInstance, scope string) string {
+	t.Helper()
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, FeatureScope: scope},
+		api.WorkflowFile{Path: "main.py", Content: "old\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	writeLocal(t, root, "main.py", "mine\n")
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	return root
+}
+
+// Somebody published a new version while this draft was open. Nothing is
+// committed, the draft is intact, and the way forward is named — but it is
+// never taken automatically.
+func TestPublishRefusesACommitWhoseParentMoved(t *testing.T) {
+	f := newFakeInstance(t)
+	f.privilegeLevel = 10
+	// Org-scoped, so this ALSO pins that a 409 never falls into the
+	// needs-review fallback: that branch is keyed on 400, and turning "your
+	// draft is based on stale code" into "an admin will review it" would report
+	// a publish that never happened as a successful one.
+	root := stagedDraft(t, f, "organization")
+	f.commitHeadVersionID = "ver-2"
+
+	var err error
+	narration := captureStderr(t, func() {
+		_, err = runCLI(t, root, "wf", "publish", "--json")
+	})
+	if err == nil {
+		t.Fatal("publish committed over a version it had never seen")
+	}
+	if !strings.Contains(err.Error(), "ver-2") {
+		t.Errorf("error = %v, want the server's message naming the current version", err)
+	}
+	// What the author is TOLD, which is the difference between this refusal and
+	// a bare rejection: what moved, and the two ways forward.
+	for _, want := range []string{"ver-2", "--overwrite-remote", "your draft is intact"} {
+		if !strings.Contains(narration, want) {
+			t.Errorf("stderr did not mention %q:\n%s", want, narration)
+		}
+	}
+	if len(f.committed) != 0 {
+		t.Errorf("committed = %v, want nothing", f.committed)
+	}
+	if len(f.reviewRequested) != 0 {
+		t.Errorf("a conflict was turned into a review request: %v", f.reviewRequested)
+	}
+	// Exactly one attempt, and it confirmed nothing. No auto-retry, no
+	// auto-override.
+	if got := f.commitConfirmations; len(got) != 1 || got[0] != "" {
+		t.Errorf("commit confirmations = %q, want one empty attempt", got)
+	}
+	// The draft survives, which is what makes re-applying possible at all.
+	if _, alive := f.workflows[f.draftOf["wf-1"]]; !alive {
+		t.Error("the refused commit destroyed the draft")
+	}
+}
+
+// A conflict has to be legible to a MACHINE, not only to the person reading
+// stderr. `wf publish` is the command an agent runs unattended, and the two
+// refusals it has to tell apart — "somebody committed first, re-apply and try
+// again" and "you may not commit this at all" — are both a non-zero exit with
+// prose on stderr. Substring-matching that prose is the exact fragility
+// HeadVersionID refuses to accept from the 409 body, so the payload says which
+// it was, and is emitted even though the command fails.
+func TestPublishReportsAConflictInTheJSONPayload(t *testing.T) {
+	t.Run("refused", func(t *testing.T) {
+		f := newFakeInstance(t)
+		root := stagedDraft(t, f, "private")
+		f.commitHeadVersionID = "ver-2"
+
+		var out string
+		var err error
+		captureStderr(t, func() {
+			out, err = runCLI(t, root, "wf", "publish", "--json")
+		})
+		if err == nil {
+			t.Fatal("publish reported success through a conflict")
+		}
+		// The whole point: stdout is a parseable object rather than empty.
+		payload := decodeJSON(t, out)
+		if payload["outcome"] != outcomeConflict {
+			t.Errorf("outcome = %v, want %q", payload["outcome"], outcomeConflict)
+		}
+		// And it is NOT one of the two success values — a caller that only
+		// knows those must not read this as a publish that happened.
+		if payload["outcome"] == outcomePublished || payload["outcome"] == outcomeSubmittedForReview {
+			t.Error("a conflict reported itself as a successful outcome")
+		}
+		// The server's own account survives into the payload, prose and all,
+		// so a human reading a CI log still learns which version won.
+		if msg, _ := payload["error"].(string); !strings.Contains(msg, "ver-2") {
+			t.Errorf("error = %q, want the server's message naming the current version", msg)
+		}
+		if payload["draftID"] == nil || payload["workflowID"] == nil {
+			t.Errorf("payload identifies nothing to act on: %v", payload)
+		}
+	})
+
+	// The second 409, mid-override. Same class of refusal — somebody got there
+	// first — so it must report the same way rather than looking like a
+	// different kind of failure because it arrived on a different code path.
+	t.Run("second conflict during --overwrite-remote", func(t *testing.T) {
+		f := newFakeInstance(t)
+		root := stagedDraft(t, f, "private")
+		f.versions["wf-1"] = []api.Workflow{{ID: "ver-2", Lifecycle: api.LifecycleVersion}}
+		f.commitHeadVersionID = "ver-3"
+
+		var out string
+		var err error
+		captureStderr(t, func() {
+			out, err = runCLI(t, root, "wf", "publish", "--overwrite-remote", "--json")
+		})
+		if err == nil {
+			t.Fatal("publish reported success through a second conflict")
+		}
+		if payload := decodeJSON(t, out); payload["outcome"] != outcomeConflict {
+			t.Errorf("outcome = %v, want %q", payload["outcome"], outcomeConflict)
+		}
+	})
+
+	// The negative half of the same contract: a refusal that is NOT a conflict
+	// must not claim to be one. A commit the server rejects for any other
+	// reason is a different problem with a different remedy, and an agent
+	// keyed on "conflict" would re-clone and re-apply for nothing.
+	t.Run("a non-conflict refusal is not a conflict", func(t *testing.T) {
+		f := newFakeInstance(t)
+		root := stagedDraft(t, f, "private")
+		f.failCommit = 500
+
+		var out string
+		var err error
+		captureStderr(t, func() {
+			out, err = runCLI(t, root, "wf", "publish", "--json")
+		})
+		if err == nil {
+			t.Fatal("publish reported success through a server error")
+		}
+		// This path has nothing to report, so it emits nothing — but it must
+		// certainly not emit a conflict.
+		if out != "" {
+			if payload := decodeJSON(t, out); payload["outcome"] == outcomeConflict {
+				t.Errorf("a 500 was reported as a conflict: %v", payload)
+			}
+		}
+	})
+}
+
+// The flag: resolve the CURRENT head from the versions listing and confirm it
+// explicitly. The id is READ, never scraped out of the 409's prose.
+func TestPublishOverwriteRemoteConfirmsTheCurrentHead(t *testing.T) {
+	f := newFakeInstance(t)
+	root := stagedDraft(t, f, "private")
+	f.commitHeadVersionID = "ver-2"
+	f.versions["wf-1"] = []api.Workflow{
+		{ID: "ver-2", Lifecycle: api.LifecycleVersion},
+		{ID: "ver-1", Lifecycle: api.LifecycleVersion},
+	}
+
+	out, err := runCLI(t, root, "wf", "publish", "--overwrite-remote", "--json")
+	if err != nil {
+		t.Fatalf("publish --overwrite-remote: %v", err)
+	}
+	payload := decodeJSON(t, out)
+	if payload["outcome"] != outcomePublished {
+		t.Errorf("outcome = %v", payload["outcome"])
+	}
+	// Reported honestly: the payload records WHICH version was discarded, which
+	// an ordinary publish never carries.
+	if payload["overwroteVersionID"] != "ver-2" {
+		t.Errorf("overwroteVersionID = %v, want ver-2", payload["overwroteVersionID"])
+	}
+	if detail, _ := payload["detail"].(string); !strings.Contains(detail, "ver-2") {
+		t.Errorf("detail = %q, want it to name the version it overwrote", detail)
+	}
+	// The retry confirmed the head — element 0 of the listing — and there were
+	// exactly two attempts.
+	if got := f.commitConfirmations; len(got) != 2 || got[0] != "" || got[1] != "ver-2" {
+		t.Fatalf("commit confirmations = %q, want [\"\", \"ver-2\"]", got)
+	}
+	if len(f.committed) != 1 {
+		t.Errorf("committed = %v, want the one successful commit", f.committed)
+	}
+}
+
+// A workflow that has never been versioned answers the listing with [], and its
+// anchor is then its OWN id — mirroring rworkflow.resolveHeadVersionID. Sending
+// "" instead reads server-side as "no override" and is refused all over again.
+func TestPublishOverwriteRemoteUsesTheWorkflowIDWhenUnversioned(t *testing.T) {
+	f := newFakeInstance(t)
+	root := stagedDraft(t, f, "private")
+	f.commitHeadVersionID = "wf-1"
+
+	if _, err := runCLI(t, root, "wf", "publish", "--overwrite-remote", "--json"); err != nil {
+		t.Fatalf("publish --overwrite-remote: %v", err)
+	}
+	if got := f.commitConfirmations; len(got) != 2 || got[1] != "wf-1" {
+		t.Errorf("commit confirmations = %q, want the second to confirm the workflow's own id", got)
+	}
+}
+
+// An override authorizes overwriting the version it was SHOWN, not whatever
+// happens to be there by the time the request lands. So a third commit arriving
+// mid-flight produces a fresh refusal — never a loop, which would authorize
+// every version in turn.
+func TestPublishOverwriteRemoteDoesNotRetryASecondConflict(t *testing.T) {
+	f := newFakeInstance(t)
+	root := stagedDraft(t, f, "private")
+	// The listing says ver-2; the parent has already moved on to ver-3.
+	f.versions["wf-1"] = []api.Workflow{{ID: "ver-2", Lifecycle: api.LifecycleVersion}}
+	f.commitHeadVersionID = "ver-3"
+
+	_, err := runCLI(t, root, "wf", "publish", "--overwrite-remote", "--json")
+	if err == nil {
+		t.Fatal("publish reported success through a second conflict")
+	}
+	if !strings.Contains(err.Error(), "moved again") {
+		t.Errorf("error = %v, want it to say the workflow moved again", err)
+	}
+	// TWO attempts and no more. A loop would keep going until it won.
+	if got := f.commitConfirmations; len(got) != 2 || got[0] != "" || got[1] != "ver-2" {
+		t.Errorf("commit confirmations = %q, want exactly [\"\", \"ver-2\"]", got)
+	}
+	if len(f.committed) != 0 {
+		t.Errorf("committed = %v, want nothing", f.committed)
+	}
+}
+
+// The flag is not a general-purpose override: an ordinary commit with no
+// conflict must not start confirming a head, because that would silently
+// overwrite a version that landed between the read and the write.
+func TestPublishOverwriteRemoteIsInertWithoutAConflict(t *testing.T) {
+	f := newFakeInstance(t)
+	root := stagedDraft(t, f, "private")
+
+	out, err := runCLI(t, root, "wf", "publish", "--overwrite-remote", "--json")
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if payload := decodeJSON(t, out); payload["overwroteVersionID"] != nil {
+		t.Errorf("overwroteVersionID = %v on a publish that overwrote nothing", payload["overwroteVersionID"])
+	}
+	if got := f.commitConfirmations; len(got) != 1 || got[0] != "" {
+		t.Errorf("commit confirmations = %q, want one unconfirmed commit", got)
+	}
+	for _, req := range f.Requests {
+		if strings.HasSuffix(req, "/versions") {
+			t.Errorf("read the version history without a conflict to resolve: %v", f.Requests)
+		}
+	}
+}

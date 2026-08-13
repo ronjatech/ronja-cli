@@ -41,6 +41,10 @@ type fakeAppInstance struct {
 	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
 	// ordinary user), mirroring sherlock's downward-counting scale.
 	privilegeLevel int
+	// noFrontendOrigin models an instance with no configured frontend origin —
+	// every row comes back WITHOUT a `url`. See the field of the same name on
+	// fakeInstance.
+	noFrontendOrigin bool
 
 	// --- failure injection -------------------------------------------------
 	// compileFails maps a file path to the diagnostics its PUT reports. The
@@ -137,6 +141,27 @@ func (f *fakeAppInstance) URL() string { return f.server.URL }
 
 func (f *fakeAppInstance) Key() wfdir.InstanceKey {
 	return wfdir.InstanceKey{URL: f.server.URL, TenantID: testTenantID}
+}
+
+// writeRow answers a SINGLE-ROW route the way the real handler does: the stored
+// row plus the `url` its view stamps (api/v2/dataapp.DataAppView), on a frontend
+// origin that is not the API's — see fakeFrontendOrigin.
+//
+// Stamped HERE rather than on the stored row, which is what the fake used to do.
+// GET /dataapp/query and GET :id/versions answer raw rows and carry no url,
+// deliberately — a fake holding the link on the row would hand it to every route
+// alike, and the first command to read one of those listings would pass a test
+// the real server fails.
+func (f *fakeAppInstance) writeRow(w http.ResponseWriter, app *api.DataApp) {
+	if app == nil {
+		writeJSON(w, nil)
+		return
+	}
+	row := *app
+	if !f.noFrontendOrigin {
+		row.URL = fakeFrontendOrigin + "/apps/" + row.ID
+	}
+	writeJSON(w, row)
 }
 
 // AddApp registers a live row and its files, filling in the fields every command
@@ -236,7 +261,7 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, nil)
 			return
 		}
-		writeJSON(w, f.apps[draftID])
+		f.writeRow(w, f.apps[draftID])
 
 	case rest == "checkout":
 		f.checkouts++
@@ -294,7 +319,7 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 			return
 		}
-		writeJSON(w, app)
+		f.writeRow(w, app)
 
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
@@ -323,7 +348,7 @@ func (f *fakeAppInstance) serveCreate(w http.ResponseWriter, r *http.Request) {
 		BundleFileKey: " ",
 	})
 	app.BundleFileKey = ""
-	writeJSON(w, app)
+	f.writeRow(w, app)
 }
 
 func (f *fakeAppInstance) serveCheckout(w http.ResponseWriter, liveID string) {
@@ -334,7 +359,7 @@ func (f *fakeAppInstance) serveCheckout(w http.ResponseWriter, liveID string) {
 	}
 	if draftID, exists := f.draftOf[liveID]; exists {
 		// Idempotent, as EnsureDraftForCaller is.
-		writeJSON(w, f.apps[draftID])
+		f.writeRow(w, f.apps[draftID])
 		return
 	}
 	f.nextID++
@@ -357,7 +382,7 @@ func (f *fakeAppInstance) serveCheckout(w http.ResponseWriter, liveID string) {
 	}, copied...)
 	draft.BundleFileKey = ""
 	f.draftOf[liveID] = draftID
-	writeJSON(w, draft)
+	f.writeRow(w, draft)
 }
 
 // serveValidate models the FIXED handler: it always recompiles, so a draft whose
@@ -376,7 +401,7 @@ func (f *fakeAppInstance) serveValidate(w http.ResponseWriter, id string) {
 	stamped := app.UpdatedAt.Add(time.Second)
 	app.ValidatedAt = &stamped
 	app.BundleFileKey = "dataapp/" + id + "-fresh.html"
-	writeJSON(w, app)
+	f.writeRow(w, app)
 }
 
 // serveFileList models the SILENT DRAFT RESOLUTION the real handler performs:
@@ -501,7 +526,7 @@ func (f *fakeAppInstance) servePatch(w http.ResponseWriter, r *http.Request, id 
 		app.Capabilities = *patch.Capabilities
 	}
 	app.Normalize()
-	writeJSON(w, app)
+	f.writeRow(w, app)
 }
 
 // mutationTarget mirrors resolveMutationTarget: a write to a LIVE app lands on

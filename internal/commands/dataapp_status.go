@@ -61,7 +61,6 @@ With --json, one object carrying all of the above.`,
 				Ambiguous:     f.BindingErr != nil,
 				DataAppID:     f.Binding.DataAppID,
 				FeatureID:     f.Binding.FeatureID,
-				AppURL:        appURL(resolved.URL, f.Binding.DataAppID),
 			}
 
 			enumeration, err := wfdir.Enumerate(f.Root, wfdir.DataAppKind)
@@ -79,7 +78,7 @@ With --json, one object carrying all of the above.`,
 				}
 			}
 
-			report.Remote = appRemoteStatus(cmd.Context(), resolved, f)
+			report.Remote, report.AppURL = appRemoteStatus(cmd.Context(), resolved, f)
 
 			if flagJSON {
 				return emitJSON(report)
@@ -109,7 +108,15 @@ type appStatusReport struct {
 	Ambiguous bool   `json:"ambiguous,omitempty"`
 	DataAppID string `json:"dataAppID,omitempty"`
 	FeatureID string `json:"featureID,omitempty"`
-	// AppURL is where a human looks at the app, empty until it exists.
+	// AppURL is where a human looks at the app, as the SERVER reported it on
+	// the row — never templated from the instance URL, which is the API origin
+	// (see printResourceURL).
+	//
+	// That makes it a fact the REMOTE half establishes: it is empty until the
+	// app exists, and also whenever the remote half was not checked at all —
+	// signed out, unbound, or unreachable. Reporting a link in those cases would
+	// mean guessing at both the origin and the row, so the local-only half of a
+	// status is now silent about the URL rather than confidently wrong.
 	AppURL   string           `json:"appURL,omitempty"`
 	Local    wfdir.Diff       `json:"local"`
 	Skipped  []wfdir.Skipped  `json:"skipped,omitempty"`
@@ -154,24 +161,31 @@ func (r *appRemoteReport) note(format string, args ...any) {
 
 // appRemoteStatus gathers everything server-side, degrading rather than
 // aborting. The local half of a status is worth having on a plane.
-func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) *appRemoteReport {
+//
+// The second return is the app's frontend page, which belongs to the top-level
+// report rather than to this block — but only the remote read can produce it,
+// since the link is the SERVER's to give (see printResourceURL). Returned
+// alongside instead of added to appRemoteReport so the --json shape stays where
+// callers already find it; "" whenever the remote half was not reached, which
+// prints as nothing at all.
+func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*appRemoteReport, string) {
 	out := &appRemoteReport{}
 	if f.BindingErr != nil {
 		out.NotCheckedReason = fmt.Sprintf("%s on %s — sign in (`ronja login`), or pass --profile to say which one",
 			f.BindingErr, resolved.URL)
-		return out
+		return out, ""
 	}
 	if !f.Bound {
 		out.NotCheckedReason = fmt.Sprintf("this folder is not bound to %s yet — the first push will create the binding", resolved.URL)
-		return out
+		return out, ""
 	}
 	if resolved.Token == "" {
 		out.NotCheckedReason = fmt.Sprintf("not signed in to %s — run `ronja login --url %s`", resolved.URL, resolved.URL)
-		return out
+		return out, ""
 	}
 	if f.Binding.DataAppID == "" {
 		out.NotCheckedReason = "no data app exists on this instance yet — the first push will create it"
-		return out
+		return out, ""
 	}
 
 	client := api.New(resolved.URL, resolved.Token)
@@ -183,12 +197,15 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 		if api.StatusOf(err) == 0 && target.App == nil {
 			out.Checked = true
 			out.Problem = err.Error()
-			return out
+			return out, ""
 		}
 		out.NotCheckedReason = fmt.Sprintf("could not read data app %s: %v", f.Binding.DataAppID, err)
-		return out
+		return out, ""
 	}
 	out.Checked = true
+	// The APP's page, not the draft's: this is the row the binding names and the
+	// one a reader means by "the app", whoever happens to have a draft open.
+	pageURL := target.App.URL
 	out.Lifecycle = target.App.Lifecycle
 	out.RemoteAccess = describeAccess(target.Access())
 
@@ -208,7 +225,7 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 	files, err := client.ListDataAppFiles(ctx, row.ID)
 	if err != nil {
 		out.note("could not read remote files: %v", err)
-		return out
+		return out, pageURL
 	}
 	out.ComparedAgainst = &comparedReport{ID: row.ID, Lifecycle: row.Lifecycle}
 	baseline := f.State.For(f.Key)
@@ -227,7 +244,7 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 		out.note("baseline came from %s (%s); comparing against %s (%s)",
 			baseline.SourceID, baseline.SourceLifecycle, row.ID, row.Lifecycle)
 	}
-	return out
+	return out, pageURL
 }
 
 func printAppStatus(r *appStatusReport) {
@@ -252,9 +269,7 @@ func printAppStatus(r *appStatusReport) {
 	if r.ManagesAccess {
 		fmt.Fprintf(out, "  Access:     %s\n", r.Access)
 	}
-	if r.AppURL != "" {
-		fmt.Fprintf(out, "  URL:        %s\n", r.AppURL)
-	}
+	printResourceURL(out, statusKeyWidth, r.AppURL)
 
 	fmt.Fprintf(out, "\n  Local changes\n")
 	if !r.Local.Dirty() {

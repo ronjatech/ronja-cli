@@ -910,8 +910,10 @@ func TestAppPublishCommitsOwnFeature(t *testing.T) {
 	if !slices.Contains(f.committed, draft.ID) {
 		t.Errorf("expected the draft to be committed, got %v", f.committed)
 	}
-	if result.AppURL == "" || !strings.HasSuffix(result.AppURL, "/apps/"+live.ID) {
-		t.Errorf("a published app should report where to look at it, got %q", result.AppURL)
+	// Where to look at it — on the FRONTEND origin the server reported, not the
+	// API origin this client was pointed at. See link_test.go.
+	if want := fakeFrontendOrigin + "/apps/" + live.ID; result.AppURL != want {
+		t.Errorf("a published app should report where to look at it: got %q, want %q", result.AppURL, want)
 	}
 }
 

@@ -68,6 +68,39 @@ type fakeInstance struct {
 	// rejection, and the one publish falls back to a review request on.
 	failCommit int
 
+	// --- optimistic concurrency -------------------------------------------
+	// fileWrites records every PUT/DELETE of a file WITH the precondition it
+	// carried, which is the only way to tell "sent no precondition" from
+	// "sent an empty one" — the difference between "overwrite whatever is
+	// there" and "this file must not exist yet".
+	fileWrites []recordedFileWrite
+	// enforcePreconditions makes the fake behave like the real server: a
+	// baseSha256 that does not describe what the row holds is answered with a
+	// 409 and the write is not applied. ON by default (newFakeInstance sets
+	// it), because a fake that ignored the field would let a CLI sending the
+	// WRONG hash pass every test here.
+	enforcePreconditions bool
+	// commitHeadVersionID models a parent that has been committed to since the
+	// draft was seeded: any commit whose confirmHeadVersionID does not equal it
+	// is refused with a 409, exactly like rworkflow's checkCommitBaseCAS. ""
+	// switches the CAS off.
+	commitHeadVersionID string
+	// versions is what GET :id/versions answers with, keyed by PARENT id,
+	// newest first. Deliberately separate from commitHeadVersionID so a test
+	// can stage the two disagreeing.
+	versions map[string][]api.Workflow
+	// commitConfirmations records the confirmHeadVersionID of every commit
+	// attempt, "" for a commit that sent none. Its LENGTH is what pins "no
+	// retry loop".
+	commitConfirmations []string
+	// beforeFileWrite, when set, runs at the top of every file PUT/DELETE.
+	//
+	// It is the only way to stage the race the preconditions exist for: a
+	// change that lands AFTER the push read the file listing and BEFORE its own
+	// write. Nothing a test can do from the outside hits that window, because
+	// the CLI makes both calls back to back.
+	beforeFileWrite func(method, path string)
+
 	// --- runs -------------------------------------------------------------
 	// runScript is what GET /workflow/run/:id answers with, in order; the LAST
 	// entry repeats forever. That is what makes both terminal cases and the
@@ -114,6 +147,11 @@ type fakeInstance struct {
 	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
 	// ordinary user), mirroring sherlock's downward-counting scale.
 	privilegeLevel int
+	// noFrontendOrigin models an instance with no configured frontend origin:
+	// every row comes back WITHOUT a `url`, which is omitempty server-side.
+	// This is the normal case on a plain dev box, so the silence it produces is
+	// the behaviour worth pinning, not an edge case.
+	noFrontendOrigin bool
 
 	// What the fake was asked to do, for assertions.
 	created      []api.CreateWorkflowInput
@@ -148,6 +186,26 @@ type recordedRun struct {
 	ParameterValues map[string]any
 }
 
+// recordedFileWrite is one file PUT or DELETE, with the precondition it carried.
+// BaseSha256 is nil when the request sent none — which is a different thing from
+// an empty string, and the distinction is the whole point of recording it.
+type recordedFileWrite struct {
+	Method     string
+	Path       string
+	BaseSha256 *string
+}
+
+// writesFor returns the recorded writes for one path, in order.
+func (f *fakeInstance) writesFor(path string) []recordedFileWrite {
+	var out []recordedFileWrite
+	for _, w := range f.fileWrites {
+		if w.Path == path {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 func newFakeInstance(t *testing.T) *fakeInstance {
 	t.Helper()
 	f := &fakeInstance{
@@ -163,6 +221,9 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 		entrypointPatches: map[string]string{},
 		tableNames:        map[string]string{},
 		privilegeLevel:    50,
+
+		versions:             map[string][]api.Workflow{},
+		enforcePreconditions: true,
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
@@ -179,6 +240,37 @@ const testTenantID = "ten-test"
 // stored under, in both ronja.json and the local baseline.
 func (f *fakeInstance) Key() wfdir.InstanceKey {
 	return wfdir.InstanceKey{URL: f.server.URL, TenantID: testTenantID}
+}
+
+// fakeFrontendOrigin is the origin every fake stamps on a row's `url`, and it
+// is DELIBERATELY not the httptest server's.
+//
+// That is what makes the url assertions mean something. The instance URL a
+// profile records is the API origin, and the deploy template puts the backend
+// on api.* and the frontend on app.*; a CLI that still templated links from it
+// would print 127.0.0.1:<port>/workflows/<id> here. So an assertion that the
+// reported link starts with this constant is proof the link came off the
+// response rather than being rebuilt locally.
+const fakeFrontendOrigin = "https://app.example.test"
+
+// writeRow answers a SINGLE-ROW route the way the real handler does: the stored
+// row plus the `url` its view stamps (api/v2/workflow.WorkflowView).
+//
+// Stamped HERE rather than on the stored row, which is what the fake used to
+// do. GET /workflow/query and GET :id/versions answer raw rows and carry no
+// url, deliberately — a fake holding the link on the row would hand it to every
+// route alike, and the first command to read one of those listings would pass a
+// test the real server fails.
+func (f *fakeInstance) writeRow(w http.ResponseWriter, wf *api.Workflow) {
+	if wf == nil {
+		writeJSON(w, nil)
+		return
+	}
+	row := *wf
+	if !f.noFrontendOrigin {
+		row.URL = fakeFrontendOrigin + "/workflows/" + row.ID
+	}
+	writeJSON(w, row)
 }
 
 // AddWorkflow registers a row and its files, filling in the fields every
@@ -286,7 +378,7 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, nil)
 			return
 		}
-		writeJSON(w, f.workflows[draftID])
+		f.writeRow(w, f.workflows[draftID])
 
 	case strings.Contains(path, "/files/"):
 		// GET one file by path. Only the push's timed-out-PUT reconciliation
@@ -300,6 +392,16 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+
+	case strings.HasSuffix(path, "/versions"):
+		// A LIST route: bare rows, and deliberately NOT through writeRow, since
+		// the real one stamps no `url` on a listing. Newest first, which is the
+		// order the CAS anchor is read out of (element 0).
+		rows := f.versions[strings.TrimSuffix(path, "/versions")]
+		if rows == nil {
+			rows = []api.Workflow{}
+		}
+		writeJSON(w, rows)
 
 	case strings.HasSuffix(path, "/files"):
 		id := strings.TrimSuffix(path, "/files")
@@ -323,7 +425,7 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 			return
 		}
-		writeJSON(w, wf)
+		f.writeRow(w, wf)
 	}
 }
 
@@ -382,7 +484,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// assume it is.
 			WorkflowID: id, Path: entrypoint, Content: fakeEntrypointStarter,
 		})
-		writeJSON(w, created)
+		f.writeRow(w, created)
 		return true
 	}
 	if r.Method == "POST" && path == "workflow/validate" {
@@ -412,16 +514,27 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 
 	// File writes: PUT/DELETE workflow/:id/files/*path.
 	if filePath, isFile := strings.CutPrefix(action, "files/"); isFile {
+		if f.beforeFileWrite != nil && (r.Method == "PUT" || r.Method == "DELETE") {
+			f.beforeFileWrite(r.Method, filePath)
+		}
 		switch r.Method {
 		case "PUT":
+			var in struct {
+				Content    string  `json:"content"`
+				BaseSha256 *string `json:"baseSha256"`
+			}
+			decodeBody(f.t, r, &in)
+			f.fileWrites = append(f.fileWrites, recordedFileWrite{Method: "PUT", Path: filePath, BaseSha256: in.BaseSha256})
 			if status := f.failPut[filePath]; status != 0 {
 				http.Error(w, `{"error":"`+filePath+` is not acceptable"}`, status)
 				return true
 			}
-			var in struct {
-				Content string `json:"content"`
+			// The precondition is checked BEFORE the write and rolls it back by
+			// simply not doing it, which is what the server's in-transaction
+			// check amounts to from the outside.
+			if f.refusePrecondition(w, id, filePath, in.BaseSha256) {
+				return true
 			}
-			decodeBody(f.t, r, &in)
 			f.putFile(id, filePath, in.Content)
 			writeJSON(w, map[string]any{
 				"id": "file-" + filePath, "workflowID": id, "path": filePath,
@@ -429,10 +542,25 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			})
 			return true
 		case "DELETE":
+			// A DELETE legitimately carries NO body at all — that is the shape
+			// the route took before preconditions existed, and still the shape
+			// of an unconditional delete.
+			var in struct {
+				BaseSha256 *string `json:"baseSha256"`
+			}
+			decodeOptionalBody(f.t, r, &in)
+			f.fileWrites = append(f.fileWrites, recordedFileWrite{Method: "DELETE", Path: filePath, BaseSha256: in.BaseSha256})
 			if status := f.failDelete[filePath]; status != 0 {
 				http.Error(w, `{"error":"`+filePath+` cannot be removed"}`, status)
 				return true
 			}
+			// ORDER MATTERS, and it is the server's: rworkflow's
+			// DeleteFileChecked refuses the entrypoint BEFORE it looks at the
+			// precondition, so an entrypoint delete is a 400 whatever hash it
+			// carries. Checking the precondition first here would answer 409 to
+			// a request production answers 400 to — and `wf publish`'s
+			// needs-review fallback is keyed on exactly that difference, so a
+			// fake with the two swapped could hide a real routing bug.
 			if wf := f.workflows[id]; wf != nil && wf.Entrypoint == filePath {
 				// Mirrors the server: the file the row NAMES as its entrypoint
 				// cannot be deleted. Note that it is the row's current
@@ -440,6 +568,9 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 				// makes a rename possible at all, and what the push's
 				// PUT → patch → DELETE ordering depends on.
 				http.Error(w, `{"error":"cannot delete the entrypoint file"}`, http.StatusBadRequest)
+				return true
+			}
+			if f.refusePrecondition(w, id, filePath, in.BaseSha256) {
 				return true
 			}
 			f.deleteFile(id, filePath)
@@ -524,11 +655,23 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		if parent := f.workflows[id]; parent != nil {
 			draft.Parameters = append([]api.WorkflowParameter(nil), parent.Parameters...)
 		}
-		writeJSON(w, draft)
+		f.writeRow(w, draft)
 		return true
 	case "commit":
+		// Optional body, like the real route: an ordinary commit sends none.
+		var in api.CommitDraftInput
+		decodeOptionalBody(f.t, r, &in)
+		f.commitConfirmations = append(f.commitConfirmations, in.ConfirmHeadVersionID)
 		if f.failCommit != 0 {
 			http.Error(w, `{"error":"admin required to commit a shared workflow draft"}`, f.failCommit)
+			return true
+		}
+		// Mirrors rworkflow.checkCommitBaseCAS: the confirmation must equal the
+		// CURRENT head, not merely be non-empty.
+		if f.commitHeadVersionID != "" && in.ConfirmHeadVersionID != f.commitHeadVersionID {
+			http.Error(w, `{"error":"this workflow changed since your draft was created — it is now at version `+
+				f.commitHeadVersionID+`. Re-read and re-apply your changes, or commit with confirmHeadVersionID=`+
+				f.commitHeadVersionID+` to overwrite those changes"}`, http.StatusConflict)
 			return true
 		}
 		f.committed = append(f.committed, id)
@@ -641,6 +784,52 @@ func decodeBody(t *testing.T, r *http.Request, out any) {
 	}
 }
 
+// decodeOptionalBody is decodeBody for the two routes whose body is genuinely
+// optional — DELETE :id/files/*path and POST :id/commit. An absent body leaves
+// `out` at its zero value, which is exactly what gt does server-side, and is
+// what makes "no precondition" and "no override" expressible as sending nothing.
+func decodeOptionalBody(t *testing.T, r *http.Request, out any) {
+	t.Helper()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("read %s %s body: %v", r.Method, r.URL.Path, err)
+	}
+	if strings.TrimSpace(string(body)) == "" {
+		return
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		t.Fatalf("decode %s %s body %q: %v", r.Method, r.URL.Path, body, err)
+	}
+}
+
+// refusePrecondition mirrors rworkflow.checkFilePrecondition, which is the
+// point: a CLI that sends a hash of the wrong thing has to fail here the way it
+// would in production, not be waved through by a fake that ignores the field.
+//
+// Reports whether it answered (with a 409).
+func (f *fakeInstance) refusePrecondition(w http.ResponseWriter, id, path string, want *string) bool {
+	if want == nil || !f.enforcePreconditions {
+		return false
+	}
+	content, exists := f.FileContents(id)[path]
+	switch {
+	case *want == "" && !exists:
+		return false
+	case *want == "":
+		http.Error(w, `{"error":"`+path+` already exists on this workflow, but the write asserted it did not"}`,
+			http.StatusConflict)
+	case exists && wfdir.HashString(content) == *want:
+		return false
+	case !exists:
+		http.Error(w, `{"error":"`+path+` does not exist on this workflow, but the write asserted its content hashed to `+*want+`"}`,
+			http.StatusConflict)
+	default:
+		http.Error(w, `{"error":"`+path+` changed since you last read it (it now hashes to `+
+			wfdir.HashString(content)+`, the write expected `+*want+`)"}`, http.StatusConflict)
+	}
+	return true
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
@@ -743,8 +932,16 @@ func signInTo(t *testing.T, url string) {
 // state these tests mean to create.
 func signOut(t *testing.T, f *fakeInstance) {
 	t.Helper()
+	signOutFrom(t, f.URL())
+}
+
+// signOutFrom is signOut for a server that is not a fakeInstance — the
+// data-app fake serves its own, and `app status` has the same
+// works-signed-out requirement `wf status` does.
+func signOutFrom(t *testing.T, url string) {
+	t.Helper()
 	t.Setenv("RONJA_CONFIG_DIR", t.TempDir())
-	t.Setenv("RONJA_URL", f.URL())
+	t.Setenv("RONJA_URL", url)
 	t.Setenv("RONJA_TOKEN", "")
 	t.Setenv("RONJA_PROFILE", "")
 }

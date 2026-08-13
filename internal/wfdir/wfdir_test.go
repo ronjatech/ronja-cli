@@ -106,6 +106,65 @@ func TestManifestParametersHaveThreeStates(t *testing.T) {
 	})
 }
 
+// Hash is a WIRE contract, not an internal fingerprint: `wf push` sends these
+// digests to the server as `baseSha256` preconditions, and the server compares
+// them against its own rworkflow.ContentSHA256
+// (backend/resource/rworkflow/store_concurrency.go). Both sides must be sha256
+// over the raw BYTES, hex-encoded LOWERCASE.
+//
+// The expectations below are literal digests — `shasum -a 256` of the exact
+// bytes — precisely because every other test in the CLI compares HashString(x)
+// against HashString(x). Those stay green through any change to this function:
+// switch to uppercase hex and the whole suite still passes while every real
+// push 409s, and the server rejects an uppercase digest as malformed input
+// (400) rather than as a conflict, because its sha256Hex regexp is
+// `^[0-9a-f]{64}$`. The backend's own TestContentSHA256MatchesCLIBaseline holds
+// the same vectors; these are the other end of that pin.
+func TestHashIsTheServersDigestExactly(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "empty", content: "",
+			want: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		{name: "ascii", content: "abc",
+			want: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+		// Multi-byte input: a rune-wise implementation produces a different
+		// digest here and the SAME one for the ascii case above, so this is the
+		// case that proves bytes rather than characters.
+		{name: "utf-8 multibyte", content: "héllo",
+			want: "3c48591d8d098a4538f5e013dfcf406e948eac4d3277b10bf614e295d6068179"},
+		// The shape of a real workflow file, trailing newline and all — the
+		// thing actually being hashed in production.
+		{name: "python source", content: "print('hello')\n",
+			want: "03e693d9f2f687e0f40e36a8df7fcb4d1c22974012b7c2a55c000eb30f305824"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HashString(tc.content); got != tc.want {
+				t.Errorf("HashString(%q) = %q, want %q", tc.content, got, tc.want)
+			}
+			// Hash and HashString must not drift apart either: the []byte form
+			// is what the local walk uses and the string form what the API
+			// responses go through, and a precondition compares one against
+			// the other.
+			if got := Hash([]byte(tc.content)); got != tc.want {
+				t.Errorf("Hash(%q) = %q, want %q", tc.content, got, tc.want)
+			}
+		})
+	}
+
+	// Stated separately from the vectors so the failure names the RULE the
+	// server enforces, rather than looking like one more digest that moved.
+	if got := HashString("abc"); got != strings.ToLower(got) {
+		t.Errorf("HashString produced %q — the server refuses a non-lowercase digest as malformed input, not as a conflict", got)
+	}
+	if got := len(HashString("abc")); got != 64 {
+		t.Errorf("digest length = %d, want 64 hex characters", got)
+	}
+}
+
 func TestManifestRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	in := &Manifest{

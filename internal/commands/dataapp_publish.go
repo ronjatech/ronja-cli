@@ -79,7 +79,17 @@ type appPublishResult struct {
 	DraftID   string `json:"draftID"`
 	// Detail is a human sentence about what actually happened.
 	Detail string `json:"detail,omitempty"`
-	// AppURL is where to look at the result, on a publish that went live.
+	// AppURL is where to look at the result, on a publish that went live — as
+	// the SERVER reported it on the row, never templated from the instance URL
+	// (which is the API origin; see printResourceURL). Omitted when the instance
+	// has no configured frontend origin, which is silent, not an error.
+	//
+	// ⚠️ That omission is a CHANGE to a shipped --json shape. The field used to
+	// be derived locally from the instance URL, so it was ALWAYS present — and
+	// always pointing at the API host, i.e. wrong. `ronja app publish --json |
+	// jq -r .appURL` therefore goes from a wrong string to `null` on any
+	// instance with no frontend origin configured, which is every dev box and
+	// every self-hosted install that has not set one.
 	AppURL string `json:"appURL,omitempty"`
 	Target string `json:"target,omitempty"`
 }
@@ -177,7 +187,10 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 		}
 		result.Outcome = outcomePublished
 		result.Detail = fmt.Sprintf("committed to %q", parent.Name)
-		result.AppURL = appURL(f.Resolved.URL, parent.ID)
+		// The PARENT's page — which is also the app's page for a first publish,
+		// since a parentless draft is promoted in place and resolveAppDraft
+		// returns that one row as both halves.
+		result.AppURL = parent.URL
 		noteBaselineRefresh(f.Kind, refreshAppBaselineFromLive(ctx, client, f, parent.ID))
 		return result, nil
 	}
@@ -302,7 +315,5 @@ func printAppPublishReport(r *appPublishResult) {
 	if r.Target != "" {
 		fmt.Fprintf(out, "  Target:   %s\n", r.Target)
 	}
-	if r.AppURL != "" {
-		fmt.Fprintf(out, "  URL:      %s\n", r.AppURL)
-	}
+	printResourceURL(out, reportKeyWidth, r.AppURL)
 }

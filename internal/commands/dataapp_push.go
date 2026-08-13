@@ -132,6 +132,11 @@ type appPushResult struct {
 	Error string `json:"error,omitempty"`
 	// Target names the instance and organization this push landed in.
 	Target string `json:"target,omitempty"`
+	// URL is the frontend page for the draft this push wrote to, as the SERVER
+	// reported it, and is rendered by the human report only — see pushResult.URL
+	// for why it stays out of the --json payload. (appPublishResult.AppURL is
+	// published, because that field was already part of that command's shape.)
+	URL string `json:"-"`
 }
 
 // runAppPush is the whole state machine, kept out of the cobra closure so it is
@@ -188,6 +193,10 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 		return nil, err
 	}
 	result.DraftID = target.ID
+	// Recorded here rather than at the end, so every success path reports the
+	// same link — including the up-to-date one, which can return before the
+	// closing validate re-reads the row.
+	result.URL = target.URL
 	if target.SubmittedForReviewAt != nil {
 		result.DraftUnderReview = true
 		fmt.Fprintf(os.Stderr, "  Warning: draft %s has already been submitted for review — this push changes what the admin is reviewing.\n",
@@ -690,6 +699,7 @@ func printAppPushReport(r *appPushResult) {
 
 	if r.UpToDate && r.Error == "" && len(r.Pushed) == 0 && len(r.Deleted) == 0 {
 		fmt.Fprintf(out, "  Up to date — the draft %s already holds this folder.\n", r.DraftID)
+		printResourceURL(out, reportKeyWidth, r.URL)
 		printCompileVerdict(out, r)
 		return
 	}
@@ -738,6 +748,7 @@ func printAppPushReport(r *appPushResult) {
 	if r.Target != "" {
 		fmt.Fprintf(out, "  Target:   %s\n", r.Target)
 	}
+	printResourceURL(out, reportKeyWidth, r.URL)
 	printCompileVerdict(out, r)
 }
 

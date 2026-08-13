@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -422,6 +423,45 @@ func describeBindings(b api.ValidateBindings) string {
 		return "no data or secret bindings"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// The width of a report's key column, which is not the same everywhere: push
+// and publish align to "Draft:    ", while a status block is one word wider —
+// "Entrypoint: " sets it. Passed to printResourceURL rather than duplicating
+// its rule per column, since which column a report uses says nothing about
+// when a link should be printed.
+const (
+	reportKeyWidth = 10
+	statusKeyWidth = 12
+)
+
+// printResourceURL closes a report with the frontend page for what was just
+// written, in the same key-value column as the ids above it — keyWidth being
+// that column, one of the two constants above.
+//
+// The url is whatever the SERVER put on the response we already hold, and this
+// is the only thing done with it — nothing here templates a route or picks an
+// origin. That is the point rather than tidiness: the instance URL a profile
+// records is the API origin, and the deploy template puts the backend on api.*
+// and the frontend on app.*, so the link this replaces pointed at a host that
+// serves no pages. (The server had the same bug from its own side; both were
+// fixed by giving one package the mapping AND the origin, backend/lib/deeplink.)
+//
+// ABSENCE IS SILENT. An instance with no configured frontend origin returns no
+// url — the normal state of a dev box, which is exactly where this gets tested
+// — so there is nothing to say and nothing to warn about. No link, no note, no
+// non-zero exit, and above all no locally-guessed fallback. Every report that
+// prints a link comes through here, so that rule has exactly one home.
+//
+// io.Writer and not *os.File: every caller passes a command's out stream, and
+// nothing here needs a file. The concrete type only narrowed who could call
+// this — link_test.go already drives it through the command harness, but a
+// direct assertion against a buffer should not have to open one.
+func printResourceURL(out io.Writer, keyWidth int, url string) {
+	if url == "" {
+		return
+	}
+	fmt.Fprintf(out, "  %-*s%s\n", keyWidth, "URL:", url)
 }
 
 // plural pluralises the handful of binding nouns above. "codex" is the reason

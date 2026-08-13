@@ -1455,3 +1455,355 @@ func TestPushUpdatesTheTitleWhenTheManifestChanged(t *testing.T) {
 		t.Errorf("title patches = %+v, want New name on %s", f.titlePatches, draftID)
 	}
 }
+
+// --- optimistic concurrency --------------------------------------------------
+
+// What the preconditions actually are, asserted on the wire. A file the baseline
+// knows carries its LAST-SYNCED hash — not the content being written and not the
+// content the server happens to hold — and a file the baseline has never seen
+// carries "", which asserts it does not exist yet.
+//
+// The distinction between an absent field and an empty one is the whole point,
+// so nil is checked explicitly rather than through a string comparison that
+// would read the two as the same thing.
+func TestPushSendsTheBaselineHashAsAPrecondition(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
+		api.WorkflowFile{Path: "main.py", Content: "old\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+
+	writeLocal(t, root, "main.py", "new\n")
+	writeLocal(t, root, "lib/helpers.py", "H\n")
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	edited := f.writesFor("main.py")
+	if len(edited) != 1 || edited[0].BaseSha256 == nil {
+		t.Fatalf("main.py writes = %+v, want one carrying a precondition", edited)
+	}
+	// The BASELINE's hash — what the last sync recorded the server as holding —
+	// which for an edited file is NOT the bytes being written.
+	if got, want := *edited[0].BaseSha256, wfdir.HashString("old\n"); got != want {
+		t.Errorf("main.py baseSha256 = %s, want the last-synced hash %s", got, want)
+	}
+	if *edited[0].BaseSha256 == wfdir.HashString("new\n") {
+		t.Error("main.py asserted the content it was about to write, which is always true and guards nothing")
+	}
+
+	added := f.writesFor("lib/helpers.py")
+	if len(added) != 1 || added[0].BaseSha256 == nil {
+		t.Fatalf("lib/helpers.py writes = %+v, want one carrying a precondition", added)
+	}
+	if *added[0].BaseSha256 != "" {
+		t.Errorf("lib/helpers.py baseSha256 = %q, want \"\" — a file the baseline has never seen must not already exist",
+			*added[0].BaseSha256)
+	}
+}
+
+// The race the drift guard cannot see: the file listing was clean, and somebody
+// wrote to the draft in the window before this push's own PUT. The write is
+// refused server-side, the file keeps THEIR content, and the push stops.
+func TestPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
+		api.WorkflowFile{Path: "main.py", Content: "old\n"},
+		api.WorkflowFile{Path: "zzz.py", Content: "Z\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	writeLocal(t, root, "main.py", "mine\n")
+	writeLocal(t, root, "zzz.py", "Z2\n")
+
+	// A colleague's web-builder save, landing between the listing this push
+	// compared against and its own first write.
+	f.beforeFileWrite = func(method, path string) {
+		if method == "PUT" && path == "main.py" {
+			f.beforeFileWrite = nil
+			f.putFile("wf-1", "main.py", "theirs\n")
+		}
+	}
+
+	var out string
+	var err error
+	narration := captureStderr(t, func() {
+		out, err = runCLI(t, root, "wf", "push", "--json")
+	})
+	if err == nil {
+		t.Fatal("push overwrote a file that changed under it")
+	}
+	if !strings.Contains(err.Error(), "main.py") {
+		t.Errorf("error = %v, want it to name the file", err)
+	}
+	// The narration is the actionable half, and it is on stderr so a --json
+	// caller's stdout stays one parseable object.
+	for _, want := range []string{"main.py", "wf status", "--force"} {
+		if !strings.Contains(narration, want) {
+			t.Errorf("stderr did not mention %q:\n%s", want, narration)
+		}
+	}
+	if got := f.FileContents("wf-1")["main.py"]; got != "theirs\n" {
+		t.Errorf("main.py = %q — the refused write landed anyway", got)
+	}
+	// Stopped rather than carried on: zzz.py sorts after the entrypoint.
+	if got := f.FileContents("wf-1")["zzz.py"]; got != "Z\n" {
+		t.Errorf("zzz.py = %q — the push continued past the conflict", got)
+	}
+	// One attempt. A retry (or an automatic --force) would be a second write.
+	if writes := f.writesFor("main.py"); len(writes) != 1 {
+		t.Errorf("main.py was written %d times, want exactly one attempt: %+v", len(writes), writes)
+	}
+	// The partial-push report still describes what did happen, and the baseline
+	// beside it must not claim the colleague's content.
+	if decodeJSON(t, out)["error"] == nil {
+		t.Error("payload carries no error field")
+	}
+	state, err := wfdir.LoadState(root)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if got := state.For(f.Key()).Files["main.py"].SHA256; got == wfdir.HashString("theirs\n") {
+		t.Error("the baseline acknowledged content this push never wrote — the next push would overwrite it in silence")
+	}
+}
+
+// The same race one file LATER — after an earlier PUT has already committed.
+//
+// TestPushStopsWhenAFileMovesUnderItMidPush conflicts on the very first write,
+// so the push has nothing to have landed and the interesting question never
+// comes up: when a push stops part-way, the baseline has to record what DID
+// land and nothing else. Getting either half wrong is silent. Forget file 1 and
+// the author's own completed write reads as somebody else's drift on the next
+// push, which then refuses the retry that would fix it. Record the colleague's
+// file 2 and the drift guard is disarmed against the very change it just
+// refused to overwrite, so the next plain push destroys it without a word.
+func TestPushBaselineAfterAMidPushConflictRecordsOnlyWhatLanded(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
+		api.WorkflowFile{Path: "main.py", Content: "M\n"},
+		api.WorkflowFile{Path: "zzz.py", Content: "Z\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	writeLocal(t, root, "main.py", "mine\n")
+	writeLocal(t, root, "zzz.py", "also mine\n")
+
+	// The colleague lands on zzz.py only — so main.py's precondition holds and
+	// its write commits, and the conflict happens on the SECOND file.
+	f.beforeFileWrite = func(method, path string) {
+		if method == "PUT" && path == "zzz.py" {
+			f.beforeFileWrite = nil
+			f.putFile("wf-1", "zzz.py", "theirs\n")
+		}
+	}
+
+	var out string
+	var err error
+	captureStderr(t, func() {
+		out, err = runCLI(t, root, "wf", "push", "--json")
+	})
+	if err == nil {
+		t.Fatal("push overwrote a file that changed under it")
+	}
+	// The premise: file 1 really did land. Without this the assertions below
+	// would pass on a push that never got past the entrypoint.
+	if got := f.FileContents("wf-1")["main.py"]; got != "mine\n" {
+		t.Fatalf("main.py = %q, want the first write to have landed before the conflict", got)
+	}
+	if got := f.FileContents("wf-1")["zzz.py"]; got != "theirs\n" {
+		t.Errorf("zzz.py = %q — the refused write landed anyway", got)
+	}
+
+	payload := decodeJSON(t, out)
+	if pushed, _ := payload["pushed"].([]any); len(pushed) != 1 || pushed[0] != "main.py" {
+		t.Errorf("pushed = %v, want exactly main.py", payload["pushed"])
+	}
+	if payload["conflict"] != true {
+		t.Errorf("conflict = %v, want true — the caller cannot tell this from a rejection otherwise", payload["conflict"])
+	}
+
+	state, err2 := wfdir.LoadState(root)
+	if err2 != nil {
+		t.Fatalf("load state: %v", err2)
+	}
+	baseline := state.For(f.Key())
+	if baseline == nil {
+		t.Fatal("the stopped push recorded no baseline at all")
+	}
+	// File 1: recorded at what this push WROTE. Anything else — the old
+	// content, or nothing — makes the author's own write look like drift.
+	if got, want := baseline.Files["main.py"].SHA256, wfdir.HashString("mine\n"); got != want {
+		t.Errorf("baseline main.py = %s, want the content this push landed (%s)", got, want)
+	}
+	// File 2: NOT the colleague's. It may honestly hold the last-synced hash —
+	// that is what the folder still knows — but never the bytes this push was
+	// just refused permission to overwrite.
+	if got := baseline.Files["zzz.py"].SHA256; got == wfdir.HashString("theirs\n") {
+		t.Error("the baseline acknowledged the colleague's file — the next push would overwrite it in silence")
+	}
+	if got, want := baseline.Files["zzz.py"].SHA256, wfdir.HashString("Z\n"); got != want {
+		t.Errorf("baseline zzz.py = %s, want the last-synced hash %s", got, want)
+	}
+}
+
+// The suppression rule, stated three ways. Each of these is a path where the
+// drift guard was deliberately bypassed, and in each the baseline demonstrably
+// does not describe the row — so a precondition built from it could only ever
+// produce a 409 for a difference the push was already told to proceed past.
+//
+// These are not merely assertions about the wire: the fake ENFORCES
+// preconditions, so a regression that stopped suppressing them fails the push
+// itself, not just the check below.
+func TestPushSuppressesPreconditionsExactlyWhereTheDriftGuardIsBypassed(t *testing.T) {
+	assertNoPreconditions := func(t *testing.T, f *fakeInstance) {
+		t.Helper()
+		if len(f.fileWrites) == 0 {
+			t.Fatal("nothing was written, so the assertion proves nothing")
+		}
+		for _, w := range f.fileWrites {
+			if w.BaseSha256 != nil {
+				t.Errorf("%s %s carried baseSha256 %q, want none", w.Method, w.Path, *w.BaseSha256)
+			}
+		}
+	}
+
+	// --force with a CLEAN baseline: nothing had drifted, so the guard had
+	// nothing to bypass — and the preconditions must still be suppressed.
+	//
+	// This is the subtest the "force" case below cannot stand in for. It stages
+	// real drift first, so it only ever exercises the branch that already
+	// suppressed; a clean baseline takes the early return above it, and an
+	// early return that reported Bypassed=false would ARM preconditions under
+	// --force. That is not a harmless extra check: it arms them in exactly the
+	// window this whole feature is about — a remote that moves AFTER the drift
+	// check read the listing — so the push 409s and noteFileConflict advises
+	// running --force, which is what the caller just did.
+	t.Run("force with a clean baseline", func(t *testing.T) {
+		f := newFakeInstance(t)
+		f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
+			api.WorkflowFile{Path: "main.py", Content: "M\n"})
+		signIn(t, f)
+		// Cloned and NOT disturbed: the baseline describes the row exactly, so
+		// checkDrift finds no drift and no metadata to report.
+		root := cloneFolder(t, f, "wf-1")
+		writeLocal(t, root, "main.py", "mine\n")
+
+		if _, err := runCLI(t, root, "wf", "push", "--force", "--json"); err != nil {
+			t.Fatalf("forced push: %v", err)
+		}
+		assertNoPreconditions(t, f)
+		if got := f.FileContents("wf-1")["main.py"]; got != "mine\n" {
+			t.Errorf("main.py = %q — the forced push did not land", got)
+		}
+	})
+
+	// --force means "overwrite the remote with what I have". Sending the
+	// baseline's hashes would refuse exactly the case the flag exists for.
+	t.Run("force", func(t *testing.T) {
+		f := newFakeInstance(t)
+		f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
+			api.WorkflowFile{Path: "main.py", Content: "M\n"})
+		signIn(t, f)
+		root := cloneFolder(t, f, "wf-1")
+		f.putFile("wf-1", "main.py", "theirs\n")
+		writeLocal(t, root, "main.py", "mine\n")
+
+		if _, err := runCLI(t, root, "wf", "push", "--force", "--json"); err != nil {
+			t.Fatalf("forced push: %v", err)
+		}
+		assertNoPreconditions(t, f)
+		if got := f.FileContents("wf-1")["main.py"]; got != "mine\n" {
+			t.Errorf("main.py = %q — --force did not overwrite", got)
+		}
+	})
+
+	// A workflow this push CREATED has no baseline, and the create SEEDS a
+	// starter file at the entrypoint inside its own transaction — so "" for
+	// that path would refuse a workflow the CLI made seconds earlier.
+	t.Run("freshly created", func(t *testing.T) {
+		f := newFakeInstance(t)
+		signIn(t, f)
+		root := initFolder(t, f, map[string]string{"main.py": "M\n"})
+
+		if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+			t.Fatalf("first push: %v", err)
+		}
+		assertNoPreconditions(t, f)
+	})
+
+	// The same seed seen a command later: a first push that died between
+	// recording the binding and writing the baseline. The guard recognises it
+	// (isUntouchedFirstPush) and so must the preconditions.
+	t.Run("resuming a crashed first push", func(t *testing.T) {
+		f := newFakeInstance(t)
+		f.AddWorkflow(&api.Workflow{ID: "wf-new-1", Lifecycle: api.LifecycleDraft, Hidden: true},
+			api.WorkflowFile{Path: "main.py", Content: fakeEntrypointStarter})
+		signIn(t, f)
+		root := bindFolder(t, f, "wf-new-1", map[string]string{"main.py": "M\n"})
+
+		if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+			t.Fatalf("resumed first push: %v", err)
+		}
+		assertNoPreconditions(t, f)
+		if got := f.FileContents("wf-new-1")["main.py"]; got != "M\n" {
+			t.Errorf("main.py = %q", got)
+		}
+	})
+}
+
+// A deletion asserts what it is removing — but never "" for a path the baseline
+// does not know, which would be a precondition that can only ever fail on the
+// one thing it is applied to.
+func TestPushDeletionCarriesTheBaselineHash(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
+		api.WorkflowFile{Path: "main.py", Content: "M\n"},
+		api.WorkflowFile{Path: "lib/old.py", Content: "O\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+
+	if err := os.Remove(filepath.Join(root, "lib", "old.py")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	deletes := f.writesFor("lib/old.py")
+	if len(deletes) != 1 || deletes[0].Method != "DELETE" || deletes[0].BaseSha256 == nil {
+		t.Fatalf("lib/old.py writes = %+v, want one DELETE carrying a precondition", deletes)
+	}
+	if got, want := *deletes[0].BaseSha256, wfdir.HashString("O\n"); got != want {
+		t.Errorf("delete baseSha256 = %s, want %s", got, want)
+	}
+}
+
+// And the delete's own race: the file changed after the listing, so what would
+// have been deleted is not what the folder last saw.
+func TestPushStopsWhenAFileToDeleteMovesUnderIt(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
+		api.WorkflowFile{Path: "main.py", Content: "M\n"},
+		api.WorkflowFile{Path: "lib/old.py", Content: "O\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+
+	if err := os.Remove(filepath.Join(root, "lib", "old.py")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	f.beforeFileWrite = func(method, path string) {
+		if method == "DELETE" && path == "lib/old.py" {
+			f.beforeFileWrite = nil
+			f.putFile("wf-1", "lib/old.py", "they kept working on it\n")
+		}
+	}
+
+	_, err := runCLI(t, root, "wf", "push", "--json")
+	if err == nil {
+		t.Fatal("push deleted a file that changed under it")
+	}
+	if !strings.Contains(err.Error(), "lib/old.py") {
+		t.Errorf("error = %v, want it to name the file", err)
+	}
+	if got := f.FileContents("wf-1")["lib/old.py"]; got != "they kept working on it\n" {
+		t.Errorf("lib/old.py = %q — the refused delete happened anyway", got)
+	}
+}

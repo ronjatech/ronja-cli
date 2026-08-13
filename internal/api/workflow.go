@@ -95,6 +95,24 @@ type Workflow struct {
 
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+
+	// URL is the absolute frontend page for this row, stamped by the SERVER
+	// (api/v2/workflow.WorkflowView) on the single-row routes. Never built here:
+	// the instance URL a profile records is the API origin, and the deploy
+	// template puts the backend on api.* and the frontend on app.*, so a link
+	// assembled from it points at a host that serves no pages. In local dev the
+	// two differ even more sharply.
+	//
+	// EMPTY IS NORMAL AND SILENT. The field is omitempty server-side and an
+	// instance with no configured frontend origin emits none at all (see
+	// backend/lib/deeplink), which is the ordinary state of a dev box. A caller
+	// with no url prints no link — it never falls back to deriving one, and it
+	// never treats absence as an error.
+	//
+	// Absent on the LIST routes (GET /workflow/query, GET :id/versions) and on
+	// rows the server refuses to link, so read it off the response you have
+	// rather than assuming every Workflow value carries one.
+	URL string `json:"url,omitempty"`
 }
 
 // WorkflowParameter mirrors rdb.WorkflowParameter. OptionsQuery is SQL carrying
