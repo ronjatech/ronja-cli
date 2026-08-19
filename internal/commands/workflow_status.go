@@ -57,6 +57,11 @@ With --json, one object carrying all of the above.`,
 				Entrypoint:        f.Manifest.Entrypoint,
 				ManagesParameters: f.Manifest.ManagesParameters(),
 				Parameters:        describeParameters(f.Manifest.DeclaredParameters()),
+				ManagesTimezone:   f.Manifest.ManagesReportingTimezone(),
+				// The zone the folder would put on the row, so what is reported is
+				// what a push would do: a declared "" is the reset, and the server
+				// stores it as the literal UTC.
+				ReportingTimezone: declaredZoneForCreate(f.Manifest),
 				Bound:             f.Bound,
 				Ambiguous:         f.BindingErr != nil,
 				WorkflowID:        f.Binding.WorkflowID,
@@ -102,6 +107,11 @@ type statusReport struct {
 	// carries, and a caller branching on Parameters alone would lose it.
 	ManagesParameters bool   `json:"managesParameters"`
 	Parameters        string `json:"parameters,omitempty"`
+	// ManagesTimezone carries the same distinction for the declared execution
+	// calendar: a folder that leaves the zone to the organization default is not
+	// a folder declaring UTC, and ReportingTimezone alone cannot say which it is.
+	ManagesTimezone   bool   `json:"managesTimezone"`
+	ReportingTimezone string `json:"reportingTimezone,omitempty"`
 	Bound             bool   `json:"bound"`
 	// Ambiguous reports a folder that IS bound here, to more than one
 	// organization, with no way to tell which applies — the signed-out case.
@@ -168,11 +178,22 @@ type remoteReport struct {
 	// something. Absent is the ordinary "they agree, or the folder does not
 	// manage them" case.
 	Parameters *parameterReport `json:"parameters,omitempty"`
+	// ReportingTimezone follows Parameters exactly: set only when the folder
+	// manages the zone and a push would change the row's.
+	ReportingTimezone *timezoneReport `json:"reportingTimezone,omitempty"`
 }
 
 // parameterReport is the declaration on each side, by name — enough to see what
 // a push would do without reprinting the whole set.
 type parameterReport struct {
+	Local  string `json:"local"`
+	Remote string `json:"remote"`
+}
+
+// timezoneReport is the declared calendar on each side. Same shape as
+// parameterReport and deliberately not the same type: one JSON document naming
+// two unrelated things with one word is a trap for anything parsing it.
+type timezoneReport struct {
 	Local  string `json:"local"`
 	Remote string `json:"remote"`
 }
@@ -292,6 +313,19 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 			Remote: describeParameters(target.Parameters),
 		}
 	}
+	// Same rule for the declared calendar, compared on the EFFECTIVE value: a
+	// folder declaring the reset value and a row already holding the literal UTC
+	// agree, and reporting them as a difference would advise a push that changes
+	// nothing.
+	if f.Manifest.ManagesReportingTimezone() {
+		local := declaredZoneForCreate(f.Manifest)
+		if local != target.ReportingTimezone {
+			out.ReportingTimezone = &timezoneReport{
+				Local:  local,
+				Remote: describeZone(target.ReportingTimezone),
+			}
+		}
+	}
 	switch {
 	case baseline == nil:
 		out.note("no local baseline — every remote file reads as new (this folder was never synced from here)")
@@ -337,6 +371,12 @@ func printStatus(r *statusReport) {
 	if r.ManagesParameters {
 		fmt.Fprintf(out, "  Parameters: %s\n", r.Parameters)
 	}
+	// Only for a folder that manages it, for the reason above: a zone printed at
+	// a folder that leaves it to the organization default would read as a fact
+	// about the workflow rather than about the folder.
+	if r.ManagesTimezone {
+		fmt.Fprintf(out, "  Timezone:   %s\n", r.ReportingTimezone)
+	}
 	printResourceURL(out, statusKeyWidth, r.WorkflowURL)
 
 	fmt.Fprintf(out, "\n  Local changes\n")
@@ -377,7 +417,7 @@ func printStatus(r *statusReport) {
 			fmt.Fprintf(out, " (vs %s)", r.Remote.ComparedAgainst.ID)
 		}
 		fmt.Fprintln(out)
-		if !r.Remote.Drift.Dirty() && r.Remote.Parameters == nil {
+		if !r.Remote.Drift.Dirty() && r.Remote.Parameters == nil && r.Remote.ReportingTimezone == nil {
 			fmt.Fprintf(out, "    none\n")
 		} else {
 			printPathList(out, "new", r.Remote.Drift.Added)
@@ -388,6 +428,9 @@ func printStatus(r *statusReport) {
 			// metadata answer.
 			if p := r.Remote.Parameters; p != nil {
 				fmt.Fprintf(out, "    %-9s parameters: %s here, %s there\n", "changed", p.Local, p.Remote)
+			}
+			if z := r.Remote.ReportingTimezone; z != nil {
+				fmt.Fprintf(out, "    %-9s timezone: %s here, %s there\n", "changed", z.Local, z.Remote)
 			}
 		}
 	}

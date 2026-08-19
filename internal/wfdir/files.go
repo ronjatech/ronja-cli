@@ -114,6 +114,37 @@ func StructuralExclusion(path string, kind Kind) string {
 	return ""
 }
 
+// Syncable reports whether a FILE path holds content a folder of this kind
+// sends. Case-insensitive, because `.SQL` is an ordinary thing to find in a repo
+// that has been through Windows.
+//
+// A kind with no SyncExt syncs everything the structural rules allow, which is
+// how workflows and data apps behave.
+func (k Kind) Syncable(path string) bool {
+	return k.SyncExt == "" || strings.EqualFold(filepath.Ext(path), k.SyncExt)
+}
+
+// NotSyncable reports why a FILE path is not one this kind syncs, or "" when it
+// is. It is StructuralExclusion plus the kind's own content rule (SyncExt).
+//
+// The one predicate both the walk and the layout check apply — Enumerate for
+// every file it finds, CheckLocalPaths for every path it is about to write —
+// and they must answer identically. A file one keeps and the other drops leaves
+// a baseline claiming a path that no later walk returns: `status` invents a
+// deletion and the next push acts on it by deleting the file server-side.
+//
+// FILES only. A DIRECTORY is tested by StructuralExclusion alone: `staging/`
+// has no extension, and pruning it here would hide every .sql file beneath it.
+func NotSyncable(path string, kind Kind) string {
+	if reason := StructuralExclusion(path, kind); reason != "" {
+		return reason
+	}
+	if !kind.Syncable(path) {
+		return fmt.Sprintf("a %s folder syncs %s files and ignores everything else", kind.Label, kind.SyncExt)
+	}
+	return ""
+}
+
 // isFolderMachinery reports whether a path is the CLI's own bookkeeping rather
 // than something the user authored. Excluded from Skipped reporting: the user
 // did not put ronja.json or .ronja/ there expecting them to sync, and naming
@@ -196,9 +227,11 @@ func Enumerate(root string, kind Kind) (*Enumeration, error) {
 			}
 			return nil
 		}
-		// The structural exclusions come out first, so a symlinked .env is
-		// ruled out by NAME rather than reported as "not a regular file".
-		if reason := StructuralExclusion(rel, kind); reason != "" {
+		// The name-based exclusions come out first, so a symlinked .env is ruled
+		// out by NAME rather than reported as "not a regular file" — and so a
+		// pipeline folder's node_modules/ or venv/ is ruled out by EXTENSION
+		// before anything is read off disk, which is the whole cost of the walk.
+		if reason := NotSyncable(rel, kind); reason != "" {
 			if !isFolderMachinery(rel) {
 				out.Skipped = append(out.Skipped, Skipped{Path: rel, Reason: reason})
 			}
@@ -314,9 +347,11 @@ func WriteFile(root, path, content string) error {
 //
 //   - A path WriteFile refuses (legacy rows, or a malicious one). Skipping it
 //     with a warning is what produced the phantom-deletion case above.
-//   - A path Enumerate structurally excludes: a dot-file or dot-directory
-//     ANYWHERE in it, the folder's own ronja.json / .ronja/, or one of this
-//     Kind's SkipDirs. The server's path grammar allows `.` in a segment, so
+//   - A path Enumerate excludes by NAME (NotSyncable): a dot-file or
+//     dot-directory ANYWHERE in it, the folder's own ronja.json / .ronja/, one
+//     of this Kind's SkipDirs, or a file outside this Kind's SyncExt — a `.md`
+//     handed to a pipeline folder is written once and then invisible to every
+//     walk. The server's path grammar allows `.` in a segment, so
 //     `.env` and `.config/x.py` are legal workflow paths that clone would
 //     happily write — and `dist/app.js` is a legal data-app path — and that the
 //     walk would then never see again. Exactly the phantom-deletion shape above,
@@ -346,7 +381,7 @@ func CheckLocalPaths(paths []string, kind Kind) error {
 
 	var excluded []string
 	for _, p := range paths {
-		if reason := StructuralExclusion(p, kind); reason != "" {
+		if reason := NotSyncable(p, kind); reason != "" {
 			excluded = append(excluded, fmt.Sprintf("%s (%s)", p, reason))
 		}
 	}

@@ -59,6 +59,12 @@ type QueryResult struct {
 	Error        string `json:"error"`
 	SQL          string `json:"sql"`
 	InstanceKind string `json:"instanceKind"`
+	// ZoneUsed is the IANA reporting timezone the query's DuckDB session ran
+	// at. The CLI carries no client timezone, so it is normally "UTC" — while
+	// the same SQL in the browser runs at the signed-in user's zone. Any query
+	// that buckets by day/week/month can therefore return different numbers on
+	// the two surfaces, and this is the only field that says so.
+	ZoneUsed string `json:"zoneUsed"`
 }
 
 // Failed reports a query the server accepted and could not run.

@@ -31,6 +31,11 @@ const maxErrorBody = 8 << 10
 // Generous for the real thing, small enough that a misaimed --url fails fast.
 const maxDocBody = 2 << 20
 
+// maxDiscardBody bounds the drain of a response nobody decodes. Draining is
+// what returns the connection to the pool; bounding it is what stops a
+// misaimed --url making that drain the request.
+const maxDiscardBody = 64 << 10
+
 // Request timeouts. The split is the point.
 //
 // http.Client.Timeout is a CEILING, not a policy: a per-request
@@ -100,6 +105,12 @@ type Client struct {
 	MaxPollFailureWindow time.Duration
 	// RateLimitBackoff is added to the interval on a 429.
 	RateLimitBackoff time.Duration
+
+	// TableBuild is the schedule WaitForTableBuild polls on. Grouped rather than
+	// flattened alongside the device-flow knobs above, because "MaxInterval"
+	// belonging to one loop or the other is not something a reader should have
+	// to infer from a comment.
+	TableBuild TableBuildPoll
 }
 
 func New(baseURL, token string) *Client {
@@ -117,6 +128,8 @@ func New(baseURL, token string) *Client {
 
 		MaxPollFailureWindow: DefaultMaxPollFailureWindow,
 		RateLimitBackoff:     DefaultRateLimitBackoff,
+
+		TableBuild: defaultTableBuildPoll(),
 	}
 }
 
@@ -329,8 +342,20 @@ func (c *Client) do(ctx context.Context, timeout time.Duration, method, path str
 		return parseError(resp)
 	}
 	if out == nil {
+		// DRAINED, not just closed. net/http only returns a connection to the
+		// pool once its body has been read to EOF, so discarding a response by
+		// closing it unread costs a fresh TCP+TLS handshake on the next call —
+		// which the build poll loop makes hundreds of. Bounded for the same
+		// reason maxDocBody is: --url can point at anything.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDiscardBody))
 		return nil
 	}
+	// Deliberately NOT capped, unlike GetText's maxDocBody. That cap protects a
+	// read whose real content is a few KB; this one decodes the query envelope,
+	// whose `result` field is a CSV of up to the server's 100 000-row ceiling —
+	// a limit small enough to catch a misaimed --url would truncate a correct
+	// answer into a decode error. A non-JSON body fails on its first byte
+	// anyway, which is the case a cap would otherwise be for.
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decode response from %s: %w", url, err)
 	}
@@ -379,9 +404,30 @@ func (c *Client) GetText(ctx context.Context, path string) (string, error) {
 // parseError turns a non-2xx response into an *Error, pulling out the `error`
 // field when the body is the JSON shape the API uses.
 func parseError(resp *http.Response) error {
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-	apiErr := &Error{Status: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+	// A body that stopped mid-stream is not the server's message, and presenting
+	// the prefix as one would quote a sentence the server never finished — and
+	// leave the machine-readable `error` field silently absent, which is what the
+	// device-flow poll branches on. Said out loud, with whatever did arrive.
+	if readErr != nil {
+		apiErr := &Error{Status: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
+		apiErr.Body = strings.TrimSpace(fmt.Sprintf("%s (the response body was truncated: %v)", apiErr.Body, readErr))
+		return apiErr
+	}
+	return errorFrom(resp.StatusCode, raw)
+}
 
+// errorFrom builds an *Error from a status and a body that has ALREADY been
+// read.
+//
+// Split out of parseError for the callers that cannot hand over an
+// *http.Response: DoRaw returns the body undecoded, so a caller that reads it
+// itself — the preview call, which needs the 200 bytes verbatim and therefore
+// reads every status the same way — would otherwise have to re-derive the
+// `error`-field extraction, and a second copy of it is a second opinion about
+// what the server said.
+func errorFrom(status int, raw []byte) *Error {
+	apiErr := &Error{Status: status, Body: strings.TrimSpace(string(raw))}
 	var shape struct {
 		Error string `json:"error"`
 	}

@@ -108,10 +108,21 @@ type fakeInstance struct {
 	// without a second knob.
 	runScript []api.RunResponse
 	runPolls  int
-	// runRequests records every POST :id/run as (workflowID, parameterValues),
-	// which is how the gate/--write-live refusals are pinned: they must make
-	// ZERO of these.
+	// runRequests records every POST :id/run as (workflowID, parameterValues,
+	// resumeOfRunID), which is how the gate/--write-live refusals are pinned:
+	// they must make ZERO of these. The resume field is what pins the other
+	// direction — a resume must send a run id and NO parameter values.
 	runRequests []recordedRun
+	// runHistory is what GET :id/runs answers with, keyed by workflow row id.
+	// Deliberately stored in an ARBITRARY order and served that way: the real
+	// endpoint applies no default ORDER BY, so a CLI that assumed one would
+	// pass here and pick a random run in production.
+	runHistory map[string][]api.WorkflowRun
+	// runQueries records the raw query string of every GET :id/runs, so the
+	// ordering the CLI asks for is asserted rather than assumed.
+	runQueries []string
+	// failRunsList is the status GET :id/runs answers with; 0 is success.
+	failRunsList int
 	// failRun is the status POST :id/run answers with, carrying failRunMessage
 	// as the server's `error` field — the shape of the credit kill-stop and of
 	// the gate refusal the CLI preflights.
@@ -161,12 +172,35 @@ type fakeInstance struct {
 	// deletedWorkflows records every DELETE /workflow/:id — the whole-row
 	// removal `discard --delete-workflow` performs, which must never happen
 	// without it.
-	deletedWorkflows  []string
-	reviewRequested   []string
-	titlePatches      map[string]string
-	parameterPatches  map[string]*[]api.WorkflowParameter
+	deletedWorkflows []string
+	reviewRequested  []string
+	titlePatches     map[string]string
+	parameterPatches map[string]*[]api.WorkflowParameter
+	// timezonePatches records the declared-zone half of every metadata patch,
+	// as a POINTER for the reason parameterPatches is one: "never patched" and
+	// "patched to the reset value" are the distinction the three states exist
+	// for, and a plain string cannot tell them apart.
+	timezonePatches   map[string]*string
 	entrypointPatches map[string]string
-	nextID            int
+	// tenantZone is what the fake stamps on a create that names no zone,
+	// mirroring rworkflow.stampDeclaredZone resolving the organization default.
+	tenantZone string
+	// zoneUnsupported turns the fake into an instance OLDER than the workflow
+	// declared-zone column: `reportingTimezone` is accepted on both the create
+	// and the metadata patch, recorded as having arrived, and then DROPPED —
+	// which is what gin's binder does with a key no struct field claims, and why
+	// the version skew is invisible to the status code. Rows keep the empty
+	// declaration such a server would answer with.
+	zoneUnsupported bool
+	// failRowGetAfterPatch makes GET /workflow/:id fail once a metadata PATCH has
+	// been served. It stages the one window a push cannot confirm: the patch was
+	// accepted and the read-back that would say what actually landed is the
+	// request that fails. Keyed off the patch rather than a request count because
+	// the push reads the row several times before it, and a count would break the
+	// moment the read order changed.
+	failRowGetAfterPatch bool
+	patchServed          bool
+	nextID               int
 
 	server *httptest.Server
 	// Requests records every request served as "METHOD /path", in order — the
@@ -184,6 +218,10 @@ const fakeEntrypointStarter = "# Write your workflow here.\n"
 type recordedRun struct {
 	WorkflowID      string
 	ParameterValues map[string]any
+	// ResumeOfRunID is empty for an ordinary run. Recorded because the two
+	// halves of a resume's contract are both about this body: it names a run,
+	// and it carries no parameter values at all.
+	ResumeOfRunID string
 }
 
 // recordedFileWrite is one file PUT or DELETE, with the precondition it carried.
@@ -216,9 +254,12 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 		failPut:           map[string]int{},
 		failDelete:        map[string]int{},
 		saveWarnings:      map[string][]string{},
+		runHistory:        map[string][]api.WorkflowRun{},
 		titlePatches:      map[string]string{},
 		parameterPatches:  map[string]*[]api.WorkflowParameter{},
+		timezonePatches:   map[string]*string{},
 		entrypointPatches: map[string]string{},
+		tenantZone:        "UTC",
 		tableNames:        map[string]string{},
 		privilegeLevel:    50,
 
@@ -366,6 +407,22 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case strings.HasSuffix(path, "/runs"):
+		// GET :id/runs — the run history --resume picks a target out of. A
+		// PAGINATED envelope, like the real route, and served in the order the
+		// history was staged in: the endpoint has no default ordering, so a CLI
+		// that did not ask for one must not be rescued by the fake.
+		f.runQueries = append(f.runQueries, r.URL.RawQuery)
+		if f.failRunsList != 0 {
+			http.Error(w, `{"error":"boom"}`, f.failRunsList)
+			return
+		}
+		runs := f.runHistory[strings.TrimSuffix(path, "/runs")]
+		if runs == nil {
+			runs = []api.WorkflowRun{}
+		}
+		writeJSON(w, map[string]any{"token": nil, "total": len(runs), "result": runs})
+
 	case strings.HasSuffix(path, "/draft"):
 		id := strings.TrimSuffix(path, "/draft")
 		if f.failDraft != 0 {
@@ -420,6 +477,10 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, files)
 
 	default:
+		if f.failRowGetAfterPatch && f.patchServed {
+			http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+			return
+		}
 		wf, ok := f.workflows[path]
 		if !ok {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
@@ -467,14 +528,26 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		if entrypoint == "" {
 			entrypoint = "main.py"
 		}
+		// Mirrors rworkflow.stampDeclaredZone: a create that names no zone gets
+		// the organization default, so a workflow is never born without one.
+		zone := in.ReportingTimezone
+		if zone == "" {
+			zone = f.tenantZone
+		}
+		if f.zoneUnsupported {
+			// An instance without the column has nothing to stamp and nothing to
+			// answer with — not even the organization default.
+			zone = ""
+		}
 		created := f.AddWorkflow(&api.Workflow{
-			ID:         id,
-			Lifecycle:  api.LifecycleDraft,
-			Title:      in.Title,
-			Entrypoint: entrypoint,
-			FeatureID:  in.FeatureID,
-			Parameters: in.Parameters,
-			Hidden:     true,
+			ID:                id,
+			Lifecycle:         api.LifecycleDraft,
+			Title:             in.Title,
+			Entrypoint:        entrypoint,
+			FeatureID:         in.FeatureID,
+			Parameters:        in.Parameters,
+			ReportingTimezone: zone,
+			Hidden:            true,
 		}, api.WorkflowFile{
 			// Mirrors rworkflow.Add (store.go): the entrypoint file is SEEDED
 			// inside the create transaction, because the file-tree panel and
@@ -616,6 +689,24 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			wf.Parameters = *patch.Parameters
 			f.parameterPatches[id] = patch.Parameters
 		}
+		// Mirrors rworkflow.resolveDeclaredZonePatch: absent leaves the
+		// declaration alone, and an explicit "" is stored as the LITERAL "UTC"
+		// rather than as NULL — which is what keeps an empty column meaning
+		// "nobody has ever declared a calendar here" and nothing else.
+		if patch.ReportingTimezone != nil {
+			zone := *patch.ReportingTimezone
+			if zone == "" {
+				zone = "UTC"
+			}
+			// The request ARRIVED either way — that is what the recorded patch
+			// means, and an old server is precisely one that receives it and does
+			// nothing. Only the stored value is conditional.
+			if !f.zoneUnsupported {
+				wf.ReportingTimezone = zone
+			}
+			f.timezonePatches[id] = patch.ReportingTimezone
+		}
+		f.patchServed = true
 		writeJSON(w, nil)
 		return true
 	}
@@ -627,11 +718,22 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 	case "run":
 		var in struct {
 			ParameterValues map[string]any `json:"parameterValues"`
+			ResumeOfRunID   string         `json:"resumeOfRunID"`
 		}
 		decodeBody(f.t, r, &in)
-		f.runRequests = append(f.runRequests, recordedRun{WorkflowID: id, ParameterValues: in.ParameterValues})
+		f.runRequests = append(f.runRequests, recordedRun{
+			WorkflowID: id, ParameterValues: in.ParameterValues, ResumeOfRunID: in.ResumeOfRunID,
+		})
 		if f.failRun != 0 {
 			http.Error(w, `{"error":"`+f.failRunMessage+`"}`, f.failRun)
+			return true
+		}
+		// Mirrors manalysis.resolveResume's rule 4: a resume inherits the
+		// target's parameters, so supplying any is refused rather than merged.
+		// Modelled because the CLI's whole job on this path is not to send them.
+		if in.ResumeOfRunID != "" && len(in.ParameterValues) > 0 {
+			http.Error(w, `{"error":"a resume inherits the original run's parameters — omit parameterValues"}`,
+				http.StatusBadRequest)
 			return true
 		}
 		// Mirrors the real endpoint: the run row comes back IMMEDIATELY at
@@ -654,6 +756,10 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		// guard fires on a difference the real server never creates.
 		if parent := f.workflows[id]; parent != nil {
 			draft.Parameters = append([]api.WorkflowParameter(nil), parent.Parameters...)
+			// And its declared zone, for the same reason: buildDraftFromParent
+			// carries the parent's calendar rather than re-stamping today's
+			// organization default, so a checkout must not look like a change.
+			draft.ReportingTimezone = parent.ReportingTimezone
 		}
 		f.writeRow(w, draft)
 		return true
@@ -852,7 +958,12 @@ func runCLI(t *testing.T, workdir string, args ...string) (string, error) {
 	// usage dump cannot be mistaken for a command's JSON.
 	root.SetOut(io.Discard)
 	root.SetErr(io.Discard)
-	err := root.Execute()
+	// The SAME context Execute builds, signal handler included: it is what makes
+	// every command's cancellation branch reachable, so a test running the tree
+	// without it would exercise a different program from the one that ships.
+	ctx, stop := signalContext()
+	defer stop()
+	err := root.ExecuteContext(ctx)
 
 	return restore(stdout), err
 }
@@ -880,6 +991,55 @@ func failOnceWithATimeout(t *testing.T, method, path string) {
 		return client
 	}
 	t.Cleanup(func() { newClient = previous })
+}
+
+// landOnceThenTimeOut lets the NEXT request to one method+path reach the fake
+// and COMMIT, then reports a deadline to the caller anyway.
+//
+// The other half of failOnceWithATimeout, and the half every reconcile is
+// actually about: "the write timed out and did not land" is the easy branch, and
+// the one that costs is "it landed and we stopped listening". Nothing in the
+// error the client sees distinguishes the two, which is why the reconcile has to
+// go and ask.
+//
+// Same transport-level trick and the same reason: it costs no wall time, and a
+// 120-second deadline cannot be waited out in a test.
+func landOnceThenTimeOut(t *testing.T, method, path string) {
+	t.Helper()
+	transport := &timeoutAfterLandingOnce{method: method, path: path}
+	previous := newClient
+	newClient = func(baseURL, token string) *api.Client {
+		client := previous(baseURL, token)
+		transport.base = client.HTTP.Transport
+		client.HTTP.Transport = transport
+		return client
+	}
+	t.Cleanup(func() { newClient = previous })
+}
+
+type timeoutAfterLandingOnce struct {
+	base   http.RoundTripper
+	method string
+	path   string
+	fired  bool
+}
+
+func (t *timeoutAfterLandingOnce) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if t.fired || req.Method != t.method || req.URL.Path != t.path {
+		return base.RoundTrip(req)
+	}
+	t.fired = true
+	resp, err := base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	// The server's work is done; the client just never gets to read it.
+	resp.Body.Close()
+	return nil, context.DeadlineExceeded
 }
 
 type timeoutOnce struct {

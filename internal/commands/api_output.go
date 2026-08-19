@@ -211,7 +211,7 @@ func (o apiOutput) buffered() bool {
 // Ordering is deliberate and matters when flags are combined: --out always gets
 // the response VERBATIM (it is the archive of what the server said), --jq
 // writes the filtered view to stdout, and the unfiltered body reaches stdout
-// only when nothing else claimed it. So `--out resp.json --jq -r .id` saves the
+// only when nothing else claimed it. So `--out resp.json --jq .id -r` saves the
 // whole answer and prints the one field, which is what both flags plainly mean.
 func (o apiOutput) emit(resp *api.RawResponse, method, path string) error {
 	if !o.buffered() {

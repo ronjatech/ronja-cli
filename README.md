@@ -36,8 +36,10 @@ Two commands make that HTTP half less unpleasant without describing any of it �
 `ronja api` (a request runner) and `ronja query` (read-only SQL). Both are
 below, and the doctrine that admits them is immediately below this.
 
-The one exception is `ronja wf`, the workflow dev loop — see below. The rule it
-keeps is **sync verbs yes, resource verbs no**: the CLI may own a
+The exceptions are the four sync loops — `ronja wf` (workflows), `ronja app`
+(data apps), `ronja pipeline` (derived tables) and `ronja db` (managed-database
+migrations), each below. The rule they keep is **sync verbs yes, resource verbs
+no**: the CLI may own a
 filesystem-to-resource sync loop, because that is stateful, multi-step and
 drift-guarded in a way plain HTTP handles badly. It still owns no list, browse
 or delete. If an agent needs something the API already does, the answer is a
@@ -468,7 +470,7 @@ cat feature.json | ronja api -X POST /api/v2/feature -d @-
 ronja api -X POST /api/v2/file/upload/report.pdf -F file=@./report.pdf
 
 # read one field out of the answer
-id=$(ronja api -X POST /api/v2/workflow -d @wf.json --jq -r '.id')
+id=$(ronja api -X POST /api/v2/workflow -d @wf.json --jq '.id' -r)
 
 # wait for asynchronous work
 ronja api "/api/v2/workflow/run/$runID" --wait-until '.status != "running"'
@@ -517,6 +519,14 @@ Two refusals, both guarding a failure that is otherwise **silent**:
 | `-r`, `--raw` | With `--jq`, print string results unquoted — the form that makes `$(...)` substitution work. Only strings are affected; a number or object still renders as JSON, as jq does. Refused without `--jq`. |
 | `-o`, `--out` | Write the response body to a file, atomically and **0600**. stdout stays empty (the count goes to stderr). Streams unless a buffering flag is also set, so a large download is not held in memory. |
 | `--fail-on-error` | Exit non-zero when a **2xx** carries a non-empty top-level `error`. Off by default. |
+
+⚠️ **`--jq` takes a value, so `--jq -r '.id'` binds `-r` as the expression** and
+leaves `.id` as a stray positional — which cobra reports as *"accepts 1 arg(s),
+received 2"*, a message about argument counts for a mistake that is entirely
+about a flag. Both `ronja api` and `ronja query` refuse it by name and show the
+working form (`--jq '.id' -r`). The check reads the command's own flag set
+rather than a list, so a flag added later is covered, and a legitimate
+dash-leading expression (`-1`) still runs.
 
 `--fail-on-error` closes the trap `ronja query` has always handled and this
 command could not: some endpoints report failure *in the envelope*, so a query
@@ -618,7 +628,7 @@ round trip.
 | `--file` | Read the SQL from a file, or from stdin with `-`. |
 | `--out` | Write the CSV to a file, mode **0600** (tenant data, same posture as the credential store) and **atomically** — temp file plus rename, not `os.WriteFile`, whose mode applies only on *create* (a pre-existing 0644 file would stay 0644), which follows a symlink, and whose short write leaves a truncated file indistinguishable from a complete result. stdout then stays empty, and the narration ("N rows written to …") goes to stderr. |
 | `--json` | Print the whole response envelope as one JSON object on stdout instead of the CSV. Combined with `--out`, the file gets the CSV and stdout gets the envelope. |
-| `--jq` | Filter the **envelope** through a jq expression — `rowCount`, `truncated`, `error`, not the rows (those are CSV, and jq does not read CSV). Refused together with `--json`: two contradictory descriptions of stdout, and either precedence would silently discard a flag someone typed on purpose. |
+| `--jq` | Filter the **envelope** through a jq expression — `rowCount`, `truncated`, `zoneUsed`, `error`, not the rows (those are CSV, and jq does not read CSV). Refused together with `--json`: two contradictory descriptions of stdout, and either precedence would silently discard a flag someone typed on purpose. |
 | `-r`, `--raw` | With `--jq`, print string results unquoted. Refused without it. |
 | `--max-rows` | `maxRows` on the request. Omitted means the server's default cap; the server clamps anything above its ceiling. |
 | `--timeout` | How long to wait for the query. Default 2m; `0` waits as long as it takes; negative is refused. |
@@ -659,6 +669,21 @@ the query again to find out why.)
 aggregating in SQL, and exits zero — the rows you got are real, there are
 simply more of them. It is on stderr because stdout is a CSV somebody is
 parsing.
+
+**The reporting timezone is stated on every successful run.** The envelope
+carries `zoneUsed` (the IANA timezone the query's DuckDB session actually ran
+at), and the CLI prints it on **stderr** as `Reporting timezone: <zone>` —
+before the truncation note, so the calendar is stated before any caveat about
+the rows. It is narration, not a warning, and it exits zero.
+
+It is said out loud every time rather than only when something looks wrong,
+because the asymmetry is invisible from either side: the CLI sends no client
+timezone, so it reads at **UTC**, while the same query in the app reads at the
+signed-in user's timezone. Any rollup bucketed by day, week or month therefore
+falls on different boundaries on the two surfaces — the numbers differ, both are
+correct, and nothing else in the output says why. Check `zoneUsed` first when
+CLI numbers disagree with the app. (With `--json` the field is in the envelope
+too; `--jq .zoneUsed` reads it.)
 
 ## Managed databases (`ronja db`)
 
@@ -719,13 +744,17 @@ clone → edit → validate → push → test → publish. The code lives in the
 customer's own repo and their own editor; Ronja holds the draft.
 
 ```bash
-ronja wf clone wf_abc                  # or: ronja wf init --from script.py --feature col_abc
+ronja wf clone workflow-abc            # or: ronja wf init --from script.py --feature collection-abc
 $EDITOR main.py
 ronja wf validate                      # server-side check, saves nothing
 ronja wf push                          # validates, then syncs the folder into YOUR draft
 ronja wf test --param month=2026-07
 ronja wf publish                       # commit, or submit for review, and say which happened
 ```
+
+A **durable** workflow (`ronja wf init --runtime 2`) adds one verb to that loop:
+`ronja wf test --resume` continues a failed run instead of starting over. See
+"Durable workflows" below.
 
 Two files describe the folder:
 
@@ -775,6 +804,76 @@ Two files describe the folder:
   the first push after upgrading wipe the workflow's declaration. `init` and
   `clone` both write the key, so folders they create manage parameters from the
   start.
+
+  `runtime` is the workflow's runtime version — `2` for a **durable** workflow,
+  absent for the default. Unlike `parameters` it is a plain int with no
+  three-state pointer, because the third state has nothing to describe: the
+  runtime is *stamped at create* and the server has no patch for it, so
+  "unmanaged" and "declares the default" both mean "send nothing, get 1". The
+  key is written only for `--runtime 2`, which keeps a v1 folder's `ronja.json`
+  byte-identical to what the CLI wrote before durable workflows existed.
+
+  `reportingTimezone` is the **calendar the workflow's runs execute on** — the
+  IANA zone its DuckDB session is set to, so it is what `date_trunc`,
+  `CAST(ts AS DATE)` and `AT TIME ZONE` bucket against inside `{{ ref() }}`
+  queries, i.e. which day or month a timestamp near midnight lands in. Every run
+  reads it, so a scheduled run and one you start by hand produce the same
+  numbers; without a declaration the calendar follows whoever triggered the run,
+  which for a workflow that writes a table means the stored table changes shape
+  depending on who ran it last. It is stored as a fixed value, so changing the
+  organization default later does not move an existing workflow.
+
+  It has the same **three states** `parameters` does, with one wrinkle worth
+  knowing before hand-editing it:
+
+  | in `ronja.json` | means |
+  |---|---|
+  | absent | the folder does not manage the calendar; push never touches it |
+  | `""` | managed, declaring the RESET — push sets the row to an explicit `UTC` |
+  | `"Europe/Stockholm"` | managed; push makes the row match |
+
+  `""` is the reset, **not** "declares none" — the row ends up holding the
+  literal `UTC`, which is a real declaration. There is no way to put a row back
+  to declaring nothing: an empty value on the server means the row has never
+  declared a calendar — because it predates the field, or because it was created
+  while the organization had no default — and it falls back to the caller's zone
+  at run time. Because `""` and `UTC` are the same request,
+  `status` compares the two on their *effective* value and reports no difference
+  between them.
+
+  `clone` writes the key when the workflow declares a calendar and leaves it out
+  when the row declares none — writing it for that row would make the very first
+  push stamp UTC onto a workflow nobody asked to change. **`init` deliberately
+  does not write it at all**, unlike `parameters`: the only value it could write
+  without a round trip is `""`, which means "declare UTC", so every fresh folder
+  would silently override its organization's default. Absent means "inherit it",
+  and the create then takes the organization default.
+
+  `push` reports the change in words (`updated  the reporting timezone to "…"`,
+  in the same list as the pushed and deleted files) and the drift guard covers
+  it like any other metadata field: a calendar changed in the web builder since
+  your last sync stops the push rather than being overwritten. To change a
+  workflow's calendar without the CLI, ask Ronja in chat or
+  `PUT /api/v2/workflow/<id>`.
+
+  **Against an older instance the key is READ BACK, not assumed.** An instance
+  that predates the workflow calendar accepts `reportingTimezone` in the request
+  body, ignores it, and answers success — unknown JSON keys are dropped, not
+  refused. So after changing the calendar `push` re-reads the workflow: if the
+  row does not hold what was sent, it warns (`this server does not support
+  reportingTimezone — the key was ignored`, plus `reportingTimezoneIgnored` in
+  `--json`) and records **what the server holds**, never what it sent. That is
+  what keeps `wf status` honest — it goes on reporting the calendar as unsynced,
+  and a later push against an upgraded instance applies it. Everything else in
+  such a push still lands normally.
+
+  ⚠️ **An older `ronja` CLI silently STRIPS the key from `ronja.json`.** The
+  manifest is decoded into a typed struct and written back whole, so a version
+  of the CLI that does not know `reportingTimezone` drops it from any file it
+  rewrites — the first `push` of a new folder (which records the binding) and
+  `wf discard` both rewrite the manifest. A hand-added declaration can therefore
+  disappear from a committed file with no message. Everyone working on one
+  folder wants the same CLI version; `ronja version` reports it.
 - **`.ronja/state.json`** — the sync baseline, never committed (`clone` and
   `init` write `.ronja/.gitignore` containing `*`). One entry per (instance,
   organization) binding, exactly like the manifest — the row the baseline came
@@ -788,12 +887,12 @@ The verbs:
 
 | Verb | Does | Flags worth knowing |
 |---|---|---|
-| `init` | writes the two files, optionally copying in a script you already have. Creates nothing server-side | `--from`, `--feature` (required), `--title` |
+| `init` | writes the two files, optionally copying in a script you already have. Creates nothing server-side | `--from`, `--feature` (required), `--title`, `--runtime` |
 | `clone` | copies a workflow's files down into a new folder. Prefers your open draft over live when you have one. Creates nothing server-side | — |
 | `status` | local changes, remote lifecycle/draft, and drift since the last sync. Read-only, and works signed out for the local half | `--json` |
 | `validate` | posts the folder to `POST /workflow/validate`. Persists nothing; works before the workflow exists | `--json` |
 | `push` | validates, ensures a draft (`checkout`, or `POST /workflow` on a first push), syncs files | `--no-validate`, `--force` |
-| `test` | runs the draft and polls to completion | `--param k=v`, `--write-live`, `--stale-ok`, `--timeout`, `--logs` |
+| `test` | runs the draft and polls to completion | `--param k=v`, `--write-live`, `--stale-ok`, `--resume`, `--timeout`, `--logs` |
 | `publish` | publishes a parentless draft, commits an attached one, or submits it for review | `--no-request-review`, `--overwrite-remote` |
 | `discard` | deletes your draft; the live workflow and your local files are untouched. A workflow that has never been published *is* its draft, so removing it needs `--delete-workflow` (a soft delete — it sits in the trash for 30 days) | `--yes`, `--delete-workflow` |
 
@@ -824,9 +923,102 @@ Four behaviours are deliberate and easy to undo by accident:
   table needs the flag from its first push, published or not. An approval-gated
   workflow is refused outright rather than worked around — disabling the gate
   on the draft would ride into the parent on publish.
-- **Exit zero means the thing finished.** `validate` exits non-zero on error
-  findings, `test` only on a successful run. Ctrl-C during `test` stops the
-  waiting, not the run — it is caught explicitly so the person is told that.
+- **Exit zero means the thing did not fail.** `validate` exits non-zero on error
+  findings; `test` exits non-zero on a failed run, on a timeout, and on a status
+  it does not recognise — but zero on a run that finished AND on a durable run
+  that parked (`waiting`) or was handed to a successor (`resuming`), neither of
+  which is a failure. Ctrl-C during `test` stops the waiting, not the run — it is
+  caught explicitly so the person is told that.
+
+### Durable workflows (`--runtime 2`)
+
+A durable workflow journals the result of every `@tools.step` under a key
+DERIVED from the function and its arguments, so a failed run can be **resumed**
+instead of re-run: the journaled steps are replayed and only the work that never
+finished executes again.
+
+Resume itself is not durable-only. On the standard runtime a step is journaled
+when the author gives it an explicit key (`tools.step("key", fn, ...)`), and
+`--resume` replays exactly those. What runtime 2 changes is that nobody has to
+write a key — so a loop journals per item, and forgetting one stops being
+possible.
+
+```bash
+ronja wf init --feature collection-abc --runtime 2   # manifest key + a durable main.py
+ronja wf push                                 # the create stamps the runtime
+ronja wf test                                 # it fails somewhere in the middle
+$EDITOR main.py && ronja wf push              # fix the bug
+ronja wf test --resume                        # continue from where it stopped
+```
+
+Three things are worth knowing, and each is a place the obvious behaviour would
+be wrong:
+
+- **The runtime is stamped at create, and only there.** There is no patch path
+  server-side, so the manifest's `runtime` rides the `POST /workflow` body of
+  the push that creates the workflow and is never sent again. A folder that
+  declares `runtime: 2` against a workflow that already exists is *not* an
+  error — it simply changes nothing, because nothing can. Getting it wrong
+  means a new folder, not a flag.
+- **`--resume` finds its target on the SERVER.** It reads
+  `GET /workflow/:id/runs` (newest first, explicitly ordered — the endpoint has
+  no default ordering) and resumes the most recent **failed** run of the row
+  `wf test` runs, which is your draft. Nothing is remembered locally: a run id
+  in `.ronja/` would be wrong the moment the workflow was run from the web
+  builder, an automation or a colleague's checkout, and missing exactly when it
+  is most wanted — after the clone that follows a failure somebody else saw.
+  With no failed run it refuses and says so; it never quietly starts a fresh one.
+  It does **not** refuse a standard-runtime workflow — that workflow may have
+  explicitly-keyed steps to replay — but it does say so before resuming, because
+  a resume that finds nothing journaled simply re-runs everything.
+- **A resume inherits the original run's parameters**, so `--param` with
+  `--resume` is refused rather than dropped. That is the server's rule — changed
+  parameters would invalidate every step result computed under the old ones —
+  and a CLI that silently discarded the flag would hide the mistake the rule
+  exists to catch. A resume runs the workflow's **current** files, which is what
+  makes fix-then-resume the intended loop.
+
+A failed durable run ends its report with the resume invocation and `N steps
+journaled — a resume skips them`. That N is the response's `journalEntries` —
+the size of the lineage's journal, which the server derives on read and sends
+only for a failed run — and deliberately **not** `len(steps)`: steps are the
+observable timeline (run spans), a different set, and printing one as the other
+would be a confident wrong number in the one place somebody is deciding whether
+to trust the skip. No `journalEntries` means no line, rather than "0 steps
+journaled" — which reads as a fact about the journal when it is equally the
+answer from an instance that does not send the field.
+
+In a resumed run's step timeline, a step whose result came out of the journal
+reads **`replayed`** rather than `skipped` — the status a continue_on_error step
+that never ran also carries.
+
+A durable run can also **park**: it hands work to an agent or waits on a timer,
+the burst finishes cleanly with its outputs persisted, and the row sits at
+`waiting` until something wakes it. `wf test` ends its poll there and exits
+zero, and both halves are deliberate. Waiting a park out is not on offer — it
+lasts until a colleague answers or a timer fires, which is days rather than
+minutes — and reporting it as a failure would stop a pipeline over a workflow
+doing exactly what it was written to do. So the report names the park, prints
+what ran before it, and offers neither of the usual closing hints: `publish`
+would invite taking code live on the strength of a run that has not finished,
+and `--resume` would offer to continue a run that nothing has stopped. A poll
+can also land on `resuming` — the single-winner latch between "a wake decided to
+continue this run" and "the successor run exists". That is terminal for the row
+being polled and is not a failure either, so it exits zero too, reported as work
+that continued in a NEWER run: the id in the report is no longer the one to
+follow.
+
+Whether a workflow is durable is read off the **row** (`runtimeVersion`), not
+the manifest: the row is what the run funnel reads, and it is right about a
+workflow this folder did not create. The manifest is the fallback for one case
+only — an instance predating durable workflows sends no `runtimeVersion`, and a
+0 means "the instance did not say", not "runtime 1".
+
+`wf init --runtime 2` also writes a `main.py` in the shapes a resume depends on
+(decorated steps, keys derived rather than written, `tools.now()`, handles
+across step boundaries). A durable workflow scaffolded from v1 code journals
+nothing and fails silently: the run works, and the resume that was the point of
+it does not.
 
 ### Two editors, one workflow
 
@@ -967,10 +1159,11 @@ same `.ronja/` baseline, same per-instance bindings, same drift guard), and
 data-app folder is refused rather than allowed to overwrite TSX with Python.
 
 ```bash
-ronja app clone data_app-abc           # or: ronja app init --from Revenue.tsx --feature col_abc
+ronja app clone data_app-abc           # or: ronja app init --from Revenue.tsx --feature collection-abc
 $EDITOR App.tsx
 ronja app push                         # syncs the folder into YOUR draft, then compiles it
 ronja app validate                     # recompile the draft on its own
+ronja app test                         # render the draft headless and report what the browser saw
 ronja app publish                      # commit, or submit for review, and say which happened
 ```
 
@@ -995,6 +1188,19 @@ compiles green and ships a blank page. And nothing static can promise that
 `Compiles: yes` renders anyway — a component that mounts and returns `null`, or
 throws on first render, publishes green too. `status` prints the app's URL; open
 it.
+
+**Forking a kit component is a local file copy.** Every app compiles against an
+embedded component kit (the shadcn/ui primitives and Ronja's operator
+components, imported as `@/components/ui/button` and friends), and an app file
+at the same path *shadows* the kit's for the whole bundle — so customisation is
+expressed by having your own `components/ui/button.tsx`, and no import anywhere
+changes. `ronja app fork components/ui/button.tsx` writes exactly that file,
+byte-identical to what the compiler currently resolves, reading it from the
+instance's public `/docs/api/kit/<path>` docs route (the full list is
+`/docs/api/kit.md`). It changes **nothing on the server** — no draft, no row —
+so the loop is fork → edit → `ronja app push`. An existing file at that path is
+never overwritten; that file already *is* the fork, and deleting it goes back to
+the built-in component.
 
 ### Four things that are not like a workflow
 
@@ -1043,14 +1249,17 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   component you never defined compiles clean and fails in the browser. What the
   check does catch is what stops a bundle existing at all: syntax errors, and
   imports that resolve to nothing (a typo'd path, a file you have not pushed).
-- **There is no `app test`, and `app validate` means something different.**
-  A data app has nothing to run headlessly; `status` prints the app's URL as the
-  server returned it instead — and no link at all when it never reached the
-  server, or when the instance has no frontend origin (see the `URL:` note under
-  the verbs below). And `wf validate` can check a candidate before the workflow
-  exists, because `POST /workflow/validate` persists nothing — data apps have
-  no such endpoint, so `app validate` compiles the draft that is already on the
-  server, and warns when your folder holds changes you have not pushed.
+- **`app validate` means something different, and `app test` is a report rather
+  than a run.** `wf validate` can check a candidate before the workflow exists,
+  because `POST /workflow/validate` persists nothing — data apps have no such
+  endpoint, so `app validate` compiles the draft that is already on the server
+  and warns when your folder holds changes you have not pushed. And `wf test`
+  RUNS a workflow, where `app test` renders the draft in a headless browser and
+  reports what it saw: it is perception, not a gate, so it exits **zero** on an
+  app full of runtime errors (see below). `status` still prints the app's URL as
+  the server returned it — and no link at all when it never reached the server,
+  or when the instance has no frontend origin (see the `URL:` note under the
+  verbs below).
 
 ### The verbs
 
@@ -1059,8 +1268,10 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
 | `init` | writes the two files, optionally copying in a component you already have. Creates nothing server-side | `--from`, `--feature` (required), `--title` |
 | `clone` | copies an app's files down into a new folder, `access` included. Prefers your open draft over live. Creates nothing server-side | — |
 | `status` | local changes, remote lifecycle/draft, whether the draft compiles, allowlist differences, and drift. Read-only, works signed out for the local half | `--json` |
+| `fork` | copies one built-in kit file into the folder at the same path, so it shadows the kit's. Local only — changes nothing server-side, and never overwrites an existing file | `--json` |
 | `push` | ensures a draft, syncs allowlists then files, then compiles | `--no-validate`, `--force` |
 | `validate` | recompiles your draft and reports diagnostics | `--json` |
+| `test` | renders the draft in a headless browser and writes `report.json` + the frames; a report, never a verdict | `--route`, `--viewport`, `--timeout`, `--steps`, `--out-dir`, `--fail-on-errors`, `--json` |
 | `publish` | commits the draft, or submits it for review. Refuses a draft that does not compile | `--no-request-review` |
 | `discard` | deletes your draft; the live app and your local files are untouched | `--yes`, `--delete-app` |
 
@@ -1105,6 +1316,492 @@ skipped rather than silently dropped. A data app holds at most 100 files and
 5 MiB per file; both are checked locally so an oversized folder is refused
 before the first request rather than half-way through a sync.
 
+### `app test` — render it and look at it
+
+```bash
+ronja app test
+ronja app test --route '#/orders' --viewport mobile --out-dir ./preview
+ronja app test --steps steps.json          # admin only; the steps really execute
+```
+
+Renders what is ON THE SERVER (your own open draft when you have one, the same
+substitution `/embed` makes) through `POST /dataapp/:id/preview`, and writes
+into `--out-dir`:
+
+| File | What |
+|---|---|
+| `report.json` | the server's answer **verbatim** — written from the raw bytes, so a field newer than this CLI's hand-mirror still lands in it |
+| `screenshot-<n>.png` | every captured frame, in capture order |
+| `screenshot.png` | the representative frame, under a second stable name |
+
+Everything is 0600, atomically (`--out-dir` is created 0700 when missing).
+`screenshot.png` is a copy of the numbered file already on disk, so the two
+names are guaranteed to be the same pixels and the frame is fetched once. A
+re-run REMOVES the previous run's frames first — and only those names, never
+anything else in the directory — so a render that captured nothing cannot leave
+an old picture beside a report describing a different one. `screenshot.png` is
+written only when a frame is marked representative, which is not every render.
+
+**The exit code is the whole difference from `wf test`.** A workflow run has an
+outcome; a render does not, and the endpoint deliberately carries no pass/fail
+field. So `app test` exits **zero whenever the harness ran** — an app with a
+hundred runtime errors included, because the errors are what you asked for.
+`--fail-on-errors` is how CI opts into the stricter reading, and it fires on
+compile diagnostics as well as runtime errors: a bundle that did not build comes
+back with an **empty** `errors` list, so a gate reading `errors` alone would pass
+the most broken state a data app can be in. Console errors are excluded (an app
+can log one on purpose).
+
+Non-zero means the render did NOT happen: a transport failure, an HTTP error, a
+bad flag, or a busy harness that stayed busy. **429 is not a verdict** — the
+shared render pool, or this credential's per-minute budget, was spent. The CLI
+waits the server's `Retry-After` (default 15s, capped at 60s) and asks **once**
+more; busy again prints a message that says nothing about your app was observed
+and exits non-zero. A client that kept retrying would add load to the thing it
+was just told is at capacity.
+
+⚠️ `--steps` requires an **administrator** — and, when you are signed in with a
+narrowly scoped token, `admin:write` on top of the role — and executes for real,
+with the same authority a viewer of the app has: a click runs the app's own code
+and can dispatch workflows and Agents, upload files, and call external systems.
+The plan is a JSON array in a file you name — nothing is ever synthesised — and
+it is decoded **strictly**: a mistyped key decoded leniently becomes a click with
+no selector, which the harness then reports as a fact about the *app*, and a file
+holding two JSON values is refused rather than half-run.
+
+`domText` and console message bodies reach `report.json` but are never printed to
+the terminal: they are the app's own rendered content (tenant rows, whatever an
+external system last wrote), and in a terminal they would be indistinguishable
+from the CLI's own words.
+
+## Pipeline folders (`ronja pipeline`)
+
+`ronja pipeline`, aliased `pl`, develops a feature's **derived tables** from a
+folder of `.sql` files: clone → edit → push → publish. It is the fourth folder
+loop, and the first one that binds *many* resources — one `.sql` file is one
+derived table.
+
+```bash
+ronja pipeline clone collection-abc    # or: ronja pipeline init --feature collection-abc
+$EDITOR orders-by-region.sql
+ronja pipeline status                  # local changes, table health, drift
+ronja pipeline push                    # per file: draft → SQL → build → verdict + report
+ronja pipeline publish                 # commit, or submit for review, and say which
+```
+
+**The name collides with something, and only one of them is this.** `api.Workflow`
+carries a `pipeline` *kind* (a workflow whose job is a data pipeline).
+`ronja pipeline` does not operate on those — it operates on derived tables.
+Expect the question.
+
+**What it earns.** Iterating on a derived table over raw HTTP is five requests
+and two documented footguns per edit cycle: check out a draft, `PUT` the
+*draft's* id, sync the *draft*, poll status **and** the error endpoint through a
+truth table, commit. Multiply by the number of tables in the pipeline and add
+the draft-id bookkeeping. The loop is stateful, multi-step and drift-guarded, so
+it passes the same test `wf` does.
+
+### The folder
+
+`ronja.json` `kind: "pipeline"`, the same manifest and the same local-only
+`.ronja/` baseline the other loops use, with three differences:
+
+- **Only `.sql` files are synced, and everything else is silently ignored** — not
+  reported as skipped. A README, a Makefile, a `fixtures/` directory, a dbt
+  project you are porting: the point of the rule is that a pipeline folder can be
+  an ordinary repo directory, and a note about `README.md` on every command is
+  noise. The rule lives on the Kind (`wfdir.Kind.SyncExt`) and is read through
+  one predicate (`wfdir.NotSyncable`) by both `Enumerate` and `CheckLocalPaths`,
+  because a walk that keeps a path the baseline drops is a phantom deletion. It
+  also means the walk never reads a non-`.sql` file, so a `venv/` in the folder
+  costs a directory listing rather than a hash of every file in it. It filters the *skipped* list too: `.git/`, a `.venv/` and
+  a dot-file were never candidates here, and reporting them on every command
+  trains the reader past the line that matters — a `.sql` file that was skipped,
+  which is still reported.
+- **The binding is a map, not an id.** `ronja.json` records `tables`, relative
+  path → the live `table-…` id that file builds, per (instance, organization)
+  like every other binding:
+
+  ```json
+  "instances": [
+    {"url": "https://app.ronja.tech", "tenantID": "ten-…", "featureID": "col-…",
+     "tables": {"orders-by-region.sql": "table-…"}}
+  ]
+  ```
+
+  `Binding.ResourceID()` / `WithResourceID()` **refuse** this kind rather than
+  answering with a workflow's field, and the baseline records the table id
+  alongside each hash — so a manifest repointed at a different table by hand or
+  by a merge is *detected* rather than silently inheriting the old table's
+  fingerprints: `push` refuses it, naming both rows, and `--force` accepts the
+  new binding by discarding the baseline rather than comparing against it.
+- **The baseline holds three fingerprints per file, not one**, because a
+  pipeline file is synced with three different things. `files[path].sha256` is
+  the last **complete** push (written *and* built) — what "changed since your
+  last sync" means. `tables[path].draftSHA256` is what this checkout last **wrote
+  into your draft**. `tables[path].liveSHA256` is the **live** table's SQL as of
+  the last moment this folder agreed with it (a clone, the fork of a draft, a
+  publish). The rule they exist for: **a hash is only ever compared against the
+  row it was taken from.** Folded into one value, the guard below compared the
+  live table against bytes that only ever existed in a draft, and refused an
+  ordinary `push` → edit → `push`.
+
+  A baseline entry whose file has left both the folder *and* the `tables` map is
+  pruned on the next `push` (and disappears from `status` immediately), so
+  removing the `ronja.json` entry is the whole of the cleanup for a table this
+  folder no longer manages.
+
+A table's display name is the file stem, stamped once at create. Renames are
+unmanaged in v1: push never writes the name again, so a rename in the web app
+survives.
+
+That makes the name a **round trip**, which is why `clone` derives filenames
+with `wfdir.FileSlug` rather than the `wfdir.Slug` the other loops use for their
+clone *directories*: `FileSlug` keeps underscores **and case**. Folding either
+away gave `orders-clean.sql` back for the `orders_clean.sql` git was already
+tracking, and `orders.sql` for `Orders` — two files for one table, and a phantom
+deletion the moment either was pushed. Everything else slugifies as before
+(spaces and punctuation become one dash, runs collapse). Collisions still take a
+`-2` suffix rather than dropping a file, and are resolved **case-insensitively**
+so `Orders` and `orders` land as `Orders.sql` and `orders-2.sql` — a folder that
+round-trips on a case-insensitive filesystem too. `Slug` itself is deliberately
+unchanged.
+
+### Refs are id-form, and that is enforced
+
+Tables reference each other with `{{ ref('table-…') }}`, and the CLI derives each
+table's declared `inputModels` from the id-shaped refs in the file on **every**
+write. Adding an upstream is therefore editing the SQL and nothing else.
+
+It never omits the field. Server-side derivation fires only when the effective
+declared list is empty, and a checked-out draft inherits its parent's non-empty
+`input_models` — so an omitted `inputModels` 400s the moment an edit adds a new
+upstream, which is the commonest pipeline edit there is. Sending the exact list
+also *removes* stale entries that would otherwise linger as phantom lineage
+edges and trigger cascade rebuilds nobody asked for.
+
+**Stored code comes back in two forms, and the second one is not legacy.** The
+write API stores id-form verbatim, but the AI build path — `POST /:id/build`,
+`/fix`, and the agent's `editDerivedTable` — persists **positional**
+`{{ ref('0') }}`, an index into the row's `input_models`. Any table a colleague
+has touched through chat holds positional refs. `internal/tablerefs` is a
+byte-for-byte mirror of `esql.IndexToTableIDRefs` (with that function's own test
+cases as fixtures), and **every remote code read is canonicalized to id-form
+before it is hashed or written to disk** — without which every chat-edited table
+would read as permanently drifted.
+
+Two refusals fall out of that, and both are hard rather than warnings:
+
+- **A local file carrying a positional ref is refused by `push`.** A positional
+  ref is an index into a list the file on disk does not have. The only list the
+  CLI can build is derived from the id-shaped refs and *sorted*, so sending the
+  file would hand the server a ref numbered against one list and a declaration
+  that is a different one — the SQL silently starts reading a different table,
+  the build succeeds, and nothing says so. The refusal names each marker, and is
+  scoped to the files that push is actually **sending**: a marker in a file this
+  run is not pushing cannot mis-resolve anything, and refusing on it would let
+  one stale file hold every other table in the folder hostage.
+- **A remote row whose positional ref cannot be resolved is refused by `clone`**
+  (collectively, before a byte is written) and counts as *drift* in `push` and
+  `status` rather than as agreement — the stored SQL and the stored inputs
+  disagree with each other, and pushing over that quietly is exactly the case the
+  guard exists for.
+
+### The verbs
+
+| Verb | Does | Flags worth knowing |
+|---|---|---|
+| `init` | writes `ronja.json` + `.ronja/`. Creates nothing server-side — each table comes into existence on the first push of its file | `--feature` (a push refuses without one), `--title` |
+| `clone` | writes one `.sql` per **derived** table in the feature, plus manifest and baseline. Prefers your own open draft over live. Creates nothing server-side; the directory must be empty or absent | — |
+| `status` | local changes, per-table build health, open drafts and their verdicts, and drift since the last sync. Read-only — not even a checkout. **Exits non-zero on drift *and* on "not checked"** (see below) | `--json` |
+| `push [paths...]` | per changed file: create → resume/check out your draft → write SQL + derived inputs → sync → build → verdict and confidence report | `--force` |
+| `publish [paths...]` | per staged draft: commit onto the table, or submit it for review | `--no-request-review` |
+| `discard [paths...]` | deletes your drafts; the live tables and your local files are untouched | `--yes` |
+
+`push`, `publish` and `discard` all take file paths and act on the whole folder
+when given none. Narrowing does not narrow the *graph*: dependency order is still
+computed over every file in the folder, so a partial `publish` still lands
+upstream first.
+
+⚠️ **A table created by a push is LIVE from the moment it exists** — `POST
+/feature/model` mints a real row, not a parentless draft the way `POST /workflow`
+and (since migration 000495) `POST /dataapp` do. So a first push puts an empty
+table in the feature that colleagues can see, and it stays empty until the draft
+behind it is published. The binding is therefore written to `ronja.json` and
+saved *immediately* after the create, before anything else is attempted: a push
+that died in between would otherwise leave a table nobody can find and the next
+push would create a second one beside it. Parentless table drafts are a
+follow-up.
+
+There is deliberately no `pipeline list`, no `pipeline delete` and **no `run`**:
+committing cascades server-side, so publishing already rebuilds everything
+downstream (see below).
+
+`clone` says on stderr what it left behind, in two deliberately different
+wordings: non-derived kinds are "not cloned (kinds: dynamic, integration)" —
+they have no SQL a file could hold — while metrics are "not cloned (out of scope
+for this loop)", because a metric runs the *identical* draft flow and claiming
+otherwise would send someone looking for a capability the product already has.
+
+### A push builds a draft, never the live table
+
+That is the safety story, and it is the reason this loop reports more than
+"saved":
+
+1. **Local guards first** — file sizes, case-only collisions, positional refs.
+   None needs the network and each names a file.
+2. **Dependency order.** Files are pushed after everything *in this folder* they
+   read from, so a downstream table is not materialized against yesterday's
+   upstream. The graph is built over the whole folder even for a narrowed
+   `push a.sql b.sql`, so a cycle is refused naming the loop rather than
+   surfacing later as a build error about one table. When an upstream is dirty in
+   the same push, the downstream's report says `validated against live
+   <upstream>` — a draft builds against its inputs' **live** data, and
+   draft-overlay chaining is a follow-up.
+3. **Your draft is resolved before it is written.** `GET :id/draft` first,
+   always: `POST :id/checkout` is not idempotent, so "check out and see" is not
+   available the way it is for a workflow.
+4. **A two-leg drift guard**, before the first byte: (a) the **live** table's
+   canonical SQL against `liveSHA256` — a colleague committed while you were
+   away; (b) when resuming, **your own draft's** canonical SQL against
+   `draftSHA256` — the chat agent's `editDerivedTable` works in exactly that row,
+   so without leg (b) a chat or web-builder edit to your own draft vanishes
+   silently under the `PUT`. Either mismatch refuses, naming the table, unless
+   `--force`.
+
+   Each leg compares a row against the fingerprint **taken from that row**, which
+   is what the three-fingerprint baseline above is for. A draft this checkout has
+   never written to (opened in the web builder, or by chat) has no fingerprint of
+   its own, so leg (b) compares it against the **live** row instead: a draft
+   nobody has edited is byte-identical to the parent it forked from, so a
+   difference is still somebody's unsynced work.
+
+   ⚠️ **There are no per-write preconditions on this API.** A `PUT` to a draft
+   overwrites it unconditionally and a commit overwrites its parent
+   unconditionally — there is no `baseSha256` and no commit CAS the way there is
+   for workflows. This guard is the whole protection and it is a check at one
+   instant: the moment those two rows were read. An empty fingerprint disarms its
+   own leg deliberately (a colleague who cloned the repo from git has no
+   `.ronja/`, and refusing that is refusing the normal way people join); a missing
+   *live* one is adopted from the row the guard just read, so a folder can leave
+   that state rather than stay unguarded for ever.
+
+   The draft fingerprint advances on the **write**, not on the build: a failed
+   build leaves the draft holding the bytes of the failed attempt, and a guard
+   that had not recorded them would read your own last attempt as somebody else's
+   edit and demand `--force` to fix your SQL. The *content* baseline advances only
+   on a complete push, so the fixed file is still something a bare `push` sends.
+5. **Then `PUT` → `/sync` → poll to a verdict.** Every command polls through one
+   helper, so the `ready`-with-an-error truth table exists exactly once. It reads
+   `buildVerdict`, the computed field on the single-row GET added for this loop
+   and for HTTP callers alike: `ok`, `ok_partial`, `failed_stale` (the run failed
+   and the table is still serving its previous data), `failed`, `building`,
+   `pending`, `invalidated`.
+
+A failed build is **not** the end of the push. The file was written and the draft
+was synced — what failed is the build, so the draft is kept to iterate on, the
+live table is untouched, the remaining files are still attempted, and the command
+exits non-zero. The per-file `--json` `outcome` vocabulary is `pushed`,
+`build_failed`, `refused`, and a caller that read `build_failed` as "nothing
+happened" would discard a draft holding their work.
+
+**One failure message gets a diagnosis rather than a repeat.** The server's bare
+`no data found` is the chain-bootstrap failure: a draft builds against its
+inputs' **live** data, so a new downstream that reads a new upstream builds
+against a row that exists, is empty, and stays empty until the upstream's draft
+is published — and nothing in the message points at that. `push` therefore
+checks the failing file's folder-local inputs and adds a `hint` (a stderr note,
+and a field in `--json`): an input with a draft recorded in the baseline, or one
+this push created, gets *"run `ronja pipeline publish <file>` first"*; otherwise
+the note says the message can be transient right after an input is published
+(issue #4607) and to push again. It never retries — a retry that happened to
+succeed would hide the first cause — and it never replaces the server's own
+`error`.
+
+### The confidence report
+
+After a successful build, `push` renders what committing that draft *would*
+change, from `GET /api/v2/table/draft/:id/review` plus one sample read:
+
+- **Schema delta** — columns added and dropped. The server compares names only,
+  so a retype is reported as neither.
+- **Lineage delta** (`Inputs: +table-a, -table-b`) — the table ids the draft's
+  declared inputs gain and lose. Printed on its own line because it is the one
+  change committing can make with *nothing in the SQL diff to look at*: a
+  positional `{{ ref('0') }}` resolves by index into that list, so repointing it
+  moves what the same text reads. Signed on one line rather than split across two
+  labels, since the commonest lineage change is a swap. The payload's `nameDelta`
+  and `descriptionDelta` are deliberately **not** mirrored — this loop never
+  pushes either (a name is stamped once at create), so a field it cannot cause is
+  a field nobody would keep in step.
+- **Row counts**, draft against live. `-1` means "not available" and prints as
+  `n/a`; printing it as a number would report a table that was never built as one
+  that came back with minus one rows.
+- **`baseStale`** — the live table has been published to since your draft forked,
+  naming the intervening versions. Committing would revert them, and nothing
+  server-side will stop you.
+- **Up to five sample rows**, via `POST /api/v2/duckdb/query` on the *draft's*
+  id. Read only after a successful sync (a checked-out-never-synced draft of a
+  partitioned parent has no partitions of its own and answers "no data") — and
+  only when the draft's row count is under `maxSampledRowCount` (1,000,000).
+  Above it the read is skipped with a note naming the row count: five rows of
+  garnish are not worth a scan of a table that size, and the user can query it
+  directly. Skipped entirely under `--json`, where the field is `json:"-"` and
+  the read would buy an LLM routing call — and possibly a Batch job — for output
+  the run does not print.
+
+All of it degrades to a stderr note and never fails the push — the build
+succeeded and the work is safe; the report is how you decide whether to publish
+it. The one degradation worth recognising is the **scope quirk**: the authoring
+loop is `data` scope but `/table/draft/*` lives in the `admin` scope group, so a
+token scoped to `data` alone runs the whole loop except this read and
+`request-review`, which sits in the same group. A full-access PAT — what
+`ronja login` stores — is unaffected.
+
+### Publishing, and why there is no `run`
+
+`publish` decides its route **up front** from the two server facts that decide it
+server-side — the feature's scope and your role, read once for the run — rather
+than by trying a commit and reading the rejection prose. Shared feature +
+non-admin → `request-review`, outcome `submitted_for_review`; otherwise commit,
+outcome `published`. `--no-request-review` turns the review route into an error,
+which is what CI wants when a merge is expected to land directly. A commit
+refused with a **400** on a *shared* feature falls back to a review request (the
+race the up-front read cannot close); a 400 on a private one does not, because a
+review request would neither fix nor describe it. A feature whose scope could not
+be read is **unknown**, not private, and keeps the fallback — read as private, an
+unreadable scope would also disarm it, and a shared-feature publish whose scope
+read happened to fail would die on the commit instead of filing the review
+request it needed. A draft the review payload already reports as submitted is not
+submitted again; the outcome is still `submitted_for_review`, and the detail says
+an admin has had it all along.
+
+It refuses a draft whose verdict is `failed`/`failed_stale` — committing it would
+put a table live with nothing behind it — one still `building`, and one still
+`pending`, which is worded differently: a checked-out draft sits at `pending`
+until something syncs it, so the commonest way to be there is a draft nobody has
+ever built, and "wait for it to finish" is advice to wait for something nobody
+started.
+
+Drafts are published in **dependency order**, as they are pushed: a commit
+cascades, so landing a downstream before its upstream commits a table computed
+from data that is about to be replaced and rebuilt again seconds later.
+
+Before each commit it warns, never refuses, on two kinds of staleness:
+`baseStale` as above, and **stale inputs** — an input table whose row was updated
+after your draft's was. That second one is not paranoia (`GetDependents` excludes
+shadow rows, so a staged draft is never invalidated by an upstream publish, and
+the confidence report silently decays between push and publish with nothing else
+to say so) but it *is* a **heuristic**, and it is worded as one: neither
+timestamp is a materialization time — the API exposes none — so it over-reports a
+renamed upstream and under-reports one rebuilt without a row write.
+
+**Committing cascades.** The server marks every table that reads the one you
+published as `invalidated` and rebuilds it asynchronously — which is why this
+loop needs no `run` verb, and why the HTTP guide's "nothing cascades over the
+API" is true of `/sync` only. The report prints a **folder-local, direct** count
+("2 tables in this folder read this one directly and will rebuild
+automatically") — never transitive and never tenant-wide: `GetDependents` is not
+exposed over HTTP, and the real cascade is both wider (it leaves the folder) and
+conditional (a zero-partition parent defers it entirely, a mid-build dependent is
+skipped, one with a dangling input is parked) in ways a confident N would paper
+over. A folder-local, direct number is one the reader can verify by looking.
+
+After a commit both fingerprints are refreshed from the live row — they now
+describe the same thing, because the draft they were taken from no longer exists
+— best-effort, since the server-side change already happened and failing the
+command afterwards would report something that did happen as something that did
+not. The draft pointer is cleared.
+
+`discard`'s per-file `--json` `outcome` vocabulary is `discarded` and `no_draft`
+(plus `refused`, on a file the run stopped at) — the same two words `wf discard`
+uses. `no_draft` is a SUCCESS, not a miss: the draft being already gone is the
+documented normal case, and a caller that read it as a failure would fail a
+folder somebody had tidied up from the web UI.
+
+`discard` re-points the content baseline at the **live** table, which is the only
+row the file is synced with once its draft is gone. That is what makes the
+command's own closing line true: with the baseline still describing the discarded
+draft, the local file read as unchanged and the next `push` answered "Up to date"
+with no draft on the server at all. It re-points it **equally when the server
+reports no draft** — the documented normal case, somebody discarding it from the
+web UI — since the draft is gone either way. One table's failure is per-file
+data, like `push`'s, and the baseline is saved as each draft goes; a baseline
+write that *fails* is that same stale state, so it stops and exits non-zero
+rather than reporting a clean discard.
+
+A `create` or a `commit` whose request **timed out** may still have landed — the
+deadline was ours, the transaction was the server's — so neither is treated as a
+plain failure. `push` reads the feature back and adopts the table the create left
+behind (refusing rather than guessing when the name is not uniquely matched;
+without this the next push creates a *second* live table beside the first, and
+this loop has no delete verb). `publish` reads the draft back: gone means the
+commit landed and cascaded, still open means it did not. The trigger is a timeout
+and nothing else — an answered failure is one the server considered and refused.
+
+### Everything else behaves like the other loops
+
+`--json` on every verb, on stdout only, with narration on stderr; non-zero exit
+on failure with the payload still emitted, because a push that stopped part-way
+has really created tables and staged drafts and "which ones" is the first thing
+anyone needs to know. The baseline is saved after **every** file, success or
+failure, for the same reason.
+
+A `.sql` file deleted from the folder is **not** a table this loop deletes. It is
+reported on stderr and left alone — there is no delete verb here on purpose, and
+quietly dropping a colleague's table because a merge removed a file is exactly
+what a sync loop must not do. The note says how to stop it being reported for
+ever: remove the file's entry from `tables` in `ronja.json`, and the baseline
+entry is pruned with it.
+
+**`status` exits non-zero on REMOTE drift AND on "not checked", so it works as a
+CI gate without parsing** — the same contract `db migrate status` has, and for
+the same reason: a gate that has to be parsed is a gate somebody eventually
+forgets to parse. The exit code answers exactly one question — *has anything
+moved on the server under this folder?* — and everything else is reported without
+touching it.
+
+Non-zero is: real remote drift (the live table's SQL, or your own draft's, is not
+what your last sync recorded — the two legs `liveDrift` and `drift` cover); "I
+could not check" (unreachable instance, expired token, a failed list); an
+ambiguous or broken binding (a manifest naming a table the baseline was not taken
+from, an unresolvable instance entry); and a bound row that could not be READ, so
+drift cannot be ruled out for it. "I could not check" is a different answer from
+"everything is fine", and a job conflating them would report a clean pipeline it
+never looked at.
+
+Zero is everything the SERVER has not moved, which deliberately includes three
+states an earlier draft of this gate failed on. A **locally-changed file** is not
+drift — local edits are the input to a push, not evidence that somebody else
+moved something, and failing on them would make the gate fire on every ordinary
+working tree. A **file with no table yet** (fresh `init`, nothing pushed) has
+nothing on the server to have moved. And a **fresh clone with no baseline at
+all** is the load-bearing one: `.ronja/` is never committed, so a colleague who
+just cloned has no record to compare against — that is the normal way somebody
+joins a pipeline, and it is the same state `push`'s drift guard deliberately
+disarms for (`driftReason`'s empty-baseline leg). Status says there is nothing to
+check yet and names `pipeline push` as the way to establish a baseline, rather
+than failing a CI job for the shape of a checkout. `--json` still emits its full
+payload first either way — the LOCAL half (changed files, unbound files) lives
+there, and the exit code is a summary of the remote half, not a substitute for
+the report.
+
+`status` degrades signed-out the way `wf status` does — "not checked" is a
+different answer from "fine" — and its remote half is two tiers: **one** list
+call for the health leg (kind, status, shadow markers, `hasError` for every bound
+row), then the per-table reads the list deliberately omits the code for —
+concurrently and bounded. Where a draft is open that is the live row *and* the
+draft by its own id, because the two drift legs are different questions: your
+file against your draft (`drift`) and your draft's base against what the live
+table has since become (`liveDrift`, present in `--json` only when a draft is
+open). Reading one row could only ever answer one of them, which made push's
+"run status to see the detail" untrue exactly when it mattered. A thirty-table
+folder must not cost ninety serial requests, or people stop running it.
+
+The HTTP loop this wraps is documented for agents in the `build-a-data-pipeline`
+API guide (`backend/lib/api/openapi/guides/build-a-data-pipeline.md`, served at
+`/docs/api/guides/build-a-data-pipeline.md`). Keep the two in step.
+
 ## Design rules
 
 These are load-bearing for the agent use case — please keep them true:
@@ -1145,15 +1842,23 @@ internal/api/        HTTP client + the endpoint shapes it mirrors, plus raw.go
                      (transport only, mirrors nothing) and query.go
 internal/config/     the CLI config file (os.UserConfigDir()/ronja/config.json),
                      one profile per (instance, organization), mode 0600
-internal/wfdir/      the workflow folder: ronja.json, .ronja/state.json,
-                     local enumeration and the sha256 drift baseline
+internal/wfdir/      the synced folder: ronja.json, .ronja/state.json, local
+                     enumeration and the sha256 drift baseline — one Kind per
+                     loop (workflow / data app / pipeline)
+internal/tablerefs/  the {{ ref('…') }} grammar: canonicalization to id form,
+                     and the input list derived from it
 ```
 
 The workflow commands are one file per verb (`workflow_push.go`,
 `workflow_testcmd.go`, …) with the shared folder plumbing in `workflow.go`;
 their endpoint mirrors live in `internal/api/workflow.go`, `workflow_write.go`
 and `workflow_run.go`, hand-mirrored against
-`backend/api/v2/workflow/handler.go`.
+`backend/api/v2/workflow/handler.go`. The data-app and pipeline commands follow
+the same shape (`dataapp_*.go`, `pipeline_*.go`, with the shared folder plumbing
+in `dataapp.go` / `pipeline.go`); the pipeline mirrors are
+`internal/api/table.go` and `table_write.go`, against
+`backend/api/v2/feature/api_model.go` and the draft-review route in
+`backend/api/v2/governance/`.
 
 `internal/api/raw.go` is the odd one out: it deliberately mirrors nothing, and
 its response body carries the request's context cancellation on `Close` so a

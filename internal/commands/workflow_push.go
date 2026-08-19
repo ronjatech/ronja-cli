@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"reflect"
 	"sort"
 	"strings"
 
@@ -90,6 +89,11 @@ type pushOptions struct {
 type pushResult struct {
 	// Created reports that this push brought the workflow into existence.
 	Created bool `json:"created"`
+	// RuntimeVersion is the runtime this push STAMPED, and is set only on the
+	// push that created the workflow — the one request that can set it. Absent
+	// afterwards rather than restated, because a later push does not send it and
+	// reporting a value it did not write would read as a claim it re-asserted one.
+	RuntimeVersion int `json:"runtimeVersion,omitempty"`
 	// WorkflowID is the STABLE identity (what ronja.json records); DraftID is
 	// the row the files were actually written to. For a parentless draft they
 	// are the same id.
@@ -104,6 +108,23 @@ type pushResult struct {
 	// DraftUnderReview reports that the draft written to has already been
 	// submitted for admin review — the push changed what someone is reviewing.
 	DraftUnderReview bool `json:"draftUnderReview"`
+	// Metadata names the metadata this push actually CHANGED on the row (the
+	// title, the entrypoint, the parameters, the declared calendar), rendered by
+	// describePatch. Empty when the manifest and the row already agreed — and
+	// empty for a field the server turned out not to have applied, so it never
+	// claims a change that did not happen.
+	Metadata string `json:"metadata,omitempty"`
+	// ReportingTimezoneIgnored reports that the row did not end up holding the
+	// calendar this push sent. Two ways to get there, and confirmDeclaredZone
+	// tells them apart in the human warning: the server IGNORED the key (an
+	// instance older than the workflow declared-zone column), or another writer
+	// changed the zone between our PUT and the confirming read.
+	//
+	// It is machine-readable for the same reason the human warning exists at
+	// all: the server accepts and silently DROPS an unknown key (gin binds
+	// without DisallowUnknownFields), so nothing else about the response
+	// distinguishes "applied" from "ignored".
+	ReportingTimezoneIgnored bool `json:"reportingTimezoneIgnored,omitempty"`
 	// Warnings are the server's soft save-time notices, verbatim.
 	Warnings []string              `json:"warnings"`
 	Findings []api.ValidateFinding `json:"findings,omitempty"`
@@ -210,6 +231,11 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 			Entrypoint: entrypoint,
 			Parameters: validateParams,
 			Files:      validateFilesOf(local),
+			// The runtime the folder DECLARES, including on a push to a workflow
+			// that already exists. The manifest cannot restamp an existing row —
+			// there is no patch path — but a candidate still has to be checked
+			// against the runtime its author wrote for.
+			RuntimeVersion: f.Manifest.Runtime,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("validate before pushing: %w (use --no-validate to skip this check)", err)
@@ -284,9 +310,22 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// (see acknowledgedRemote): a --force push that stops must not hand the
 	// retry a baseline containing the very content it was forcing past.
 	landed := acknowledgedRemote(f.State.For(f.Key), remoteFiles, local, result.Created)
+	// The declared calendar is the one metadata field a 2xx does not confirm, so
+	// there is a window in which the row's zone is UNKNOWN to us: the patch was
+	// accepted, the read-back that would tell us what landed failed. `target`
+	// still holds the PRE-patch value there (applyPatch deliberately does not
+	// touch the zone), and recording that as the baseline would arm the
+	// third-party-change guard against our own successful patch — the next push
+	// would refuse, naming a colleague who did nothing.
+	//
+	// So the baseline records NOTHING for the zone in that window, which is what
+	// the read-back's warning already tells the author: a nil zone reads as "not
+	// part of this baseline" everywhere (metadataDriftOf and baselineDescribes
+	// both skip it), so the next push simply tries again.
+	zoneUnconfirmed := false
 	stop := func(err error) (*pushResult, error) {
 		result.Error = err.Error()
-		saveBaseline(f, target, landed)
+		saveBaseline(f, target, landed, zoneUnconfirmed)
 		return result, err
 	}
 
@@ -315,6 +354,24 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		// holding a request ago, and the next push would read its own change
 		// back as somebody else's.
 		applyPatch(target, patch)
+		// The declared calendar is the one field a 2xx does NOT confirm, so it
+		// is the one field `target` learns from the server rather than from what
+		// we sent — see confirmDeclaredZone.
+		applied := patch
+		if patch.ReportingTimezone != nil {
+			landedZone, knownZone := confirmDeclaredZone(ctx, client, target, *patch.ReportingTimezone, result)
+			if !landedZone {
+				applied.ReportingTimezone = nil
+			}
+			// Only an unreadable row leaves the baseline without a zone. A server
+			// that merely dropped the key told us what it holds, and recording
+			// that is right.
+			zoneUnconfirmed = !knownZone
+		}
+		// What the push CHANGED, for the success report. Built from the
+		// confirmed patch, so an ignored zone is not reported as applied — and a
+		// zone-only patch that was ignored leaves this empty and prints nothing.
+		result.Metadata = describePatch(applied)
 	}
 
 	// 8. Deletions last.
@@ -360,80 +417,6 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return result, err
 	}
 	return result, nil
-}
-
-// metadataPatch is the difference between what the manifest says and what the
-// row says. Empty when they agree, so the round trip is skipped.
-//
-// A blank manifest field is skipped rather than sent as "": the server's Patch
-// fields are optionals, and an explicit empty string CLEARS the value rather
-// than leaving it alone.
-func metadataPatch(manifest *wfdir.Manifest, target *api.Workflow) api.WorkflowPatch {
-	var patch api.WorkflowPatch
-	if manifest.Title != "" && manifest.Title != target.Title {
-		patch.Title = manifest.Title
-	}
-	if manifest.Entrypoint != "" && manifest.Entrypoint != target.Entrypoint {
-		patch.Entrypoint = manifest.Entrypoint
-	}
-	// A folder that does not manage parameters never patches them — that is the
-	// whole point of the absent/empty distinction, and it is what keeps a push
-	// from a pre-parameters folder off a workflow's declaration.
-	if manifest.ManagesParameters() {
-		declared := manifest.DeclaredParameters()
-		if !sameParameters(declared, target.Parameters) {
-			// Normalized, so "declares none" always goes up as [] rather than
-			// null — the server reads null as absent, which would be a silent
-			// no-op exactly when the author is removing their last parameter.
-			out := append([]api.WorkflowParameter{}, declared...)
-			patch.Parameters = &out
-		}
-	}
-	return patch
-}
-
-// sameParameters compares two declarations for sync purposes. Order is
-// significant: it is the order the parameters are presented in, the manifest
-// controls it, and reordering is a change worth pushing.
-//
-// reflect.DeepEqual is safe here despite DefaultValue being `any`: both sides
-// arrive by JSON decode (the manifest from ronja.json, the row from the API), so
-// a number is float64 on both and there is no int/float64 mismatch to trip on.
-func sameParameters(a, b []api.WorkflowParameter) bool {
-	if len(a) == 0 && len(b) == 0 {
-		return true
-	}
-	return reflect.DeepEqual(a, b)
-}
-
-// applyPatch mirrors an ACCEPTED metadata patch onto the in-memory row.
-//
-// PUT :id answers with nothing, so this is the only way `target` keeps
-// describing the server without the re-read the success path does anyway.
-func applyPatch(row *api.Workflow, patch api.WorkflowPatch) {
-	if patch.Title != "" {
-		row.Title = patch.Title
-	}
-	if patch.Entrypoint != "" {
-		row.Entrypoint = patch.Entrypoint
-	}
-	if patch.Parameters != nil {
-		row.Parameters = *patch.Parameters
-	}
-}
-
-// baselineDescribes reports whether the recorded baseline already describes this
-// row — the same id, and the same metadata. False for a baseline written before
-// the metadata was recorded at all, which is exactly when it wants replacing.
-func baselineDescribes(baseline *wfdir.InstanceState, row *api.Workflow) bool {
-	return baseline != nil &&
-		baseline.SourceID == row.ID &&
-		baseline.Title == row.Title &&
-		baseline.Entrypoint == row.Entrypoint &&
-		// An unrecorded parameter set (a baseline predating the guard) does not
-		// make the baseline stale on its own — same treatment the metadata
-		// fields get, and the next push records it.
-		(baseline.Parameters == nil || sameParameters(*baseline.Parameters, row.Parameters))
 }
 
 // acknowledgedRemote seeds the map that becomes the baseline if this push stops
@@ -513,13 +496,24 @@ func describePatch(patch api.WorkflowPatch) string {
 	if patch.Parameters != nil {
 		parts = append(parts, fmt.Sprintf("the parameters to %s", describeParameters(*patch.Parameters)))
 	}
+	if patch.ReportingTimezone != nil {
+		parts = append(parts, fmt.Sprintf("the reporting timezone to %q", effectiveDeclaredZone(*patch.ReportingTimezone)))
+	}
 	return strings.Join(parts, " and ")
 }
 
-// saveBaseline records a baseline on the partial-push path, where the push has
-// already failed and a second failure must not replace the first in the report.
-func saveBaseline(f *folder, source *api.Workflow, files map[string]string) {
-	f.State.Set(f.Key, baselineFromLocal(source, files))
+// saveBaseline records what a stopping push may honestly claim: it runs on the
+// partial-push path, where the push has already failed and a second failure must
+// not replace the first in the report. zoneUnconfirmed drops the declared
+// calendar from the record — see the comment on the caller: `source` carries the
+// pre-patch zone in that case, and writing it would make the next push read our
+// own change back as somebody else's.
+func saveBaseline(f *folder, source *api.Workflow, files map[string]string, zoneUnconfirmed bool) {
+	inst := baselineFromLocal(source, files)
+	if zoneUnconfirmed {
+		inst.ReportingTimezone = nil
+	}
+	f.State.Set(f.Key, inst)
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
 	}
@@ -628,6 +622,19 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 			// row created without them would disagree — this just saves the round
 			// trip. Nil for an unmanaged folder, which creates none either way.
 			Parameters: f.Manifest.DeclaredParameters(),
+			// The ONE request that can set the runtime: it is stamped at create,
+			// and the server has no patch for it. A manifest declaring runtime 2
+			// therefore takes effect here or never — a push to a workflow that
+			// already exists does not re-send it, and is not refused for
+			// declaring something nothing can act on.
+			RuntimeVersion: f.Manifest.Runtime,
+			// Same round-trip saving for the declared calendar, but the value is
+			// the EFFECTIVE one: create refuses an explicit "" outright (unlike
+			// patch, where it is the reset), so a folder declaring the reset sends
+			// the literal "UTC" here. Empty for an unmanaged folder, where
+			// omitempty drops the key and the server stamps the organization
+			// default.
+			ReportingTimezone: declaredZoneForCreate(f.Manifest),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create workflow in feature %s: %w", featureID, err)
@@ -642,6 +649,7 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 		}
 		result.Created = true
 		result.WorkflowID = created.ID
+		result.RuntimeVersion = f.Manifest.RuntimeVersion()
 		return created, nil
 	}
 
@@ -863,6 +871,14 @@ func metadataDriftOf(baseline *wfdir.InstanceState, target *api.Workflow, patch 
 			Field:    "parameters",
 			Baseline: describeParameters(*baseline.Parameters),
 			Remote:   describeParameters(target.Parameters),
+		})
+	}
+	if patch.ReportingTimezone != nil && baseline.ReportingTimezone != nil &&
+		target.ReportingTimezone != *baseline.ReportingTimezone {
+		out = append(out, metadataDrift{
+			Field:    "reporting timezone",
+			Baseline: describeZone(*baseline.ReportingTimezone),
+			Remote:   describeZone(target.ReportingTimezone),
 		})
 	}
 	return out
@@ -1104,12 +1120,25 @@ func printPushReport(r *pushResult) {
 
 	if r.Created {
 		fmt.Fprintf(out, "  Created workflow %s\n", r.WorkflowID)
+		// Said only for the durable runtime, and only here: this is the moment
+		// it was stamped, and it cannot be changed afterwards.
+		if r.RuntimeVersion >= wfdir.RuntimeDurable {
+			fmt.Fprintf(out, "    runtime  %d — steps are journaled; a failed run resumes with `ronja wf test --resume`\n",
+				r.RuntimeVersion)
+		}
 	}
 	for _, path := range r.Pushed {
 		fmt.Fprintf(out, "    pushed   %s\n", path)
 	}
 	for _, path := range r.Deleted {
 		fmt.Fprintf(out, "    deleted  %s\n", path)
+	}
+	// The metadata a push changes is as much a change as a file is, and it was
+	// previously visible ONLY when the patch failed (describePatch's other call
+	// site). A push that silently re-declared a workflow's calendar is exactly
+	// the thing this report exists to make visible.
+	if r.Metadata != "" {
+		fmt.Fprintf(out, "    updated  %s\n", r.Metadata)
 	}
 	if r.Unchanged > 0 {
 		fmt.Fprintf(out, "    %d unchanged\n", r.Unchanged)

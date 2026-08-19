@@ -80,13 +80,13 @@ another interpreter to read it. -r prints strings unquoted, which is what makes
 the result safe to substitute:
 
   ronja api /api/v2/feature/query --jq '.items[] | select(.scope=="shared") | .id'
-  id=$(ronja api -X POST /api/v2/workflow -d @wf.json --jq -r '.id')
+  id=$(ronja api -X POST /api/v2/workflow -d @wf.json --jq '.id' -r)
 
 Wait for asynchronous work with --wait-until, which re-issues the request until
 a jq condition holds. It works for anything that finishes eventually — workflow
 runs, table builds, connector syncs, exports:
 
-  ronja api /api/v2/workflow/run/$id --wait-until '.status != "running"' --jq -r '.status'
+  ronja api /api/v2/workflow/run/$id --wait-until '.status != "running"' --jq '.status' -r
 
 Note jq's truthiness: [] and 0 are TRUE, so write an explicit comparison
 (.errors | length > 0) rather than relying on a bare field.
@@ -121,7 +121,18 @@ does real work rather than treating a truncated payload as the answer.
 
 This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 ` + "`ronja context`" + ` or the instance's /llms.txt.`,
-		Args: cobra.ExactArgs(1),
+		// The flag-order guard runs BEFORE the arity check rather than in RunE,
+		// because the arity check is where this mistake lands: `--jq -r .id`
+		// swallows -r as the expression, .id becomes a second positional, and
+		// cobra answers "accepts 1 arg(s), received 2" — a message about the
+		// wrong flag entirely. RunE never runs, so a check inside it is a check
+		// that never fires.
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := refuseFlagAsJQExpr(cmd, jqExpr); err != nil {
+				return err
+			}
+			return cobra.ExactArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
 			// Checked before anything else, because it is the mistake this
@@ -353,6 +364,46 @@ func readBodyFile(path string) ([]byte, error) {
 			path, maxRequestBody>>20)
 	}
 	return body, nil
+}
+
+// refuseFlagAsJQExpr catches the one flag-order mistake `--jq` invites.
+//
+// `--jq` takes a value, so `--jq -r '.id'` binds "-r" as the EXPRESSION and
+// leaves '.id' as a positional argument. What the caller then sees is an error
+// about argument counts (or, on `ronja query`, a query whose SQL is ".rowCount")
+// — neither of which mentions the flag that actually went wrong, and both of
+// which look like a bug in the command rather than a space in the wrong place.
+//
+// The flag set is read off the COMMAND rather than listed here, so a flag added
+// later is covered without anybody remembering this function exists. It also
+// keeps the check honest per command: `ronja query` has no -F and no --retry,
+// and refusing an expression on a flag that command does not have would be
+// inventing a mistake.
+//
+// A leading dash alone is not enough to refuse: "-1" is an ordinary jq
+// expression and no command has a -1 flag, so it passes.
+func refuseFlagAsJQExpr(cmd *cobra.Command, expr string) error {
+	if !isOwnFlagToken(cmd, expr) {
+		return nil
+	}
+	return fmt.Errorf("--jq was given %q, which is one of this command's own flags — --jq takes a value, so it swallowed the flag and left the expression as a stray argument.\n  Quote the expression and pass the flag after it: --jq '.id' %s",
+		expr, expr)
+}
+
+// isOwnFlagToken reports whether a token is a flag THIS command defines, in
+// either its long or its short spelling.
+//
+// Persistent flags inherited from the root (--json, --url, --profile) are
+// included: cmd.Flags() is the complete set that applies here, and `--jq --json`
+// is the same mistake as `--jq -r`.
+func isOwnFlagToken(cmd *cobra.Command, token string) bool {
+	if long, ok := strings.CutPrefix(token, "--"); ok {
+		return long != "" && cmd.Flags().Lookup(long) != nil
+	}
+	short, ok := strings.CutPrefix(token, "-")
+	// Exactly one character: ShorthandLookup PANICS on anything longer, and a
+	// multi-letter "-abc" is not a shorthand this CLI defines anyway.
+	return ok && len(short) == 1 && cmd.Flags().ShorthandLookup(short) != nil
 }
 
 // parseHeaders turns repeated -H values into a header set.

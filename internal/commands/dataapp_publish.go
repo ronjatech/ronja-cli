@@ -152,7 +152,7 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 	// than by trying a commit and reading the rejection prose. Matching on an
 	// error message is how a client silently starts doing the wrong thing the day
 	// someone rewords it.
-	shared, err := appFeatureIsShared(ctx, client, parent)
+	shared, err := featureIsShared(ctx, client, appFeatureID(parent))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not read the feature's scope (%v) — trying to commit.\n", err)
 	}
@@ -220,21 +220,16 @@ func formatCompileDetail(message string) string {
 	return "\n  " + message
 }
 
-// appFeatureIsShared reports whether the app's feature is organization-scoped,
-// which is what makes committing admin-only.
+// appFeatureID is the app's feature, or "" for a nil row — the nil check
+// featureIsShared cannot make for a caller holding a typed pointer.
 //
-// Unlike rdb.Workflow, rdb.DataApp carries no joined featureScope column, so
-// this reads the feature. A failure is the caller's to interpret — publish
-// degrades to attempting the commit.
-func appFeatureIsShared(ctx context.Context, client *api.Client, app *api.DataApp) (bool, error) {
-	if app == nil || app.FeatureID == "" {
-		return false, nil
+// Unlike rdb.Workflow, rdb.DataApp carries no joined featureScope column, which
+// is why this loop asks the feature at all.
+func appFeatureID(app *api.DataApp) string {
+	if app == nil {
+		return ""
 	}
-	feature, err := client.GetFeature(ctx, app.FeatureID)
-	if err != nil {
-		return false, err
-	}
-	return feature.Scope == scopeOrganization, nil
+	return app.FeatureID
 }
 
 // resolveAppDraft finds the draft a validate, publish or discard acts on,

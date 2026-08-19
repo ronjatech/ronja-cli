@@ -57,8 +57,10 @@ Two ways in:
 Then edit locally and check where you stand:
 
   ronja app status                 local changes, remote state, and drift
+  ronja app fork <kit-path>        copy a built-in kit component in to customise
   ronja app push                   sync the folder into your draft and compile
   ronja app validate               recompile your draft and report diagnostics
+  ronja app test                   render it headlessly and report what was seen
   ronja app publish                commit the draft (or ask an admin to)
   ronja app discard                throw your draft away
 
@@ -79,8 +81,8 @@ production without either overwriting the other's binding.`,
 	}
 	app.AddCommand(
 		newDataAppInitCmd(), newDataAppCloneCmd(), newDataAppStatusCmd(),
-		newDataAppPushCmd(), newDataAppValidateCmd(),
-		newDataAppPublishCmd(), newDataAppDiscardCmd(),
+		newDataAppForkCmd(), newDataAppPushCmd(), newDataAppValidateCmd(),
+		newDataAppTestCmd(), newDataAppPublishCmd(), newDataAppDiscardCmd(),
 	)
 	return app
 }
@@ -205,7 +207,32 @@ func (t appTarget) Access() api.DataAppAccess {
 // inspectAppTarget reads the binding's current state without changing anything,
 // resolving the caller's draft explicitly.
 func inspectAppTarget(ctx context.Context, client *api.Client, f *folder) (appTarget, error) {
-	appID := f.ResourceID()
+	target, err := inspectAppRow(ctx, client, f)
+	if err != nil || target.App == nil || target.App.Lifecycle == api.LifecycleDraft {
+		return target, err
+	}
+	draft, err := client.GetDataAppDraft(ctx, target.App.ID)
+	if err != nil {
+		return appTarget{}, fmt.Errorf("check for your draft of %s: %w", target.App.ID, err)
+	}
+	target.Draft = draft
+	return target, nil
+}
+
+// inspectAppRow is inspectAppTarget WITHOUT the draft round trip: the binding's
+// row, the deleted-app message and the unworkable-lifecycle refusal, and nothing
+// else.
+//
+// It exists for `app test`, which sends the LIVE id and lets the endpoint
+// substitute the caller's draft server-side — the server's answer names the row
+// it rendered, and that is the only authority on what the pixels are a picture
+// of. Resolving the draft locally there would be a GET whose result is never
+// read. Every other command writes to the draft and therefore needs its id.
+func inspectAppRow(ctx context.Context, client *api.Client, f *folder) (appTarget, error) {
+	appID, err := f.ResourceID()
+	if err != nil {
+		return appTarget{}, err
+	}
 	if appID == "" {
 		return appTarget{}, nil
 	}
@@ -220,14 +247,7 @@ func inspectAppTarget(ctx context.Context, client *api.Client, f *folder) (appTa
 	if err := refuseUnworkableApp(app); err != nil {
 		return appTarget{}, err
 	}
-	if app.Lifecycle == api.LifecycleDraft {
-		return appTarget{App: app}, nil
-	}
-	draft, err := client.GetDataAppDraft(ctx, app.ID)
-	if err != nil {
-		return appTarget{}, fmt.Errorf("check for your draft of %s: %w", app.ID, err)
-	}
-	return appTarget{App: app, Draft: draft}, nil
+	return appTarget{App: app}, nil
 }
 
 // hashAppFiles fingerprints a fetched file set for baseline and drift

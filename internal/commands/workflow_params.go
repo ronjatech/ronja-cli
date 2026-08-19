@@ -14,17 +14,22 @@ import (
 // never declared.
 //
 // Its own file because it is the one part of the command that is pure — no
-// client, no folder, no terminal — and because the v2 run endpoint does not
-// validate parameters at all, which makes these checks worth reading on their
-// own rather than in the middle of a poll loop.
+// client, no folder, no terminal — which makes these checks worth reading on
+// their own rather than in the middle of a poll loop.
 
 // parseParams turns repeated --param key=value flags into the run's parameter
 // values, checked against what the workflow declares.
 //
-// This mirrors rscheduledjob.ValidateWorkflowParameterValues, which the v2 run
-// endpoint does NOT apply — so the checks are the CLI's or they are nobody's.
-// Coercion is the CLI-only part: a shell hands over strings, and a "number"
-// parameter arriving as "12" would reach the script as text.
+// This mirrors rworkflow.CoerceWorkflowParameterValues, which the v2 run
+// endpoint DOES now apply (it did not when this was written, which is why these
+// checks exist at all). They stay because a --param typo caught here costs no
+// round trip, and because a shell hands over strings: a "number" parameter
+// arriving as "12" would otherwise travel as text.
+//
+// The server's pass is the authority and is strictly wider — it folds select
+// casing and canonicalizes dates to YYYY-MM-DD, neither of which happens here —
+// so a value this accepts may still be rewritten server-side. Keep this the
+// SUBSET; never let it accept something the server refuses.
 func parseParams(specs []string, declared []api.WorkflowParameter) (map[string]any, error) {
 	byName := make(map[string]api.WorkflowParameter, len(declared))
 	for _, p := range declared {

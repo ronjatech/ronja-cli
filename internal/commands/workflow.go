@@ -156,9 +156,8 @@ func openFolder(ctx context.Context, resolved *config.Resolved, kind wfdir.Kind)
 	root, err := wfdir.FindRoot(cwd)
 	if err != nil {
 		if errors.Is(err, wfdir.ErrNoManifest) {
-			cmd := kindCommand(kind)
 			return nil, fmt.Errorf("no %s here or in any parent directory — run this inside a folder created by `%s clone` or `%s init`",
-				wfdir.ManifestName, cmd, cmd)
+				wfdir.ManifestName, kind.Command, kind.Command)
 		}
 		return nil, err
 	}
@@ -187,20 +186,17 @@ func openFolder(ctx context.Context, resolved *config.Resolved, kind wfdir.Kind)
 	}, nil
 }
 
-// kindCommand names the command group that drives a folder of this kind, for
-// messages that tell the caller what to run next. A data-app failure that
-// answers "run `ronja wf status`" points at a command that refuses the folder
-// it was said about.
-func kindCommand(kind wfdir.Kind) string {
-	if kind.Name == wfdir.KindDataApp {
-		return "ronja app"
-	}
-	return "ronja wf"
-}
-
 // ResourceID is the row this folder is bound to on its instance, empty when it
 // has never been pushed there.
-func (f *folder) ResourceID() string { return f.Binding.ResourceID(f.Kind) }
+//
+// It errors for a folder kind that binds MANY rows (a pipeline), which is why
+// the signature is not a bare string: that caller has to read Binding.Tables,
+// and answering it with an empty id would read as "never pushed here".
+//
+// The command a kind's messages should name is wfdir.Kind.Command — one
+// mapping, declared on the Kind itself. It used to be spelled here as well, as
+// a binary if/else that would have routed a third kind to `ronja wf`.
+func (f *folder) ResourceID() (string, error) { return f.Binding.ResourceID(f.Kind) }
 
 // bindNew resolves the organization and returns the key a NEW binding should be
 // written under. Only the paths that create a binding need this, and they are
@@ -309,6 +305,12 @@ func readLocalFiles(root string, kind wfdir.Kind) (map[string]string, *wfdir.Enu
 // checkPushable takes the cap as an argument rather than reading this: refusing
 // a 2 MB .tsx that rdataapp would have accepted is the same class of unhelpful
 // local refusal, just pointed the other way.
+//
+// `ronja pipeline push` reuses this number for a .sql file, deliberately and on
+// the first rationale rather than the second: a table's `code` is a text column
+// with no server-side cap either, and a megabyte is far beyond any hand-written
+// query. There is no pipeline VALIDATE endpoint to keep in step, so the "change
+// both" rule above is about workflows only.
 const maxFileBytes = 1 << 20
 
 // checkPushable refuses a local file set that cannot be synced safely, BEFORE
@@ -492,6 +494,16 @@ func baselineParameters(source *api.Workflow) *[]api.WorkflowParameter {
 	return &params
 }
 
+// baselineReportingTimezone records the row's declared execution calendar for
+// the drift guard, always non-nil for the same reason baselineParameters is.
+// "The server declares none" (an empty string, a row predating migration 000499)
+// is a fact worth recording; a nil means UNRECORDED, which disarms the guard and
+// is only ever right for a state file written before the zone was part of one.
+func baselineReportingTimezone(source *api.Workflow) *string {
+	zone := source.ReportingTimezone
+	return &zone
+}
+
 func baselineFrom(source *api.Workflow, files []api.WorkflowFile) *wfdir.InstanceState {
 	inst := &wfdir.InstanceState{
 		SourceID:          source.ID,
@@ -500,6 +512,7 @@ func baselineFrom(source *api.Workflow, files []api.WorkflowFile) *wfdir.Instanc
 		Title:             source.Title,
 		Entrypoint:        source.Entrypoint,
 		Parameters:        baselineParameters(source),
+		ReportingTimezone: baselineReportingTimezone(source),
 		Files:             map[string]wfdir.FileState{},
 	}
 	for _, f := range files {
@@ -526,6 +539,7 @@ func baselineFromLocal(source *api.Workflow, files map[string]string) *wfdir.Ins
 		Title:             source.Title,
 		Entrypoint:        source.Entrypoint,
 		Parameters:        baselineParameters(source),
+		ReportingTimezone: baselineReportingTimezone(source),
 		Files:             map[string]wfdir.FileState{},
 	}
 	for path, content := range files {

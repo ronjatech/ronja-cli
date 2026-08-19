@@ -122,7 +122,7 @@ func Decode(body []byte) (any, error) {
 // Render writes each result on its own line.
 //
 // raw unquotes STRING results, which is the whole point of the mode: the common
-// use is `$(ronja api ... --jq -r '.id')`, and a quoted "wf-123" substituted
+// use is `$(ronja api ... --jq '.id' -r)`, and a quoted "wf-123" substituted
 // into the next command is a path that does not exist. Only strings are
 // affected — a raw number or object still renders as JSON, because there is no
 // other form for them and jq does the same.

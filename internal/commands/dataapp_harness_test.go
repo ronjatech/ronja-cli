@@ -46,6 +46,42 @@ type fakeAppInstance struct {
 	// fakeInstance.
 	noFrontendOrigin bool
 
+	// kit is the embedded component kit as /docs/api/kit/<path> serves it:
+	// kit-relative path to verbatim source. Unauthenticated and outside the
+	// /api/v2 surface entirely, which is the point — a kit file is not an app
+	// file, so nothing under /dataapp will ever list one.
+	kit map[string]string
+	// --- the preview harness ------------------------------------------------
+	// previewAnswers is the queue POST :id/preview walks, one entry per call;
+	// once it runs out the LAST entry repeats. That shape is what makes the two
+	// busy cases expressible with the same field: [busy] repeats forever (busy
+	// through the retry), [busy, ok] is a queue that clears.
+	previewAnswers []fakePreviewAnswer
+	previewCalls   int
+	// previewRequests and previewTargets record what each call asked for and
+	// which row id it was addressed to.
+	previewRequests []api.PreviewRequest
+	previewTargets  []string
+
+	// blobs backs the two-call frame fetch: GET /feature/file/:id for the row,
+	// then GET /file/download/:key for the bytes. Keyed by FILE ID.
+	blobs map[string]fakeBlob
+	// fileRowCalls counts GET /feature/file/:id — the FALLBACK leg. It is the
+	// only way to prove the preferred one-call path was taken: both legs end in
+	// the same bytes on disk, so a client that quietly resolved every id would
+	// look identical in the result and differ only in the requests it made (and
+	// in whether a scoped token could have made them at all).
+	fileRowCalls int
+	// fileDownloadCalls counts GET /file/download/:key, the leg both paths end on.
+	fileDownloadCalls int
+
+	// kitNotFoundBody is what an unknown kit path answers with, modelling the
+	// real instance's plain-text /docs/api breadcrumb rather than a JSON error.
+	// A test that wants the near-miss case sets it to a body naming a real kit
+	// route; the near-miss engine itself lives in the backend's route table and
+	// is not worth reimplementing here.
+	kitNotFoundBody string
+
 	// --- failure injection -------------------------------------------------
 	// compileFails maps a file path to the diagnostics its PUT reports. The
 	// write still SUCCEEDS — that is the whole point of the 200 — so this
@@ -130,6 +166,8 @@ func newFakeAppInstance(t *testing.T) *fakeAppInstance {
 		compileFails:   map[string]string{},
 		failPut:        map[string]int{},
 		failDelete:     map[string]int{},
+		kit:            map[string]string{},
+		blobs:          map[string]fakeBlob{},
 		privilegeLevel: 50,
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
@@ -225,6 +263,13 @@ func (f *fakeAppInstance) AddDraft(liveID, draftID string, files ...api.DataAppF
 func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
 
+	// The read-only component kit on the docs surface. Served BEFORE the auth
+	// check below because the real one takes no credential either.
+	if kitPath, ok := strings.CutPrefix(r.URL.Path, "/docs/api/kit/"); ok {
+		f.serveKitFile(w, kitPath)
+		return
+	}
+
 	if r.URL.Path == "/api/v2/authentication/me" {
 		writeJSON(w, map[string]any{
 			"user":   map[string]any{"id": "usr-1", "email": "dev@example.com"},
@@ -233,6 +278,21 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// The two legs of a preview frame fetch. BOTH must be matched before the
+	// /feature/ branch below, which would otherwise swallow /feature/file/:id and
+	// answer a file read with a feature.
+	if fileID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/file/"); ok {
+		f.serveFileRow(w, fileID)
+		return
+	}
+	if key, ok := strings.CutPrefix(r.URL.Path, "/api/v2/file/download/"); ok {
+		// r.URL.Path is DECODED, so the key's own slashes are back — which is
+		// also the assertion: the client escaped the whole key into one segment
+		// and it round-tripped.
+		f.serveFileDownload(w, key)
+		return
+	}
+
 	// GET /feature/:id — how publish learns whether the feature is shared.
 	if featureID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/"); ok {
 		scope, known := f.featureScope[featureID]
@@ -269,6 +329,9 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 
 	case rest == "validate":
 		f.serveValidate(w, id)
+
+	case rest == "preview":
+		f.servePreview(w, r, id)
 
 	case rest == "commit":
 		if f.failCommit != 0 {
@@ -324,6 +387,147 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}
+}
+
+// fakePreviewAnswer is one canned answer to POST :id/preview.
+//
+// Body is sent VERBATIM, which is the point: the CLI writes report.json from
+// the bytes rather than from a re-marshal, and only a fake that can send a body
+// this package's mirror does not fully describe can prove it.
+type fakePreviewAnswer struct {
+	// Status is the HTTP status; 0 means 200.
+	Status int
+	Body   []byte
+	// RetryAfter, when set, is sent as the header of the same name.
+	RetryAfter string
+}
+
+// fakeBlob is one stored file: the row's storage key and its bytes.
+type fakeBlob struct {
+	Key  string
+	Data []byte
+}
+
+// AnswerPreview appends one canned preview answer to the queue.
+func (f *fakeAppInstance) AnswerPreview(answer fakePreviewAnswer) {
+	f.previewAnswers = append(f.previewAnswers, answer)
+}
+
+// AnswerPreviewResult is AnswerPreview for an ordinary 200 observation.
+func (f *fakeAppInstance) AnswerPreviewResult(result api.PreviewResult) {
+	body, err := json.Marshal(result)
+	if err != nil {
+		f.t.Fatalf("encode preview result: %v", err)
+	}
+	f.AnswerPreview(fakePreviewAnswer{Body: body})
+}
+
+// AnswerPreviewBusy queues the 429 the endpoint answers a spent render pool
+// with: a Retry-After header and a body carrying {busy: true}.
+func (f *fakeAppInstance) AnswerPreviewBusy(message string) {
+	body, err := json.Marshal(map[string]any{
+		"busy": true, "message": message, "calibration": "a busy pool says nothing about your app",
+	})
+	if err != nil {
+		f.t.Fatalf("encode busy body: %v", err)
+	}
+	f.AnswerPreview(fakePreviewAnswer{
+		Status: http.StatusTooManyRequests, Body: body, RetryAfter: "15",
+	})
+}
+
+// AddFileBlob registers a file row and its bytes, reachable by the two-call
+// fetch a preview frame needs.
+func (f *fakeAppInstance) AddFileBlob(fileID, key string, data []byte) {
+	f.blobs[fileID] = fakeBlob{Key: key, Data: data}
+}
+
+func (f *fakeAppInstance) servePreview(w http.ResponseWriter, r *http.Request, id string) {
+	var in api.PreviewRequest
+	decodeBody(f.t, r, &in)
+	f.previewRequests = append(f.previewRequests, in)
+	f.previewTargets = append(f.previewTargets, id)
+
+	answer := fakePreviewAnswer{}
+	if n := len(f.previewAnswers); n > 0 {
+		idx := f.previewCalls
+		if idx >= n {
+			idx = n - 1
+		}
+		answer = f.previewAnswers[idx]
+	}
+	f.previewCalls++
+
+	if answer.RetryAfter != "" {
+		w.Header().Set("Retry-After", answer.RetryAfter)
+	}
+	status := answer.Status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	body := answer.Body
+	if body == nil {
+		// The degenerate honest answer: a render that painted and saw nothing.
+		body, _ = json.Marshal(api.PreviewResult{
+			Rendered: true, Viewport: "desktop", DataAppID: id,
+			Ops: []api.PreviewOp{}, Errors: []api.PreviewRuntimeError{},
+			ConsoleErrors: []api.PreviewConsoleError{},
+			Screenshots:   []api.PreviewScreenshot{},
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func (f *fakeAppInstance) serveFileRow(w http.ResponseWriter, fileID string) {
+	f.fileRowCalls++
+	blob, ok := f.blobs[fileID]
+	if !ok {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, api.File{
+		ID: fileID, Name: "preview.png", FileKey: blob.Key,
+		ContentType: "image/png", ContentSize: int64(len(blob.Data)),
+	})
+}
+
+func (f *fakeAppInstance) serveFileDownload(w http.ResponseWriter, key string) {
+	f.fileDownloadCalls++
+	for _, blob := range f.blobs {
+		if blob.Key == key {
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(blob.Data)
+			return
+		}
+	}
+	http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+}
+
+// AddKitFile registers one component-kit file at its import path.
+func (f *fakeAppInstance) AddKitFile(path, source string) {
+	f.kit[path] = source
+}
+
+// serveKitFile mirrors the docs route: verbatim source as text/plain, and a
+// PLAIN-TEXT 404 breadcrumb for anything else — no route is mounted for a path
+// that is not in the kit, so an unknown one falls through to the API's own
+// not-found page rather than a JSON error envelope.
+func (f *fakeAppInstance) serveKitFile(w http.ResponseWriter, path string) {
+	source, ok := f.kit[path]
+	if !ok {
+		body := f.kitNotFoundBody
+		if body == "" {
+			body = "404 page not found\n\nThis is the Ronja API. Start at /llms.txt\n"
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(body))
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(source))
 }
 
 func (f *fakeAppInstance) serveCreate(w http.ResponseWriter, r *http.Request) {

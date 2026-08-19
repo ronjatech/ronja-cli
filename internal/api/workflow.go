@@ -56,9 +56,32 @@ type Workflow struct {
 	Entrypoint  string `json:"entrypoint"`
 	// Kind is the output-channel discriminator: unspecified|function|report|pipeline.
 	Kind string `json:"kind"`
+	// RuntimeVersion is the semantics generation the code is written against: 1
+	// (the standard runtime) or 2 (durable — steps are journaled, so a failed
+	// run can be resumed). Stamped at create and never patched.
+	//
+	// ZERO MEANS THE INSTANCE DID NOT SAY, not "runtime 1". The column is NOT
+	// NULL server-side, so an instance that has it always sends a value; a 0
+	// here is an instance predating durable workflows, and the caller falls back
+	// to what the folder's manifest declares rather than concluding v1.
+	RuntimeVersion int `json:"runtimeVersion"`
 
 	Parameters []WorkflowParameter `json:"parameters"`
 	Variables  map[string]any      `json:"variables"`
+
+	// ReportingTimezone is the IANA calendar the workflow's DuckDB session runs
+	// at on EVERY run (migration 000499) — what date_trunc and date casts bucket
+	// against, so it decides which day or month a timestamp near midnight lands
+	// in. A plain string for the reason the other optional strings are: the
+	// server's optional.V marshals `null` when unset, and unmarshalling null into
+	// a string is a documented no-op.
+	//
+	// "" therefore means the row declares NO zone, and falls back to the caller's
+	// context zone at run time. That is a PERMANENT state, not a migration
+	// backlog: 000499 backfills nothing, and a workflow created while the
+	// organization has no default declares nothing either. It is NOT the same as
+	// the literal "UTC" a reset writes, and the CLI keeps the two apart.
+	ReportingTimezone string `json:"reportingTimezone"`
 
 	UseDedicatedCompute bool `json:"useDedicatedCompute"`
 	// ApprovalGate is null on a workflow with no gate. `wf test` (Phase 4)

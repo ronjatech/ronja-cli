@@ -75,11 +75,17 @@ envelope.
 --jq filters the ENVELOPE, not the rows — the rows are CSV, and jq does not
 read CSV. It is for the metadata around them:
 
-  ronja query --file report.sql --jq -r '.rowCount'
+  ronja query --file report.sql --jq '.rowCount' -r
   ronja query --file report.sql --jq '.truncated'
 
 A truncated result is reported on stderr and still exits zero — the rows you
 got are real, there are simply more of them.
+
+The reporting timezone the query ran at is also printed on stderr (and carried
+as .zoneUsed). The CLI sends no client timezone, so queries read at UTC while
+the browser reads at your own zone — a rollup bucketed by day, week or month
+can legitimately differ between the two. Check it first when CLI numbers
+disagree with the app.
 
 A large query can be routed to bigger compute server-side and take minutes.
 Raise --timeout for those; the default is generous for an interactive query and
@@ -91,7 +97,18 @@ is non-zero.`,
 		// One optional positional. Two would be somebody who forgot to quote
 		// their SQL, and cobra's own error says so better than a merged string
 		// that half-runs.
-		Args: cobra.MaximumNArgs(1),
+		//
+		// The --jq guard runs here rather than in RunE because this is where the
+		// mistake lands: `--jq -r '.rowCount'` binds "-r" as the expression and
+		// leaves '.rowCount' as the SQL, which is worse than the arity error
+		// `ronja api` gives — it is a round trip that fails server-side with a
+		// syntax error nobody typed.
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := refuseFlagAsJQExpr(cmd, jqExpr); err != nil {
+				return err
+			}
+			return cobra.MaximumNArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sql, err := querySQL(args, file)
 			if err != nil {
@@ -161,8 +178,18 @@ is non-zero.`,
 				return fmt.Errorf("query failed: %s", strings.TrimSpace(result.Error))
 			}
 
-			// Always stderr, in every mode: a truncation notice on stdout would
-			// land in the middle of the CSV a pipeline is parsing.
+			// Always stderr, in every mode: narration on stdout would land in
+			// the middle of the CSV a pipeline is parsing.
+			//
+			// The zone is worth saying out loud on every successful run, not
+			// only when something looks wrong: the CLI sends no client
+			// timezone, so it reads at UTC while the app reads at the user's
+			// zone, and a monthly rollup can legitimately differ between them.
+			// Printed before the truncation note so the calendar is stated
+			// before any caveat about the rows.
+			if result.ZoneUsed != "" {
+				fmt.Fprintf(os.Stderr, "  Reporting timezone: %s\n", result.ZoneUsed)
+			}
 			if result.Truncated {
 				fmt.Fprintf(os.Stderr,
 					"  Note: truncated at %d %s — this is a prefix, not the whole answer. Raise --max-rows (with --out for a large result), or aggregate in SQL.\n",

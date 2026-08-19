@@ -250,15 +250,18 @@ func TestManifestAccessRoundTrip(t *testing.T) {
 // two ids, and the accessor is what keeps callers from reaching for the wrong
 // field.
 func TestBindingResourceIDIsPerKind(t *testing.T) {
-	b := Binding{}.WithResourceID(DataAppKind, "data_app-1")
+	b, err := Binding{}.WithResourceID(DataAppKind, "data_app-1")
+	if err != nil {
+		t.Fatalf("WithResourceID(DataAppKind): %v", err)
+	}
 	if b.DataAppID != "data_app-1" || b.WorkflowID != "" {
 		t.Errorf("a data-app binding must set only dataAppID, got %+v", b)
 	}
-	if got := b.ResourceID(DataAppKind); got != "data_app-1" {
-		t.Errorf("ResourceID(DataAppKind) = %q", got)
+	if got, err := b.ResourceID(DataAppKind); err != nil || got != "data_app-1" {
+		t.Errorf("ResourceID(DataAppKind) = %q, %v", got, err)
 	}
-	if got := b.ResourceID(WorkflowKind); got != "" {
-		t.Errorf("a data-app binding has no workflow id, got %q", got)
+	if got, err := b.ResourceID(WorkflowKind); err != nil || got != "" {
+		t.Errorf("a data-app binding has no workflow id, got %q, %v", got, err)
 	}
 }
 

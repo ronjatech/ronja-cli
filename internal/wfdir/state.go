@@ -55,6 +55,13 @@ func (i InstanceBaseline) Key() InstanceKey {
 // before parameters were recorded has to be distinguishable from one that
 // recorded "the row declares none", or every pre-existing folder would read as
 // having lost a parameter set it never knew about.
+// ReportingTimezone is the same guard for the declared execution calendar: a
+// colleague changing the workflow's zone in the web builder must not be silently
+// reverted by the next push. Pointer for the reason the others are — a state
+// file written before the zone was recorded (nil) has to be distinguishable from
+// one that recorded "the row declares none" (a pointer to ""), or every
+// pre-existing folder would read as having lost a declaration it never knew
+// about and the guard would fire on a difference nobody made.
 // Access is the data-app counterpart of Parameters, and it is a pointer for the
 // same reason: a state file written before allowlists were recorded must be
 // distinguishable from one that recorded "the row allows nothing". Without that
@@ -67,8 +74,77 @@ type InstanceState struct {
 	Title             string                   `json:"title,omitempty"`
 	Entrypoint        string                   `json:"entrypoint,omitempty"`
 	Parameters        *[]api.WorkflowParameter `json:"parameters,omitempty"`
+	ReportingTimezone *string                  `json:"reportingTimezone,omitempty"`
 	Access            *api.DataAppAccess       `json:"access,omitempty"`
 	Files             map[string]FileState     `json:"files"`
+	// Tables is a PIPELINE folder's per-file remote state: relative path →
+	// which row the baseline describes, and whether this checkout holds an open
+	// draft of it.
+	//
+	// Separate from Files rather than folded into FileState because the two
+	// answer different questions and are written at different moments: Files is
+	// "what were the bytes at the last sync" (the drift baseline), Tables is
+	// "which rows are these files, and where is my draft" (so push can resume
+	// its own draft without a round trip and status can say "draft staged"
+	// without one either).
+	//
+	// omitempty and three-state-safe: ABSENT means this folder does not track
+	// table state — the ordinary reading for every workflow and data-app
+	// baseline, and for a pipeline folder written before the key existed. It
+	// never means "no tables", which is what a present-but-empty map says.
+	Tables map[string]TableState `json:"tables,omitempty"`
+}
+
+// TableState is one pipeline file's remote identity as this checkout last saw
+// it, plus the fingerprints of the two REMOTE ROWS that file is synced with.
+//
+// The invariant the two hashes exist for, and the one to keep true when adding
+// a third: A HASH IS ONLY EVER COMPARED AGAINST THE ROW IT WAS TAKEN FROM. A
+// pipeline file is synced with three different things, and folding them into one
+// fingerprint was a real bug rather than a tidiness question — the single value
+// meant "the bytes I wrote into my draft" after a push and "the bytes the live
+// table holds" after a clone or a publish, while the drift guard compared BOTH
+// rows against it. An ordinary push → edit → push was then refused as drift on a
+// live table that had never moved.
+//
+//	InstanceState.Files[path].SHA256  the last COMPLETE push (written AND built).
+//	                                  What "changed since the last sync" means,
+//	                                  for `status` and for what a bare push sends.
+//	TableState.DraftSHA256            what this checkout last WROTE into DraftID.
+//	                                  Leg (b) of the drift guard compares the
+//	                                  draft against this.
+//	TableState.LiveSHA256             the LIVE row's SQL as of the last moment
+//	                                  this folder agreed with it — a clone, the
+//	                                  fork of a draft, a publish. Leg (a)
+//	                                  compares the live table against this.
+//
+// TableID is the LIVE row those hashes are fingerprints OF. It duplicates the
+// manifest's Binding.Tables entry deliberately: the baseline has to say WHICH
+// ROW it describes, not merely that it describes one. Without it a manifest
+// edited to point a path at a different table — by hand, by a merge, by a second
+// clone — would silently inherit the previous table's hashes, and the next push
+// would compare a colleague's table against a baseline taken from something else
+// entirely and conclude nothing had changed. `pipeline push` checks it against
+// the binding before it writes anything, so the rebinding is DETECTED rather
+// than trusted.
+//
+// DraftID is the caller's OWN open draft of that table, empty when there is
+// none. It is local-only for the reason the whole baseline is: drafts are
+// per-user, and a colleague inheriting this id from git would be pointed at a
+// row they cannot see. It is a HINT, never authority — a draft can be committed
+// or discarded from the web UI between two commands, so a caller re-reads
+// (GET /feature/model/:id/draft) rather than trusting a recorded id blindly.
+//
+// Both hashes are omitempty and three-state-safe. EMPTY means "no baseline for
+// that row", which disarms its leg of the drift guard exactly the way an absent
+// file baseline does — the state of a folder cloned from git, of a draft this
+// checkout never wrote to, and of a baseline written before these fields
+// existed.
+type TableState struct {
+	TableID     string `json:"tableID"`
+	DraftID     string `json:"draftID,omitempty"`
+	DraftSHA256 string `json:"draftSHA256,omitempty"`
+	LiveSHA256  string `json:"liveSHA256,omitempty"`
 }
 
 // FileState is one file as the server last had it. UpdatedAt is diagnostics
@@ -176,6 +252,17 @@ func (s *State) Clear(key InstanceKey) {
 		}
 	}
 	s.Instances = kept
+}
+
+// TableStateFor returns one file's recorded table state, or the zero value when
+// there is none — which is also what a nil receiver answers, since a folder that
+// has never synced here has no state for any path. The zero value disarms both
+// legs of the drift guard, which is the documented meaning of "no baseline".
+func (i *InstanceState) TableStateFor(path string) TableState {
+	if i == nil {
+		return TableState{}
+	}
+	return i.Tables[path]
 }
 
 // Hashes flattens a baseline into path → sha256 for diffing. A nil receiver

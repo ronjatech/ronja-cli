@@ -37,11 +37,11 @@ existence on your first push.
 Point --from at a component you already have and it is copied in as the
 entrypoint:
 
-  ronja app init --from src/Revenue.tsx --feature feat-abc
+  ronja app init --from src/Revenue.tsx --feature collection-abc123
 
 Without --from you get an empty folder to write App.tsx into yourself:
 
-  ronja app init --feature feat-abc --title "Revenue explorer"
+  ronja app init --feature collection-abc123 --title "Revenue explorer"
 
 --feature names the feature the app will be created in; find it with
 ` + "`ronja api /api/v2/feature/query`" + `. An organization with no features yet answers

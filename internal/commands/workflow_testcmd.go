@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,6 +92,7 @@ func newWorkflowTestCmd() *cobra.Command {
 		params    []string
 		writeLive bool
 		staleOK   bool
+		resume    bool
 		timeout   time.Duration
 		logsMode  string
 	)
@@ -116,23 +117,34 @@ sandbox — so a draft with bound output tables refuses to run without
 --write-live. A workflow that binds no output tables yet — before you push a
 {{ write }} marker — runs without it.
 
+--resume restarts the last FAILED run of this workflow instead of starting a
+fresh one. Only a durable workflow (runtime 2) has anything to resume: its
+journaled step results are replayed and only the work that never finished runs
+again. A resume inherits the original run's parameters, so --param is refused
+with it.
+
+A durable workflow can also PARK mid-run — waiting on an agent it handed work
+to, or on a timer. This stops waiting there and reports status "waiting" with
+what ran so far: nothing failed, and the run resumes on its own, so the rest of
+it happens in Ronja rather than here.
+
 Approval-gated workflows cannot be run from here at all: an approval can only be
 produced inside an agent session, so test those from a Ronja chat.
 
-Exits zero only when the run finishes successfully. With --json, the finished
-run — row, steps and health — as one object on stdout, with progress on stderr.
+Exits non-zero when the run FAILED — a run that finished, and a durable run that
+parked or was handed on to a successor run, all exit zero. With --json, the run
+as last read — row, steps and health — as one object on stdout, with progress on
+stderr.
 
 Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Ctrl-C has to be caught HERE rather than left to the runtime's
-			// default: this command waits on somebody else's run, and the thing a
-			// person needs to be told at that moment is that killing the wait does
-			// not kill the run. cmd.Context() is Background (root calls Execute,
-			// not ExecuteContext), so without this the poll loop's cancellation
-			// branch is unreachable and the process just dies mid-poll.
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-			defer stop()
+			// Ctrl-C is caught at the ROOT (see signalContext), so cmd.Context()
+			// is already cancelled on a signal and this command's poll loop takes
+			// its cancellation branch rather than the process dying mid-poll. What
+			// this command adds is the sentence a person needs at that moment:
+			// killing the wait does not kill the run.
+			ctx := cmd.Context()
 
 			resolved, err := resolveInstance()
 			if err != nil {
@@ -157,6 +169,7 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 				Params:    params,
 				WriteLive: writeLive,
 				StaleOK:   staleOK,
+				Resume:    resume,
 				Timeout:   timeout,
 			})
 			// The report is emitted even on failure: a failed run IS the answer
@@ -187,6 +200,8 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 		"allow a run that writes to the workflow's live output tables")
 	cmd.Flags().BoolVar(&staleOK, "stale-ok", false,
 		"run even though this folder has changes you have not pushed")
+	cmd.Flags().BoolVar(&resume, "resume", false,
+		"resume the last failed run instead of starting a new one (durable workflows only)")
 	cmd.Flags().DurationVar(&timeout, "timeout", 15*time.Minute,
 		"give up waiting after this long (0 waits forever; the run continues either way)")
 	cmd.Flags().StringVar(&logsMode, "logs", logsTail,
@@ -198,6 +213,7 @@ type testOptions struct {
 	Params    []string
 	WriteLive bool
 	StaleOK   bool
+	Resume    bool
 	Timeout   time.Duration
 }
 
@@ -208,6 +224,9 @@ type testOptions struct {
 type testOutcome struct {
 	Run      *api.RunResponse
 	TimedOut bool
+	// Durable reports a workflow whose steps are journaled, which is what makes
+	// a FAILED run resumable rather than merely re-runnable.
+	Durable bool
 }
 
 // runTest is the whole command, ordered so that everything which can refuse
@@ -254,13 +273,25 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 			draft.ID)
 	}
 
-	// 4. Parameters, checked locally: the v2 run endpoint does not validate them
-	// (only the automation and script paths do), so an unknown name would
-	// otherwise silently do nothing and a mistyped number would fail somewhere
-	// inside the script.
-	values, err := parseParams(opts.Params, draft.Parameters)
-	if err != nil {
-		return nil, err
+	// 4. Parameters, checked locally FIRST. The v2 run endpoint validates them
+	// too now, but a --param typo caught here costs no round trip and reports
+	// against the declaration already in hand.
+	//
+	// A resume declares none, and is refused rather than quietly ignoring them:
+	// the server rejects parameterValues on a resume because a changed parameter
+	// would invalidate every step result computed under the old ones, so a CLI
+	// that dropped --param silently would be hiding exactly the mistake that
+	// rule exists to catch.
+	var values map[string]any
+	if opts.Resume {
+		if len(opts.Params) > 0 {
+			return nil, fmt.Errorf("a resume inherits the failed run's parameters — drop --param, or run without --resume to start a fresh run with new values")
+		}
+	} else {
+		values, err = parseParams(opts.Params, draft.Parameters)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// 5. Output safety. Asymmetric on purpose: a draft with no bound output
@@ -282,13 +313,41 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 	noteDraftDrift(ctx, client, f, draft)
 
 	// 7. Everything above has passed; from here the run exists in the world.
-	started, err := client.RunWorkflow(ctx, draft.ID, values)
-	if err != nil {
-		return nil, fmt.Errorf("run %s: %s", draft.ID, serverMessage(err))
+	var started *api.WorkflowRun
+	if opts.Resume {
+		// A distinct name rather than a shadowing `:=`, so `err` below is
+		// unambiguously the one the rest of this function uses.
+		target, targetErr := lastFailedRun(ctx, client, f, draft)
+		if targetErr != nil {
+			return nil, targetErr
+		}
+		// A note, not a refusal. Resume is NOT a durable-only feature: on the
+		// standard runtime a step is journaled when the author gives it an
+		// explicit key (`tools.step("key", fn, ...)`), and resuming such a
+		// workflow replays exactly those. What the durable runtime changes is
+		// that the key is derived, so every step is journaled without the author
+		// writing one — which is why a standard-runtime resume may well find
+		// nothing to skip, and why that is worth saying before it happens.
+		if !isDurable(f, draft) {
+			fmt.Fprintf(os.Stderr, "  Note: workflow %s runs the standard runtime, so only steps written as tools.step(\"key\", fn, ...) are journaled; anything else re-runs.\n",
+				draft.ID)
+		}
+		started, err = client.ResumeWorkflowRun(ctx, draft.ID, target)
+		if err != nil {
+			return nil, fmt.Errorf("resume run %s: %s", target, serverMessage(err))
+		}
+		fmt.Fprintf(os.Stderr, "  Resuming run %s as %s — journaled steps are replayed, not re-run.\n",
+			target, started.ID)
+	} else {
+		started, err = client.RunWorkflow(ctx, draft.ID, values)
+		if err != nil {
+			return nil, fmt.Errorf("run %s: %s", draft.ID, serverMessage(err))
+		}
+		fmt.Fprintf(os.Stderr, "  Started run %s of draft %s.\n", started.ID, draft.ID)
 	}
-	fmt.Fprintf(os.Stderr, "  Started run %s of draft %s.\n", started.ID, draft.ID)
 
 	outcome := &testOutcome{
+		Durable: isDurable(f, draft),
 		// A synthesized response so there is ALWAYS something to report once a
 		// run exists: the first poll can fail, and a caller who has just started
 		// a run must still be told its id.
@@ -313,13 +372,28 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 	if err != nil {
 		return outcome, err
 	}
-	// Exit zero means the run SUCCEEDED, and nothing else. The enum is three
-	// values today, so the interesting branch is the last one: a status added
-	// server-side (a "cancelled", say) ends the poll — see api.RunResponse.Running
-	// — and used to fall through to a zero exit, which would tell a script that
-	// something it never heard of was a pass.
+	// Exit zero means the run DID NOT FAIL — which since durable waits is a
+	// wider claim than "it finished", because a run can stop being this
+	// command's business without being over. The interesting branch is still
+	// the last one: a status added server-side (a "cancelled", say) ends the
+	// poll — see api.RunResponse.Running — and used to fall through to a zero
+	// exit, which would tell a script that something it never heard of was a
+	// pass.
 	switch outcome.Run.Status {
 	case api.RunStatusDone:
+		return outcome, nil
+	case api.RunStatusWaiting:
+		// A park is not a failure: the burst finished cleanly, its outputs are
+		// persisted, and the run continues by itself when whatever it waits on
+		// happens. A non-zero exit here would stop a pipeline over a durable
+		// workflow doing exactly what it was written to do, and there would be
+		// nothing to retry — the run is parked, not stuck. The report says
+		// which of the two this was; see printTestReport.
+		return outcome, nil
+	case api.RunStatusResuming:
+		// The wake latch. This row handed the lineage to a successor run and
+		// will never execute again, so it is terminal here — and it is terminal
+		// because the work is CONTINUING, which is not a failure either.
 		return outcome, nil
 	case api.RunStatusError:
 		return outcome, fmt.Errorf("run %s failed", outcome.Run.ID)
@@ -327,6 +401,71 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 		return outcome, fmt.Errorf("run %s ended with status %q, which this version of the CLI does not know — treating it as a failure rather than a pass.\n  The report above is what the instance said; upgrade the CLI if this status is a new one",
 			outcome.Run.ID, outcome.Run.Status)
 	}
+}
+
+// isDurable reports whether the workflow being run journals its steps.
+//
+// The ROW is the authority — it is the thing the run funnel reads, and it is
+// right about a workflow this folder did not create (a `wf clone` records no
+// runtime at all, since the runtime is not the folder's to declare once the
+// workflow exists). The manifest is the fallback for ONE case: an instance
+// predating durable workflows sends no runtimeVersion, which decodes to 0, and
+// 0 means "the instance did not say" rather than "runtime 1".
+func isDurable(f *folder, row *api.Workflow) bool {
+	if row != nil && row.RuntimeVersion > 0 {
+		return row.RuntimeVersion >= wfdir.RuntimeDurable
+	}
+	return f.Manifest.IsDurable()
+}
+
+// recentRunsScanned bounds the run history --resume reads to find the last
+// failed run. The answer is nearly always the first entry — you run, it fails,
+// you fix, you resume — and a workflow with more than this many runs since its
+// last failure is one nobody is resuming by hand.
+const recentRunsScanned = 20
+
+// lastFailedRun finds the run `--resume` should continue: the most recent
+// FAILED run of the row `wf test` runs.
+//
+// Discovered from the SERVER (GET /workflow/:id/runs) rather than remembered
+// locally, and that is the design rather than an economy. A local note of "the
+// last run id" would be wrong in every case the folder is not the only way the
+// workflow is run — the web builder, an automation, a colleague's checkout —
+// and it would be absent exactly when it is most wanted, after the clone that
+// follows a failure somebody else saw. The server already knows, per row, and
+// the row is the same one the server's own resume rule is written against: the
+// target must belong to the workflow the resume is posted to.
+//
+// It only NOMINATES a target. Every other resume rule (the lineage must have no
+// run already running and none that has succeeded; a gated workflow cannot be
+// resumed) is the server's, and re-implementing it here would produce a second
+// opinion that goes stale — so a nominated run the server refuses comes back as
+// the server's own refusal.
+func lastFailedRun(ctx context.Context, client *api.Client, f *folder, row *api.Workflow) (string, error) {
+	runs, err := client.ListWorkflowRuns(ctx, row.ID, recentRunsScanned)
+	if err != nil {
+		return "", fmt.Errorf("read the run history of %s: %s", row.ID, serverMessage(err))
+	}
+	// Sorted here as well as requested of the server: the ordering is what makes
+	// "the last failed run" mean anything, and a listing that came back in
+	// another order would otherwise resume an ARBITRARY failed run rather than
+	// fail to find one — a wrong answer wearing a right one's clothes.
+	sort.SliceStable(runs, func(i, j int) bool {
+		return runs[i].ExecutedAt.After(runs[j].ExecutedAt)
+	})
+	for _, run := range runs {
+		if run.Status == api.RunStatusError {
+			return run.ID, nil
+		}
+	}
+
+	// Nothing to resume, and there is only ONE situation: no failed run. A
+	// standard-runtime workflow is deliberately NOT refused here — resume works
+	// on both runtimes, it is the JOURNAL that decides how much a resume skips,
+	// and a workflow whose steps carry explicit keys is as resumable as a
+	// durable one.
+	return "", fmt.Errorf("no failed run of %s to resume — the last %d runs on %s are all running or done.\n  Run `ronja wf test` to start a fresh one",
+		row.ID, recentRunsScanned, f.Resolved.URL)
 }
 
 // noteDraftDrift says so, without refusing, when the draft on the server holds
@@ -421,9 +560,12 @@ func writeLiveRefusal(ctx context.Context, client *api.Client, tableIDs []string
 		named = named[:maxNamedTables]
 	}
 	for _, id := range named {
+		// Best effort: an unreadable table (or an unnamed one — a real state for
+		// a freshly created row) leaves the name empty and the id is printed
+		// alone. Which of the two it was is not worth a second line here.
 		name := ""
-		if table, err := client.GetTable(ctx, id); err == nil && table.Name != nil {
-			name = *table.Name
+		if table, err := client.GetTable(ctx, id); err == nil {
+			name = table.Name
 		}
 		if name == "" {
 			fmt.Fprintf(&lines, "    %s\n", id)

@@ -33,6 +33,30 @@ const (
 // parent is admin-only server-side.
 const scopeOrganization = "organization"
 
+// featureIsShared reports whether a feature is organization-scoped, which is
+// what makes committing into it admin-only.
+//
+// The one reader of that field, for the two loops that have to ASK: rdb.DataApp
+// and the table rows carry no joined featureScope column, so both read the
+// feature. (`wf publish` does not appear here — rdb.Workflow joins the scope, so
+// it already has the answer and a call would be a round trip for a field in
+// hand.)
+//
+// An empty id is NOT shared rather than an error: a resource with no feature has
+// no shared feature, which is a real state and not a failure. Every other
+// failure is the caller's to interpret — both publish paths degrade to
+// attempting the commit and reading its refusal.
+func featureIsShared(ctx context.Context, client *api.Client, featureID string) (bool, error) {
+	if featureID == "" {
+		return false, nil
+	}
+	feature, err := client.GetFeature(ctx, featureID)
+	if err != nil {
+		return false, err
+	}
+	return feature.Scope == scopeOrganization, nil
+}
+
 // `ronja wf publish` takes your draft live — or, when you may not, asks an
 // admin to.
 //
@@ -357,16 +381,28 @@ func callerIsAdmin(ctx context.Context, client *api.Client) (bool, error) {
 }
 
 // warnIfDirty says so when the folder holds changes the draft does not.
+//
+// Enumerates with the FOLDER'S OWN kind rather than a hardcoded WorkflowKind:
+// the exclusion rules differ per kind (a data app skips node_modules/, a
+// pipeline pushes only .sql), so walking a folder as the wrong kind counts files
+// the folder's own commands never see — and the fix-it line it prints has to
+// name the command the caller actually ran, or it points them at one that
+// refuses their folder.
+//
+// Through enumerateFolder rather than wfdir.Enumerate directly, which is what
+// applies the pipeline loop's pushable-set rule: a README in a pipeline folder
+// is not a local change being left behind, and warning about one before every
+// publish would train the reader to ignore the warning that matters.
 func warnIfDirty(f *folder) error {
-	enumeration, err := wfdir.Enumerate(f.Root, wfdir.WorkflowKind)
+	enumeration, err := enumerateFolder(f.Root, f.Kind)
 	if err != nil {
 		return err
 	}
 	diff := wfdir.DiffHashes(enumeration.Files, f.State.For(f.Key).Hashes())
 	if diff.Dirty() {
 		fmt.Fprintf(os.Stderr,
-			"  Warning: %d local file(s) differ from your last sync and are NOT in what is being published — run `ronja wf push` first if you meant to include them.\n",
-			diff.Total())
+			"  Warning: %d local file(s) differ from your last sync and are NOT in what is being published — run `%s push` first if you meant to include them.\n",
+			diff.Total(), f.Kind.Command)
 	}
 	return nil
 }
@@ -380,6 +416,11 @@ func warnIfDirty(f *folder) error {
 // would report something that did happen as something that did not. Hence
 // noteBaselineRefresh below — but the error is real, so a future caller that
 // needs to act on it can.
+//
+// The ROW half is workflow-specific by construction (it reads a workflow and
+// its files). The FOLDER half is not, and follows f.Kind: which paths a baseline
+// may claim is a per-kind rule, and asserting one kind's rules about another
+// kind's folder is the phantom-deletion bug CheckLocalPaths exists to prevent.
 func refreshBaselineFromLive(ctx context.Context, client *api.Client, f *folder, liveID string) error {
 	live, err := client.GetWorkflow(ctx, liveID)
 	if err != nil {
@@ -396,7 +437,7 @@ func refreshBaselineFromLive(ctx context.Context, client *api.Client, f *folder,
 	// deleting the file server-side. Refusing to record the baseline leaves the
 	// PREVIOUS one in place — stale, which `wf status` shows and the next push
 	// heals — rather than replacing it with one that is actively wrong.
-	if err := wfdir.CheckLocalPaths(pathsOf(files), wfdir.WorkflowKind); err != nil {
+	if err := wfdir.CheckLocalPaths(pathsOf(files), f.Kind); err != nil {
 		return fmt.Errorf("the files of %s cannot all be tracked locally: %w", liveID, err)
 	}
 	f.State.Set(f.Key, baselineFrom(live, files))
@@ -419,7 +460,7 @@ func noteBaselineRefresh(kind wfdir.Kind, err error) {
 	}
 	fmt.Fprintf(os.Stderr, "  Note: baseline not refreshed: %v.\n", err)
 	fmt.Fprintf(os.Stderr, "  `%s status` will show your folder as drifted until the next push heals it.\n",
-		kindCommand(kind))
+		kind.Command)
 }
 
 func printPublishReport(r *publishResult) {

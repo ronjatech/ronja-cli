@@ -144,6 +144,26 @@ at the right flow.`,
 			// faithful copy, and a folder that came down without the key would
 			// silently not manage the parameters it can plainly see.
 			manifest.SetParameters(source.Parameters)
+			// The declared calendar, but ONLY when the row declares one. An empty
+			// value means the row declares nothing at all — permanently, not
+			// pending a migration — and falls back to the caller's zone at run
+			// time, which is a state the API
+			// cannot express (an explicit "" patches the row to the literal UTC),
+			// so writing the key for it would make the first push silently stamp
+			// UTC onto a workflow whose calendar nobody asked to change. Absent
+			// leaves it exactly as the server has it.
+			if source.ReportingTimezone != "" {
+				manifest.SetReportingTimezone(source.ReportingTimezone)
+			}
+			// The runtime is identity, not preference. A clone of a Durable
+			// workflow whose folder is later pushed into a NEW workflow
+			// elsewhere must create runtime 2 — absent, the create defaults to
+			// runtime 1 and the v2 code's first run dies on the availability
+			// probe. Written only when non-default, matching init's shape (an
+			// absent key IS how the manifest says runtime 1).
+			if source.RuntimeVersion > wfdir.RuntimeDefault {
+				manifest.Runtime = source.RuntimeVersion
+			}
 			if err := wfdir.SaveManifest(root, manifest); err != nil {
 				return err
 			}
@@ -157,13 +177,19 @@ at the right flow.`,
 
 			if flagJSON {
 				return emitJSON(map[string]any{
-					"root":            root,
-					"url":             resolved.URL,
-					"workflowID":      wf.IdentityID(),
-					"featureID":       source.FeatureID,
-					"title":           source.Title,
-					"entrypoint":      entrypoint,
-					"lifecycle":       wf.Lifecycle,
+					"root":       root,
+					"url":        resolved.URL,
+					"workflowID": wf.IdentityID(),
+					"featureID":  source.FeatureID,
+					"title":      source.Title,
+					"entrypoint": entrypoint,
+					"lifecycle":  wf.Lifecycle,
+					// Empty when the row declares none, which is also when the
+					// manifest is left unmanaging it.
+					"reportingTimezone": source.ReportingTimezone,
+					// 1 for the standard runtime; the manifest key is written
+					// only when this is 2.
+					"runtimeVersion":  source.RuntimeVersion,
 					"sourceID":        source.ID,
 					"sourceLifecycle": source.Lifecycle,
 					"clonedFromDraft": source.ID != wf.ID,
@@ -216,6 +242,11 @@ func printCloneReport(root, url string, wf, source *api.Workflow, entrypoint str
 	}
 	fmt.Fprintf(out, "  Feature:    %s\n", source.FeatureID)
 	fmt.Fprintf(out, "  Entrypoint: %s\n", entrypoint)
+	// Printed only when the row declares one — the same condition under which
+	// the manifest now manages it, so the report says what the folder holds.
+	if source.ReportingTimezone != "" {
+		fmt.Fprintf(out, "  Timezone:   %s\n", source.ReportingTimezone)
+	}
 	fmt.Fprintf(out, "  Files:      %d\n", written)
 	fmt.Fprintf(out, "  Instance:   %s\n", url)
 	fmt.Fprintf(out, "\n  Next: cd %s && ronja wf status\n", filepath.Base(root))

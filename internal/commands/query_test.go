@@ -483,3 +483,39 @@ func TestQueryRefusesWhenSignedOut(t *testing.T) {
 		t.Errorf("error does not say what to do: %v", err)
 	}
 }
+
+// --- the --jq flag-order footgun ---------------------------------------------
+
+// The same trap as `ronja api`, and here it is worse rather than better: with
+// "-r" bound as the expression, '.rowCount' becomes the SQL, the arity check
+// passes, and the round trip fails server-side with a syntax error nobody typed.
+func TestQueryRefusesAFlagAsTheJQExpression(t *testing.T) {
+	q := newQueryServer(t)
+	signInTo(t, q.URL())
+
+	_, err := runCLI(t, t.TempDir(), "query", "--jq", "-r", ".rowCount")
+	if err == nil {
+		t.Fatal("a flag was accepted as the --jq expression")
+	}
+	if !strings.Contains(err.Error(), "--jq") || !strings.Contains(err.Error(), `"-r"`) {
+		t.Errorf("the refusal names neither the flag nor what it got: %v", err)
+	}
+	if len(q.inputs) != 0 {
+		t.Errorf("a query went out anyway: %+v", q.inputs)
+	}
+}
+
+// And the recommended form still runs: expression first, flag after it.
+func TestQueryAcceptsJQWithTheFlagAfterIt(t *testing.T) {
+	q := newQueryServer(t)
+	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
+	signInTo(t, q.URL())
+
+	out, err := runCLI(t, t.TempDir(), "query", "--jq", ".rowCount", "-r", "SELECT 1")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if out != "2\n" {
+		t.Errorf("stdout = %q", out)
+	}
+}

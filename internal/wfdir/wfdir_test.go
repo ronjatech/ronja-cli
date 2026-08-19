@@ -106,6 +106,81 @@ func TestManifestParametersHaveThreeStates(t *testing.T) {
 	})
 }
 
+// Manifest.Runtime is a plain int rather than the three-state pointer
+// Parameters carries, so what has to hold is narrower and sharper: an absent
+// key reads as the default AND is never written back, so a v1 folder's
+// ronja.json is byte-identical to one written before durable workflows existed.
+func TestManifestRuntimeDefaultsAndRoundTrips(t *testing.T) {
+	t.Run("absent is the default and is never written", func(t *testing.T) {
+		root := t.TempDir()
+		write(t, root, ManifestName, `{"kind":"workflow","title":"T","entrypoint":"main.py","instances":[]}`)
+		m, err := LoadManifest(root, WorkflowKind)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if m.Runtime != 0 {
+			t.Errorf("Runtime = %d, want 0 for an absent key", m.Runtime)
+		}
+		if m.RuntimeVersion() != RuntimeDefault {
+			t.Errorf("RuntimeVersion() = %d, want %d", m.RuntimeVersion(), RuntimeDefault)
+		}
+		if m.IsDurable() {
+			t.Error("a manifest with no runtime key reports as durable")
+		}
+		if err := SaveManifest(root, m); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if raw := readBack(t, root); strings.Contains(raw, "runtime") {
+			t.Errorf("save added a runtime key to a manifest that had none: %s", raw)
+		}
+	})
+
+	// A hand-written explicit 1 means exactly what an absent key means. It is
+	// kept on disk rather than normalized away — rewriting somebody's committed
+	// file to say the same thing differently is churn in a git diff — but it
+	// must not read as anything other than the default runtime.
+	t.Run("an explicit 1 is the default", func(t *testing.T) {
+		root := t.TempDir()
+		write(t, root, ManifestName, `{"kind":"workflow","title":"T","entrypoint":"main.py","runtime":1,"instances":[]}`)
+		m, err := LoadManifest(root, WorkflowKind)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if m.RuntimeVersion() != RuntimeDefault || m.IsDurable() {
+			t.Errorf("runtime 1 reports as %d (durable %v)", m.RuntimeVersion(), m.IsDurable())
+		}
+	})
+
+	t.Run("the durable runtime round trips", func(t *testing.T) {
+		root := t.TempDir()
+		m := &Manifest{Kind: KindWorkflow, Title: "T", Entrypoint: "main.py", Runtime: RuntimeDurable}
+		if err := SaveManifest(root, m); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if raw := readBack(t, root); !strings.Contains(raw, `"runtime": 2`) {
+			t.Errorf("the durable runtime is not in the saved manifest: %s", raw)
+		}
+		again, err := LoadManifest(root, WorkflowKind)
+		if err != nil {
+			t.Fatalf("reload: %v", err)
+		}
+		if again.RuntimeVersion() != RuntimeDurable || !again.IsDurable() {
+			t.Errorf("reloaded runtime = %d (durable %v)", again.RuntimeVersion(), again.IsDurable())
+		}
+	})
+}
+
+// readBack is the saved manifest as text, for the assertions about what a save
+// did and did not write.
+func readBack(t *testing.T, root string) string {
+	t.Helper()
+	raw, err := os.ReadFile(ManifestPath(root))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	return string(raw)
+}
+
 // Hash is a WIRE contract, not an internal fingerprint: `wf push` sends these
 // digests to the server as `baseSha256` preconditions, and the server compares
 // them against its own rworkflow.ContentSHA256
@@ -642,6 +717,95 @@ func TestSlug(t *testing.T) {
 	}
 	if got := Slug(long, KindWorkflow); len(got) > 60 {
 		t.Fatalf("Slug of a long title = %d chars, want <= 60", len(got))
+	}
+}
+
+// FileSlug is Slug plus one rule, and the rule is a round trip: the file stem
+// this folder pushed becomes the table's name, and a clone of that feature has
+// to write the same filename back.
+func TestFileSlug(t *testing.T) {
+	tests := []struct{ in, want string }{
+		// The whole reason it exists. Slug gives orders-clean, which is a second
+		// file for one table beside the one git is already tracking.
+		{in: "orders_clean", want: "orders_clean"},
+		// Case survives for the same round trip: folding it made `Orders` come
+		// back as a second file beside the Orders.sql git already tracked.
+		{in: "Orders", want: "Orders"},
+		{in: "Revenue By Region", want: "Revenue-By-Region"},
+		{in: "Sales/Revenue (v2)", want: "Sales-Revenue-v2"},
+		{in: "already-slugged", want: "already-slugged"},
+		// A literal dash is a separator like any other punctuation, so runs
+		// collapse rather than surviving into a filename.
+		{in: "a -- b", want: "a-b"},
+		{in: "  Spaced  Out  ", want: "Spaced-Out"},
+		// Underscores are content, not separators: a doubled one was typed.
+		{in: "orders__clean", want: "orders__clean"},
+		// A leading underscore is a real staging-table convention, and trimming
+		// it would be the same round-trip bug in a smaller font.
+		{in: "_staging_orders", want: "_staging_orders"},
+		{in: "ÅÄÖ", want: "table"},
+		{in: "", want: "table"},
+		{in: "---", want: "table"},
+	}
+	for _, tc := range tests {
+		if got := FileSlug(tc.in, "table"); got != tc.want {
+			t.Errorf("FileSlug(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	long := strings.Repeat("a", 200)
+	if got := FileSlug(long, "table"); len(got) > 60 {
+		t.Errorf("FileSlug of a long name = %d chars, want <= 60", len(got))
+	}
+}
+
+// The ESCAPE property, pinned separately from the round trip because it is the
+// one that matters if a server-supplied name is ever hostile: a table's display
+// name is attacker-choosable text, and the result of this function is joined to
+// a folder path and written to disk.
+//
+// The stem must be a single path segment with nothing in it but [A-Za-z0-9_-],
+// and it must not collide with the folder's own machinery.
+func TestFileSlugCannotEscapeOrShadowTheFolder(t *testing.T) {
+	for _, name := range []string{
+		"../evil",
+		"../../etc/passwd",
+		"/etc/passwd",
+		`C:\windows\system32`,
+		ManifestName,
+		StateDirName,
+		"nul\x00byte",
+		".",
+		"..",
+	} {
+		got := FileSlug(name, "table")
+		if got == "" {
+			t.Errorf("FileSlug(%q) = \"\", want the fallback", name)
+			continue
+		}
+		for _, r := range got {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			default:
+				t.Errorf("FileSlug(%q) = %q, which carries the disallowed character %q", name, got, r)
+			}
+		}
+		// The stem is used as `<stem>.sql`, so both it and that file have to be
+		// paths the folder can hold.
+		if err := ValidatePath(got + ".sql"); err != nil {
+			t.Errorf("FileSlug(%q) = %q, whose file is not a writable path: %v", name, got, err)
+		}
+		if reason := NotSyncable(got+".sql", PipelineKind); reason != "" {
+			t.Errorf("FileSlug(%q) = %q, whose file the walk would never return: %s", name, got, reason)
+		}
+	}
+}
+
+// The divergence is deliberate and is the point of having two functions, so it
+// is asserted rather than assumed: Slug names a clone DIRECTORY, which nothing
+// compares against later, and its behaviour must not move.
+func TestSlugStillFoldsUnderscores(t *testing.T) {
+	if got := Slug("orders_clean", KindWorkflow); got != "orders-clean" {
+		t.Errorf("Slug(%q) = %q — directory naming must not change", "orders_clean", got)
 	}
 }
 

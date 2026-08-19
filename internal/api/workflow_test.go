@@ -28,6 +28,7 @@ const workflowFixture = `{
   "filenameTemplate": "",
   "entrypoint": "main.py",
   "kind": "report",
+  "runtimeVersion": 2,
   "parameters": [
     {"name": "month", "label": "Month", "type": "select", "required": true,
      "options": ["jan", "feb"], "optionsQuery": "SELECT m FROM {{ ref('tbl-1') }}",
@@ -90,6 +91,7 @@ func TestGetWorkflowDecodesEveryMirroredField(t *testing.T) {
 		{"Description", wf.Description, "Rolls up last month"},
 		{"Entrypoint", wf.Entrypoint, "main.py"},
 		{"Kind", wf.Kind, "report"},
+		{"RuntimeVersion", wf.RuntimeVersion, 2},
 		{"UseDedicatedCompute", wf.UseDedicatedCompute, true},
 		{"ParentWorkflowID", wf.ParentWorkflowID, "wf-parent"},
 		{"Hidden", wf.Hidden, true},

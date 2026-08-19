@@ -616,3 +616,70 @@ func TestSleepCtxWaitsWhenLive(t *testing.T) {
 		t.Errorf("returned after %s, want it to have actually waited", elapsed)
 	}
 }
+
+// --- the --jq flag-order footgun ---------------------------------------------
+
+// `--jq -r '.id'` binds "-r" as the EXPRESSION and leaves '.id' as a second
+// positional, so cobra answers "accepts 1 arg(s), received 2" — a message about
+// argument counts for a mistake that is entirely about a flag. The refusal has
+// to name the real problem and the one-word fix.
+func TestAPIRefusesAFlagAsTheJQExpression(t *testing.T) {
+	e := newEchoServer(t)
+	signInTo(t, e.URL())
+
+	_, err := runCLI(t, t.TempDir(), "api", "--jq", "-r", ".id", "/api/v2/thing")
+	if err == nil {
+		t.Fatal("a flag was accepted as the --jq expression")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "--jq") || !strings.Contains(msg, `"-r"`) {
+		t.Errorf("the refusal names neither the flag nor what it got: %v", err)
+	}
+	if !strings.Contains(msg, "--jq '.id' -r") {
+		t.Errorf("the refusal does not show the working form: %v", err)
+	}
+	if len(e.requests) != 0 {
+		t.Errorf("a request went out anyway: %+v", e.requests)
+	}
+}
+
+// A long flag is the same mistake, and --json is inherited from the root rather
+// than declared on this command — so the check has to read the complete flag
+// set, not the local one.
+func TestAPIRefusesAnInheritedFlagAsTheJQExpression(t *testing.T) {
+	e := newEchoServer(t)
+	signInTo(t, e.URL())
+
+	_, err := runCLI(t, t.TempDir(), "api", "--jq", "--json", "/api/v2/thing")
+	if err == nil {
+		t.Fatal("a persistent root flag was accepted as the --jq expression")
+	}
+	if len(e.requests) != 0 {
+		t.Errorf("a request went out anyway: %+v", e.requests)
+	}
+}
+
+// The guard must not cost a legitimate expression. A leading dash is ordinary
+// jq — "-1" is negative one, and no command has a -1 flag.
+func TestAPIAllowsADashLeadingJQExpression(t *testing.T) {
+	e := newEchoServer(t)
+	e.body = `{"id":"wf-1"}`
+	signInTo(t, e.URL())
+
+	out, err := runCLI(t, t.TempDir(), "api", "--jq", "-1", "/api/v2/thing")
+	if err != nil {
+		t.Fatalf("api: %v", err)
+	}
+	if out != "-1\n" {
+		t.Errorf("stdout = %q", out)
+	}
+	// And the form the refusal recommends really works: expression first, flag
+	// after it.
+	out, err = runCLI(t, t.TempDir(), "api", "--jq", ".id", "-r", "/api/v2/thing")
+	if err != nil {
+		t.Fatalf("api: %v", err)
+	}
+	if out != "wf-1\n" {
+		t.Errorf("stdout = %q, want the unquoted string", out)
+	}
+}

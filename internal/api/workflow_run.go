@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -20,24 +21,46 @@ import (
 // CLI's output rather than merely going unread.
 
 // Workflow run statuses, mirrored from rdb.WorkflowRunStatus
-// (backend/ronja/rdb/table_workflow.go:78). The enum is exactly these three,
-// and the poll loop's terminal condition is "not running", so a status added
+// (backend/ronja/rdb/table_workflow.go). The enum is exactly these five, and
+// the poll loop's terminal condition is "not running", so a status added
 // server-side would end the poll rather than hang it.
+//
+// The last two belong to durable waits and only ever appear on a runtime-2 run
+// that suspended:
+//
+//   - waiting is PARKED: the burst finished cleanly, its outputs are persisted,
+//     and the server knows what has to happen before the run resumes. Nothing
+//     failed and nothing is executing, so it is neither a success nor a
+//     failure — it is a run that is not finished yet.
+//   - resuming is the wake race's single-winner latch, between "a wake decided
+//     to resume this run" and "the resume run exists". Terminal for THIS row:
+//     the parked run never executes again, its successor carries the lineage.
+//
+// Both are real persisted statuses, so a poll can land on either — briefly on
+// resuming, indefinitely on waiting — which is why the CLI has to name them
+// rather than let them fall through to "a status this version does not know"
+// and report a parked run as a failure.
 const (
-	RunStatusRunning = "running"
-	RunStatusDone    = "done"
-	RunStatusError   = "error"
+	RunStatusRunning  = "running"
+	RunStatusDone     = "done"
+	RunStatusError    = "error"
+	RunStatusWaiting  = "waiting"
+	RunStatusResuming = "resuming"
 )
 
 // Derived run health, mirrored from workflow.RunHealth
 // (backend/api/v2/workflow/run_steps.go). Never stored: the server computes it
 // on read from the run status plus the step rows. Degraded is the one worth
 // knowing about — a run that finished but had a best-effort step fail, which a
-// bare "done" would hide.
+// bare "done" would hide. Waiting is the parked run's health, and it is a
+// SEPARATE value rather than a flavour of done for the reason the status is:
+// a parked run reported as healthy tells the reader a stalled pipeline
+// succeeded.
 const (
 	RunHealthDone     = "done"
 	RunHealthDegraded = "degraded"
 	RunHealthFailed   = "failed"
+	RunHealthWaiting  = "waiting"
 )
 
 // WorkflowRun mirrors rdb.WorkflowRun — one execution of one workflow row.
@@ -55,7 +78,7 @@ type WorkflowRun struct {
 	ID              string         `json:"id"`
 	WorkflowID      string         `json:"workflowID"`
 	ParameterValues map[string]any `json:"parameterValues"`
-	// Status is running|done|error — see the constants above.
+	// Status is running|done|error|waiting|resuming — see the constants above.
 	Status       string                   `json:"status"`
 	Outputs      []WorkflowRunOutput      `json:"outputs"`
 	TableOutputs []WorkflowRunTableOutput `json:"tableOutputs"`
@@ -83,9 +106,24 @@ type WorkflowRun struct {
 	// the container never reported in.
 	ProcessingStartedAt *time.Time `json:"processingStartedAt"`
 
+	// ResumeOfRunID marks this run as a RESUME of an earlier failed one: the
+	// lineage's journaled step results were replayed instead of re-executed.
+	// Absent for an ordinary run, which is every run of a v1 workflow.
+	//
+	// It always names the LINEAGE ROOT, never the run the caller asked to
+	// resume — the server normalizes it — so a chain R1 → R2 → R3 has both R2
+	// and R3 pointing at R1. Nothing in the CLI has to unwind that: a resume is
+	// requested against the failed run you have, and the server does the rest.
+	ResumeOfRunID *string `json:"resumeOfRunID"`
+
 	// Kind is the workflow's output channel, denormalized at run-create time:
 	// unspecified|function|report|pipeline.
 	Kind string `json:"kind"`
+	// RuntimeVersion is the workflow's runtime, denormalized at run-create time
+	// — the semantics this run and every resume of its lineage execute under,
+	// which is deliberately not re-read off the workflow row. 0 on an instance
+	// that predates durable workflows.
+	RuntimeVersion int `json:"runtimeVersion"`
 	// Body is the inline return value of a function-kind run, capped server-side
 	// at 8 KB.
 	Body *string `json:"body"`
@@ -130,8 +168,19 @@ type RunResponse struct {
 	WorkflowRun
 	// Steps is never null: a legacy or step-less run hydrates as [].
 	Steps []StepDTO `json:"steps"`
-	// Health is done|degraded|failed — see the constants above.
+	// Health is done|degraded|failed|waiting — see the constants above.
 	Health string `json:"health"`
+	// JournalEntries is how many steps this run's resume LINEAGE has journaled
+	// — what a resume would replay instead of re-running. Derived on read, and
+	// populated only for a FAILED run: 0 everywhere else, including on a
+	// successful run that journaled plenty, because that run has nothing to
+	// resume.
+	//
+	// It is NOT len(Steps). Steps are the observable timeline (run spans), a
+	// different set from the journal, and a report that printed one as the other
+	// would be a confident wrong number at the moment somebody decides whether
+	// to trust a resume to skip work.
+	JournalEntries int `json:"journalEntries"`
 }
 
 // StepDTO mirrors workflow.StepDTO — one observable step of a run, projected
@@ -155,28 +204,30 @@ type StepDTO struct {
 	TokensUsed  int64   `json:"tokensUsed"`
 	Error       *string `json:"error"`
 	Logs        *string `json:"logs"`
+	// Replayed marks a step whose result came out of the resume lineage's
+	// journal — the body never ran. Always present server-side, and false for
+	// every step of a run that is not a resume. It is what separates a
+	// durability skip from a continue_on_error skip, which share status
+	// "skipped".
+	Replayed bool `json:"replayed"`
 }
 
 // Running reports a run still in flight — the poll loop's continue condition.
 //
-// Written as "== running" rather than "not done and not error" on purpose. The
-// enum is exactly three values today, so the two spellings agree; they differ
-// only on a status added server-side later, and there the failure modes are not
-// symmetric. Ending the poll on an unrecognised status reports it (a caller
-// sees "status: cancelled" and knows more than the CLI does), while treating it
-// as still-running hangs until --timeout on a run that already finished.
+// Written as "== running" rather than "not done and not error" on purpose, and
+// durable waits are what turned that from a preference into the only correct
+// spelling: a parked run is in flight in the SERVER's sense — it resumes on its
+// own — but there is nothing here to wait for, because a park lasts until an
+// agent answers or a timer fires, which can be days. "Not done and not error"
+// would sit on it until --timeout.
+//
+// The same shape covers a status added server-side later, where the failure
+// modes are not symmetric either. Ending the poll on an unrecognised status
+// reports it (a caller sees "status: cancelled" and knows more than the CLI
+// does), while treating it as still-running hangs on a run that has already
+// stopped executing.
 func (r *RunResponse) Running() bool {
 	return r != nil && r.Status == RunStatusRunning
-}
-
-// Table is a minimal mirror of rdb.ModelV2: an id and a name, which is all the
-// CLI wants — a table id in a refusal message is correct but unreadable.
-//
-// Name is optional server-side, hence the pointer: an unnamed table is a real
-// state (a freshly created one), not a decode failure.
-type Table struct {
-	ID   string  `json:"id"`
-	Name *string `json:"name"`
 }
 
 // RunWorkflow starts a run and returns IMMEDIATELY with the created run row at
@@ -205,6 +256,61 @@ func (c *Client) RunWorkflow(ctx context.Context, workflowID string, parameterVa
 	return &out, nil
 }
 
+// ResumeWorkflowRun starts a run that RESUMES a failed one, replaying the
+// lineage's journaled step results instead of re-executing the work they
+// record. Like RunWorkflow it returns immediately at status "running".
+//
+// It sends resumeOfRunID and NOTHING ELSE, which is the contract rather than a
+// simplification. A resume inherits the target run's parameter values verbatim
+// — the server copies them across — and refuses any parameterValues the caller
+// supplies, because changed parameters would silently invalidate every step
+// result computed under the old ones. So this deliberately does not share
+// RunWorkflow's body struct: there, an empty map is sent to avoid a null; here,
+// a parameterValues key is a thing to be unable to send at all.
+//
+// The server owns the rest of the rules (the target must be a failed run of
+// THIS workflow, its lineage must have no run already running and none that has
+// succeeded, and a gated workflow cannot be resumed) and its refusals are
+// passed through verbatim.
+func (c *Client) ResumeWorkflowRun(ctx context.Context, workflowID, resumeOfRunID string) (*WorkflowRun, error) {
+	body := struct {
+		ResumeOfRunID string `json:"resumeOfRunID"`
+	}{ResumeOfRunID: resumeOfRunID}
+	var out WorkflowRun
+	if err := c.Do(ctx, "POST", "workflow/"+url.PathEscape(workflowID)+"/run", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListWorkflowRuns reads a workflow's most recent runs, newest first.
+//
+// The ordering is REQUESTED, not assumed: rworkflow.QueryRuns applies no
+// default ORDER BY, so a limited query without one returns whatever rows
+// Postgres happened to reach first — which for a "find the last failed run"
+// caller is not a sort problem but a wrong answer. `executed_at desc` is
+// validated server-side against the table's columns.
+//
+// Runs belong to a workflow ROW, and a draft is its own row, so this is asked
+// of the draft `wf test` runs rather than of the live workflow. That matches
+// the server's own resume rule: the run being resumed must belong to the same
+// workflow the resume is posted to.
+func (c *Client) ListWorkflowRuns(ctx context.Context, workflowID string, limit int) ([]WorkflowRun, error) {
+	query := url.Values{}
+	query.Set("orderBy", "executed_at desc")
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	var out struct {
+		Result []WorkflowRun `json:"result"`
+	}
+	path := "workflow/" + url.PathEscape(workflowID) + "/runs?" + query.Encode()
+	if err := c.Do(ctx, "GET", path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Result, nil
+}
+
 // GetWorkflowRun reads one run: the row, its steps and its derived health.
 //
 // Note the route is /workflow/run/:runID — keyed by the RUN, not nested under
@@ -217,16 +323,7 @@ func (c *Client) GetWorkflowRun(ctx context.Context, runID string) (*RunResponse
 	return &out, nil
 }
 
-// GetTable reads a table's identity so an id can be shown with its name.
-//
-// Best-effort by contract: the caller is expected to fall back to printing the
-// bare id. A token scoped away from the data surface, or a table the caller
-// cannot read, fails here — and neither is a reason to refuse to tell someone
-// which tables a run would overwrite.
-func (c *Client) GetTable(ctx context.Context, id string) (*Table, error) {
-	var out Table
-	if err := c.Do(ctx, "GET", "feature/model/"+url.PathEscape(id), nil, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
+// `wf test` also reads table NAMES, to show which tables a run would overwrite.
+// That lives on Client.GetTable in table.go — one mirror of the table row, not a
+// second minimal one here. It stays best-effort by contract for this caller: a
+// table it cannot read fails, and that is no reason to refuse to name the rest.

@@ -36,12 +36,13 @@ type localWorkflow struct {
 	// Python. That is the `wf init` case, and the one where somebody is about
 	// to start doing it by hand.
 	LoosePython string
-	// Kind is which folder loop this is — wfdir.KindWorkflow or KindDataApp,
-	// or "" when there is a ronja.json we could not read as either.
+	// Kind is which folder loop this is — wfdir.KindWorkflow, KindDataApp or
+	// KindPipeline — or "" when there is a ronja.json we could not read as any
+	// of them.
 	//
-	// Load-bearing rather than cosmetic: the two folder types are
-	// indistinguishable by shape, and pointing a data-app folder at `wf` would
-	// name commands that LoadManifest's kind check then refuses.
+	// Load-bearing rather than cosmetic: the folder types are indistinguishable
+	// by shape, and pointing a pipeline folder at `wf` would name commands that
+	// LoadManifest's kind check then refuses.
 	Kind string
 }
 
@@ -56,10 +57,10 @@ func localWork() *localWorkflow {
 	if root, err := wfdir.FindRoot(cwd); err == nil {
 		found := &localWorkflow{Root: root}
 		// FindRoot only knows there is a ronja.json; which loop it belongs to
-		// is the manifest's `kind`, and LoadManifest refuses the other one. Ask
+		// is the manifest's `kind`, and LoadManifest refuses every other one. Ask
 		// for each in turn rather than parsing the file ourselves, so this
 		// stays honest if the refusal rules change.
-		for _, k := range []wfdir.Kind{wfdir.WorkflowKind, wfdir.DataAppKind} {
+		for _, k := range []wfdir.Kind{wfdir.WorkflowKind, wfdir.DataAppKind, wfdir.PipelineKind} {
 			if m, err := wfdir.LoadManifest(root, k); err == nil {
 				found.Kind = k.Name
 				found.Title = m.Title
@@ -109,6 +110,12 @@ func (l *localWorkflow) payload() map[string]any {
 	if l.Root != "" {
 		out["root"] = l.Root
 		out["bound"] = l.Bound
+		// Which loop this folder belongs to, which the payload used to omit
+		// entirely — so a program reading this could see that there was a folder
+		// but not which commands drive it, the one thing the note exists to say.
+		if l.Kind != "" {
+			out["kind"] = l.Kind
+		}
 		if l.Title != "" {
 			out["title"] = l.Title
 		}
@@ -131,8 +138,11 @@ func printLocalWork(l *localWorkflow) {
 	fmt.Fprintf(out, "\n---\n\n## In this directory\n\n")
 
 	noun := "workflow folder"
-	if l.Kind == wfdir.KindDataApp {
+	switch l.Kind {
+	case wfdir.KindDataApp:
 		noun = "data-app folder"
+	case wfdir.KindPipeline:
+		noun = "pipeline folder"
 	}
 
 	switch {
@@ -148,18 +158,38 @@ func printLocalWork(l *localWorkflow) {
 		return
 	}
 
+	if l.Kind == wfdir.KindPipeline {
+		fmt.Fprintf(out, "    ronja pipeline status    local changes, table health, and drift\n")
+		fmt.Fprintf(out, "    ronja pipeline push      sync each changed .sql file and build it\n")
+		fmt.Fprintf(out, "    ronja pipeline publish   commit your drafts\n\n")
+		// The two things the raw-HTTP path makes people do by hand: the draft-id
+		// bookkeeping per edit cycle, and the poll-plus-truth-table that decides
+		// whether a build actually worked.
+		fmt.Fprintf(out, "One .sql file is one derived table; everything else in the folder is ignored.\n")
+		fmt.Fprintf(out, "`pipeline push` opens the draft, writes the SQL and its derived inputs, builds\n")
+		fmt.Fprintf(out, "it and reports the verdict with a schema diff and sample rows — so none of that\n")
+		fmt.Fprintf(out, "needs a hand-written poll loop. Publishing cascades, so downstream tables\n")
+		fmt.Fprintf(out, "rebuild on their own.\n")
+		if !l.Bound {
+			fmt.Fprintf(out, "\nNothing pushed to this instance yet; the first `pipeline push` creates each\n")
+			fmt.Fprintf(out, "table and records the binding.\n")
+		}
+		return
+	}
+
 	if l.Kind == wfdir.KindDataApp {
 		fmt.Fprintf(out, "    ronja app status     local changes, remote state, and drift\n")
 		fmt.Fprintf(out, "    ronja app validate   compile the draft on the server\n")
 		fmt.Fprintf(out, "    ronja app push       sync the folder into your draft\n")
+		fmt.Fprintf(out, "    ronja app test       render it headlessly and report what was seen\n")
 		fmt.Fprintf(out, "    ronja app publish    take the draft live\n\n")
 		// The data-app equivalents of the two hand-rolled steps below: the
 		// allowlist is the one nobody expects, because nothing infers it from
 		// the code and an empty one publishes green.
 		fmt.Fprintf(out, "`app push` syncs the files AND the access block in ronja.json — the tables and\n")
-		fmt.Fprintf(out, "secrets the app may read, which nothing derives from your source. There is no\n")
-		fmt.Fprintf(out, "`app test`: a data app has nothing to run headlessly, so `status` prints its\n")
-		fmt.Fprintf(out, "URL instead.\n")
+		fmt.Fprintf(out, "secrets the app may read, which nothing derives from your source. `app test`\n")
+		fmt.Fprintf(out, "renders the app in a headless browser and writes a screenshot plus a report of\n")
+		fmt.Fprintf(out, "what it saw — perception, not a pass/fail gate, so it exits zero either way.\n")
 		if !l.Bound {
 			fmt.Fprintf(out, "\nNot pushed to this instance yet; the first `app push` creates the app as an\n")
 			fmt.Fprintf(out, "unpublished draft only you can see.\n")

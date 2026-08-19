@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
 // `wf test` tests, in the order the command refuses things: which row, is the
@@ -446,6 +447,239 @@ func TestTestWriteLiveRefusalSurvivesNameLookupFailure(t *testing.T) {
 	}
 }
 
+// --- resume -----------------------------------------------------------------
+
+// durableFolder is draftFolder with the ROW declaring the durable runtime,
+// which is where the CLI reads it from: the row is what the run funnel reads,
+// and it is right about a workflow this folder did not create.
+func durableFolder(t *testing.T, f *fakeInstance, shape func(*api.Workflow)) string {
+	t.Helper()
+	return draftFolder(t, f, func(draft *api.Workflow) {
+		draft.RuntimeVersion = wfdir.RuntimeDurable
+		if shape != nil {
+			shape(draft)
+		}
+	})
+}
+
+// declareDurableInManifest is the FALLBACK path: an instance that predates
+// durable workflows sends no runtimeVersion, so the row decodes as 0 and the
+// folder's own declaration is all there is to go on. A 0 means "the instance
+// did not say", not "runtime 1".
+func declareDurableInManifest(t *testing.T, root string) {
+	t.Helper()
+	manifest, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	manifest.Runtime = wfdir.RuntimeDurable
+	if err := wfdir.SaveManifest(root, manifest); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+}
+
+// historicRun is one entry of a workflow's run history.
+func historicRun(id, status string, executedAt time.Time) api.WorkflowRun {
+	return api.WorkflowRun{ID: id, WorkflowID: "draft-1", Status: status, ExecutedAt: executedAt}
+}
+
+// The two halves of a resume's contract, in one test: it names the most recent
+// FAILED run, and it sends no parameter values at all — the server refuses a
+// resume that carries any, because a changed parameter invalidates every step
+// result computed under the old ones.
+//
+// The history is staged newest-LAST and out of order, because the endpoint has
+// no default ordering: a CLI that took the first row would pick a done run here
+// and a random one in production.
+func TestTestResumeSendsTheLastFailedRunAndNoParameters(t *testing.T) {
+	f := newFakeInstance(t)
+	resumed := finishedRun(api.RunStatusDone, api.RunHealthDone)
+	resumed.Steps = []api.StepDTO{
+		{ID: "span-1", Name: "Load orders", Status: "skipped", Replayed: true},
+		{ID: "span-2", Name: "Publish", Status: "done"},
+	}
+	f.runScript = []api.RunResponse{resumed}
+	base := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
+	f.runHistory["draft-1"] = []api.WorkflowRun{
+		historicRun("run-old-failure", api.RunStatusError, base),
+		historicRun("run-latest-failure", api.RunStatusError, base.Add(2*time.Hour)),
+		historicRun("run-done", api.RunStatusDone, base.Add(time.Hour)),
+	}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test", "--resume")
+	if err != nil {
+		t.Fatalf("test --resume: %v", err)
+	}
+	// A replayed step reads as replayed rather than as "skipped", which is what
+	// a continue_on_error step that never ran also says.
+	if !strings.Contains(out, "replayed  Load orders") {
+		t.Errorf("the report does not distinguish a journal hit from a skip:\n%s", out)
+	}
+	if len(f.runRequests) != 1 {
+		t.Fatalf("runRequests = %+v, want one", f.runRequests)
+	}
+	got := f.runRequests[0]
+	if got.ResumeOfRunID != "run-latest-failure" {
+		t.Errorf("resumed %q, want the most recent failed run", got.ResumeOfRunID)
+	}
+	if len(got.ParameterValues) != 0 {
+		t.Errorf("a resume sent parameterValues %+v", got.ParameterValues)
+	}
+	// The ordering is REQUESTED, not hoped for. Without it the limit above
+	// returns an arbitrary window of the history.
+	if len(f.runQueries) != 1 || !strings.Contains(f.runQueries[0], "orderBy=executed_at+desc") {
+		t.Errorf("run history query = %v, want an explicit newest-first ordering", f.runQueries)
+	}
+}
+
+// A resume with nothing to resume must say so. Starting a fresh run instead
+// would be the one outcome the flag exists to avoid — a full re-run of work
+// somebody asked to continue.
+func TestTestResumeWithNoFailedRunRefusesRatherThanStartingOne(t *testing.T) {
+	f := newFakeInstance(t)
+	base := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
+	f.runHistory["draft-1"] = []api.WorkflowRun{historicRun("run-done", api.RunStatusDone, base)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	_, err := runCLI(t, root, "wf", "test", "--resume")
+	if err == nil {
+		t.Fatal("--resume with no failed run exited zero")
+	}
+	if !strings.Contains(err.Error(), "no failed run") {
+		t.Errorf("error does not say what is missing: %v", err)
+	}
+	if len(f.runRequests) != 0 {
+		t.Errorf("a refused resume started a run anyway: %+v", f.runRequests)
+	}
+}
+
+// A standard-runtime folder is NOT refused for being standard-runtime. Resume
+// works on both runtimes — on the standard one a step is journaled when the
+// author writes an explicit key — so the only thing that can be missing is a
+// failed run, and that is what the refusal must say. Refusing on the runtime
+// would tell an author who did write keys that their resume is impossible.
+func TestTestResumeOnADefaultRuntimeFolderRefusesOnlyForWantOfAFailedRun(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	withFastPolling(t)
+	root := draftFolder(t, f, nil)
+
+	_, err := runCLI(t, root, "wf", "test", "--resume")
+	if err == nil {
+		t.Fatal("--resume with no failed run exited zero")
+	}
+	if !strings.Contains(err.Error(), "no failed run") {
+		t.Errorf("error does not say what is missing: %v", err)
+	}
+	if strings.Contains(err.Error(), "--runtime 2") {
+		t.Errorf("the standard runtime was treated as the reason a resume is impossible: %v", err)
+	}
+	if len(f.runRequests) != 0 {
+		t.Errorf("a refused resume started a run anyway: %+v", f.runRequests)
+	}
+}
+
+// --param with --resume is refused rather than dropped: the server rejects
+// parameter values on a resume, and a CLI that silently discarded them would
+// hide exactly the mistake that rule exists to catch.
+func TestTestResumeRefusesParameters(t *testing.T) {
+	f := newFakeInstance(t)
+	base := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
+	f.runHistory["draft-1"] = []api.WorkflowRun{historicRun("run-failed", api.RunStatusError, base)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, func(draft *api.Workflow) {
+		draft.Parameters = []api.WorkflowParameter{{Name: "month", Type: "string"}}
+	})
+
+	_, err := runCLI(t, root, "wf", "test", "--resume", "--param", "month=2026-07")
+	if err == nil {
+		t.Fatal("--resume --param exited zero")
+	}
+	if !strings.Contains(err.Error(), "--param") {
+		t.Errorf("error does not name the flag: %v", err)
+	}
+	if len(f.runRequests) != 0 {
+		t.Errorf("a refused resume started a run anyway: %+v", f.runRequests)
+	}
+}
+
+// A failed run of a durable workflow ends with the invocation that continues it
+// and the size of what a resume would skip.
+//
+// The count is the response's journalEntries — the LINEAGE's journal — and NOT
+// len(steps): the run below has one observable step and three journaled ones,
+// so a report that counted steps would print a confident wrong number in the
+// one place somebody is deciding whether to trust the skip.
+func TestTestFailedDurableRunPrintsTheResumeInvocationAndTheJournalSize(t *testing.T) {
+	f := newFakeInstance(t)
+	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
+	failed.JournalEntries = 3
+	failed.Steps = []api.StepDTO{{ID: "span-1", Name: "Load orders", Status: "done"}}
+	f.runScript = []api.RunResponse{failed}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err == nil {
+		t.Fatal("a failed run exited zero")
+	}
+	if !strings.Contains(out, "ronja wf test --resume") {
+		t.Errorf("a failed durable run does not offer the resume:\n%s", out)
+	}
+	if !strings.Contains(out, "3 steps journaled — a resume skips them") {
+		t.Errorf("the journal size is missing or is not journalEntries:\n%s", out)
+	}
+}
+
+// The same hint on a folder whose INSTANCE never sends a runtimeVersion: the
+// row decodes as 0, and the folder's own declaration is the fallback.
+func TestTestFailedRunUsesTheManifestWhenTheRowSaysNothing(t *testing.T) {
+	f := newFakeInstance(t)
+	f.runScript = []api.RunResponse{finishedRun(api.RunStatusError, api.RunHealthFailed)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := draftFolder(t, f, nil)
+	declareDurableInManifest(t, root)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err == nil {
+		t.Fatal("a failed run exited zero")
+	}
+	if !strings.Contains(out, "ronja wf test --resume") {
+		t.Errorf("the manifest's declaration was ignored:\n%s", out)
+	}
+	// No count: the instance sent none, and "0 steps journaled" would read as a
+	// fact about the journal rather than as an absent field.
+	if strings.Contains(out, "journaled") {
+		t.Errorf("a count was printed with no journalEntries on the response:\n%s", out)
+	}
+}
+
+// The same failure on a v1 folder offers nothing, because there is nothing to
+// offer: a v1 run journals no steps, and a resume of it would re-run all of them.
+func TestTestFailedDefaultRuntimeRunOffersNoResume(t *testing.T) {
+	f := newFakeInstance(t)
+	f.runScript = []api.RunResponse{finishedRun(api.RunStatusError, api.RunHealthFailed)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := draftFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err == nil {
+		t.Fatal("a failed run exited zero")
+	}
+	if strings.Contains(out, "--resume") {
+		t.Errorf("a v1 failure offered a resume:\n%s", out)
+	}
+}
+
 // --- a refused run POST -----------------------------------------------------
 
 // Some refusals only the server can make: the credit kill-stop is the one that
@@ -531,8 +765,77 @@ func TestTestExitsNonZeroOnAFailedRun(t *testing.T) {
 	}
 }
 
-// Exit zero means the run SUCCEEDED and nothing else. A status this CLI does
-// not know — one added server-side after it shipped — ends the poll (see
+// A durable run that PARKS is not a failure: the burst finished cleanly, its
+// outputs are persisted, and it resumes on its own. So the poll ends there (a
+// park lasts until an agent answers or a timer fires — days, possibly) and the
+// command exits ZERO, because a non-zero exit would stop a nightly pipeline
+// over a workflow doing exactly what it was written to do.
+func TestTestParkedRunExitsZeroAndReportsTheWait(t *testing.T) {
+	f := newFakeInstance(t)
+	parked := finishedRun(api.RunStatusWaiting, api.RunHealthWaiting)
+	parked.Steps = []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "done", DurationMs: ptr(int64(900))}}
+	f.runScript = []api.RunResponse{parked}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err != nil {
+		t.Fatalf("a parked run exited non-zero: %v", err)
+	}
+	// The status is named as a park rather than left as a bare "waiting", which
+	// reads as stuck...
+	for _, want := range []string{"waiting — parked, and nothing failed", "It resumes on its own", "run-1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q:\n%s", want, out)
+		}
+	}
+	// ...and what DID run is still reported: a park is a partial answer, not no
+	// answer.
+	if !strings.Contains(out, "Ask the agent") {
+		t.Errorf("report dropped the steps that ran before the park:\n%s", out)
+	}
+	// Neither hint applies. Publish would take code live on a run that has not
+	// finished; resume would offer to continue a run nothing has stopped.
+	for _, forbidden := range []string{"wf publish", "--resume"} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("a parked run was offered %q:\n%s", forbidden, out)
+		}
+	}
+	// The poll ENDED on it rather than sitting the park out.
+	if f.runPolls != 1 {
+		t.Errorf("polls = %d, want exactly one — the park was waited out", f.runPolls)
+	}
+}
+
+// The wake latch: a poll can land on `resuming` between "a wake decided to
+// resume this run" and "the resume run exists". Terminal for the row we polled
+// and not a failure — the work is continuing — so it exits zero and says where
+// the work went, because the run id in the report is no longer the one to
+// follow.
+func TestTestResumingRunExitsZeroAndSaysItContinuedElsewhere(t *testing.T) {
+	f := newFakeInstance(t)
+	f.runScript = []api.RunResponse{finishedRun(api.RunStatusResuming, api.RunHealthDone)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err != nil {
+		t.Fatalf("a run handed to a successor exited non-zero: %v", err)
+	}
+	for _, want := range []string{"resuming — continued in a newer run", "continued in a NEWER run"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "wf publish") {
+		t.Errorf("a handed-on run was offered publish:\n%s", out)
+	}
+}
+
+// Exit zero means the run did not FAIL, and nothing wider. A status this CLI
+// does not know — one added server-side after it shipped — ends the poll (see
 // api.RunResponse.Running) and must NOT be reported as a pass: a green exit for
 // "cancelled" is the kind of thing a nightly pipeline believes.
 func TestTestExitsNonZeroOnAStatusItDoesNotRecognise(t *testing.T) {
@@ -562,8 +865,8 @@ func TestTestExitsNonZeroOnAStatusItDoesNotRecognise(t *testing.T) {
 
 // Ctrl-C stops the WAITING. The run is somebody else's process on somebody
 // else's machine and keeps going, which is the one thing a person needs told at
-// that moment — and it only gets said because the command installs its own
-// interrupt handler (cobra hands it a background context).
+// that moment — and it only gets said because the ROOT installs an interrupt
+// handler (signalContext) and hands every command a context that carries it.
 func TestTestCtrlCStopsWaitingAndSaysTheRunSurvives(t *testing.T) {
 	f := newFakeInstance(t)
 	// Never terminates: the only way out of the poll loop is the interrupt.
@@ -576,8 +879,8 @@ func TestTestCtrlCStopsWaitingAndSaysTheRunSurvives(t *testing.T) {
 	root := draftFolder(t, f, nil)
 
 	go func() {
-		// A served poll proves the handler is installed: it is registered before
-		// the command makes any request at all.
+		// A served poll proves the handler is installed: the root registers it
+		// before the command makes any request at all.
 		<-polled
 		self, err := os.FindProcess(os.Getpid())
 		if err != nil {

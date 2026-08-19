@@ -184,6 +184,68 @@ func TestPushFirstPushCreatesWorkflowAndRecordsBinding(t *testing.T) {
 	}
 }
 
+// The runtime is stamped at CREATE and has no patch path, so the manifest's
+// declaration has exactly one chance to reach the server. Both halves are the
+// test: the create carries it, and every later push does not — a folder whose
+// workflow already exists must not fail, and must not appear to restamp it.
+func TestPushSendsTheDeclaredRuntimeOnCreateOnly(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	dir := t.TempDir()
+	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "2", "--json"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	out, err := runCLI(t, dir, "wf", "push", "--json")
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	payload := decodeJSON(t, out)
+	if payload["runtimeVersion"] != float64(wfdir.RuntimeDurable) {
+		t.Errorf("push reported runtimeVersion = %v, want %d", payload["runtimeVersion"], wfdir.RuntimeDurable)
+	}
+	if len(f.created) != 1 {
+		t.Fatalf("created %d workflows, want 1", len(f.created))
+	}
+	if got := f.created[0].RuntimeVersion; got != wfdir.RuntimeDurable {
+		t.Errorf("create sent runtimeVersion %d, want %d", got, wfdir.RuntimeDurable)
+	}
+	// The candidate is validated against the runtime it was written for, or a
+	// v2-only construct is checked by v1 rules and passes for the wrong reason.
+	if len(f.validated) == 0 || f.validated[0].RuntimeVersion != wfdir.RuntimeDurable {
+		t.Errorf("validate sent runtimeVersion %+v, want %d", f.validated, wfdir.RuntimeDurable)
+	}
+
+	writeLocal(t, dir, "main.py", "print('changed')\n")
+	if _, err := runCLI(t, dir, "wf", "push", "--json"); err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if len(f.created) != 1 {
+		t.Errorf("the second push created another workflow: %+v", f.created)
+	}
+}
+
+// A v1 folder's create body has to stay what it was: no runtimeVersion key at
+// all, so an instance that predates durable workflows sees the same request.
+func TestPushOfADefaultRuntimeFolderSendsNoRuntimeVersion(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	root := initFolder(t, f, map[string]string{"main.py": "print('hi')\n"})
+
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(f.created) != 1 {
+		t.Fatalf("created %d workflows, want 1", len(f.created))
+	}
+	if got := f.created[0].RuntimeVersion; got != 0 {
+		t.Errorf("create sent runtimeVersion %d, want it absent", got)
+	}
+	if got := f.validated[0].RuntimeVersion; got != 0 {
+		t.Errorf("validate sent runtimeVersion %d, want it absent", got)
+	}
+}
+
 // --- checkout ---------------------------------------------------------------
 
 func TestPushChecksOutOnceThenReusesTheDraft(t *testing.T) {

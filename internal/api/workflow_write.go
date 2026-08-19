@@ -45,12 +45,19 @@ type ValidateFile struct {
 // candidate declares no parameters" rather than "I am not telling you about
 // them". The server treats an absent list as none, which is the honest answer
 // for a folder that has no record of them.
+//
+// RuntimeVersion is omitempty for a third reason: the server reads an absent
+// value as 1, so a v1 candidate's request bytes stay exactly what they were
+// before durable workflows existed.
 type ValidateInput struct {
 	FeatureID   string              `json:"featureID"`
 	Entrypoint  string              `json:"entrypoint"`
 	Parameters  []WorkflowParameter `json:"parameters,omitempty"`
 	Files       []ValidateFile      `json:"files"`
 	PipPackages []string            `json:"pipPackages,omitempty"`
+	// RuntimeVersion is 1 or 2 — the runtime the candidate would be checked
+	// against. 0 sends nothing, which the server reads as 1.
+	RuntimeVersion int `json:"runtimeVersion,omitempty"`
 }
 
 // ValidateFinding mirrors rworkflow.ValidateFinding: one problem, attributed to
@@ -142,6 +149,22 @@ type CreateWorkflowInput struct {
 	// omitempty because a folder that does not manage parameters must create a
 	// workflow with none rather than assert an empty declaration.
 	Parameters []WorkflowParameter `json:"parameters,omitempty"`
+	// RuntimeVersion is 1 or 2, and is STAMPED AT CREATE: there is no field for
+	// it on WorkflowPatch because the server has no patch path for it. This is
+	// the only request in the CLI that can set it, which is why the manifest's
+	// `runtime` key is read here and nowhere else on the write side.
+	//
+	// omitempty, so a v1 folder's create body is byte-identical to the one the
+	// CLI sent before durable workflows existed — an absent key is 1 server-side.
+	RuntimeVersion int `json:"runtimeVersion,omitempty"`
+	// ReportingTimezone is the declared execution calendar, when the folder
+	// manages one. A plain string with omitempty rather than the patch's pointer,
+	// because the three-state distinction does not exist here: the CREATE
+	// endpoint REFUSES an explicit empty string (reportingtz.ParseDeclared
+	// rejects it) and stamps the organization's default when the key is absent,
+	// which is exactly what an unmanaged folder wants. A folder declaring the
+	// reset value sends the literal "UTC" instead — see effectiveDeclaredZone.
+	ReportingTimezone string `json:"reportingTimezone,omitempty"`
 }
 
 // WorkflowPatch is the body of PUT /workflow/:id, mirroring the subset of
@@ -164,16 +187,23 @@ type CreateWorkflowInput struct {
 // legitimately means — "I don't manage parameters" and "I declare none" — and a
 // plain slice with omitempty collapses them into the first, making it impossible
 // to remove the last parameter from a workflow.
+// ReportingTimezone is a POINTER for the same reason Parameters is one, and the
+// server's rule is what forces it: an absent key leaves the declared execution
+// zone alone, while an explicit "" RESETS it to the literal "UTC"
+// (rworkflow.resolveDeclaredZonePatch). Both are things a folder legitimately
+// means — "I don't manage the zone" and "I declare UTC" — and a plain string
+// with omitempty collapses them into the first, making the reset unexpressible.
 type WorkflowPatch struct {
-	Title      string               `json:"title,omitempty"`
-	Entrypoint string               `json:"entrypoint,omitempty"`
-	Parameters *[]WorkflowParameter `json:"parameters,omitempty"`
+	Title             string               `json:"title,omitempty"`
+	Entrypoint        string               `json:"entrypoint,omitempty"`
+	Parameters        *[]WorkflowParameter `json:"parameters,omitempty"`
+	ReportingTimezone *string              `json:"reportingTimezone,omitempty"`
 }
 
 // Empty reports a patch that would change nothing, so the caller can skip the
 // round trip rather than send `{}`.
 func (p WorkflowPatch) Empty() bool {
-	return p.Title == "" && p.Entrypoint == "" && p.Parameters == nil
+	return p.Title == "" && p.Entrypoint == "" && p.Parameters == nil && p.ReportingTimezone == nil
 }
 
 // ValidateWorkflowFiles dry-runs a candidate workflow. Findings are data: a

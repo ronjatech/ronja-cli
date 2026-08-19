@@ -98,6 +98,10 @@ With --json, the server's response verbatim plus an "ok" boolean.`,
 				Entrypoint: f.Manifest.Entrypoint,
 				Parameters: params,
 				Files:      validateFilesOf(files),
+				// The runtime the FOLDER declares, so a candidate is checked
+				// against the rules its author wrote for. Absent (0) sends
+				// nothing and the server reads the default.
+				RuntimeVersion: f.Manifest.Runtime,
 			})
 			if err != nil {
 				return err
@@ -245,9 +249,14 @@ func printFindings(out *os.File, findings []api.ValidateFinding) {
 			return group[i].IsError() && !group[j].IsError()
 		})
 		for _, f := range group {
-			label := "warning"
-			if f.IsError() {
-				label = "error"
+			// The server's own word, so a tier the CLI has never heard of prints
+			// as itself. It grew an `info` tier for the durable-workflow
+			// advisories, and labelling those "warning" would report a note about
+			// a shape as a problem with it — while hard-coding the new word here
+			// would only move the same bug to the next tier.
+			label := f.Severity
+			if label == "" {
+				label = "warning"
 			}
 			fmt.Fprintf(out, "    %-7s %s: %s\n", label, f.Code, f.Message)
 			if f.Marker != "" {

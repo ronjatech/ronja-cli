@@ -388,6 +388,126 @@ func TestInitFromAcceptsAnIdenticalDestinationAndRefusesADifferentOne(t *testing
 	}
 }
 
+// The runtime is stamped when the first push CREATES the workflow and cannot be
+// changed afterwards, so a value the instance cannot act on has to be refused
+// at the flag rather than discovered later as a create-body rejection.
+func TestInitRejectsAnUnknownRuntime(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+
+	for _, value := range []string{"0", "3", "-1"} {
+		dir := t.TempDir()
+		_, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", value)
+		if err == nil {
+			t.Fatalf("init accepted --runtime %s", value)
+		}
+		if !strings.Contains(err.Error(), "--runtime") {
+			t.Errorf("error does not mention the flag: %v", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, wfdir.ManifestName)); !os.IsNotExist(statErr) {
+			t.Error("a manifest was written despite the refusal")
+		}
+	}
+}
+
+// The v1 folder is the one that must not move: no runtime key, no scaffold,
+// byte-for-byte what `wf init` produced before durable workflows existed.
+func TestInitDefaultRuntimeWritesNeitherKeyNorScaffold(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	dir := t.TempDir()
+
+	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--json")
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if payload := decodeJSON(t, out); payload["runtime"] != float64(wfdir.RuntimeDefault) {
+		t.Errorf("runtime = %v, want %d", payload["runtime"], wfdir.RuntimeDefault)
+	}
+	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, "runtime") {
+		t.Errorf("a v1 manifest carries a runtime key: %s", raw)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "main.py")); !os.IsNotExist(err) {
+		t.Error("a v1 init wrote a scaffold — v1 folders start empty, as they always have")
+	}
+}
+
+// --runtime 2 has to produce both halves: the manifest key the first push sends
+// as runtimeVersion, and code written in the shapes a resume depends on. A
+// durable workflow scaffolded from v1 code journals nothing, which is a silent
+// failure — the run works, and the resume that was the point of it does not.
+func TestInitDurableRuntimeWritesTheKeyAndAScaffold(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	dir := t.TempDir()
+
+	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "2", "--json")
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	payload := decodeJSON(t, out)
+	if payload["runtime"] != float64(wfdir.RuntimeDurable) {
+		t.Errorf("runtime = %v, want %d", payload["runtime"], wfdir.RuntimeDurable)
+	}
+	if payload["scaffolded"] != true {
+		t.Errorf("scaffolded = %v, want true", payload["scaffolded"])
+	}
+
+	manifest, err := wfdir.LoadManifest(dir, wfdir.WorkflowKind)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	if !manifest.IsDurable() {
+		t.Fatalf("manifest runtime = %d, want %d", manifest.RuntimeVersion(), wfdir.RuntimeDurable)
+	}
+
+	// The scaffold is checked by the PROPERTIES that make a resume work, not by
+	// its prose: decorated steps, a keyless loop, and a journaled clock.
+	scaffold := readFile(t, dir, "main.py")
+	for _, want := range []string{"@tools.step", "for order_id in load_orders():", "tools.now()"} {
+		if !strings.Contains(scaffold, want) {
+			t.Errorf("the durable scaffold is missing %q:\n%s", want, scaffold)
+		}
+	}
+	// CODE lines only: the comment naming datetime.now() is the constraint being
+	// stated, and a substring check over the whole file would flag it.
+	for _, line := range strings.Split(scaffold, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if strings.Contains(line, "datetime.now()") {
+			t.Errorf("the durable scaffold reaches for the wall clock, which a resume cannot replay: %s", line)
+		}
+	}
+	// Keys are DERIVED in the durable runtime. A scaffold carrying a hand-written
+	// key would teach the one habit that breaks a loop's resume: two iterations
+	// on one key.
+	if strings.Contains(scaffold, `tools.step("`) {
+		t.Errorf("the durable scaffold writes a key string:\n%s", scaffold)
+	}
+}
+
+// `wf init --runtime 2` inside a directory that already holds main.py is the
+// documented way to adopt a script you have. The scaffold is skipped, never
+// written over the file.
+func TestInitDurableRuntimeLeavesAnExistingEntrypointAlone(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	dir := t.TempDir()
+	writeLocal(t, dir, "main.py", "print('mine')\n")
+
+	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "2", "--json")
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if payload := decodeJSON(t, out); payload["scaffolded"] != false {
+		t.Errorf("scaffolded = %v, want false", payload["scaffolded"])
+	}
+	if got := readFile(t, dir, "main.py"); got != "print('mine')\n" {
+		t.Errorf("main.py = %q — the scaffold overwrote an existing entrypoint", got)
+	}
+}
+
 // --- status ----------------------------------------------------------------
 
 func TestStatusCleanAfterClone(t *testing.T) {

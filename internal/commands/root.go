@@ -10,11 +10,14 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime/debug"
+	"syscall"
 
 	"github.com/spf13/cobra"
 )
@@ -88,6 +91,24 @@ func Execute() {
 	}
 }
 
+// signalContext is the context every command runs under: cancelled on SIGINT or
+// SIGTERM.
+//
+// Installed at the ROOT rather than per command, because the alternative is
+// per-command and was: cmd.Context() was context.Background(), so every
+// cancellation branch a poll loop carries — `wf test`'s run wait,
+// WaitForTableBuild's, `api --wait-until`'s — was unreachable, and Ctrl-C simply
+// killed the process mid-request. A cancelled context ends the wait with a
+// reason instead, and the exit is non-zero because a wait that was interrupted
+// did not finish.
+//
+// It cancels the WAIT, never the work: a build, a run and a commit all continue
+// server-side whether or not this process is watching, which is what the
+// commands that wait say out loud.
+func signalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
 // run executes the command tree and returns the process exit code, reporting
 // any failure on stderr.
 //
@@ -101,7 +122,9 @@ func run(args []string) int {
 	if args != nil {
 		root.SetArgs(args)
 	}
-	if err := root.Execute(); err != nil {
+	ctx, stop := signalContext()
+	defer stop()
+	if err := root.ExecuteContext(ctx); err != nil {
 		// Cobra has already printed the error for usage problems; this covers
 		// the RunE path. Keep it on stderr so --json output stays parseable.
 		if !errors.Is(err, errAlreadyReported) {
@@ -139,19 +162,22 @@ Both take --jq to pull a field out of the answer, so nothing has to be piped
 through another interpreter to read it. api also has -F for file uploads and
 --wait-until for asynchronous work:
 
-  ronja api /api/v2/feature/query --jq -r '.items[].id'
+  ronja api /api/v2/feature/query --jq '.items[].id' -r
   ronja api -X POST /api/v2/file/upload/uploads -F file=@report.pdf
   ronja api /api/v2/workflow/run/$id --wait-until '.status != "running"'
 
-The other exceptions are the two folder dev loops, which are stateful in a way
-HTTP alone handles badly. If you are editing a workflow or a data app from
-files on disk, use these rather than PUTting source into a JSON body:
+The other exceptions are the folder dev loops, which are stateful in a way HTTP
+alone handles badly. If you are editing a workflow, a data app or a feature's
+derived tables from files on disk, use these rather than PUTting source into a
+JSON body:
 
   ronja wf             develop a workflow from a local folder
                        (init, clone, status, validate, push, test, publish,
                        discard)
   ronja app            develop a data app from a local folder
                        (init, clone, status, push, validate, publish, discard)
+  ronja pipeline       develop a feature's derived tables from a local folder
+                       (init, clone, status, push, publish, discard)
 
 Each login is stored as a named PROFILE — one instance, one organization, one
 token. An access token belongs to a single organization, so belonging to two
@@ -179,7 +205,7 @@ credentials entirely and never touch disk.`,
 
 	root.AddCommand(newLoginCmd(), newLogoutCmd(), newWhoamiCmd(), newProfileCmd(),
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
-		newAPICmd(), newQueryCmd(), newDatabaseCmd())
+		newPipelineCmd(), newAPICmd(), newQueryCmd(), newDatabaseCmd())
 	return root
 }
 
