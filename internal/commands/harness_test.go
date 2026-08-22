@@ -182,6 +182,10 @@ type fakeInstance struct {
 	// for, and a plain string cannot tell them apart.
 	timezonePatches   map[string]*string
 	entrypointPatches map[string]string
+	// runtimePatches records the runtimeVersion each PUT :id carried. A plain
+	// int, unlike the pointer maps above: the field has no reset value and no
+	// third state — 0 is "the push did not send one".
+	runtimePatches map[string]int
 	// tenantZone is what the fake stamps on a create that names no zone,
 	// mirroring rworkflow.stampDeclaredZone resolving the organization default.
 	tenantZone string
@@ -259,6 +263,7 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 		parameterPatches:  map[string]*[]api.WorkflowParameter{},
 		timezonePatches:   map[string]*string{},
 		entrypointPatches: map[string]string{},
+		runtimePatches:    map[string]int{},
 		tenantZone:        "UTC",
 		tableNames:        map[string]string{},
 		privilegeLevel:    50,
@@ -706,6 +711,19 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			}
 			f.timezonePatches[id] = patch.ReportingTimezone
 		}
+		// Mirrors rworkflow.CheckRuntimeUpgrade: the runtime moves ONE WAY, so a
+		// value below the row's is a 400 rather than a silent no-op. Modelled
+		// because the CLI's own refusal runs BEFORE any write, and a test that
+		// only exercised the client-side guard would not notice the day the
+		// server's disappeared.
+		if patch.RuntimeVersion != 0 {
+			if patch.RuntimeVersion < wf.RuntimeVersion {
+				http.Error(w, `{"error":"runtimeVersion is a one-way upgrade"}`, http.StatusBadRequest)
+				return true
+			}
+			wf.RuntimeVersion = patch.RuntimeVersion
+			f.runtimePatches[id] = patch.RuntimeVersion
+		}
 		f.patchServed = true
 		writeJSON(w, nil)
 		return true
@@ -760,6 +778,10 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// carries the parent's calendar rather than re-stamping today's
 			// organization default, so a checkout must not look like a change.
 			draft.ReportingTimezone = parent.ReportingTimezone
+			// And its runtime — same rule, and it is what makes the upgrade
+			// legible: the draft starts at the parent's generation, the push
+			// raises it there, and commit publishes the flip.
+			draft.RuntimeVersion = parent.RuntimeVersion
 		}
 		f.writeRow(w, draft)
 		return true

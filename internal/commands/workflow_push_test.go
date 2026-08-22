@@ -184,11 +184,11 @@ func TestPushFirstPushCreatesWorkflowAndRecordsBinding(t *testing.T) {
 	}
 }
 
-// The runtime is stamped at CREATE and has no patch path, so the manifest's
-// declaration has exactly one chance to reach the server. Both halves are the
-// test: the create carries it, and every later push does not — a folder whose
-// workflow already exists must not fail, and must not appear to restamp it.
-func TestPushSendsTheDeclaredRuntimeOnCreateOnly(t *testing.T) {
+// The runtime is stamped at CREATE. Both halves are the test: the create carries
+// the manifest's declaration, and a later push of a folder that already AGREES
+// with its row does not restamp it. (The upgrade a later push CAN carry, when
+// the two disagree, is workflow_runtime_test.go's.)
+func TestPushSendsTheDeclaredRuntimeAtCreate(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	dir := t.TempDir()

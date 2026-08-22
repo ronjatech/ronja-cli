@@ -267,9 +267,12 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 	// command line cannot execute. Note what is deliberately NOT suggested:
 	// turning the gate off on the draft would work, and would then commit that
 	// governance change onto the live workflow at publish. Nobody should learn
-	// that trick from a CLI hint.
+	// that trick from a CLI hint — which is also why the second line names the
+	// CONVERSION (a mid-run approval, which the author performs in Ronja with the
+	// code change it belongs to) and not the off-switch that would appear to be
+	// the same fix and is not.
 	if draft.IsGated() {
-		return nil, fmt.Errorf("workflow %s has an approval gate, and an approval can only be produced inside an agent session — a run started over HTTP has no way to carry one.\n  Test this workflow from a Ronja chat instead",
+		return nil, fmt.Errorf("workflow %s has an approval gate, and an approval can only be produced inside an agent session — a run started over HTTP has no way to carry one.\n  Test this workflow from a Ronja chat instead.\n  This is the legacy PRE-RUN gate and it is deprecated: ask Ronja to convert the workflow to a mid-run approval (tools.requireApproval in a Durable workflow), which runs from here, from automations and from apps",
 			draft.ID)
 	}
 

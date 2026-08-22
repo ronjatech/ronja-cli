@@ -808,10 +808,13 @@ Two files describe the folder:
   `runtime` is the workflow's runtime version — `2` for a **durable** workflow,
   absent for the default. Unlike `parameters` it is a plain int with no
   three-state pointer, because the third state has nothing to describe: the
-  runtime is *stamped at create* and the server has no patch for it, so
-  "unmanaged" and "declares the default" both mean "send nothing, get 1". The
-  key is written only for `--runtime 2`, which keeps a v1 folder's `ronja.json`
-  byte-identical to what the CLI wrote before durable workflows existed.
+  runtime moves **one way**, so "unmanaged" and "declares the default" both mean
+  "send nothing, get 1". The key is written only for `--runtime 2`, which keeps a
+  v1 folder's `ronja.json` byte-identical to what the CLI wrote before durable
+  workflows existed. A push carries the declaration to a workflow still on
+  runtime 1 (`runtime  1 → 2 (Durable)` in the report; the patch lands on your
+  draft, and `wf publish` commits the flip). Declaring `1` against a workflow
+  that is already durable is **refused** — the runtime cannot be lowered.
 
   `reportingTimezone` is the **calendar the workflow's runs execute on** — the
   IANA zone its DuckDB session is set to, so it is what `date_trunc`,
@@ -922,7 +925,13 @@ Four behaviours are deliberate and easy to undo by accident:
   re-derives the bindings on every push, so a converted script that writes a
   table needs the flag from its first push, published or not. An approval-gated
   workflow is refused outright rather than worked around — disabling the gate
-  on the draft would ride into the parent on publish.
+  on the draft would ride into the parent on publish. That refusal is about the
+  **legacy pre-run gate**, which is deprecated and can no longer be turned on:
+  it holds the whole run and only a Ronja chat session can satisfy it. Ask Ronja
+  to convert the workflow to a **mid-run approval** (`tools.requireApproval` in a
+  durable workflow), which parks the run where the decision belongs and works
+  from `wf test`, automations and data apps alike; the configured approvers and
+  delivery carry over unchanged.
 - **Exit zero means the thing did not fail.** `validate` exits non-zero on error
   findings; `test` exits non-zero on a failed run, on a timeout, and on a status
   it does not recognise — but zero on a run that finished AND on a durable run
@@ -954,12 +963,24 @@ ronja wf test --resume                        # continue from where it stopped
 Three things are worth knowing, and each is a place the obvious behaviour would
 be wrong:
 
-- **The runtime is stamped at create, and only there.** There is no patch path
-  server-side, so the manifest's `runtime` rides the `POST /workflow` body of
-  the push that creates the workflow and is never sent again. A folder that
-  declares `runtime: 2` against a workflow that already exists is *not* an
-  error — it simply changes nothing, because nothing can. Getting it wrong
-  means a new folder, not a flag.
+- **The runtime moves one way: 1 → 2.** The manifest's `runtime` rides the
+  `POST /workflow` body of the push that creates the workflow, and afterwards a
+  push **upgrades** a workflow still on runtime 1 to match — the patch lands on
+  your draft, so the flip is reviewed and published with the code change that
+  needs it (`ronja wf publish`). The upgrade is reported as
+  `runtime  1 → 2 (Durable)`, and `ronja wf status` shows it as pending drift
+  beforehand. The other direction does not exist: a durable workflow's journal is
+  keyed by the v2 derivation, so lowering it would orphan every journaled step
+  and silently re-run the pipeline. A folder declaring `runtime: 1` against a
+  durable workflow is refused before the push writes anything — fix `ronja.json`,
+  or clone the workflow again. A live workflow is also refused while one of its
+  runs is in flight; runs already started keep the runtime they began with,
+  resumes included.
+  Upgrading does not rewrite your Python. Convert the code in the same push:
+  keyless `tools.step`, `tools.now()` / `tools.uuid()` / `tools.random()`,
+  `tools.http` for outbound calls, and an entrypoint ending in a bare name.
+  `ronja wf push` validates against the declared runtime, so the Durable
+  advisories come back in the same command.
 - **`--resume` finds its target on the SERVER.** It reads
   `GET /workflow/:id/runs` (newest first, explicitly ordered — the endpoint has
   no default ordering) and resumes the most recent **failed** run of the row

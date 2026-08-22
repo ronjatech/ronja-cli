@@ -149,10 +149,8 @@ type CreateWorkflowInput struct {
 	// omitempty because a folder that does not manage parameters must create a
 	// workflow with none rather than assert an empty declaration.
 	Parameters []WorkflowParameter `json:"parameters,omitempty"`
-	// RuntimeVersion is 1 or 2, and is STAMPED AT CREATE: there is no field for
-	// it on WorkflowPatch because the server has no patch path for it. This is
-	// the only request in the CLI that can set it, which is why the manifest's
-	// `runtime` key is read here and nowhere else on the write side.
+	// RuntimeVersion is 1 or 2. Stamped at CREATE here, and afterwards raisable
+	// one way (1 -> 2) through WorkflowPatch — never lowered.
 	//
 	// omitempty, so a v1 folder's create body is byte-identical to the one the
 	// CLI sent before durable workflows existed — an absent key is 1 server-side.
@@ -193,17 +191,25 @@ type CreateWorkflowInput struct {
 // (rworkflow.resolveDeclaredZonePatch). Both are things a folder legitimately
 // means — "I don't manage the zone" and "I declare UTC" — and a plain string
 // with omitempty collapses them into the first, making the reset unexpressible.
+// RuntimeVersion is a plain int with omitempty, and the third state the two
+// pointers carry has nothing to describe here: the field moves ONE WAY (1 -> 2,
+// the Durable runtime), so "the folder does not manage it" and "the folder
+// declares the runtime the row already has" both mean "send nothing". The server
+// refuses 2 -> 1 outright; the CLI refuses it earlier, before it has written
+// anything.
 type WorkflowPatch struct {
 	Title             string               `json:"title,omitempty"`
 	Entrypoint        string               `json:"entrypoint,omitempty"`
 	Parameters        *[]WorkflowParameter `json:"parameters,omitempty"`
 	ReportingTimezone *string              `json:"reportingTimezone,omitempty"`
+	RuntimeVersion    int                  `json:"runtimeVersion,omitempty"`
 }
 
 // Empty reports a patch that would change nothing, so the caller can skip the
 // round trip rather than send `{}`.
 func (p WorkflowPatch) Empty() bool {
-	return p.Title == "" && p.Entrypoint == "" && p.Parameters == nil && p.ReportingTimezone == nil
+	return p.Title == "" && p.Entrypoint == "" && p.Parameters == nil &&
+		p.ReportingTimezone == nil && p.RuntimeVersion == 0
 }
 
 // ValidateWorkflowFiles dry-runs a candidate workflow. Findings are data: a

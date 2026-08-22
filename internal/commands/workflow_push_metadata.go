@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"fmt"
 	"reflect"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
@@ -68,7 +69,46 @@ func metadataPatch(manifest *wfdir.Manifest, target *api.Workflow) api.WorkflowP
 			patch.ReportingTimezone = &zone
 		}
 	}
+	// The runtime upgrade. Only ever RAISED, and only from a runtime the server
+	// actually told us about: a row whose runtimeVersion came back 0 is an
+	// instance that did not say (the field predates this CLI's contract with it),
+	// and patching a runtime on that guess would be changing semantics on a hunch.
+	// The DOWNGRADE half is not expressible here at all — checkRuntimeDrift
+	// refuses it before the push writes anything, because a folder that declares
+	// runtime 1 against a Durable row is a mistake to report, not a patch to skip.
+	if target.RuntimeVersion > 0 && manifest.RuntimeVersion() > target.RuntimeVersion {
+		patch.RuntimeVersion = manifest.RuntimeVersion()
+	}
 	return patch
+}
+
+// checkRuntimeDrift refuses the ONE runtime difference a push can never resolve:
+// a folder declaring the standard runtime against a workflow that is already
+// Durable.
+//
+// It is a refusal rather than a silent skip because the two readings of that
+// state are far apart — "my ronja.json predates the upgrade somebody made in the
+// browser" and "I want this workflow back on runtime 1" — and the second is
+// impossible: a Durable workflow's journal is keyed by the v2 derivation, so the
+// server refuses the downgrade too. Silently pushing code written for one runtime
+// at a workflow running the other is the outcome worth spending an error on.
+//
+// Runs against the LIVE row, before the push writes anything — the point is to
+// fail before a file lands, not after.
+//
+// A row reporting runtime 0 said nothing (an instance older than this contract),
+// and an unbound folder has no row at all: both answer "no opinion" rather than
+// a refusal built on a missing value.
+func checkRuntimeDrift(f *folder, live *api.Workflow) error {
+	if live == nil || live.RuntimeVersion == 0 {
+		return nil
+	}
+	if f.Manifest.RuntimeVersion() >= live.RuntimeVersion {
+		return nil
+	}
+	return fmt.Errorf("this folder declares runtime %d, but %s is already runtime %d (Durable) on the server — the runtime is a one-way upgrade and cannot be lowered.\n  Set \"runtime\": %d in %s to match, or clone the workflow again into a fresh folder",
+		f.Manifest.RuntimeVersion(), live.ID, live.RuntimeVersion,
+		live.RuntimeVersion, wfdir.ManifestPath(f.Root))
 }
 
 // sameParameters compares two declarations for sync purposes. Order is
@@ -101,6 +141,9 @@ func applyPatch(row *api.Workflow, patch api.WorkflowPatch) {
 	}
 	if patch.Parameters != nil {
 		row.Parameters = *patch.Parameters
+	}
+	if patch.RuntimeVersion != 0 {
+		row.RuntimeVersion = patch.RuntimeVersion
 	}
 }
 

@@ -58,7 +58,8 @@ type Workflow struct {
 	Kind string `json:"kind"`
 	// RuntimeVersion is the semantics generation the code is written against: 1
 	// (the standard runtime) or 2 (durable — steps are journaled, so a failed
-	// run can be resumed). Stamped at create and never patched.
+	// run can be resumed). Stamped at create and afterwards raisable ONE WAY,
+	// 1 -> 2, through WorkflowPatch; the server refuses 2 -> 1 outright.
 	//
 	// ZERO MEANS THE INSTANCE DID NOT SAY, not "runtime 1". The column is NOT
 	// NULL server-side, so an instance that has it always sends a value; a 0

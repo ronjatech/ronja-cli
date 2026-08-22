@@ -89,11 +89,15 @@ type pushOptions struct {
 type pushResult struct {
 	// Created reports that this push brought the workflow into existence.
 	Created bool `json:"created"`
-	// RuntimeVersion is the runtime this push STAMPED, and is set only on the
-	// push that created the workflow — the one request that can set it. Absent
-	// afterwards rather than restated, because a later push does not send it and
-	// reporting a value it did not write would read as a claim it re-asserted one.
+	// RuntimeVersion is the runtime this push WROTE — at create, or on the one-way
+	// upgrade a later push can carry. Absent when the push did not write it,
+	// rather than restated from the row: reporting a value it did not send would
+	// read as a claim it re-asserted one.
 	RuntimeVersion int `json:"runtimeVersion,omitempty"`
+	// RuntimeUpgradedFrom is the runtime the row held BEFORE this push raised it.
+	// Set only on an upgrade, so RuntimeVersion alone cannot tell a create from a
+	// conversion and this is what says which happened.
+	RuntimeUpgradedFrom int `json:"runtimeUpgradedFrom,omitempty"`
 	// WorkflowID is the STABLE identity (what ronja.json records); DraftID is
 	// the row the files were actually written to. For a parentless draft they
 	// are the same id.
@@ -213,6 +217,16 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return nil, err
 	}
 
+	// 2b. The runtime, which moves ONE WAY. A folder declaring runtime 1 against
+	// a workflow that is already Durable is refused HERE — still in the pure-read
+	// phase, before a draft is checked out or a file is written — because the
+	// push cannot resolve it in either direction and pushing v1 code at a v2 row
+	// is the outcome the refusal exists to prevent. The UPGRADE half needs no
+	// decision: it rides the ordinary metadata patch below.
+	if err := checkRuntimeDrift(f, existing.Workflow); err != nil {
+		return nil, err
+	}
+
 	// 3. Validate, so a binding error names the file that contains it rather
 	// than whichever file the sync happened to be writing.
 	if opts.Validate {
@@ -232,9 +246,10 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 			Parameters: validateParams,
 			Files:      validateFilesOf(local),
 			// The runtime the folder DECLARES, including on a push to a workflow
-			// that already exists. The manifest cannot restamp an existing row —
-			// there is no patch path — but a candidate still has to be checked
-			// against the runtime its author wrote for.
+			// that already exists — where it is both what the metadata patch may
+			// RAISE the row to (1 -> 2, never lowered) and, either way, the
+			// runtime this candidate's author wrote for. Validating against the
+			// row's instead would check the code about to be upgraded past.
 			RuntimeVersion: f.Manifest.Runtime,
 		})
 		if err != nil {
@@ -345,8 +360,14 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// file before it will let that one be deleted.
 	patch := metadataPatch(f.Manifest, target)
 	if !patch.Empty() {
+		// Read BEFORE applyPatch, which mirrors the accepted patch onto `target`.
+		runtimeBefore := target.RuntimeVersion
 		if err := client.UpdateWorkflow(ctx, target.ID, patch); err != nil {
 			return stop(fmt.Errorf("update %s: %w", describePatch(patch), err))
+		}
+		if patch.RuntimeVersion != 0 {
+			result.RuntimeUpgradedFrom = runtimeBefore
+			result.RuntimeVersion = patch.RuntimeVersion
 		}
 		// The row holds this now, and `target` is what a baseline recorded from
 		// here on describes — including the one stop() writes if the deletions
@@ -499,6 +520,9 @@ func describePatch(patch api.WorkflowPatch) string {
 	if patch.ReportingTimezone != nil {
 		parts = append(parts, fmt.Sprintf("the reporting timezone to %q", effectiveDeclaredZone(*patch.ReportingTimezone)))
 	}
+	if patch.RuntimeVersion != 0 {
+		parts = append(parts, fmt.Sprintf("the runtime to %d (Durable)", patch.RuntimeVersion))
+	}
 	return strings.Join(parts, " and ")
 }
 
@@ -622,11 +646,12 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 			// row created without them would disagree — this just saves the round
 			// trip. Nil for an unmanaged folder, which creates none either way.
 			Parameters: f.Manifest.DeclaredParameters(),
-			// The ONE request that can set the runtime: it is stamped at create,
-			// and the server has no patch for it. A manifest declaring runtime 2
-			// therefore takes effect here or never — a push to a workflow that
-			// already exists does not re-send it, and is not refused for
-			// declaring something nothing can act on.
+			// The runtime, stamped at create. This is the only request that can
+			// pick it FREELY: afterwards it moves one way only, so a push to a
+			// workflow that already exists sends runtimeVersion 2 as a metadata
+			// patch when the folder declares 2 against a runtime-1 row (reported
+			// as an upgrade), and refuses the reverse before writing anything —
+			// there is no downgrade, on the server or here.
 			RuntimeVersion: f.Manifest.Runtime,
 			// Same round-trip saving for the declared calendar, but the value is
 			// the EFFECTIVE one: create refuses an explicit "" outright (unlike
@@ -1121,11 +1146,19 @@ func printPushReport(r *pushResult) {
 	if r.Created {
 		fmt.Fprintf(out, "  Created workflow %s\n", r.WorkflowID)
 		// Said only for the durable runtime, and only here: this is the moment
-		// it was stamped, and it cannot be changed afterwards.
+		// it was stamped.
 		if r.RuntimeVersion >= wfdir.RuntimeDurable {
 			fmt.Fprintf(out, "    runtime  %d — steps are journaled; a failed run resumes with `ronja wf test --resume`\n",
 				r.RuntimeVersion)
 		}
+	}
+	// The conversion of an EXISTING workflow, which lands on the draft and takes
+	// effect for live runs at `ronja wf publish`. Named as a transition rather
+	// than as a value because that is the change the author is making, and it is
+	// the one metadata change on this report that cannot be undone.
+	if r.RuntimeUpgradedFrom != 0 {
+		fmt.Fprintf(out, "    runtime  %d → %d (Durable) — one way; takes effect for live runs at `ronja wf publish`\n",
+			r.RuntimeUpgradedFrom, r.RuntimeVersion)
 	}
 	for _, path := range r.Pushed {
 		fmt.Fprintf(out, "    pushed   %s\n", path)

@@ -181,6 +181,11 @@ type remoteReport struct {
 	// ReportingTimezone follows Parameters exactly: set only when the folder
 	// manages the zone and a push would change the row's.
 	ReportingTimezone *timezoneReport `json:"reportingTimezone,omitempty"`
+	// Runtime is set only when the folder and the row disagree about the
+	// workflow's runtime generation — i.e. only when a push would upgrade it, or
+	// would be REFUSED for declaring the lower one. Absent otherwise, including
+	// for a row whose instance did not report a runtime at all.
+	Runtime *runtimeReport `json:"runtime,omitempty"`
 }
 
 // parameterReport is the declaration on each side, by name — enough to see what
@@ -196,6 +201,16 @@ type parameterReport struct {
 type timezoneReport struct {
 	Local  string `json:"local"`
 	Remote string `json:"remote"`
+}
+
+// runtimeReport is the runtime generation on each side. Distinct is what makes
+// it readable: Local above Remote is the upgrade a push would apply, Local BELOW
+// Remote is the downgrade a push refuses — and Refused says which without the
+// reader comparing two numbers.
+type runtimeReport struct {
+	Local   int  `json:"local"`
+	Remote  int  `json:"remote"`
+	Refused bool `json:"refused,omitempty"`
 }
 
 // note appends one drift caveat. Every caller uses this rather than assigning,
@@ -326,6 +341,18 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 			}
 		}
 	}
+	// The runtime generation. Reported for EVERY folder, managed or not: unlike
+	// parameters and the calendar there is no "this folder does not manage the
+	// runtime" state — an absent `runtime` key means 1, which is a declaration.
+	// A row that reported no runtime at all (an older instance) is the one case
+	// with nothing to compare.
+	if target.RuntimeVersion > 0 && f.Manifest.RuntimeVersion() != target.RuntimeVersion {
+		out.Runtime = &runtimeReport{
+			Local:   f.Manifest.RuntimeVersion(),
+			Remote:  target.RuntimeVersion,
+			Refused: f.Manifest.RuntimeVersion() < target.RuntimeVersion,
+		}
+	}
 	switch {
 	case baseline == nil:
 		out.note("no local baseline — every remote file reads as new (this folder was never synced from here)")
@@ -417,7 +444,7 @@ func printStatus(r *statusReport) {
 			fmt.Fprintf(out, " (vs %s)", r.Remote.ComparedAgainst.ID)
 		}
 		fmt.Fprintln(out)
-		if !r.Remote.Drift.Dirty() && r.Remote.Parameters == nil && r.Remote.ReportingTimezone == nil {
+		if !r.Remote.Drift.Dirty() && r.Remote.Parameters == nil && r.Remote.ReportingTimezone == nil && r.Remote.Runtime == nil {
 			fmt.Fprintf(out, "    none\n")
 		} else {
 			printPathList(out, "new", r.Remote.Drift.Added)
@@ -431,6 +458,17 @@ func printStatus(r *statusReport) {
 			}
 			if z := r.Remote.ReportingTimezone; z != nil {
 				fmt.Fprintf(out, "    %-9s timezone: %s here, %s there\n", "changed", z.Local, z.Remote)
+			}
+			if rt := r.Remote.Runtime; rt != nil {
+				label := "changed"
+				suffix := " — a push upgrades it (one way)"
+				if rt.Refused {
+					// Named as a refusal, not as drift: this is the one row in
+					// this list a push does not resolve, it stops on.
+					label = "refused"
+					suffix = " — the runtime cannot be lowered; a push is refused"
+				}
+				fmt.Fprintf(out, "    %-9s runtime: %d here, %d there%s\n", label, rt.Local, rt.Remote, suffix)
 			}
 		}
 	}

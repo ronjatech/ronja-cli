@@ -63,13 +63,17 @@ type Manifest struct {
 	// can be resumed instead of re-run from the top.
 	//
 	// A plain int with omitempty rather than the three-state pointer Parameters
-	// and Access carry, because the third state has nothing to describe. Runtime
-	// is STAMPED AT CREATE and there is no patch path for it server-side, so the
-	// only thing this field can do is ride the create body of a first push:
-	// "unmanaged" and "declares the default" both mean "send nothing, get v1".
-	// A pointer would publish a distinction no code could act on, and would make
-	// every ronja.json written before durable workflows existed differ on disk
-	// from one that means exactly the same thing.
+	// and Access carry, because the third state has nothing to describe. The
+	// runtime moves ONE WAY (1 -> 2), so "unmanaged" and "declares the default"
+	// both mean "send nothing, get v1" — a pointer would publish a distinction no
+	// code could act on, and would make every ronja.json written before durable
+	// workflows existed differ on disk from one that means exactly the same thing.
+	//
+	// It rides the create body of a first push, and after that a push RAISES a
+	// row still on runtime 1 to match (the patch lands on the draft; publish
+	// commits the flip). Declaring 1 against a row that is already Durable is a
+	// REFUSAL, not a silent skip: the runtime cannot be lowered, and pushing v1
+	// code at a v2 row is the outcome worth an error.
 	//
 	// 0 is therefore absent, and absent is 1. `wf init` writes the key only for
 	// --runtime 2, so a v1 folder's manifest is byte-identical to what the CLI
