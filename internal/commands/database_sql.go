@@ -138,7 +138,7 @@ Mint one with:
 	cmd.Flags().StringVar(&out, "out", "",
 		"write the CSV to this file instead of stdout")
 	cmd.Flags().StringVar(&params, "params", "",
-		`bound parameters for $1, $2 … as a JSON array (e.g. '["a@b.c", 42]')`)
+		`bound parameters for $1, $2 … as a JSON array (e.g. '["a@b.c", 42]'). An element may itself be a list, bound as one Postgres array — match it with 'col = ANY($1)', not 'col IN ($1)'`)
 	cmd.Flags().IntVar(&maxRows, "max-rows", 0,
 		"maximum rows to return (default: the server's cap)")
 	cmd.Flags().DurationVar(&timeout, "timeout", api.DefaultDatabaseSQLTimeout,
@@ -150,9 +150,10 @@ Mint one with:
 //
 // It is parsed here rather than forwarded as an opaque string so a malformed
 // value fails locally, naming the flag, instead of arriving at the server as a
-// type error about a field the user did not type. The scalars-only rule is left
-// to the server, which already enforces it for the agent's identical parameter
-// path — duplicating it here would be a second definition to keep in step.
+// type error about a field the user did not type. The accepted-value rule (which
+// scalars, and where a list may bind as an array) is left to the server, which
+// already enforces it for the agent's identical parameter path — duplicating it
+// here would be a second definition to keep in step.
 //
 // The elements stay as RAW JSON. Decoding them into []any would turn every
 // number into a float64 and silently lose precision above 2^53, so a bound

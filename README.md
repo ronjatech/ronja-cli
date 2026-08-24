@@ -32,6 +32,13 @@ API can do, so it cannot drift from the API it describes. Everything it points
 at (`/llms.txt`, `/docs/api/endpoints.md`, `/docs/api/skills.md`,
 `/docs/api/openapi.json`) is served unauthenticated.
 
+`context` also **notices which kind of folder you are standing in** — a
+workflow, data-app or pipeline folder, or a loose `.py` — reports it as `kind`
+under `--json`, and prints that loop's verbs. A capability nobody finds is a
+capability that does not exist, and each of these loops already does the folder
+sync, the declarations and the polling that people were otherwise hand-rolling
+over raw HTTP.
+
 Two commands make that HTTP half less unpleasant without describing any of it —
 `ronja api` (a request runner) and `ronja query` (read-only SQL). Both are
 below, and the doctrine that admits them is immediately below this.
@@ -119,6 +126,10 @@ choice.** We ship a *cask*, because GoReleaser's formula support is deprecated
 and a formula was always the wrong shape for a pre-built binary — and Homebrew
 does not support casks on Linux. Linux and CI take `go install` or the tarball.
 
+The binaries are unsigned, so the cask carries a `postflight` hook that strips
+the Gatekeeper quarantine bit. Without it macOS reports a freshly installed
+`ronja` as "damaged" — which is not a message anyone connects to code signing.
+
 ### Working on the CLI
 
 From a checkout of the monorepo:
@@ -186,6 +197,13 @@ version (Go modules require a bare `vX.Y.Z` tag at a repository root), then
 runs [GoReleaser](.goreleaser.yaml) — tests, four cross-compiled targets, a
 GitHub Release on the mirror, and the Homebrew cask pushed to
 `ronjatech/homebrew-tap`.
+
+The publish step passes `GORELEASER_CURRENT_TAG` together with `--skip=validate`
+so that both triggers run **one** code path. On a tag push the environment
+variable merely restates the tag already on HEAD; on a `workflow_dispatch` run
+no such tag exists in the mirror checkout and GoReleaser's own validation would
+fail a perfectly correct release. The version is validated in the workflow
+instead.
 
 ### When a release fails part-way
 
@@ -334,6 +352,12 @@ a pipe, an agent, or `--json` — the name is REQUIRED and a bare call is an err
 rather than a prompt: the rule from `stdin.go` applies here too, and a picker
 drawn into a pipe would block forever on input nobody is typing.
 
+⚠️ One detail in `internal/commands/picker.go` (raw mode via the already-present
+`golang.org/x/term`) is easy to undo: `decodeKey` returns the number of bytes it
+**consumed**, because one read is not one keypress. Key repeat delivers several
+escape sequences in a single read, and a decoder that handles only the front of
+the buffer drops every keypress but the first.
+
 Profiles are created by signing in — there is no `profile add`, because a
 profile without a working credential reports "signed in" and then 401s.
 
@@ -382,6 +406,13 @@ A conflict between a typed flag and an exported variable resolves in favour of
 the flag. A conflict *within* one layer — both flags, or both variables — is an
 error.
 
+⚠️ An `$RONJA_TOKEN` credential resolves with **no organization**: `FromEnv`
+leaves `Resolved.TenantID` empty on purpose. An exported token and a stored
+profile are independent things — `eval "$(ronja env)"` followed by
+`profile use other-org` is an ordinary sequence — so borrowing the current
+profile's organization would have `wf push` send one organization's workflow id
+under the other organization's token.
+
 ## How login works
 
 `ronja login` runs an RFC 8628 device-authorization flow:
@@ -406,10 +437,13 @@ because it carries its bound user's live role and so can never exceed them. A
 plain `api_token` is refused outright, because `Who()` is then the token id
 rather than a row in `users`.
 
-> ⚠️ **Approving is therefore not session-only.** A PAT holder can drive the
+> ⚠️ **This was the ladder, and it is now closed.** A PAT holder could drive the
 > whole handshake headlessly and mint fresh, independently-revocable *child*
-> PATs. This is accepted — but note revoking the parent does **not** revoke the
-> children.
+> PATs — a credential that never really expires, which is precisely what the
+> 90-day TTL exists to cut. `POST /api/v2/cli/device/:userCode/approve` is now
+> `gt.HumanOnly`: a person approves in a browser, which is what `/cli-auth` was
+> always for. Denying stays machine-callable, because refusing a request narrows
+> nothing but the request.
 
 The PAT is **full access but time-bounded — 90 days**. Full access is right
 because a PAT never exceeds its bound user's live role (and `/api/v2/authentication`
@@ -418,6 +452,28 @@ expiry is right because this credential is reachable from a link a human can be
 phished into clicking. The server returns `expiresAt`, the CLI stores it, and
 `login` / `whoami` / `context` all report it — a credential's shelf
 life should be visible, not discovered as a 401.
+
+### Full access still stops short of a few things — deliberately
+
+Full access means "everything your role can do **through a machine**", which is
+not quite everything your role can do. A small set of routes carry `gt.HumanOnly`
+and refuse every machine caller — a PAT included — with a `403` whose body is
+`{"code": "human_required", "error": "…"}` naming what to do instead.
+
+Three things earn it: **hard delete** (a machine may never make something
+unrecoverable, so `DELETE :id` works and `DELETE :id/purge` does not),
+**changing who can get in** (invites, member removal, role assignment, auto-join
+domains, workspace membership — though *revoking* stays scriptable, because
+rotating a leaked credential at 3am is exactly when a human-only gate makes
+security worse), and **irreversible at organisation scale** (deleting the org,
+cascade execute, billing).
+
+⚠️ **This makes the CLI strictly less capable than the app, on purpose, and
+someone will file it as a bug.** The defence is the same one the whole PAT model
+rests on: you approved this credential in a browser ninety days ago, for the
+work you were doing then — not for *this*. Authorisation-at-mint is not
+authorisation-at-action. Creating secrets and managed-database roles are NOT in
+this class and stay fully scriptable; only Ronja's own auth is closed.
 
 Two properties of the poll loop are deliberate and easy to undo by accident:
 
@@ -515,7 +571,7 @@ Two refusals, both guarding a failure that is otherwise **silent**:
 
 | Flag | Does |
 |---|---|
-| `-q`, `--jq` | Filter the JSON response through a jq expression (real jq, via `gojq` — see `internal/jqf`). Compiled **before** the request goes out, so a typo costs nothing. |
+| `-q`, `--jq` | Filter the JSON response through a jq expression (real jq, via `gojq` — see `internal/jqf`). Compiled **before** the request goes out, so a typo costs nothing. Prints **every** matched value or fails; two bounds can make it fail — a **work and memory budget** scaled to the response size, and **10 s** per application. |
 | `-r`, `--raw` | With `--jq`, print string results unquoted — the form that makes `$(...)` substitution work. Only strings are affected; a number or object still renders as JSON, as jq does. Refused without `--jq`. |
 | `-o`, `--out` | Write the response body to a file, atomically and **0600**. stdout stays empty (the count goes to stderr). Streams unless a buffering flag is also set, so a large download is not held in memory. |
 | `--fail-on-error` | Exit non-zero when a **2xx** carries a non-empty top-level `error`. Off by default. |
@@ -542,6 +598,38 @@ turned into a failure.
 the filtered view. That is what each flag plainly means, so combining them makes
 neither one lie.
 
+**`--jq` prints every value the expression matched, or it prints nothing and
+fails. There is no cap, so there is never a prefix.** That is the whole rule,
+and it is what makes the output safe to capture: `ids=$(ronja api ... --jq
+'.result[].id' -r)` either holds the complete list or the command exited
+non-zero. Nothing is rendered until the whole stream has been collected, so a
+filter that fails at value 15,000 prints nothing rather than 14,999 good lines
+and then a failure.
+
+⚠️ **A 10,000-value cap was tried and removed, and re-adding one would be a
+regression.** It printed the first 10,000 with a note on stderr and exit 0, which
+is silent data loss: `2>/dev/null` — what a script normally does — throws away
+the only warning there was. Unlike `ronja query`'s `truncated:true`, which is
+reported *in the data*, a jq stream has nowhere to put such a field, so there
+was nothing honest to signal with. A `--jq-strict` flag to opt out only moved
+the problem: the default still lost data, and turning it on made `--jq` over a
+large listing print *nothing at all* for an answer that had been printable in
+full one release earlier — and `--fail-on-error` implied it, so that flag
+started destroying output it used to return. The flag is gone with the cap.
+
+What bounds an enormous answer instead is **a work and memory budget scaled to
+the size of the response**, plus **10 s** per application, `ronja query --jq`
+included. `--timeout` bounds the *request* and `--wait-timeout` the poll loop,
+and a jq expression can loop forever (`def f: f; f`) or manufacture data rather
+than select it (`range`, `recurse`, `repeat`, a string repeated with `*`), so
+the filter carries its own bounds rather than borrowing ones that do not exist.
+Both fail loudly and name the fitting remedy: past ~256 KiB of response the
+message says to narrow the **request**, below it that the **expression** is
+generating data. Those budgets are also what bounds the *collected answer* — the
+slice allocates like anything else, and the memory budget counts it — which is
+why removing the cap cost nothing. Constants and calibration live in
+`internal/jqf`.
+
 ### Waiting (`--wait-until`)
 
 | Flag | Does |
@@ -560,7 +648,7 @@ every one of them, including the ones added after it.
 Three rules worth knowing:
 
 - **A condition that produces no output is NOT satisfied.** "All of none" is
-  vacuously true in logic and catastrophically wrong here: `.items[] |
+  vacuously true in logic and catastrophically wrong here: `.result[] |
   select(.done)` matching nothing would end the wait the instant an endpoint
   answered with an unexpected shape. See `jqf.Holds`.
 - **jq truthiness surprises people**: `[]`, `0` and `""` are all **true**. Write
@@ -628,7 +716,7 @@ round trip.
 | `--file` | Read the SQL from a file, or from stdin with `-`. |
 | `--out` | Write the CSV to a file, mode **0600** (tenant data, same posture as the credential store) and **atomically** — temp file plus rename, not `os.WriteFile`, whose mode applies only on *create* (a pre-existing 0644 file would stay 0644), which follows a symlink, and whose short write leaves a truncated file indistinguishable from a complete result. stdout then stays empty, and the narration ("N rows written to …") goes to stderr. |
 | `--json` | Print the whole response envelope as one JSON object on stdout instead of the CSV. Combined with `--out`, the file gets the CSV and stdout gets the envelope. |
-| `--jq` | Filter the **envelope** through a jq expression — `rowCount`, `truncated`, `zoneUsed`, `error`, not the rows (those are CSV, and jq does not read CSV). Refused together with `--json`: two contradictory descriptions of stdout, and either precedence would silently discard a flag someone typed on purpose. |
+| `--jq` | Filter the **envelope** through a jq expression — `rowCount`, `truncated`, `zoneUsed`, `error`, not the rows (those are CSV, and jq does not read CSV). Refused together with `--json`: two contradictory descriptions of stdout, and either precedence would silently discard a flag someone typed on purpose. Same rule and bounds as `ronja api --jq`: every matched value or a failure, under the input-scaled work and memory budget and a 10 s deadline. |
 | `-r`, `--raw` | With `--jq`, print string results unquoted. Refused without it. |
 | `--max-rows` | `maxRows` on the request. Omitted means the server's default cap; the server clamps anything above its ceiling. |
 | `--timeout` | How long to wait for the query. Default 2m; `0` waits as long as it takes; negative is refused. |
@@ -781,8 +869,12 @@ Two files describe the folder:
   appears in ordinary API paths and is useless without a credential.
 
   A signed-out `wf status` has no organization to match on; it falls back to
-  matching on URL alone when that is unambiguous, and says so rather than
-  guessing when it is not.
+  matching on URL alone when that is unambiguous, and returns
+  `ErrAmbiguousInstance` — saying so rather than guessing — when it is not.
+
+  The organization itself is resolved **lazily** (`ensureTenant`, called only
+  where a binding is actually written, and a matched entry supplies it for
+  free), so a command that refuses locally still costs no round trip.
 
   `parameters` is the workflow's declared parameter set — what `wf test --param`
   supplies and the script reads with `tools.getVariable(name)`. Each entry takes
@@ -1179,6 +1271,10 @@ same `.ronja/` baseline, same per-instance bindings, same drift guard), and
 `ronja.json`'s `kind` is what keeps the two apart — running `wf push` in a
 data-app folder is refused rather than allowed to overwrite TSX with Python.
 
+The HTTP loop this wraps is documented for agents in the `dataapp-dev` API guide
+(`backend/lib/api/openapi/guides/dataapp-dev.md`, served at
+`/docs/api/guides/dataapp-dev.md`). Keep the two in step.
+
 ```bash
 ronja app clone data_app-abc           # or: ronja app init --from Revenue.tsx --feature collection-abc
 $EDITOR App.tsx
@@ -1257,6 +1353,16 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   working app's access on the first push after upgrading. Because these are
   privileges rather than settings, `push` and `status` list every id being
   granted or revoked instead of reporting that a difference exists.
+
+  ⚠️ "Declared, never derived" is true **over HTTP and in `ronja app`** — it is
+  not true of data apps in general, and asserting either half unqualified is
+  wrong. The in-app AGENT path does derive: `autoRegisterDataAppRefs` scans a
+  file the agent just wrote for `{{ ref('table-…') }}` markers and for id-shaped
+  `secret-` / `workflow-` / `agent-` literals, and registers what it finds.
+  Neither path is the gate, though. The **actual** enforcement is server-side:
+  `ValidateDataAppScope` at checkout and `ValidateAllowlistRefsLive` at publish,
+  plus admin-only commit for a shared app. `ronja.json` declares what the app
+  should be allowed; the server decides what it is.
 - **Every file write recompiles the whole bundle.** A push of N files is N
   esbuild compiles and N bundle uploads, so it takes a few seconds per file and
   says which file it is on. It also means intermediate states that do not
@@ -1895,6 +2001,21 @@ expression jq documentation teaches must get jq's answer or a clear parse
 error, never a subtly different one from a lookalike implementing the easy half
 of the syntax. `jqf.Holds` is the poll condition's truth rule and the one piece
 worth reading before touching it: zero outputs is **not** satisfied.
+
+**`cli/internal/jqf` is now the only copy.** It used to be hand-synced with a
+`backend/lib/jqf` twin, kept honest by a golden fixture CI diffed across the two
+modules; the backend copy went away when the agent's `callAPI` tool stopped
+taking a jq filter at all. That removal is worth knowing before anyone proposes
+putting one back: `match`/`gsub` with the `g` flag can peg a core inside a
+*single* uninterruptible gojq builtin, which no step, allocation or context
+budget can interrupt — tolerable on a laptop the caller owns, not on a shared
+multi-tenant pod with the expression chosen by a model. `testdata/jq_golden.json`
+survives as this package's own regression suite rather than a drift guard.
+
+`Run`/`RunBytes` have one policy — collect every output or return an error —
+and every command applies a filter through `runFilter` (or `runCondition` for
+`--wait-until`), which is where the 10 s deadline lives. `cmd.Context()` carries
+no deadline of its own.
 
 `internal/commands/api_output.go` holds everything `api` does with a response —
 the send-with-retry loop, the wait loop, and the emit path. Note

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"fmt"
 	"mime"
 	"net/http"
 	"os"
@@ -24,10 +25,10 @@ import (
 
 func TestAPIJQFiltersTheResponse(t *testing.T) {
 	e := newEchoServer(t)
-	e.body = `{"items":[{"id":"wf-1"},{"id":"wf-2"}]}`
+	e.body = `{"result":[{"id":"wf-1"},{"id":"wf-2"}]}`
 	signInTo(t, e.URL())
 
-	out, err := runCLI(t, t.TempDir(), "api", "--jq", ".items[].id", "/api/v2/workflow")
+	out, err := runCLI(t, t.TempDir(), "api", "--jq", ".result[].id", "/api/v2/workflow/query")
 	if err != nil {
 		t.Fatalf("api: %v", err)
 	}
@@ -52,13 +53,116 @@ func TestAPIJQRawUnquotesStrings(t *testing.T) {
 	}
 }
 
+// A LARGE LISTING IS PRINTED IN FULL. There is no cap, so there is no prefix.
+//
+// Both halves of this were regressions against the previous release. A 10,000-
+// value cap meant `ronja api --jq '.result[].id' -r 2>/dev/null` captured a
+// silently wrong prefix and exited zero, and the flag added to opt out of that
+// (--jq-strict, implied by --fail-on-error) printed NOTHING for an answer that
+// had been printable in full one release earlier. --fail-on-error is in the
+// table below precisely because that combination was the worse of the two.
+//
+// 20,000 is deliberately twice the old cap: a test at the boundary would pass
+// on an off-by-one that reintroduced it.
+func TestAPIJQPrintsEveryValueOfALargeListing(t *testing.T) {
+	const items = 20000
+
+	e := newEchoServer(t)
+	var body strings.Builder
+	body.WriteString(`{"result":[`)
+	for i := 0; i < items; i++ {
+		if i > 0 {
+			body.WriteString(",")
+		}
+		fmt.Fprintf(&body, `{"id":"wf-%d"}`, i)
+	}
+	body.WriteString(`]}`)
+	e.body = body.String()
+	signInTo(t, e.URL())
+
+	for _, args := range [][]string{
+		{"api", "--jq", ".result[].id", "-r", "/api/v2/feature/query"},
+		// The combination that regressed hardest: on the previous release this
+		// printed all 20,000 lines and exited zero, and on the branch it printed
+		// none and exited 1.
+		{"api", "--fail-on-error", "--jq", ".result[].id", "-r", "/api/v2/feature/query"},
+	} {
+		t.Run(strings.Join(args[1:len(args)-1], " "), func(t *testing.T) {
+			out, err := runCLI(t, t.TempDir(), args...)
+			if err != nil {
+				t.Fatalf("a large listing must not be a failure: %v", err)
+			}
+			if got := strings.Count(out, "\n"); got != items {
+				t.Errorf("printed %d values, want all %d", got, items)
+			}
+			if !strings.HasPrefix(out, "wf-0\nwf-1\n") ||
+				!strings.HasSuffix(out, fmt.Sprintf("wf-%d\n", items-1)) {
+				t.Errorf("stdout is not the whole stream in order: starts %.12q, ends %.12q",
+					out, out[len(out)-12:])
+			}
+		})
+	}
+}
+
+// --jq-strict does not exist, and this pins that it stays gone.
+//
+// It was the flag that let a caller opt out of a silent truncation, and it was
+// removed with the truncation it described: with no prefix there is nothing for
+// it to make strict, and leaving it as a no-op would tell a script author their
+// output is guarded by something that is not there. cobra refuses an unknown
+// flag, which is the honest answer — the caller finds out at the command line
+// rather than from the size of the file they captured.
+func TestAPIHasNoJQStrictFlag(t *testing.T) {
+	e := newEchoServer(t)
+	e.body = `{"result":[]}`
+	signInTo(t, e.URL())
+
+	_, err := runCLI(t, t.TempDir(), "api", "--jq-strict", "--jq", ".result[].id", "/api/v2/feature/query")
+	if err == nil {
+		t.Fatal("--jq-strict was accepted; it must not exist any more")
+	}
+	if !strings.Contains(err.Error(), "jq-strict") {
+		t.Errorf("the refusal should name the unknown flag, got: %v", err)
+	}
+}
+
+// A filter that FAILS prints nothing at all — not a prefix and then a failure.
+//
+// A jq program is a stream and a stream can fail late, so the CLI collects
+// every value before rendering any of them. Without that, `--jq` over a listing
+// with one bad row would write thousands of good lines to stdout and then exit
+// non-zero, and a caller redirecting stdout to a file would keep them.
+func TestAPIJQPrintsNothingWhenTheFilterFailsLate(t *testing.T) {
+	e := newEchoServer(t)
+	var body strings.Builder
+	body.WriteString(`{"result":[`)
+	for i := 0; i < 200; i++ {
+		if i > 0 {
+			body.WriteString(",")
+		}
+		fmt.Fprintf(&body, "%d", i)
+	}
+	body.WriteString(`]}`)
+	e.body = body.String()
+	signInTo(t, e.URL())
+
+	out, err := runCLI(t, t.TempDir(), "api",
+		"--jq", `.result[] | if . == 150 then . + "boom" else . end`, "/api/v2/feature/query")
+	if err == nil {
+		t.Fatal("a filter that fails partway must not exit zero")
+	}
+	if out != "" {
+		t.Errorf("stdout = %.60q, want nothing at all", out)
+	}
+}
+
 // A bad expression must cost nothing. Compiling after the round trip would
 // spend a request — and with --wait-until, a whole poll — to report a typo.
 func TestAPIRefusesABadJQExpressionBeforeSending(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
 
-	_, err := runCLI(t, t.TempDir(), "api", "--jq", ".items[", "/api/v2/workflow")
+	_, err := runCLI(t, t.TempDir(), "api", "--jq", ".result[", "/api/v2/workflow/query")
 	if err == nil {
 		t.Fatal("a malformed jq expression was accepted")
 	}

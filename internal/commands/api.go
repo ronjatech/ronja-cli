@@ -79,7 +79,7 @@ Pull one field out of the answer with --jq, so nothing has to be piped through
 another interpreter to read it. -r prints strings unquoted, which is what makes
 the result safe to substitute:
 
-  ronja api /api/v2/feature/query --jq '.items[] | select(.scope=="shared") | .id'
+  ronja api /api/v2/feature/query --jq '.result[] | select(.scope=="shared") | .id'
   id=$(ronja api -X POST /api/v2/workflow -d @wf.json --jq '.id' -r)
 
 Wait for asynchronous work with --wait-until, which re-issues the request until
@@ -90,6 +90,17 @@ runs, table builds, connector syncs, exports:
 
 Note jq's truthiness: [] and 0 are TRUE, so write an explicit comparison
 (.errors | length > 0) rather than relying on a bare field.
+
+--jq prints EVERY value the expression matched, or it fails and prints nothing.
+There is no cap and no prefix, so a script can trust what it captured. Two
+bounds can make it fail, and each says which one it was and what to do:
+
+  * a work and memory budget, scaled to the size of the response. A filter that
+    manufactures data (range, recurse, repeat, a string repeated with *) is
+    refused rather than allowed to exhaust the machine, and so is an honest
+    filter over a response too big for it — that one says to narrow the REQUEST.
+  * a 10-second deadline on one application of the filter, separate from
+    --timeout, which bounds the REQUEST.
 
 Other output handling:
 
@@ -249,7 +260,7 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 			}
 			defer resp.Body.Close()
 
-			return out.emit(resp, method, path)
+			return out.emit(cmd.Context(), resp, method, path)
 		},
 	}
 

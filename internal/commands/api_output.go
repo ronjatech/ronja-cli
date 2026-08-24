@@ -34,6 +34,23 @@ import (
 // that silently hands back a prefix.
 const maxResponseBuffer = 64 << 20
 
+// jqFilterTimeout bounds ONE application of a jq filter.
+//
+// ⚠️ THE COMMAND'S OWN CONTEXT IS NOT A BOUND. cmd.Context() carries no
+// deadline, and --timeout bounds the REQUEST, not what is done with the answer
+// — so `ronja query --jq 'def f: f; f'` had nothing at all standing between it
+// and a wedged terminal, and --wait-timeout 0 left the poll condition equally
+// unbounded. jqf's step budget refuses a runaway program on its own, but not
+// the shapes a step count cannot see (one enormous value costs a handful of
+// instructions), which is what this is for.
+//
+// Ten seconds is enormous for the work: the body is already in memory and the
+// heaviest realistic filter over one costs single-digit milliseconds. It is the
+// third of the three bounds a filter runs under — the other two are jqf's work
+// and memory budgets — and like them it FAILS rather than truncating, because
+// half an answer presented as a whole one is the outcome none of them may have.
+const jqFilterTimeout = 10 * time.Second
+
 // retryBaseDelay is the first pause before a retried attempt; it doubles up to
 // retryMaxDelay. A 429 or a 5xx from a pod restarting mid-deploy clears in
 // seconds, and starting lower just spends the budget before it does.
@@ -213,7 +230,7 @@ func (o apiOutput) buffered() bool {
 // writes the filtered view to stdout, and the unfiltered body reaches stdout
 // only when nothing else claimed it. So `--out resp.json --jq .id -r` saves the
 // whole answer and prints the one field, which is what both flags plainly mean.
-func (o apiOutput) emit(resp *api.RawResponse, method, path string) error {
+func (o apiOutput) emit(ctx context.Context, resp *api.RawResponse, method, path string) error {
 	if !o.buffered() {
 		return o.emitStreaming(resp, method, path)
 	}
@@ -255,7 +272,7 @@ func (o apiOutput) emit(resp *api.RawResponse, method, path string) error {
 	}
 
 	if o.filter != nil {
-		results, err := o.filter.RunBytes(body)
+		results, err := runFilter(ctx, o.filter, body)
 		if err != nil {
 			return err
 		}
@@ -267,6 +284,33 @@ func (o apiOutput) emit(resp *api.RawResponse, method, path string) error {
 		}
 	}
 	return nil
+}
+
+// runFilter applies a compiled filter to one response body, under a deadline.
+//
+// THE RULE IT ENFORCES IS ALL-OR-NOTHING: every value the filter matched is
+// returned, or an error is, and there is no third outcome. Nothing is rendered
+// until the whole stream has been collected, so a filter that fails at value
+// 15,000 prints nothing rather than 14,999 lines and then a failure.
+//
+// ⚠️ AN EARLIER FORM TRUNCATED AT 10,000 VALUES with a note on stderr and a
+// zero exit, and that is why the rule is written down here rather than assumed.
+// `ids=$(ronja api ... --jq '.result[].id' -r 2>/dev/null)` throws the note away
+// and captures a silently wrong PREFIX — and unlike `ronja query`'s
+// `truncated:true`, which is IN the data, a jq stream has nowhere to put such a
+// field. A --jq-strict flag was tried and only moved the problem: the default
+// still lost data, and turning it on printed nothing at all for an answer that
+// had been printable in full. What bounds an enormous answer now is jqf's memory
+// budget, which fails loudly and names a remedy.
+//
+// The deadline is separate from --timeout (which bounds the REQUEST) because
+// cmd.Context() carries none of its own: `--jq 'def f: f; f'` had nothing at all
+// standing between it and a wedged terminal.
+func runFilter(ctx context.Context, filter *jqf.Filter, body []byte) ([]any, error) {
+	ctx, cancel := context.WithTimeout(ctx, jqFilterTimeout)
+	defer cancel()
+
+	return filter.RunBytes(ctx, body)
 }
 
 // emitStreaming is the original path, unchanged in behaviour: the body is never
@@ -389,7 +433,7 @@ func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, 
 			return nil, errAlreadyReported
 		}
 
-		results, err := plan.until.RunBytes(body)
+		results, err := runCondition(ctx, plan.until, body)
 		if err != nil {
 			return nil, err
 		}
@@ -410,6 +454,24 @@ func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, 
 			return nil, waitFailure(plan, attempt, err)
 		}
 	}
+}
+
+// runCondition evaluates a --wait-until condition against one response.
+//
+// It is the same all-or-nothing contract as runFilter, and a condition is where
+// that matters most: Holds requires EVERY output to be truthy, so a PREFIX that
+// happened to be all-truthy would end the poll on a response whose next value
+// was false — a wait reporting success for work that never finished. Nothing
+// truncates any more, so that cannot happen; when this path did truncate it had
+// to refuse outright, which is the asymmetry that is now gone.
+//
+// The condition gets the same deadline as any other filter: --wait-timeout may
+// legitimately be 0, so it cannot be relied on to bound one evaluation.
+func runCondition(ctx context.Context, until *jqf.Filter, body []byte) ([]any, error) {
+	ctx, cancel := context.WithTimeout(ctx, jqFilterTimeout)
+	defer cancel()
+
+	return until.RunBytes(ctx, body)
 }
 
 // waitFailure turns a cancelled or expired wait into a message that says what

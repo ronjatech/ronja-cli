@@ -1,0 +1,169 @@
+{
+  "_comment": [
+    "jq semantics golden for cli/internal/jqf.",
+    "It was once shared with a second copy of this package in the backend module, which is",
+    "why it reads like a contract rather than a test file; the backend copy is gone.",
+    "",
+    "Every case here is a place a hand-rolled lookalike gets jq wrong.",
+    "Add a case whenever you touch this package's semantics.",
+    "",
+    "outputs is the list of results as COMPACT JSON strings, one per stream output.",
+    "error is one of: \"\" (success), \"compile\", \"decode\", \"runtime\"."
+  ],
+  "cases": [
+    {
+      "name": "identity",
+      "expr": ".",
+      "input": "{\"a\":1}",
+      "outputs": ["{\"a\":1}"],
+      "error": ""
+    },
+    {
+      "name": "field access",
+      "expr": ".name",
+      "input": "{\"name\":\"table-1\"}",
+      "outputs": ["\"table-1\""],
+      "error": ""
+    },
+    {
+      "name": "iterate yields one output per element, not one array",
+      "expr": ".items[].id",
+      "input": "{\"items\":[{\"id\":\"a\"},{\"id\":\"b\"}]}",
+      "outputs": ["\"a\"", "\"b\""],
+      "error": ""
+    },
+    {
+      "name": "select filters the stream",
+      "expr": ".items[] | select(.ready) | .id",
+      "input": "{\"items\":[{\"id\":\"a\",\"ready\":true},{\"id\":\"b\",\"ready\":false}]}",
+      "outputs": ["\"a\""],
+      "error": ""
+    },
+    {
+      "name": "empty yields NO outputs and is not an error",
+      "expr": "empty",
+      "input": "{\"a\":1}",
+      "outputs": [],
+      "error": ""
+    },
+    {
+      "name": "a missing key is null, not an error",
+      "expr": ".nope",
+      "input": "{\"a\":1}",
+      "outputs": ["null"],
+      "error": ""
+    },
+    {
+      "name": "alternative operator // supplies a default for null",
+      "expr": ".missing // \"fallback\"",
+      "input": "{\"a\":1}",
+      "outputs": ["\"fallback\""],
+      "error": ""
+    },
+    {
+      "name": "alternative operator // does NOT override false-y-but-present values other than null and false",
+      "expr": ".count // 99",
+      "input": "{\"count\":0}",
+      "outputs": ["0"],
+      "error": ""
+    },
+    {
+      "name": "alternative operator // DOES override false",
+      "expr": ".flag // \"replaced\"",
+      "input": "{\"flag\":false}",
+      "outputs": ["\"replaced\""],
+      "error": ""
+    },
+    {
+      "name": "optional operator ? swallows a type error into no outputs",
+      "expr": ".a[]?",
+      "input": "{\"a\":\"not-an-array\"}",
+      "outputs": [],
+      "error": ""
+    },
+    {
+      "name": "without ? the same type error is a runtime failure",
+      "expr": ".a[]",
+      "input": "{\"a\":\"not-an-array\"}",
+      "outputs": [],
+      "error": "runtime"
+    },
+    {
+      "name": "indexing an object with a number is a runtime error",
+      "expr": ".[0]",
+      "input": "{\"a\":1}",
+      "outputs": [],
+      "error": "runtime"
+    },
+    {
+      "name": "length of an array",
+      "expr": ".items | length",
+      "input": "{\"items\":[1,2,3]}",
+      "outputs": ["3"],
+      "error": ""
+    },
+    {
+      "name": "an empty array has length 0 and is still a real output",
+      "expr": ".items | length",
+      "input": "{\"items\":[]}",
+      "outputs": ["0"],
+      "error": ""
+    },
+    {
+      "name": "map over a projection",
+      "expr": "[.items[] | {id, name}]",
+      "input": "{\"items\":[{\"id\":\"a\",\"name\":\"x\",\"junk\":1},{\"id\":\"b\",\"name\":\"y\",\"junk\":2}]}",
+      "outputs": ["[{\"id\":\"a\",\"name\":\"x\"},{\"id\":\"b\",\"name\":\"y\"}]"],
+      "error": ""
+    },
+    {
+      "name": "numbers decode through float64 but render as integers when exact",
+      "expr": ".n",
+      "input": "{\"n\":9007199254740991}",
+      "outputs": ["9007199254740991"],
+      "error": ""
+    },
+    {
+      "name": "unbalanced bracket fails at COMPILE time, before any input is touched",
+      "expr": ".items[",
+      "input": "{\"items\":[]}",
+      "outputs": [],
+      "error": "compile"
+    },
+    {
+      "name": "a non-JSON body is a DECODE failure, not a jq failure",
+      "expr": ".",
+      "input": "<html>gateway timeout</html>",
+      "outputs": [],
+      "error": "decode"
+    },
+    {
+      "name": "top-level array input iterates",
+      "expr": ".[].id",
+      "input": "[{\"id\":\"a\"},{\"id\":\"b\"}]",
+      "outputs": ["\"a\"", "\"b\""],
+      "error": ""
+    },
+    {
+      "name": "string interpolation",
+      "expr": ".items[] | \"\\(.id)=\\(.n)\"",
+      "input": "{\"items\":[{\"id\":\"a\",\"n\":1}]}",
+      "outputs": ["\"a=1\""],
+      "error": ""
+    },
+    {
+      "name": "a generator collected into one array is refused, not run",
+      "expr": "[range(20000000)] | length",
+      "input": "0",
+      "outputs": [],
+      "error": "runtime"
+    },
+    {
+      "name": "a non-terminating program is refused without a caller deadline",
+      "expr": "def f: f; f",
+      "input": "0",
+      "outputs": [],
+      "error": "runtime"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +78,12 @@ read CSV. It is for the metadata around them:
 
   ronja query --file report.sql --jq '.rowCount' -r
   ronja query --file report.sql --jq '.truncated'
+
+--jq prints EVERY value the expression matched, or it fails and prints nothing;
+there is no cap and no prefix. Two bounds can make it fail: a work and memory
+budget, scaled to the size of the envelope, which refuses a filter that
+manufactures data rather than selecting it; and a 10-second deadline on one
+application of the filter, separate from --timeout, which bounds the QUERY.
 
 A truncated result is reported on stderr and still exits zero — the rows you
 got are real, there are simply more of them.
@@ -167,7 +174,7 @@ is non-zero.`,
 				// run the query again to find out why it failed.
 				switch {
 				case filter != nil:
-					if emitErr := emitFiltered(filter, result, rawOutput); emitErr != nil {
+					if emitErr := emitFiltered(cmd.Context(), filter, result, rawOutput); emitErr != nil {
 						return emitErr
 					}
 				case flagJSON:
@@ -204,7 +211,7 @@ is non-zero.`,
 					result.RowCount, plural(result.RowCount, "row"), out)
 			}
 			if filter != nil {
-				return emitFiltered(filter, result, rawOutput)
+				return emitFiltered(cmd.Context(), filter, result, rawOutput)
 			}
 			if flagJSON {
 				return emitJSON(result)
@@ -240,12 +247,16 @@ is non-zero.`,
 // a lossy round trip — QueryResult carries no omitempty and mirrors the wire
 // shape field for field, which is exactly the property `--json` already
 // depends on.
-func emitFiltered(filter *jqf.Filter, result *api.QueryResult, raw bool) error {
+//
+// It goes through runFilter for the deadline: --timeout bounds the QUERY, and
+// cmd.Context() carries no deadline at all, so a filter that never terminates
+// had nothing to stop it here.
+func emitFiltered(ctx context.Context, filter *jqf.Filter, result *api.QueryResult, raw bool) error {
 	encoded, err := json.Marshal(result)
 	if err != nil {
 		return fmt.Errorf("encode the query envelope for --jq: %w", err)
 	}
-	results, err := filter.RunBytes(encoded)
+	results, err := runFilter(ctx, filter, encoded)
 	if err != nil {
 		return err
 	}

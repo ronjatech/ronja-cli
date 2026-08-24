@@ -162,7 +162,7 @@ Both take --jq to pull a field out of the answer, so nothing has to be piped
 through another interpreter to read it. api also has -F for file uploads and
 --wait-until for asynchronous work:
 
-  ronja api /api/v2/feature/query --jq '.items[].id' -r
+  ronja api /api/v2/feature/query --jq '.result[].id' -r
   ronja api -X POST /api/v2/file/upload/uploads -F file=@report.pdf
   ronja api /api/v2/workflow/run/$id --wait-until '.status != "running"'
 
