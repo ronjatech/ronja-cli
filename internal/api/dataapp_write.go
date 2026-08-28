@@ -12,6 +12,8 @@ package api
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/url"
 	"strings"
 )
@@ -235,6 +237,35 @@ type DataAppCommitOutcome struct {
 	DataAppID    string `json:"dataAppID"`
 	FirstPublish bool   `json:"firstPublish"`
 	Proposed     bool   `json:"proposed"`
+	// Audience is who ends up able to open the app and what they can do — the
+	// question publish never answered, and the reason two customers shipped a
+	// system of record to an audience of one, or handed a whole organization a
+	// managed database's write role without being told.
+	Audience *DataAppAudience `json:"audience,omitempty"`
+}
+
+// DataAppAudience mirrors rdataapp.AudienceSummary.
+//
+// The SENTENCE is composed server-side and printed verbatim. Composing one here
+// would be a second statement of "who can do what", and two statements of one
+// grant drift — the CLI would eventually describe an app's powers differently
+// from the app's own publish response and from what Ronja tells the user in
+// chat.
+type DataAppAudience struct {
+	// Reach is "author" (a private feature — an audience of one) or
+	// "organization" (everyone in the org can open it).
+	Reach string `json:"reach"`
+	// FeatureName is the feature that DECIDES the reach; an app has no scope of
+	// its own.
+	FeatureName string `json:"featureName"`
+	// Reads / Calls / Writes are the app's bindings, labelled. Writes is
+	// non-empty only when the app can write to a managed database — every
+	// viewer gets it, since an app cannot tell viewers apart.
+	Reads  []string `json:"reads"`
+	Calls  []string `json:"calls"`
+	Writes []string `json:"writes"`
+	// Sentence is the line to print.
+	Sentence string `json:"sentence"`
 }
 
 // CommitDataAppDraft applies a draft onto its parent — or, for a never-published
@@ -270,8 +301,31 @@ func (c *Client) DeleteDataApp(ctx context.Context, id string) error {
 //
 // Unlike the workflow equivalent this lives on the data-app handler itself
 // rather than the governance one, so the path has no /draft/ segment.
-func (c *Client) RequestDataAppReview(ctx context.Context, draftID string) error {
-	return c.Do(ctx, "POST", "dataapp/"+url.PathEscape(draftID)+"/request-review", nil, nil)
+//
+// It answers the same DataAppCommitOutcome shape as the commit route (with
+// `proposed: false`), so the audience is available on BOTH endings of "take my
+// draft live".
+//
+// An older server answers this route with an EMPTY body, which is io.EOF to the
+// decoder. That is not a failure — the review WAS submitted; only the narration
+// is missing — so it degrades to a zero-value outcome rather than reporting a
+// successful submission as an error.
+//
+// io.ErrUnexpectedEOF is deliberately NOT tolerated, and the distinction is the
+// whole point: io.EOF means the server sent NO body (nothing to narrate), while
+// ErrUnexpectedEOF means it sent a body that was CUT OFF mid-way — a truncated
+// response we have no business reading as "fine, just quiet". Widening the
+// check to any EOF-ish error would swallow exactly the connection failures a
+// publish path must surface.
+func (c *Client) RequestDataAppReview(ctx context.Context, draftID string) (*DataAppCommitOutcome, error) {
+	var out DataAppCommitOutcome
+	if err := c.Do(ctx, "POST", "dataapp/"+url.PathEscape(draftID)+"/request-review", nil, &out); err != nil {
+		if errors.Is(err, io.EOF) {
+			return &out, nil
+		}
+		return nil, err
+	}
+	return &out, nil
 }
 
 // dataAppFilePath builds a file route, escaping each segment but keeping the

@@ -154,10 +154,11 @@ func refuseUnworkableApp(app *api.DataApp) error {
 // names, plus the caller's own draft of it.
 //
 // It exists to make the draft resolution EXPLICIT, and that is not tidiness.
-// GET /dataapp/:id/files silently answers with the caller's draft when they have
-// one (see api.ListDataAppFiles), and says nothing about having done so. Every
-// read in this command tree therefore goes through here and then addresses
-// Row().ID — never a live id in the hope that the server picks the same row.
+// A draft is its own address: GET /dataapp/:id/files answers with exactly the
+// row named (see api.ListDataAppFiles), so a read that means the draft has to
+// name it. Every read in this command tree therefore goes through here and
+// then addresses Row().ID — never a live id in the hope that the server picks
+// the draft.
 // Getting that wrong records draft bytes under the live app's identity, which
 // makes the drift guard compare two different rows and either invent a conflict
 // or miss one.
@@ -223,11 +224,10 @@ func inspectAppTarget(ctx context.Context, client *api.Client, f *folder) (appTa
 // row, the deleted-app message and the unworkable-lifecycle refusal, and nothing
 // else.
 //
-// It exists for `app test`, which sends the LIVE id and lets the endpoint
-// substitute the caller's draft server-side — the server's answer names the row
-// it rendered, and that is the only authority on what the pixels are a picture
-// of. Resolving the draft locally there would be a GET whose result is never
-// read. Every other command writes to the draft and therefore needs its id.
+// It is for commands that only need the app itself — `app test` used to be
+// one, back when the preview endpoint substituted the caller's draft server-side;
+// it now names the draft and goes through inspectAppTarget like every other
+// command that needs the draft's id.
 func inspectAppRow(ctx context.Context, client *api.Client, f *folder) (appTarget, error) {
 	appID, err := f.ResourceID()
 	if err != nil {

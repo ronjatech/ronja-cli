@@ -217,6 +217,11 @@ func TestAppCommandsReportTheServersLink(t *testing.T) {
 	if got, want := urlLine(pushed), fakeFrontendOrigin+"/apps/"+draft.ID; got != want {
 		t.Errorf("push link = %q, want %q", got, want)
 	}
+	// And the LIVE link beside it: a draft is its own address, so the author
+	// needs to be told which link keeps showing the published version.
+	if !strings.Contains(pushed, "Live URL:") || !strings.Contains(pushed, fakeFrontendOrigin+"/apps/"+live.ID+"  (unchanged") {
+		t.Errorf("push report does not name the unchanged live link:\n%s", pushed)
+	}
 
 	published, err := runCLI(t, root, "app", "publish")
 	if err != nil {

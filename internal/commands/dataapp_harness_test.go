@@ -19,7 +19,7 @@ import (
 // surfaces look alike from a distance and behave differently in the three places
 // these tests are about: a data-app file write reports a compile failure inside
 // a 200, a data app has no persist-nothing dry run, and — the one worth a
-// harness of its own — GET :id/files silently answers with the caller's draft.
+// harness of its own — a draft is its own row, addressed by its own id.
 // Folding that into the workflow fake would have meant a fake that lies about
 // one kind or the other.
 type fakeAppInstance struct {

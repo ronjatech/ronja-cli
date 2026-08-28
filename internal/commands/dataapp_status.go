@@ -219,9 +219,9 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 		out.Validated = &validated
 	}
 
-	// Addressed to the row we RESOLVED, never to the live id: GET :id/files would
-	// quietly answer with the draft anyway, and then the drift below would be
-	// measured against a row we did not name.
+	// Addressed to the row we RESOLVED — the draft when one is open — because
+	// GET :id/files answers with exactly the row it is named, and the drift
+	// below has to be measured against the row the push wrote to.
 	files, err := client.ListDataAppFiles(ctx, row.ID)
 	if err != nil {
 		out.note("could not read remote files: %v", err)

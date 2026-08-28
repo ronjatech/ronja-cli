@@ -92,6 +92,14 @@ type appPublishResult struct {
 	// every self-hosted install that has not set one.
 	AppURL string `json:"appURL,omitempty"`
 	Target string `json:"target,omitempty"`
+	// Audience is who ends up able to open the app and what they can do once
+	// they do — server-computed, printed verbatim (see api.DataAppAudience).
+	// It is the thing this command never said: "published" is not an answer to
+	// "who can use it", and both endings of publish need one.
+	//
+	// Omitted when the server did not supply it (an older instance, or a
+	// hydration failure). The publish still happened.
+	Audience *api.DataAppAudience `json:"audience,omitempty"`
 }
 
 func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPublishResult, error) {
@@ -164,17 +172,20 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 			// round trip rather than the command.
 			fmt.Fprintf(os.Stderr, "  Note: could not read your role (%v) — trying to commit.\n", err)
 		} else if !admin {
-			if err := client.RequestDataAppReview(ctx, draft.ID); err != nil {
+			review, err := client.RequestDataAppReview(ctx, draft.ID)
+			if err != nil {
 				return nil, fmt.Errorf("submit %s for review: %w", draft.ID, err)
 			}
 			result.Outcome = outcomeSubmittedForReview
 			result.Detail = fmt.Sprintf("%q is in a shared feature, so an admin commits changes to it", parent.Name)
+			result.Audience = audienceOf(review)
 			return result, nil
 		}
 	}
 
 	outcome, commitErr := client.CommitDataAppDraft(ctx, draft.ID)
 	if commitErr == nil {
+		result.Audience = audienceOf(outcome)
 		// Nothing went live: a first publish into a shared feature by a
 		// non-admin was handed to an admin as a proposal. Saying "published"
 		// here is exactly the lie this command's two-outcome shape exists to
@@ -203,13 +214,25 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 		return nil, fmt.Errorf("commit %s: %w", draft.ID, commitErr)
 	}
 	fmt.Fprintf(os.Stderr, "  Note: the commit was refused (%v) — submitting the draft for review instead.\n", commitErr)
-	if err := client.RequestDataAppReview(ctx, draft.ID); err != nil {
+	review, err := client.RequestDataAppReview(ctx, draft.ID)
+	if err != nil {
 		return nil, fmt.Errorf("commit %s was refused (%v), and submitting it for review failed too: %w",
 			draft.ID, commitErr, err)
 	}
 	result.Outcome = outcomeSubmittedForReview
 	result.Detail = fmt.Sprintf("the commit was refused (%v), so the draft was submitted for review", commitErr)
+	result.Audience = audienceOf(review)
 	return result, nil
+}
+
+// audienceOf is the nil-safe read of the outcome's audience. Both routes return
+// the same shape, and both may omit it (an older instance, or a server-side
+// hydration failure) — the publish still happened either way.
+func audienceOf(outcome *api.DataAppCommitOutcome) *api.DataAppAudience {
+	if outcome == nil {
+		return nil
+	}
+	return outcome.Audience
 }
 
 // formatCompileDetail appends the compiler's own message when there is one.
@@ -304,6 +327,12 @@ func printAppPublishReport(r *appPublishResult) {
 	}
 	if r.Detail != "" {
 		fmt.Fprintf(out, "  %s\n", r.Detail)
+	}
+	// Who can use it, on EVERY path — the answer publish never gave. Printed
+	// verbatim from the server so this loop, the app's own commit response and
+	// what Ronja says in chat are one sentence, not three.
+	if r.Audience != nil && r.Audience.Sentence != "" {
+		fmt.Fprintf(out, "  %s\n", r.Audience.Sentence)
 	}
 	fmt.Fprintf(out, "\n  Data app: %s\n", r.DataAppID)
 	fmt.Fprintf(out, "  Draft:    %s\n", r.DraftID)

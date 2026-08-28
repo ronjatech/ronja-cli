@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -137,6 +138,13 @@ type appPushResult struct {
 	// for why it stays out of the --json payload. (appPublishResult.AppURL is
 	// published, because that field was already part of that command's shape.)
 	URL string `json:"-"`
+	// LiveURL is the frontend page of the LIVE app when this push wrote to an
+	// edit draft of it — printed beside URL so the author sees which link keeps
+	// showing the published version (a draft is its own address; the server
+	// never swaps the draft in for the live id). Empty on a first push, where
+	// the draft IS the app and there is no live version behind it. Human report
+	// only, for the same reason as URL; --json already carries dataAppID.
+	LiveURL string `json:"-"`
 }
 
 // runAppPush is the whole state machine, kept out of the cobra closure so it is
@@ -197,6 +205,9 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// same link — including the up-to-date one, which can return before the
 	// closing validate re-reads the row.
 	result.URL = target.URL
+	if existing.App != nil && existing.App.ID != target.ID {
+		result.LiveURL = existing.App.URL
+	}
 	if target.SubmittedForReviewAt != nil {
 		result.DraftUnderReview = true
 		fmt.Fprintf(os.Stderr, "  Warning: draft %s has already been submitted for review — this push changes what the admin is reviewing.\n",
@@ -699,7 +710,7 @@ func printAppPushReport(r *appPushResult) {
 
 	if r.UpToDate && r.Error == "" && len(r.Pushed) == 0 && len(r.Deleted) == 0 {
 		fmt.Fprintf(out, "  Up to date — the draft %s already holds this folder.\n", r.DraftID)
-		printResourceURL(out, reportKeyWidth, r.URL)
+		printAppPushURLs(out, r)
 		printCompileVerdict(out, r)
 		return
 	}
@@ -748,8 +759,20 @@ func printAppPushReport(r *appPushResult) {
 	if r.Target != "" {
 		fmt.Fprintf(out, "  Target:   %s\n", r.Target)
 	}
-	printResourceURL(out, reportKeyWidth, r.URL)
+	printAppPushURLs(out, r)
 	printCompileVerdict(out, r)
+}
+
+// printAppPushURLs prints where to look at what was pushed. When the push wrote
+// to an edit draft of a live app, BOTH links are printed: the draft's, which is
+// where these files are, and the live app's, which is unchanged — the server
+// serves exactly the row a link names, so the author's live link keeps showing
+// the published version until `ronja app publish`.
+func printAppPushURLs(out io.Writer, r *appPushResult) {
+	printResourceURL(out, reportKeyWidth, r.URL)
+	if r.LiveURL != "" {
+		fmt.Fprintf(out, "  %-*s%s  (unchanged until `ronja app publish`)\n", reportKeyWidth, "Live URL:", r.LiveURL)
+	}
 }
 
 // printCompileVerdict renders the closing validate, which is the only thing that

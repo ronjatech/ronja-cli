@@ -1281,7 +1281,7 @@ $EDITOR App.tsx
 ronja app push                         # syncs the folder into YOUR draft, then compiles it
 ronja app validate                     # recompile the draft on its own
 ronja app test                         # render the draft headless and report what the browser saw
-ronja app publish                      # commit, or submit for review, and say which happened
+ronja app publish                      # commit, or submit for review, say which happened, and who can now use it
 ```
 
 **`App.tsx` has to mount itself.** It must end with:
@@ -1334,7 +1334,7 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   records it, push never syncs it, and a manifest naming a different one is
   refused rather than silently written elsewhere.
 - **What the app may read lives in `ronja.json`.** A workflow's bindings are
-  derived from `{{ ref }}` / `{{ secret }}` markers in its code. A data app's
+  derived from the markers in its code (`{{ ref }}`, `{{ secret }}`, `{{ workflow }}` and the rest). A data app's
   are explicit grants, and `POST :id/validate` does not scan source for them —
   so an app pushed without them compiles and can then query nothing. The
   `access` block is the folder's declaration:
@@ -1408,6 +1408,39 @@ absent link is silent. Two details are specific to apps: `push` reports the
 **draft** it wrote to while `status` and `publish` report the **app** itself,
 and `status` only knows the link when it actually reached the server, so a
 signed-out or unbound status has no `URL:` line.
+
+A draft is its own address. The server renders exactly the row a link names —
+it never swaps your open draft in for the live app — so after a push to a draft
+of a published app, `push` prints the draft's `URL:` AND a `Live URL:` line: the
+live link keeps showing the published version, to you as well as to everyone
+else, until `ronja app publish`. `app test` renders the draft by naming it.
+
+**`publish` says who can use it, on every path.** Both endings — `Published.`
+and `Submitted for review` — print one server-composed sentence under the
+outcome line:
+
+```
+  Published.
+  committed to "NCR register"
+  Everyone in your organization can open "NCR register" (its feature "Quality").
+  Anyone who opens it can read tables "ncr", "ncr_events" and WRITE via secret
+  "ncr_db write role". Every viewer gets the same powers — the app cannot tell
+  viewers apart.
+```
+
+A private feature gets the other half of the answer: `Only you (and admins) can
+open "…" — its feature "…" is private. Share the feature to give it an audience.`
+For a draft
+awaiting an admin it speaks in the future tense (`Once approved, …`), because
+nothing went live.
+
+The sentence is **not composed here.** It comes from the server
+(`rdataapp.DescribeAudience`) on the commit and request-review responses, and is
+printed verbatim; `--json` carries the whole `audience` object
+(`reach` / `featureName` / `reads` / `calls` / `writes` / `sentence`). Composing
+a local one would be a second statement of "who can do what", and the two would
+drift from what the app's own publish response and Ronja's chat both say. It is
+omitted — silently, with no stub line — when the server does not supply it.
 
 ⚠️ One thing is *not* the same as `wf`: the `--json` payloads of `app status`
 and `app publish` **did** change. Both carry an `appURL` field, and both used to

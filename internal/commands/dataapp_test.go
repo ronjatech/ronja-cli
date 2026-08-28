@@ -16,9 +16,9 @@ import (
 // TestAppStatusReadsTheDraftNotTheLiveApp is the regression for the deviation
 // that has no workflow equivalent.
 //
-// GET /dataapp/:id/files SILENTLY answers with the caller's open draft when they
-// have one, and says nothing about having done so. So a command that addresses
-// the LIVE id gets draft bytes back and has no way to know — it would record
+// GET /dataapp/:id/files answers with exactly the row named (it once silently
+// answered with the caller's open draft, which is why this guard exists). A
+// command that addressed the LIVE id while meaning the draft would record
 // them in the baseline under the live app's identity, and every later drift
 // comparison would be against a row it never named.
 //

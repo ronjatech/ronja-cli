@@ -245,20 +245,12 @@ func (c *Client) GetDataAppDraft(ctx context.Context, id string) (*DataApp, erro
 	return out, nil
 }
 
-// ListDataAppFiles reads every file of ONE data-app row.
-//
-// ⚠️ The id you pass is NOT necessarily the row you get. Unlike the workflow
-// equivalent, GET /dataapp/:id/files SILENTLY RESOLVES TO THE CALLER'S OWN OPEN
-// DRAFT when one exists (api/v2/dataapp/handler.go), and nothing in the response
-// says which row answered — the files carry a dataAppID, but a caller that did
-// not think to look will never notice.
-//
-// That matters because a baseline is a claim about a specific row. Recording
-// draft bytes under the live app's identity makes `status` compare the wrong two
-// things: it reports drift that is not there, or worse hides drift that is, and
-// a push then acts on the difference. So every caller in this CLI resolves the
-// draft explicitly with GetDataAppDraft and passes the id it actually means —
-// never a live id in the hope that the server picks the same row it would have.
+// ListDataAppFiles reads every file of ONE data-app row — exactly the row whose
+// id is passed. A draft is its own address: the server never substitutes the
+// caller's open draft for a live id (it once did, silently, which is why every
+// caller in this CLI resolves the draft explicitly with GetDataAppDraft and
+// passes the id it actually means). A baseline is a claim about a specific row,
+// so naming the row is what keeps `status` comparing the right two things.
 func (c *Client) ListDataAppFiles(ctx context.Context, id string) ([]DataAppFile, error) {
 	var out []DataAppFile
 	if err := c.Do(ctx, "GET", "dataapp/"+url.PathEscape(id)+"/files", nil, &out); err != nil {

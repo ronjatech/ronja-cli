@@ -81,11 +81,11 @@ func newDataAppTestCmd() *cobra.Command {
 		Short: "Render the app in a headless browser and report what was seen",
 		Long: `Render the app in a headless browser and report what was seen.
 
-Renders what is ON THE SERVER — your own open draft when you have one, exactly
-as the in-app preview does — and reports a screenshot filmstrip, runtime errors
-with App.tsx:line:col frames, the queries the app ran and how many rows they
-returned, console errors, network failures, and a settle report saying why the
-harness stopped waiting.
+Renders what is ON THE SERVER — your own open draft when you have one (the draft
+"ronja app push" writes to), the app itself otherwise — and reports a screenshot
+filmstrip, runtime errors with App.tsx:line:col frames, the queries the app ran
+and how many rows they returned, console errors, network failures, and a settle
+report saying why the harness stopped waiting.
 
   ronja app test
   ronja app test --route '#/orders' --viewport mobile
@@ -197,14 +197,14 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	}
 	client := api.New(resolved.URL, resolved.Token)
 
-	// The binding's row, and NOT its draft: the endpoint substitutes the caller's
-	// own draft server-side and its answer names the row it rendered, which is the
-	// only authority on what these pixels are a picture of. Resolving the draft
-	// here would be a round trip whose result nothing reads — hence inspectAppRow
-	// rather than inspectAppTarget. What is still wanted is the rest of it: an
-	// unbound folder, a deleted app and an unworkable lifecycle each get their own
+	// The row to render is resolved HERE, not by the server: POST :id/preview
+	// renders exactly the row it is named (a draft is its own address; nothing
+	// substitutes the caller's draft for a live id), so rendering the open draft
+	// means naming it. inspectAppTarget reads the binding's row AND the caller's
+	// draft, and appTarget.Row picks the draft when there is one. An unbound
+	// folder, a deleted app and an unworkable lifecycle each still get their own
 	// message instead of a bare 404.
-	target, err := inspectAppRow(ctx, client, f)
+	target, err := inspectAppTarget(ctx, client, f)
 	if err != nil {
 		return err
 	}
@@ -226,15 +226,14 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 		TimeoutMs:      int(opts.Timeout / time.Millisecond),
 		Steps:          steps,
 	}
-	outcome, err := previewWithOneRetry(ctx, client, target.App.ID, req)
+	outcome, err := previewWithOneRetry(ctx, client, target.FilesRow().ID, req)
 	if err != nil {
 		return err
 	}
 	result := outcome.Result
 
-	// Said AFTER the render rather than guessed before it: the server decides
-	// which row it substituted, and the id it reports is the only authority on
-	// what these pixels are a picture of.
+	// Said off the server's answer rather than off our own choice: the id it
+	// reports is the only authority on what these pixels are a picture of.
 	if result.DataAppID != "" && result.DataAppID != target.App.ID {
 		fmt.Fprintf(os.Stderr, "  Rendered your own draft %s of %s.\n", result.DataAppID, target.App.ID)
 	}

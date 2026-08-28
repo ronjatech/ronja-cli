@@ -435,6 +435,14 @@ func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, 
 
 		results, err := runCondition(ctx, plan.until, body)
 		if err != nil {
+			// The WAIT's deadline can expire while the condition is being
+			// evaluated (a slow box, a --wait-timeout of a few ms). That is a
+			// timed-out wait, not a broken filter, and must read as one —
+			// jqf's own message quotes the expression with %q, so the
+			// condition the reader is looking for is not even in it verbatim.
+			if ctx.Err() != nil {
+				return nil, waitFailure(plan, attempt, ctx.Err())
+			}
 			return nil, err
 		}
 		if jqf.Holds(results) {
