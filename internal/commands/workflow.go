@@ -51,6 +51,7 @@ Then edit locally and check where you stand:
   ronja wf push                    sync the folder into your draft
   ronja wf test                    run your draft and report what happened
   ronja wf publish                 take the draft live (or ask an admin to)
+  ronja wf run                     run the live workflow and report what happened
   ronja wf discard                 throw your draft away
 
 Bindings are per-instance, so the same folder can target a local backend and
@@ -59,7 +60,7 @@ production without either overwriting the other's binding.`,
 	wf.AddCommand(
 		newWorkflowInitCmd(), newWorkflowCloneCmd(), newWorkflowStatusCmd(),
 		newWorkflowValidateCmd(), newWorkflowPushCmd(), newWorkflowTestCmd(),
-		newWorkflowPublishCmd(), newWorkflowDiscardCmd(),
+		newWorkflowPublishCmd(), newWorkflowRunCmd(), newWorkflowDiscardCmd(),
 	)
 	return wf
 }
@@ -331,7 +332,14 @@ const maxFileBytes = 1 << 20
 //   - Files over maxFileBytes, or containing NUL bytes. `content` is a text
 //     column; binary content is either rejected with an opaque encoding error
 //     or stored as something nobody can read back.
-func checkPushable(files map[string]string, maxBytes int) error {
+//
+// The KIND is a parameter for the message alone, and only because the message
+// was wrong: this runs for all three folder loops, and a data app refused for
+// holding a PNG was told "a workflow holds source code" — naming a primitive the
+// author is not working on, which reads as a bug in the CLI rather than as
+// something they can act on. kind.Label is the same word every other message in
+// this package uses for the folder, so nothing here decides on its own wording.
+func checkPushable(files map[string]string, kind wfdir.Kind, maxBytes int) error {
 	byFold := map[string][]string{}
 	for path := range files {
 		fold := strings.ToLower(path)
@@ -351,7 +359,7 @@ func checkPushable(files map[string]string, maxBytes int) error {
 			strings.Join(collisions, "\n    "))
 	}
 
-	var rejected []string
+	var rejected, rejectedPaths []string
 	for _, path := range sortedPaths(files) {
 		content := files[path]
 		switch {
@@ -359,11 +367,14 @@ func checkPushable(files map[string]string, maxBytes int) error {
 			rejected = append(rejected, fmt.Sprintf("%s (%d bytes, limit %d)", path, len(content), maxBytes))
 		case strings.ContainsRune(content, 0):
 			rejected = append(rejected, path+" (binary content: contains null bytes)")
+		default:
+			continue
 		}
+		rejectedPaths = append(rejectedPaths, path)
 	}
 	if len(rejected) > 0 {
-		return fmt.Errorf("these files cannot be synced to Ronja — a workflow holds source code, not data or binaries:\n    %s\n  Remove them from the folder (or keep them out of it) and try again",
-			strings.Join(rejected, "\n    "))
+		return fmt.Errorf("these files cannot be synced to Ronja — a %s holds source code, not data or binaries:\n    %s\n%s  Remove them from the folder (or keep them out of it) and try again",
+			kind.Label, strings.Join(rejected, "\n    "), appTestArtifactHint(kind, rejectedPaths))
 	}
 	return nil
 }

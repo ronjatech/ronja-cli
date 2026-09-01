@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -111,7 +113,7 @@ const (
 // Every refusal is local and names what to remove, because the server's version
 // of each of these is a late failure with a number in it.
 func checkAppPushable(files map[string]string) error {
-	if err := checkPushable(files, appMaxFileBytes); err != nil {
+	if err := checkPushable(files, wfdir.DataAppKind, appMaxFileBytes); err != nil {
 		return err
 	}
 	if len(files) > appMaxFiles {
@@ -125,6 +127,46 @@ func checkAppPushable(files map[string]string) error {
 	if total > appMaxTotalBytes {
 		return fmt.Errorf("this folder holds %d bytes of source and a data app holds at most %d in total.\n  Move whatever is not source out of the folder and try again",
 			total, appMaxTotalBytes)
+	}
+	return nil
+}
+
+// declarableCapabilities is the closed vocabulary of "access"."capabilities" in
+// a data-app manifest: the capabilities the server never hands an app on its
+// own, one per SDK call no allowlist implies. Everything else an app can do —
+// read the tables it lists, run an allowed agent or workflow, evaluate an
+// allowed metric, search a codex, fetch through an allowed secret, read the org
+// roster — is derived server-side from the allowlists, so naming it here grants
+// nothing that listing the resource did not already grant.
+//
+// It is the backend's rscripttoken.dataAppAllowedCaps minus everything
+// dataAppCaps auto-grants, and that correspondence is pinned there by
+// TestDataAppCaps_DeclareOnlySetIsExactlyFour — whose failure message names
+// this variable, because the CLI is a separate module and no compiler relates
+// the two. The same four names are also written out in `ronja app init --help`,
+// in the post-init report, in cli/README.md and on the docs site.
+var declarableCapabilities = []string{"ai", "query_external", "write_external", "upload_file"}
+
+// checkDeclaredCapabilities refuses a manifest that grants a capability which
+// does not exist.
+//
+// A refusal rather than a warning, because the failure it replaces has no
+// author-visible cause at all: nothing validates "capabilities" on the way in,
+// and the token mint FILTERS the stored list (rscripttoken.dataAppCaps), so
+// `"upload_fil"` pushes green, publishes green, shows no drift, and then
+// surfaces weeks later as a "capability not granted" in one viewer's console.
+// This is the only place that sees both the typo and the person who made it.
+//
+// The message ends by naming the stale-CLI case explicitly. The vocabulary is
+// closed but not frozen: a CLI older than the server would otherwise refuse a
+// perfectly valid capability while sounding certain it does not exist.
+func checkDeclaredCapabilities(access api.DataAppAccess, manifestPath string) error {
+	for _, declared := range access.Capabilities {
+		if slices.Contains(declarableCapabilities, declared) {
+			continue
+		}
+		return fmt.Errorf("%s grants %q under \"access\".\"capabilities\", and that is not a data-app capability.\n  Only these names ever belong there: %s. Everything else — reading tables, running an allowed agent or workflow, evaluating a metric, codex search, HTTP fetch through a secret — is granted by the allowlist naming the resource, not by a capability.\n  Nothing on the server would have told you: an unknown name is dropped when the app's token is minted, so this would have published green and failed in a viewer's browser.\n  A newer Ronja may accept more than these: if the server's docs name this capability, update the CLI",
+			manifestPath, declared, strings.Join(declarableCapabilities, ", "))
 	}
 	return nil
 }
@@ -411,4 +453,45 @@ func missingFrom(ids, other []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// appNamespaceRe matches the `ronja-app:` prefix esbuild stamps on an author
+// file, but ONLY where it introduces a located diagnostic — a path followed by
+// `:line:col:`. Anchoring on the digits is what keeps it from eating the same
+// text out of a message that merely quotes it.
+var appNamespaceRe = regexp.MustCompile(`ronja-app:(\S+?:\d+:\d+:)`)
+
+// stripBundleNamespace removes the bundler's internal namespace from the file
+// locations in a compile message, so `ronja app validate` reports
+// `components/Today.tsx:37:38: …` — the path the author typed — rather than
+// `ronja-app:components/Today.tsx:37:38: …`, which names a namespace they have
+// never heard of and cannot open.
+//
+// Lives here rather than beside either caller: `app push` and `app validate`
+// both render a compile message, and the second one to want this is how a
+// second copy gets written.
+//
+// `ronja-vendor:` is deliberately LEFT ALONE. That prefix is the one piece of
+// information distinguishing "your file" from "ours": a diagnostic attributed
+// to the vendored SDK is a bug in Ronja, not something the author can fix by
+// editing the path, and quietly rendering it as a bare filename would send them
+// looking for a file their folder does not contain.
+//
+// Applied at RENDER, not where the message is built: `--json` relays the
+// server's answer verbatim, and the human report is the half we format.
+func stripBundleNamespace(msg string) string {
+	return appNamespaceRe.ReplaceAllString(msg, "$1")
+}
+
+// stripBundleNamespacePath is the same removal for a path that arrives as its
+// OWN field rather than embedded in a message — a compile diagnostic's File,
+// which `ronja app test` renders structurally. The regex above cannot serve it:
+// it anchors on the `:line:col:` that follows the path inside a message, and
+// there is nothing to anchor on here.
+//
+// Same two rules, for the same reasons: `ronja-app:` is a namespace the author
+// has never heard of, and `ronja-vendor:` stays, because it is what says the
+// diagnostic is ours and not theirs.
+func stripBundleNamespacePath(file string) string {
+	return strings.TrimPrefix(file, "ronja-app:")
 }

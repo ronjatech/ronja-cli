@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,6 +131,139 @@ func TestAppTestReportKeepsFieldsTheMirrorDoesNotKnow(t *testing.T) {
 	}
 	if got := readFile(t, outDir, "report.json"); !strings.Contains(got, `"somethingNewer"`) {
 		t.Errorf("report.json must be the server's bytes verbatim; got:\n%s", got)
+	}
+}
+
+// ── Where the artefacts go ──────────────────────────────────────────────────
+
+// With no --out-dir, the artefacts land inside the folder's local-only .ronja/,
+// NOT in the folder root.
+//
+// The root was the old default, and it made the next command impossible: a PNG
+// beside App.tsx is binary content in a folder of source, so `ronja app push`
+// refused the whole folder — one command's output blocking the next. .ronja/ is
+// the one place the push walk structurally cannot see (it is the folder's own
+// bookkeeping, excluded by name and not even reported as skipped), which is why
+// the location is asserted literally here rather than recomputed from the
+// constant that produced it.
+func TestAppTestDefaultsIntoTheStateDirectory(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, app := appTestFolder(t, f)
+	f.AddFileBlob("file-1", "toolresult/1.png", []byte("\x89PNG-settled"))
+	f.AnswerPreviewResult(api.PreviewResult{
+		Rendered: true, Viewport: "desktop", DataAppID: app.ID,
+		Ops: []api.PreviewOp{}, Errors: []api.PreviewRuntimeError{},
+		ConsoleErrors: []api.PreviewConsoleError{},
+		Screenshots: []api.PreviewScreenshot{
+			{FileID: "file-1", FileKey: "toolresult/1.png", Phase: "settled", Selected: true},
+		},
+	})
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() {
+		out, err = runCLI(t, root, "app", "test")
+	})
+	if err != nil {
+		t.Fatalf("app test: %v", err)
+	}
+
+	dir := filepath.Join(root, ".ronja", "test")
+	for _, name := range []string{"report.json", "screenshot-1.png", "screenshot.png"} {
+		// readFile fails the test when the file is not there.
+		readFile(t, dir, name)
+		// And NOT where the old default put it, beside the source.
+		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+			t.Errorf("%s landed in the folder root, where the next push would refuse it (%v)", name, err)
+		}
+	}
+
+	// Nothing became less discoverable: the resolved directory is narrated on
+	// stderr, and the summary still names every file in full. Matched on the
+	// suffix, because the absolute prefix is whatever the test's temp directory
+	// resolved to.
+	if !strings.Contains(stderr, filepath.Join(".ronja", "test")) {
+		t.Errorf("the resolved out-dir must be printed, got:\n%s", stderr)
+	}
+	if !strings.Contains(out, filepath.Join(".ronja", "test", "report.json")) {
+		t.Errorf("the summary should still name what it wrote, got:\n%s", out)
+	}
+
+	// The state directory excludes itself from git with a "*" .gitignore, and
+	// this run may be the first thing to create the directory at all — a folder
+	// cloned from git correctly has no .ronja/ in it.
+	if got := readFile(t, root, ".ronja", ".gitignore"); !strings.Contains(got, "*") {
+		t.Errorf(".ronja/.gitignore should exclude the directory, got %q", got)
+	}
+
+	// The --json shape is unchanged; outDir just reports where they really went.
+	out, err = runCLI(t, root, "app", "test", "--json")
+	if err != nil {
+		t.Fatalf("app test --json: %v", err)
+	}
+	var result appTestResult
+	decodeJSONInto(t, out, &result)
+	if !strings.HasSuffix(result.OutDir, filepath.Join(".ronja", "test")) {
+		t.Errorf("--json outDir = %q, want the resolved default under %s", result.OutDir, dir)
+	}
+}
+
+// The "*" .gitignore is what keeps tenant screenshots and query results out of
+// somebody's repository, and failing to write it is a WARNING — refusing would
+// throw away an observation over the way it is stored. So the warning has to
+// survive being read: it names the consequence rather than the syscall, and it
+// is said again after the report, because on its own it lands before a render
+// that can take twenty seconds and then fills the terminal.
+func TestAppTestWarnsTwiceWhenItCannotIgnoreTheArtefacts(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, app := appTestFolder(t, f)
+	f.AnswerPreviewResult(api.PreviewResult{
+		Rendered: true, Viewport: "desktop", DataAppID: app.ID,
+		Ops: []api.PreviewOp{}, Errors: []api.PreviewRuntimeError{},
+		ConsoleErrors: []api.PreviewConsoleError{}, Screenshots: []api.PreviewScreenshot{},
+	})
+	// A DIRECTORY where the ignore file goes: the write fails, everything else
+	// still works, which is exactly the case the warning exists for.
+	if err := os.MkdirAll(filepath.Join(root, ".ronja", ".gitignore"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	stderr := captureStderr(t, func() {
+		if _, err := runCLI(t, root, "app", "test"); err != nil {
+			t.Fatalf("a folder that cannot be git-ignored must still be rendered and reported: %v", err)
+		}
+	})
+	if n := strings.Count(stderr, "nothing is ignoring these files"); n != 2 {
+		t.Errorf("the warning should be said before the render and again beside the paths written, got %d:\n%s", n, stderr)
+	}
+	// The consequence, not the syscall: a reader has to know what is now
+	// committable, and where.
+	if !strings.Contains(stderr, "git add .") || !strings.Contains(stderr, root) {
+		t.Errorf("the warning must name what happens and to which folder, got:\n%s", stderr)
+	}
+}
+
+// An explicit --out-dir is used exactly as given — the app folder itself
+// included. The default moved because one command's output was making the next
+// one impossible, not because writing there is forbidden, and someone who asks
+// for it gets it (and gets the ordinary push refusal that follows).
+func TestAppTestHonoursAnExplicitOutDir(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, app := appTestFolder(t, f)
+	f.AnswerPreviewResult(api.PreviewResult{
+		Rendered: true, Viewport: "desktop", DataAppID: app.ID,
+		Ops: []api.PreviewOp{}, Errors: []api.PreviewRuntimeError{},
+		ConsoleErrors: []api.PreviewConsoleError{}, Screenshots: []api.PreviewScreenshot{},
+	})
+
+	if _, err := runCLI(t, root, "app", "test", "--out-dir", "."); err != nil {
+		t.Fatalf("app test: %v", err)
+	}
+	if got := readFile(t, root, "report.json"); got == "" {
+		t.Error("--out-dir . should write into the folder itself, as asked")
+	}
+	if _, err := os.Stat(filepath.Join(root, ".ronja", "test", "report.json")); !os.IsNotExist(err) {
+		t.Errorf("a named --out-dir must not be second-guessed (%v)", err)
 	}
 }
 
@@ -730,6 +864,17 @@ func TestAppTestClearsThePreviousRunsFrames(t *testing.T) {
 	}
 }
 
+// isAppTestArtifact claims it cannot drift from the pattern it matches, because
+// it reads the pattern rather than repeating it. That only holds while the
+// pattern stays one this function can decode: `screenshot-%02d.png` would break
+// the matcher AND the cleanup above it, silently and in the same edit. Pinned
+// here, one line, so the edit fails loudly instead.
+func TestAppTestFrameNamesMatchThePatternTheyAreWrittenFrom(t *testing.T) {
+	if name := fmt.Sprintf(appTestFramePattern, 7); !isAppTestArtifact(name) {
+		t.Errorf("%q is written by this command but not recognised as its own artefact", name)
+	}
+}
+
 // ── Untrusted text on the terminal ──────────────────────────────────────────
 
 // Every message printed here is text the APP produced. An ESC starts an ANSI
@@ -957,5 +1102,54 @@ func TestAppTestRefusesAStepsFileWithTrailingJSON(t *testing.T) {
 	}
 	if f.previewCalls != 0 {
 		t.Errorf("nothing should have been sent: %d preview calls", f.previewCalls)
+	}
+}
+
+// A folder cloned from git can carry a committed symlink anywhere along
+// .ronja/test; the default output path is this command's own choice, so it must
+// refuse to follow one rather than write (and pre-clean) somewhere else
+// entirely. A named --out-dir stays the user's own business.
+//
+// Both links are covered because only one of them used to be. The guard was an
+// os.Lstat on the LEAF, which follows every component before it — so a link at
+// .ronja itself answered "not a symlink" for .ronja/test and every write, and
+// every delete, landed in the link's target.
+func TestAppTestRefusesASymlinkedDefaultOutDir(t *testing.T) {
+	for _, tc := range []struct{ name, link string }{
+		{"the leaf", filepath.Join(".ronja", "test")},
+		{"the state directory itself", ".ronja"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAppInstance(t)
+			root, _ := appTestFolder(t, f)
+
+			elsewhere := t.TempDir()
+			link := filepath.Join(root, tc.link)
+			if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(elsewhere, link); err != nil {
+				t.Skipf("cannot create symlinks here: %v", err)
+			}
+
+			captureStderr(t, func() {
+				_, err := runCLI(t, root, "app", "test")
+				if err == nil {
+					t.Fatalf("expected a refusal for a symlinked default out dir")
+				}
+				if !strings.Contains(err.Error(), "symlink") || !strings.Contains(err.Error(), "--out-dir") {
+					t.Fatalf("refusal should name the symlink and the escape hatch, got: %v", err)
+				}
+			})
+			// The refusal is a LOCAL one, and it has to fire before the render is
+			// paid for: a render costs real time and, with --steps, really clicks
+			// things. Refusing after it would throw away work already done.
+			if f.previewCalls != 0 {
+				t.Errorf("the destination must be settled before anything is rendered: %d preview calls", f.previewCalls)
+			}
+			if _, err := os.Stat(filepath.Join(elsewhere, "report.json")); !os.IsNotExist(err) {
+				t.Errorf("nothing may be written through the link (%v)", err)
+			}
+		})
 	}
 }

@@ -160,13 +160,16 @@ type pushResult struct {
 	URL string `json:"-"`
 }
 
-// newClient builds the client a push talks to. A package var, not a call to
-// api.New, for one reason — the same one that makes stdin.go's isTerminal a var.
+// newClient builds the client a push — and `wf run` — talks to. A package var,
+// not a call to api.New, for one reason: the same one that makes stdin.go's
+// isTerminal a var.
 //
-// The branch below that a mistake would turn into silent data loss is the one
-// behind a TIMED-OUT write, and a timeout is a deadline: the only ways to reach
-// it are to wait a real one out or to hand the client a transport that reports
-// one. Tests do the second. Nothing in the CLI ever reassigns this.
+// The branches a mistake would turn into silent damage are the ones behind a
+// TIMED-OUT write: the file reconcile below, and the run reconcile in
+// workflow_runcmd.go, whose failure mode is a live workflow fired twice. A
+// timeout is a deadline, so the only ways to reach either are to wait a real
+// one out or to hand the client a transport that reports one. Tests do the
+// second. Nothing in the CLI ever reassigns this.
 var newClient = api.New
 
 // runPush is the whole state machine, kept out of the cobra closure so it is
@@ -193,7 +196,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	for _, s := range enumeration.Skipped {
 		fmt.Fprintf(os.Stderr, "  Note: skipping %s — %s\n", s.Path, s.Reason)
 	}
-	if err := checkPushable(local, maxFileBytes); err != nil {
+	if err := checkPushable(local, wfdir.WorkflowKind, maxFileBytes); err != nil {
 		return nil, err
 	}
 	entrypoint := f.Manifest.Entrypoint

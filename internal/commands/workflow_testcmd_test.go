@@ -785,7 +785,7 @@ func TestTestParkedRunExitsZeroAndReportsTheWait(t *testing.T) {
 	}
 	// The status is named as a park rather than left as a bare "waiting", which
 	// reads as stuck...
-	for _, want := range []string{"waiting — parked, and nothing failed", "It resumes on its own", "run-1"} {
+	for _, want := range []string{"waiting — nothing failed, and it resumes on its own", "It resumes on its own", "run-1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report missing %q:\n%s", want, out)
 		}

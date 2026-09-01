@@ -144,6 +144,38 @@ func TestAppInitNeverOverwritesAnExistingEntrypoint(t *testing.T) {
 	}
 }
 
+// The manifest's "capabilities" vocabulary lives in the command, statically, on
+// both surfaces an author meets: `ronja app init --help` describes each name,
+// and the post-init report — printed at the one moment they are about to write
+// the manifest — enumerates them. The authoritative set is the backend's
+// dataAppAllowedCaps minus its auto-granted members (rscripttoken/dataapp.go,
+// which carries its own pin); the CLI is a separate module, so this is the
+// CLI-side half of the drift net.
+//
+// The help is matched as TABLE ROWS rather than substrings — "ai" alone matches
+// half the English words in it — and the report as the joined list it prints,
+// which is built from declarableCapabilities and so covers whatever that holds.
+func TestAppInitNamesTheDeclarableCapabilities(t *testing.T) {
+	long := newDataAppInitCmd().Long
+	for _, capability := range declarableCapabilities {
+		row := "\n  " + capability + "  "
+		if !strings.Contains(long, row) {
+			t.Errorf("`ronja app init --help` no longer carries the capability table row for %q — the manifest vocabulary must live in the command", capability)
+		}
+	}
+
+	f := newFakeAppInstance(t)
+	signInApp(t, f)
+	out, err := runCLI(t, t.TempDir(), "app", "init", "--feature", "feat-1", "--title", "Revenue explorer")
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if names := strings.Join(declarableCapabilities, ", "); !strings.Contains(out, names) {
+		t.Errorf("the post-init report no longer names the capabilities (%s) — an author about to write the manifest reads this, not --help. Got:\n%s",
+			names, out)
+	}
+}
+
 // ── Push ────────────────────────────────────────────────────────────────────
 
 // TestAppPushCreatesDraftAppAndSyncs covers the first push: no app exists, so
@@ -761,6 +793,40 @@ func TestAppPushSyncsAccessBeforeFiles(t *testing.T) {
 	}
 }
 
+// A folder still holding `ronja app test` output from a CLI that wrote it into
+// the root is refused, is told which primitive it is being refused for, and is
+// told what those files look like.
+//
+// The names are deliberately NOT excluded from the walk: a user's own
+// report.json is their file and must sync, or be refused out loud, rather than
+// disappearing under a rule about a name. So the hint arrives after the refusal
+// has already fired, and points at where the artefacts go now.
+func TestAppPushRefusesAppTestArtefactsAndNamesThem(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, _ := appTestFolder(t, f)
+	if err := os.WriteFile(filepath.Join(root, "screenshot.png"), []byte("\x89PNG\x00\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runCLI(t, root, "app", "push")
+	if err == nil {
+		t.Fatal("a folder holding a PNG cannot be synced")
+	}
+	for _, want := range []string{
+		"a data app holds source code",
+		"screenshot.png",
+		"ronja app test",
+		filepath.Join(".ronja", "test"),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal should carry %q, got: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "a workflow holds") {
+		t.Errorf("a data app is not a workflow, and the refusal must not say so: %v", err)
+	}
+}
+
 // TestAppPushRefusesEntrypointMismatch: a data app's entrypoint is immutable, so
 // a manifest naming a different one can never sync. Refused with the only remedy
 // there is, rather than silently writing the author's code into a file they are
@@ -786,6 +852,98 @@ func TestAppPushRefusesEntrypointMismatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cannot be changed") {
 		t.Errorf("the refusal should say the entrypoint is immutable, got %v", err)
+	}
+}
+
+// TestAppPushRefusesAnUnknownCapability covers the one manifest field nothing
+// on the server validates.
+//
+// "capabilities" is a closed vocabulary that is FILTERED at token-mint time
+// rather than checked on the way in, so a typo used to push green, publish
+// green, show no drift, and surface weeks later as a "capability not granted"
+// in one viewer's console with nothing pointing at the manifest. The refusal
+// has to happen before the first request — asserted as the absence of any
+// /dataapp call, since a push that refused only after creating the app would
+// still have left a row behind.
+func TestAppPushRefusesAnUnknownCapability(t *testing.T) {
+	f := newFakeAppInstance(t)
+	signInApp(t, f)
+
+	root := writeAppFolder(t, t.TempDir(), &wfdir.Manifest{Title: "App"},
+		map[string]string{"App.tsx": "x"})
+	m := appManifestOf(t, root)
+	m.SetBinding(f.Key(), wfdir.Binding{FeatureID: "feat-1"})
+	m.SetAccess(api.DataAppAccess{
+		AllowedTableIDs: []string{"table-abc"},
+		Capabilities:    []string{"ai", "upload_fil"},
+	})
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runCLI(t, root, "app", "push")
+	if err == nil {
+		t.Fatal("expected a push declaring a capability that does not exist to be refused")
+	}
+	if !strings.Contains(err.Error(), "upload_fil\"") {
+		t.Errorf("the refusal must name the offending entry, got %v", err)
+	}
+	for _, capability := range declarableCapabilities {
+		if !strings.Contains(err.Error(), capability) {
+			t.Errorf("the refusal must name the valid capabilities (missing %q), got %v", capability, err)
+		}
+	}
+	// The stale-CLI case, said out loud: the vocabulary is closed but not
+	// frozen, and a CLI older than the server must not sound certain.
+	if !strings.Contains(err.Error(), "update the CLI") {
+		t.Errorf("the refusal should explain what to do if the server knows a capability this CLI does not, got %v", err)
+	}
+	for _, request := range f.Requests {
+		if strings.Contains(request, "/dataapp") {
+			t.Errorf("the refusal is local — nothing should have been sent, got requests %v", f.Requests)
+			break
+		}
+	}
+}
+
+// The other half of the refusal: every name that IS in the vocabulary passes,
+// and so does declaring none. An over-eager guard here would be worse than none
+// at all — it would refuse the exact manifest `ronja app init --help` tells the
+// author to write.
+func TestAppPushAcceptsTheDeclarableCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		capabilities []string
+	}{
+		{"all four", declarableCapabilities},
+		{"none declared", []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAppInstance(t)
+			signInApp(t, f)
+
+			root := writeAppFolder(t, t.TempDir(), &wfdir.Manifest{Title: "App"},
+				map[string]string{"App.tsx": "x"})
+			m := appManifestOf(t, root)
+			m.SetBinding(f.Key(), wfdir.Binding{FeatureID: "feat-1"})
+			m.SetAccess(api.DataAppAccess{
+				AllowedTableIDs: []string{"table-abc"},
+				Capabilities:    tc.capabilities,
+			})
+			if err := wfdir.SaveManifest(root, m); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := runCLI(t, root, "app", "push"); err != nil {
+				t.Fatalf("push: %v", err)
+			}
+			if len(f.created) != 1 {
+				t.Fatalf("expected the app to be created, got %d creates", len(f.created))
+			}
+			if got := f.created[0].Capabilities; !slices.Equal(got, slices.Sorted(slices.Values(tc.capabilities))) {
+				t.Errorf("the create should carry the declared capabilities %v, got %v", tc.capabilities, got)
+			}
+		})
 	}
 }
 
@@ -1338,4 +1496,125 @@ func appFolderBoundTo(t *testing.T, f *fakeAppInstance, liveID string, files map
 		t.Fatal(err)
 	}
 	return root
+}
+
+// The compile message the server sends is dataappbundle.CompileError.Error(),
+// which locates every diagnostic with esbuild's own namespace prefix. That
+// prefix names an internal bundler concept, so the author is handed
+// `ronja-app:components/Today.tsx:37:38` for a file they know as
+// `components/Today.tsx` — and the identifier check made this the common case
+// rather than the rare one, because it reports a location for every hit.
+func TestStripBundleNamespace(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "one located diagnostic",
+			in:   `data app compile failed: ronja-app:components/Today.tsx:37:38: "useState" is not defined — it is neither imported nor declared. Import it from "react": import { useState } from "react"`,
+			want: `data app compile failed: components/Today.tsx:37:38: "useState" is not defined — it is neither imported nor declared. Import it from "react": import { useState } from "react"`,
+		},
+		{
+			name: "every occurrence, not just the first",
+			in:   "data app compile failed: ronja-app:App.tsx:1:0: a; ronja-app:lib/queries.ts:9:4: b",
+			want: "data app compile failed: App.tsx:1:0: a; lib/queries.ts:9:4: b",
+		},
+		{
+			// The vendored SDK's namespace is the one thing that tells an author
+			// the diagnostic is not about a file they can edit.
+			name: "vendor namespace is preserved",
+			in:   "data app compile failed: ronja-vendor:app/index.js:12:3: boom",
+			want: "data app compile failed: ronja-vendor:app/index.js:12:3: boom",
+		},
+		{
+			// Anchored on `:line:col:`, so prose that merely mentions the
+			// namespace is left as the server wrote it.
+			name: "prose mentioning the namespace is untouched",
+			in:   "the ronja-app: namespace is an esbuild detail",
+			want: "the ronja-app: namespace is an esbuild detail",
+		},
+		{
+			name: "a message with no location at all",
+			in:   "data app compile failed",
+			want: "data app compile failed",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripBundleNamespace(tc.in); got != tc.want {
+				t.Errorf("stripBundleNamespace()\n got: %s\nwant: %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// `ronja app test` renders a diagnostic structurally, so its path arrives as
+// its own field and the message regex has nothing to anchor on. Same two rules
+// as above, asserted separately because the code is separate.
+func TestStripBundleNamespacePath(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"app namespace comes off", "ronja-app:components/Today.tsx", "components/Today.tsx"},
+		{"vendor namespace is preserved", "ronja-vendor:app/index.js", "ronja-vendor:app/index.js"},
+		{"a bare path is untouched", "App.tsx", "App.tsx"},
+		{"only a leading prefix counts", "src/ronja-app:x.tsx", "src/ronja-app:x.tsx"},
+		{"an empty path stays empty", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripBundleNamespacePath(tc.in); got != tc.want {
+				t.Errorf("stripBundleNamespacePath(%q)\n got: %s\nwant: %s", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// The end-to-end half for the test report, matching
+// TestAppValidateReportDropsTheBundleNamespace below: a unit test on the helper
+// would still pass if formatCompileDiagnostic stopped calling it.
+func TestAppTestReportDropsTheBundleNamespace(t *testing.T) {
+	got := formatCompileDiagnostic(api.CompileDiagnostic{
+		File:    "ronja-app:components/Today.tsx",
+		Line:    37,
+		Column:  38,
+		Message: `"useState" is not defined`,
+	})
+	if strings.Contains(got, "ronja-app:") {
+		t.Errorf("the build-error line still names the bundler namespace: %s", got)
+	}
+	if !strings.HasPrefix(got, "components/Today.tsx:37:38") {
+		t.Errorf("want the author's own path and position, got: %s", got)
+	}
+}
+
+// The end-to-end half: the string really does reach stdout through the report,
+// and it really is stripped there. A unit test on the helper alone would still
+// pass if nothing called it.
+func TestAppValidateReportDropsTheBundleNamespace(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := &api.DataApp{ID: "data_app-live-1", Lifecycle: api.LifecycleLive}
+	f.AddApp(live, api.DataAppFile{Path: "App.tsx", Content: "x"})
+	f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "x"})
+	f.validateFails = `data app compile failed: ronja-app:components/Today.tsx:37:38: "useState" is not defined — it is neither imported nor declared. Import it from "react": import { useState } from "react"`
+	signInApp(t, f)
+
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "x"})
+
+	out, err := runCLI(t, root, "app", "validate")
+	if err == nil {
+		t.Fatal("a draft that does not compile must exit non-zero")
+	}
+	if strings.Contains(out, "ronja-app:") {
+		t.Errorf("the report still names the bundler's namespace:\n%s", out)
+	}
+	if !strings.Contains(out, "components/Today.tsx:37:38") {
+		t.Errorf("the report lost the file location:\n%s", out)
+	}
+	if !strings.Contains(out, `"useState" is not defined`) {
+		t.Errorf("the report lost the diagnostic:\n%s", out)
+	}
 }

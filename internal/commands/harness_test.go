@@ -128,6 +128,12 @@ type fakeInstance struct {
 	// the gate refusal the CLI preflights.
 	failRun        int
 	failRunMessage string
+	// failRunBody replaces that bare {"error": …} with a whole JSON object, which
+	// is what the concurrency-skip 409 actually looks like: it carries a `code`
+	// and names the blocking run in top-level DETAILS, because the message alone
+	// cannot be relied on to survive (gt.NewRunInFlightConflict). A CLI that read
+	// the run id out of the prose would pass a test that only staged an `error`.
+	failRunBody map[string]any
 	// failRunGets makes the next N run polls fail with a 500, so the transient-
 	// failure tolerance is testable without a flaky network.
 	failRunGets int
@@ -743,6 +749,12 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			WorkflowID: id, ParameterValues: in.ParameterValues, ResumeOfRunID: in.ResumeOfRunID,
 		})
 		if f.failRun != 0 {
+			if f.failRunBody != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(f.failRun)
+				_ = json.NewEncoder(w).Encode(f.failRunBody)
+				return true
+			}
 			http.Error(w, `{"error":"`+f.failRunMessage+`"}`, f.failRun)
 			return true
 		}

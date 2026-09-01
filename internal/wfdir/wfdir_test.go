@@ -398,6 +398,67 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 }
 
+// .ronja is written on every push and every clone, and a folder is an ordinary
+// git checkout — so it can arrive as a COMMITTED SYMLINK. Following one would
+// let whoever wrote that repository choose where this CLI's baseline, its
+// ignore file and (through StateDir's other caller, `app test`) its deletes
+// land on the machine running it.
+//
+// The nested case is the one a leaf-only check misses: resolving `.ronja/test`
+// with os.Lstat follows every component before the last, so a link at `.ronja`
+// itself reads as "not a symlink" and the guard passes.
+func TestStateWritesRefuseASymlinkedStateDirectory(t *testing.T) {
+	root := t.TempDir()
+	elsewhere := t.TempDir()
+	if err := os.Symlink(elsewhere, filepath.Join(root, StateDirName)); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+
+	if _, err := StateDir(root, "test"); err == nil {
+		t.Error("StateDir followed a symlink out of the folder")
+	} else if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("the refusal should name what is wrong, got: %v", err)
+	}
+	if err := WriteStateGitignore(root); err == nil {
+		t.Error("WriteStateGitignore wrote through a symlink out of the folder")
+	}
+	if err := SaveState(root, &State{}); err == nil {
+		t.Error("SaveState wrote through a symlink out of the folder")
+	}
+	entries, err := os.ReadDir(elsewhere)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the link target must be untouched, found %d entries", len(entries))
+	}
+}
+
+// The ordinary case still works, symlinks and all: t.TempDir hands back a path
+// under /var on macOS, which IS a symlink to /private/var — so a check that
+// resolved only the state directory and compared it against an unresolved root
+// would refuse every folder on that platform.
+func TestStateDirAcceptsARootReachedThroughASymlink(t *testing.T) {
+	real := t.TempDir()
+	root := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, root); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	dir, err := StateDir(root, "test")
+	if err != nil {
+		t.Fatalf("StateDir refused a folder reached through a symlink: %v", err)
+	}
+	if want := filepath.Join(root, StateDirName, "test"); dir != want {
+		t.Errorf("StateDir = %q, want the path as given (%q)", dir, want)
+	}
+	if err := WriteStateGitignore(root); err != nil {
+		t.Fatalf("WriteStateGitignore: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(real, StateDirName, GitignoreName)); err != nil {
+		t.Errorf("the ignore file should be in the folder the link points at: %v", err)
+	}
+}
+
 // Clear is per-binding, which is the whole reason it exists: a folder bound to
 // staging and production keeps a baseline each, and dropping one must leave the
 // other exactly as it was. Wiping both is not a cosmetic slip — an absent

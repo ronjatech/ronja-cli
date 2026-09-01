@@ -122,7 +122,7 @@ func printAppValidateReport(r *appValidateResult) {
 	}
 	fmt.Fprintf(out, "  Compiles: NO\n")
 	if r.CompileError != nil && r.CompileError.Message != "" {
-		fmt.Fprintf(out, "\n  %s\n", r.CompileError.Message)
+		fmt.Fprintf(out, "\n  %s\n", stripBundleNamespace(r.CompileError.Message))
 	}
 	fmt.Fprintf(out, "\n  Draft:    %s\n", r.DraftID)
 	fmt.Fprintf(out, "\n  The app stays on its last published version until this compiles.\n")

@@ -32,7 +32,9 @@ package wfdir
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -185,8 +187,89 @@ const (
 const DefaultEntrypoint = "main.py"
 
 // ManifestPath and StatePath locate the two files inside a folder root.
+//
+// Both are pure joins, for naming a path in a message. Anything that WRITES
+// inside StateDirName goes through StateDir instead.
 func ManifestPath(root string) string { return filepath.Join(root, ManifestName) }
 func StatePath(root string) string    { return filepath.Join(root, StateDirName, StateFileName) }
+
+// StateDir locates the folder's local-only state directory — or a path inside
+// it, when sub is given — and refuses one a symlink puts OUTSIDE root.
+//
+// Everything under .ronja/ is written, overwritten and (for `app test`'s
+// artefacts) deleted by the CLI at paths the CLI itself chose, not ones anybody
+// typed. A folder is an ordinary git checkout, so `.ronja` — or any component
+// under it — can arrive as a COMMITTED SYMLINK, and following one hands whoever
+// wrote that repository the ability to point this CLI's writes and its deletes
+// at any path on the machine running it.
+//
+// The check resolves the longest EXISTING prefix of the path and asserts the
+// result is still inside root. Resolving the LEAF alone is not enough, which is
+// the bug this replaced: os.Lstat follows every component before the last, so a
+// link at `.ronja` itself answered "not a symlink" for `.ronja/test` and the
+// guard passed. Components that do not exist yet cannot be links; they are the
+// caller's to create. Both sides are resolved, because root itself routinely
+// arrives through one (/var → /private/var on macOS, and every t.TempDir).
+func StateDir(root string, sub ...string) (string, error) {
+	dir := filepath.Join(append([]string{root, StateDirName}, sub...)...)
+	realRoot, err := resolveExistingPrefix(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", root, err)
+	}
+	real, err := resolveExistingPrefix(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", dir, err)
+	}
+	if !underPath(realRoot, real) {
+		return "", fmt.Errorf("%s is reached through a symlink that leaves the folder — it resolves to %s, so writing there would put files, and delete files, somewhere else entirely.\n  Remove the symlink to continue", dir, real)
+	}
+	return dir, nil
+}
+
+// resolveExistingPrefix resolves path's symlinks as far as path exists, then
+// re-attaches whatever is not there yet.
+//
+// filepath.EvalSymlinks fails outright on a path whose last components are
+// missing, which is the ordinary case here — the state directory is often
+// created by the very command asking about it.
+func resolveExistingPrefix(path string) (string, error) {
+	cur := filepath.Clean(path)
+	rest := ""
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			if rest == "" {
+				return resolved, nil
+			}
+			return filepath.Join(resolved, rest), nil
+		}
+		// Only a MISSING component is walked past. Anything else (a file where a
+		// directory should be, a permission failure) is reported rather than
+		// stepped over, since it means the answer is unknown rather than "not
+		// there yet".
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", err
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
+// underPath reports whether path is root itself or something inside it.
+func underPath(root, path string) bool {
+	if path == root {
+		return true
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
 
 // Hash is the content fingerprint used everywhere in this package: sha256 over
 // the raw bytes, hex-encoded.

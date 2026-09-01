@@ -178,6 +178,14 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 		return nil, fmt.Errorf("the entrypoint %q is not in this folder — a data app compiles from it, so it has to exist.\n  Create it, or check \"entrypoint\" in %s",
 			entrypoint, wfdir.ManifestPath(f.Root))
 	}
+	// The capability vocabulary is closed and the SERVER does not police it —
+	// an unknown name is dropped at token-mint time, so a typo publishes green
+	// and fails in a viewer's browser. Checked here, before anything is sent.
+	if f.Manifest.ManagesAccess() {
+		if err := checkDeclaredCapabilities(f.Manifest.DeclaredAccess(), wfdir.ManifestPath(f.Root)); err != nil {
+			return nil, err
+		}
+	}
 
 	// 2. Read what is already on the server, resolving the draft explicitly.
 	existing, err := inspectAppTarget(ctx, client, f)
@@ -788,7 +796,9 @@ func printCompileVerdict(out *os.File, r *appPushResult) {
 	default:
 		fmt.Fprintf(out, "  Compiles: NO\n")
 		if r.CompileError != nil && r.CompileError.Message != "" {
-			fmt.Fprintf(out, "\n  %s\n", r.CompileError.Message)
+			// Same message, same treatment as `ronja app validate` — push is
+			// where most authors meet it first.
+			fmt.Fprintf(out, "\n  %s\n", stripBundleNamespace(r.CompileError.Message))
 		}
 		fmt.Fprintf(out, "\n  Your files are saved on the draft. Fix the diagnostics above and push again;\n")
 		fmt.Fprintf(out, "  the app stays on its last published version until this compiles.\n")

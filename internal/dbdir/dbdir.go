@@ -126,7 +126,14 @@ func (b *Binding) Save(dir string, key wfdir.InstanceKey, databaseID string) err
 	if err != nil {
 		return fmt.Errorf("encode binding: %w", err)
 	}
-	stateDir := filepath.Join(dir, DirName)
+	// Located through wfdir.StateDir rather than joined, for the reason its own
+	// doc gives: this directory is shared with the workflow baseline, a folder is
+	// an ordinary git checkout, and a committed symlink at .ronja would otherwise
+	// choose where this binding lands on the machine running the command.
+	stateDir, err := wfdir.StateDir(dir)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", stateDir, err)
 	}

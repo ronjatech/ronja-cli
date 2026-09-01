@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/url"
 	"strconv"
 	"time"
@@ -254,6 +256,50 @@ func (c *Client) RunWorkflow(ctx context.Context, workflowID string, parameterVa
 		return nil, err
 	}
 	return &out, nil
+}
+
+// RunInFlightCode is the wire discriminator on the 409 every run surface
+// answers when a resource's `skip` concurrency policy refuses a start, mirrored
+// from gt.RunInFlightCode (backend/lib/api/gt/error.go).
+const RunInFlightCode = "run_in_flight"
+
+// RunInFlight is the machine-readable half of that 409: the run already holding
+// the workflow's concurrency slot.
+//
+// It exists because the message cannot be relied on to carry it. The server
+// builds this refusal with the blocking run in DETAILS precisely so a client
+// does not have to parse a sentence — rjerr's client message unwraps to the bare
+// sentinel and drops anything a wrapper added — so reading these fields is the
+// only way to name the run that is in the way, and matching prose is the thing
+// that breaks the day somebody rewords it.
+//
+// BlockingRunID is empty when the server could not name the run: the partial
+// unique index is the race-proof layer and works without a read, so the loser is
+// sometimes anonymous. Callers must handle that rather than print an empty id.
+type RunInFlight struct {
+	Code              string `json:"code"`
+	BlockingRunID     string `json:"blockingRunId"`
+	BlockingRunStatus string `json:"blockingRunStatus"`
+	BlockingSince     string `json:"blockingSince"`
+}
+
+// AsRunInFlight reports whether an error is the concurrency-skip refusal, and
+// what it said.
+//
+// Gated on the CODE and not on the status: a 409 on this client also means a
+// file precondition refusing (see workflow_write.go), and those two have nothing
+// in common but a number. An unrecognised 409 comes back false, and the caller
+// falls through to the server's own message.
+func AsRunInFlight(err error) (*RunInFlight, bool) {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Status != StatusConflict {
+		return nil, false
+	}
+	var out RunInFlight
+	if json.Unmarshal([]byte(apiErr.Body), &out) != nil || out.Code != RunInFlightCode {
+		return nil, false
+	}
+	return &out, true
 }
 
 // ResumeWorkflowRun starts a run that RESUMES a failed one, replaying the

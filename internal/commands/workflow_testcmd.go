@@ -73,6 +73,32 @@ const (
 // bounding total wall time already and does not need a second clock.
 const maxConsecutivePollFailures = 3
 
+// validateLogsMode checks --logs, which `wf test` and `wf run` both take.
+//
+// Shared, like validateRunTimeout below and runVerdict, because the two verbs
+// are one loop: a flag that means something slightly different in each of them
+// is a flag nobody can rely on.
+func validateLogsMode(mode string) error {
+	if mode == logsFull || mode == logsTail || mode == logsNone {
+		return nil
+	}
+	return fmt.Errorf("--logs must be one of %s, %s or %s (got %q)",
+		logsFull, logsTail, logsNone, mode)
+}
+
+// validateRunTimeout refuses a negative --timeout.
+//
+// 0 means "wait forever" — a documented value. A negative duration has no such
+// meaning and used to land on the same branch, so `--timeout -5m` silently
+// waited forever, which is the opposite of what anybody typing a negative
+// timeout could have meant.
+func validateRunTimeout(timeout time.Duration) error {
+	if timeout < 0 {
+		return fmt.Errorf("--timeout cannot be negative (got %s) — pass 0 to wait for as long as the run takes", timeout)
+	}
+	return nil
+}
+
 // maxNamedTables bounds the per-table name lookups the --write-live refusal
 // makes. Ten is more than any hand-written workflow binds, and the ids past it
 // are still counted — what must never happen is a refusal that takes a minute
@@ -123,7 +149,7 @@ journaled step results are replayed and only the work that never finished runs
 again. A resume inherits the original run's parameters, so --param is refused
 with it.
 
-A durable workflow can also PARK mid-run — waiting on an agent it handed work
+A durable workflow can also PAUSE mid-run — waiting on an agent it handed work
 to, or on a timer. This stops waiting there and reports status "waiting" with
 what ran so far: nothing failed, and the run resumes on its own, so the rest of
 it happens in Ronja rather than here.
@@ -132,7 +158,7 @@ Approval-gated workflows cannot be run from here at all: an approval can only be
 produced inside an agent session, so test those from a Ronja chat.
 
 Exits non-zero when the run FAILED — a run that finished, and a durable run that
-parked or was handed on to a successor run, all exit zero. With --json, the run
+paused or was handed on to a successor run, all exit zero. With --json, the run
 as last read — row, steps and health — as one object on stdout, with progress on
 stderr.
 
@@ -150,16 +176,11 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 			if err != nil {
 				return err
 			}
-			if logsMode != logsFull && logsMode != logsTail && logsMode != logsNone {
-				return fmt.Errorf("--logs must be one of %s, %s or %s (got %q)",
-					logsFull, logsTail, logsNone, logsMode)
+			if err := validateLogsMode(logsMode); err != nil {
+				return err
 			}
-			// 0 means "wait forever" — a documented value. A negative duration has
-			// no such meaning and used to land on the same branch, so `--timeout
-			// -5m` silently waited forever, which is the opposite of what anybody
-			// typing a negative timeout could have meant.
-			if timeout < 0 {
-				return fmt.Errorf("--timeout cannot be negative (got %s) — pass 0 to wait for as long as the run takes", timeout)
+			if err := validateRunTimeout(timeout); err != nil {
+				return err
 			}
 			f, err := openFolder(cmd.Context(), resolved, wfdir.WorkflowKind)
 			if err != nil {
@@ -227,6 +248,15 @@ type testOutcome struct {
 	// Durable reports a workflow whose steps are journaled, which is what makes
 	// a FAILED run resumable rather than merely re-runnable.
 	Durable bool
+	// Live marks a run of the LIVE workflow (`wf run`) rather than of the draft.
+	//
+	// It is read by the report and by nothing else, because the two commands
+	// differ only in what is worth saying at the end: a live run has already been
+	// published, so "Next: ronja wf publish" would be nonsense; `--resume`
+	// continues a run of the DRAFT, so offering it after a live failure would
+	// point at a different row; and a park matters more here, because a live run
+	// is the one somebody is about to call verified.
+	Live bool
 }
 
 // runTest is the whole command, ordered so that everything which can refuse
@@ -248,7 +278,7 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 	}
 	draft := existing.Row()
 	if draft == nil {
-		return nil, fmt.Errorf("you have no draft of workflow %s, and `wf test` runs the draft rather than the live version.\n  Run `ronja wf push` first — it opens a draft and syncs this folder into it",
+		return nil, fmt.Errorf("you have no draft of workflow %s, and `wf test` runs the draft rather than the live version.\n  Run `ronja wf push` first — it opens a draft and syncs this folder into it.\n  To run the LIVE workflow as it already stands, run `ronja wf run`",
 			existing.Workflow.ID)
 	}
 
@@ -375,35 +405,10 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 	if err != nil {
 		return outcome, err
 	}
-	// Exit zero means the run DID NOT FAIL — which since durable waits is a
-	// wider claim than "it finished", because a run can stop being this
-	// command's business without being over. The interesting branch is still
-	// the last one: a status added server-side (a "cancelled", say) ends the
-	// poll — see api.RunResponse.Running — and used to fall through to a zero
-	// exit, which would tell a script that something it never heard of was a
-	// pass.
-	switch outcome.Run.Status {
-	case api.RunStatusDone:
-		return outcome, nil
-	case api.RunStatusWaiting:
-		// A park is not a failure: the burst finished cleanly, its outputs are
-		// persisted, and the run continues by itself when whatever it waits on
-		// happens. A non-zero exit here would stop a pipeline over a durable
-		// workflow doing exactly what it was written to do, and there would be
-		// nothing to retry — the run is parked, not stuck. The report says
-		// which of the two this was; see printTestReport.
-		return outcome, nil
-	case api.RunStatusResuming:
-		// The wake latch. This row handed the lineage to a successor run and
-		// will never execute again, so it is terminal here — and it is terminal
-		// because the work is CONTINUING, which is not a failure either.
-		return outcome, nil
-	case api.RunStatusError:
-		return outcome, fmt.Errorf("run %s failed", outcome.Run.ID)
-	default:
-		return outcome, fmt.Errorf("run %s ended with status %q, which this version of the CLI does not know — treating it as a failure rather than a pass.\n  The report above is what the instance said; upgrade the CLI if this status is a new one",
-			outcome.Run.ID, outcome.Run.Status)
-	}
+	// What the run's terminal status is worth as an exit code — the same
+	// question `wf run` asks, and deliberately answered in one place. See
+	// runVerdict.
+	return outcome, runVerdict(outcome.Run)
 }
 
 // isDurable reports whether the workflow being run journals its steps.
@@ -484,11 +489,29 @@ func lastFailedRun(ctx context.Context, client *api.Client, f *folder, row *api.
 // from the live workflow, or none at all, makes every remote file read as
 // drifted — noise, not news, and `wf status` explains that case in full.
 func noteDraftDrift(ctx context.Context, client *api.Client, f *folder, draft *api.Workflow) {
+	noteRemoteDrift(ctx, client, f, draft, "draft "+draft.ID,
+		"the web builder edits the same draft.")
+}
+
+// noteRemoteDrift is the body both drift notes share: read the row's files,
+// compare them against the sync baseline, and say so when they differ.
+//
+// One body rather than two near-copies, because the callers differ only in
+// which row they name and in the clause explaining how it drifted. Everything
+// else — that the baseline has to describe THIS row, that a read failure is
+// best-effort rather than a refusal, that silence is the answer when nothing
+// differs — is the same rule twice, and a fix that landed in one copy would
+// leave `wf test` and `wf run` disagreeing about what drift is.
+//
+// `subject` names the row as the sentence reads it ("draft draft-1", "the live
+// workflow wf-1"); `because` is the clause that follows the dash, punctuation
+// included.
+func noteRemoteDrift(ctx context.Context, client *api.Client, f *folder, row *api.Workflow, subject, because string) {
 	baseline := f.State.For(f.Key)
-	if baseline == nil || baseline.SourceID != draft.ID {
+	if baseline == nil || baseline.SourceID != row.ID {
 		return
 	}
-	files, err := client.ListWorkflowFiles(ctx, draft.ID)
+	files, err := client.ListWorkflowFiles(ctx, row.ID)
 	if err != nil {
 		// Best effort, like the table-name lookup: not being able to check for
 		// drift is no reason to refuse to run.
@@ -498,8 +521,8 @@ func noteDraftDrift(ctx context.Context, client *api.Client, f *folder, draft *a
 	if !diff.Dirty() {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "  Note: draft %s holds %d change(s) that did not come from this folder — the web builder edits the same draft. `ronja wf status` lists them.\n",
-		draft.ID, diff.Total())
+	fmt.Fprintf(os.Stderr, "  Note: %s holds %d change(s) that did not come from this folder — %s `ronja wf status` lists them.\n",
+		subject, diff.Total(), because)
 }
 
 // checkStale refuses to test a folder whose contents have not been pushed.

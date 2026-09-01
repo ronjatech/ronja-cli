@@ -194,7 +194,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	for _, s := range enumeration.Skipped {
 		fmt.Fprintf(os.Stderr, "  Note: skipping %s — %s\n", s.Path, s.Reason)
 	}
-	if err := checkPushable(local, maxFileBytes); err != nil {
+	if err := checkPushable(local, wfdir.PipelineKind, maxFileBytes); err != nil {
 		return nil, err
 	}
 

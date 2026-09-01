@@ -74,30 +74,59 @@ func printTestReport(o *testOutcome, logsMode string) {
 	printRunLogs(out, run.Logs, logsMode)
 
 	switch {
-	case run.Status == api.RunStatusDone:
+	// A live run says nothing here on purpose: the code is already published,
+	// and there is no next verb in the loop to name.
+	case run.Status == api.RunStatusDone && !o.Live:
 		fmt.Fprintf(out, "\n  Next: ronja wf publish\n")
-	// A parked run gets NEITHER of the two hints below, and both omissions are
+	// The same pause, said louder, because a live run is the one somebody is
+	// about to record as a verification — and a run that has not finished is not
+	// one. The exit code is still zero (nothing failed, see runVerdict), so this
+	// line is all that stands between a paused run and a green tick.
+	//
+	// WAITING and CONTINUED are the product's own words for these two states
+	// (docs-site/TERMINOLOGY.md), which bans "parked" and "resuming" for them
+	// precisely because both read as trouble: one as stuck, the other as this
+	// run still going. The engineering prose in these files still says "park" —
+	// that is internal vocabulary, and it is not what the reader sees.
+	case run.Status == api.RunStatusWaiting && o.Live:
+		fmt.Fprintf(out, "\n  WAITING:  the run has NOT finished — it is waiting on an agent, an approval or a\n")
+		fmt.Fprintf(out, "            timer, so this is NOT a completed verification.\n")
+		fmt.Fprintf(out, "            It resumes on its own: nothing failed, and there is nothing to re-run.\n")
+		fmt.Fprintf(out, "            Check on it later: ronja api /api/v2/workflow/run/%s\n", run.ID)
+	// A waiting run gets NEITHER of the two hints below, and both omissions are
 	// the point. The publish hint would invite taking code live on the strength
 	// of a run that has not finished; the resume hint would offer to continue a
 	// run that nothing has stopped. What it gets instead is the sentence that
 	// keeps somebody from re-running the work by hand: it is coming back on its
 	// own.
 	case run.Status == api.RunStatusWaiting:
-		fmt.Fprintf(out, "\n  Waiting:  the run parked — a durable workflow waiting on an agent or a timer.\n")
+		fmt.Fprintf(out, "\n  Waiting:  the run paused — a durable workflow waiting on an agent or a timer.\n")
 		fmt.Fprintf(out, "            It resumes on its own: nothing failed, and there is nothing to re-run.\n")
 		fmt.Fprintf(out, "            Check on it later: ronja api /api/v2/workflow/run/%s\n", run.ID)
+	// The wake latch, said louder, for the reason the pause is: a poll can land
+	// on this status and end there — the wait ended and the successor run was
+	// minted between two polls — and that is no more a finished verification
+	// than a pause is. Same zero exit, same reader about to record a green tick,
+	// so the same loud line has to stand in the way. What differs is why it is
+	// not finished: the work did not stop, it moved.
+	case run.Status == api.RunStatusResuming && o.Live:
+		fmt.Fprintf(out, "\n  CONTINUED: the run has NOT finished — the wait ended and the work continued in a\n")
+		fmt.Fprintf(out, "             NEWER run that is still executing, so this is NOT a completed verification.\n")
+		fmt.Fprintf(out, "             Nothing failed, and there is nothing to re-run: follow the newer run in Ronja.\n")
 	// The wake latch. This row is finished with — its successor carries the
 	// lineage from here — so the run id printed above is not the one to follow,
 	// which is the whole reason this says anything at all.
 	case run.Status == api.RunStatusResuming:
-		fmt.Fprintf(out, "\n  Resuming: the wait ended and the work continued in a NEWER run, so this one is\n")
-		fmt.Fprintf(out, "            finished with. Nothing failed; follow the newer run in Ronja.\n")
+		fmt.Fprintf(out, "\n  Continued: the wait ended and the work continued in a NEWER run, so this one is\n")
+		fmt.Fprintf(out, "             finished with. Nothing failed; follow the newer run in Ronja.\n")
 	// The hint is offered for a durable workflow OR for any failed run whose
 	// lineage actually has a journal — resume is not durable-only, and a
 	// standard-runtime workflow with explicitly-keyed steps has real work to
 	// skip. Gating on the runtime alone would hide the offer from exactly the
 	// authors who already took the trouble to write the keys.
-	case run.Status == api.RunStatusError && (o.Durable || run.JournalEntries > 0):
+	// Offered for a DRAFT run only: `wf test --resume` continues a run of the
+	// draft, and a live failure has no draft to continue it from.
+	case run.Status == api.RunStatusError && !o.Live && (o.Durable || run.JournalEntries > 0):
 		printResumeHint(out, run.JournalEntries)
 	}
 }
@@ -134,7 +163,7 @@ func printResumeHint(out *os.File, journaled int) {
 func describeRunStatus(run *api.RunResponse) string {
 	switch run.Status {
 	case api.RunStatusWaiting:
-		return "waiting — parked, and nothing failed"
+		return "waiting — nothing failed, and it resumes on its own"
 	case api.RunStatusResuming:
 		return "resuming — continued in a newer run"
 	}

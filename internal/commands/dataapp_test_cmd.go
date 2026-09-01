@@ -59,13 +59,10 @@ var (
 // Names of the files written into --out-dir. Fixed rather than derived from the
 // app id or the run: a caller scripting this needs to know where the report is
 // without parsing anything, and re-running overwrites rather than accumulating.
-const (
-	appTestReportName    = "report.json"
-	appTestSelectedName  = "screenshot.png"
-	appTestFramePattern  = "screenshot-%d.png"
-	appTestOutDirPerm    = 0o700
-	appTestMaxStepsShown = 20
-)
+// How many interaction steps the human report lists before it stops. The
+// artefact names, their permissions and where they go all live with the code
+// that writes them, in dataapp_test_output.go.
+const appTestMaxStepsShown = 20
 
 func newDataAppTestCmd() *cobra.Command {
 	var (
@@ -89,7 +86,7 @@ report saying why the harness stopped waiting.
 
   ronja app test
   ronja app test --route '#/orders' --viewport mobile
-  ronja app test --out-dir ./preview
+  ronja app test --out-dir ./preview   # anywhere you like, this folder included
 
 This is PERCEPTION, NOT A PASS/FAIL GATE. There is no verdict field and this
 command exits zero whenever the harness ran, errors and all — what it saw is
@@ -103,7 +100,10 @@ bundle that did not compile comes back as diagnostics and no frame.
 Use --fail-on-errors to make CI treat runtime errors, or a bundle that did not
 build, as a failure.
 
-Written into --out-dir (default the current directory):
+Written into --out-dir, which defaults to .ronja/test/ inside the folder — the
+local-only directory "ronja app push" never syncs and git never sees. The path
+is printed on every run. Name --out-dir yourself and it is used exactly as
+given, the folder itself included.
 
   report.json        the server's answer verbatim
   screenshot-1.png   every captured frame, in capture order
@@ -140,8 +140,8 @@ note and warning goes to stderr either way.`,
 		"render size: desktop or mobile")
 	cmd.Flags().DurationVar(&timeout, "timeout", 20*time.Second,
 		"render budget (0 leaves it to the server; the harness clamps it either way)")
-	cmd.Flags().StringVar(&outDir, "out-dir", ".",
-		"directory to write report.json and the screenshots into")
+	cmd.Flags().StringVar(&outDir, "out-dir", "",
+		"directory to write report.json and the screenshots into (default: .ronja/test inside the app folder, which is never synced)")
 	cmd.Flags().BoolVar(&failOnErrors, "fail-on-errors", false,
 		"exit non-zero when the render reported runtime errors or the bundle did not build")
 	return cmd
@@ -195,6 +195,19 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	if err != nil {
 		return err
 	}
+	// Where the answer will go is settled BEFORE anything is rendered, and that
+	// ordering is the point rather than tidiness. Resolving it afterwards meant a
+	// refusal here threw away a render that had already been paid for — and, with
+	// --steps, one whose clicks had already dispatched workflows and written data
+	// for real. It is also the last local check, so it keeps this command's own
+	// contract: a folder that cannot be written to costs no round trip, and a
+	// non-zero exit still means nothing about the app was observed. The narration
+	// now lands before the render's 20-second wait rather than after it, which is
+	// where a reader is actually looking.
+	out, err := resolveAppTestOutDir(opts.OutDir, f.Root)
+	if err != nil {
+		return err
+	}
 	client := api.New(resolved.URL, resolved.Token)
 
 	// The row to render is resolved HERE, not by the server: POST :id/preview
@@ -238,14 +251,14 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 		fmt.Fprintf(os.Stderr, "  Rendered your own draft %s of %s.\n", result.DataAppID, target.App.ID)
 	}
 
-	files, err := writeAppTestOutputs(ctx, client, opts.OutDir, outcome)
+	files, err := writeAppTestOutputs(ctx, client, out.Path, outcome)
 	if err != nil {
 		return err
 	}
 
 	report := &appTestResult{
 		DataAppID: result.DataAppID,
-		OutDir:    opts.OutDir,
+		OutDir:    out.Path,
 		Files:     files,
 		Preview:   json.RawMessage(outcome.Raw),
 	}
@@ -256,6 +269,11 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	} else {
 		printAppTestReport(result, files)
 	}
+	// Said again, last, because it is now said first: the ignore warning is
+	// printed before a render that takes up to twenty seconds and then fills the
+	// terminal, and one line that far up the scrollback is one nobody reads. The
+	// files it is about have only just been written.
+	out.WarnIfNotIgnored()
 
 	// The exit code, and the only place this command takes a position. Note what
 	// it does NOT do by default: an app full of runtime errors still exits zero,

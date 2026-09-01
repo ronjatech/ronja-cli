@@ -79,7 +79,7 @@ With --json, the server's response verbatim plus an "ok" boolean.`,
 			// the worst place to skip it — and the server's own validate cap
 			// (1 MiB per file) is the same number, so a folder this refuses is
 			// one the server would refuse anyway, less helpfully.
-			if err := checkPushable(files, maxFileBytes); err != nil {
+			if err := checkPushable(files, wfdir.WorkflowKind, maxFileBytes); err != nil {
 				return err
 			}
 

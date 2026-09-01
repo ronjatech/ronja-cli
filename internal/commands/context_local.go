@@ -201,7 +201,8 @@ func printLocalWork(l *localWorkflow) {
 	fmt.Fprintf(out, "    ronja wf validate    check it server-side, save nothing\n")
 	fmt.Fprintf(out, "    ronja wf push        sync the folder into your draft\n")
 	fmt.Fprintf(out, "    ronja wf test        run the draft and report what happened\n")
-	fmt.Fprintf(out, "    ronja wf publish     take the draft live\n\n")
+	fmt.Fprintf(out, "    ronja wf publish     take the draft live\n")
+	fmt.Fprintf(out, "    ronja wf run         run the live workflow and report what happened\n\n")
 	// The two things the raw-HTTP path makes people do by hand, named
 	// explicitly — they are the reason to prefer these commands, and neither is
 	// obvious from the verb list.

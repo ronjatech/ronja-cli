@@ -485,4 +485,11 @@ func printPublishReport(r *publishResult) {
 		fmt.Fprintf(out, "  Target:   %s\n", r.Target)
 	}
 	printResourceURL(out, reportKeyWidth, r.URL)
+	// The step after a publish, and only after one that landed: the live
+	// workflow is what runs from here on, and nothing has run it yet. A draft
+	// submitted for review put nothing live, and a conflict put nothing
+	// anywhere, so neither of those gets the hint.
+	if r.Outcome == outcomePublished {
+		fmt.Fprintf(out, "\n  Next: ronja wf run\n")
+	}
 }

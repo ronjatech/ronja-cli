@@ -180,12 +180,20 @@ func LoadState(root string) (*State, error) {
 // deliberate: the baseline records what one USER's draft looked like, and a
 // second developer inheriting it from git would see phantom drift against a
 // draft that is not theirs.
+// Both writers locate the directory through StateDir rather than joining it,
+// so neither can be redirected out of the folder by a committed symlink at
+// .ronja — see StateDir. They are the two writes that happen on every push and
+// every clone, which is why the check lives there and not at either call site.
 func SaveState(root string, s *State) error {
 	body, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode state: %w", err)
 	}
-	if err := writeAtomic(StatePath(root), append(body, '\n'), 0o644); err != nil {
+	dir, err := StateDir(root)
+	if err != nil {
+		return err
+	}
+	if err := writeAtomic(filepath.Join(dir, StateFileName), append(body, '\n'), 0o644); err != nil {
 		return err
 	}
 	return WriteStateGitignore(root)
@@ -194,8 +202,11 @@ func SaveState(root string, s *State) error {
 // WriteStateGitignore drops a "*" .gitignore inside .ronja/, so the directory
 // excludes itself no matter what the surrounding repo's rules are.
 func WriteStateGitignore(root string) error {
-	path := filepath.Join(root, StateDirName, GitignoreName)
-	return writeAtomic(path, []byte("*\n"), 0o644)
+	dir, err := StateDir(root)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(filepath.Join(dir, GitignoreName), []byte("*\n"), 0o644)
 }
 
 // For returns one binding's baseline, or nil when it has never been synced from

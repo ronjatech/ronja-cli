@@ -101,8 +101,12 @@ type DataAppAccess struct {
 	AllowedWorkflowIDs []string `json:"allowedWorkflowIDs"`
 	AllowedCodexIDs    []string `json:"allowedCodexIDs"`
 	AllowedMetricIDs   []string `json:"allowedMetricIDs"`
-	// Capabilities are the coarse switches (query_ronja, run_agent, …) the
-	// minted script-token carries alongside the id allowlists.
+	// Capabilities are the coarse switches the minted script-token carries
+	// alongside the id allowlists. Only four names ever belong here (ai,
+	// query_external, write_external, upload_file) — everything else is
+	// derived server-side from the allowlists. The list lives in
+	// commands.declarableCapabilities, which `app push` refuses against;
+	// `ronja app init --help` describes each one.
 	Capabilities []string `json:"capabilities"`
 }
 

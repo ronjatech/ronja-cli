@@ -59,9 +59,21 @@ the app will render with nothing to show. Nothing later warns you either: an app
 with an empty allowlist compiles, validates and publishes exactly like a working
 one, and only fails once someone opens it.
 
-Leave "capabilities" empty unless the app calls completeAI, queryExternal,
-executeExternal or uploadFile. Reading Ronja tables needs no capability — listing
-a table under allowedTableIDs grants it.`,
+Leave "capabilities" empty unless the app calls one of these four, each declared
+by its manifest name:
+
+  ai              completeAI — ask the AI for a completion
+  query_external  queryExternal — read an external or managed database
+  write_external  executeExternal — write rows to a managed database
+  upload_file     uploadFile — store a file in Ronja
+
+Nothing else ever goes in "capabilities": reading Ronja tables, running an
+allowed agent or workflow, evaluating an allowed metric, codex search and HTTP
+fetch through an allowed secret are all granted by their "access" allowlists —
+listing the table (or agent, workflow, metric, codex, secret) is all it takes —
+and the org roster (users()) needs neither. Any other name is refused by
+` + "`ronja app push`" + ` before it sends anything, since the server would drop it
+silently and the app would fail in the browser.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// MarkFlagRequired only asserts the flag was PASSED, so `--feature ""`
@@ -246,6 +258,12 @@ func printAppInitReport(root, url, title, entrypoint, featureID, fromPath string
 	fmt.Fprintf(out, "  derives it from your code, and nothing warns you if you forget: an app\n")
 	fmt.Fprintf(out, "  with an empty allowlist publishes green and reads nothing. Listing a\n")
 	fmt.Fprintf(out, "  table is all it takes — reading tables needs no \"capabilities\" entry.\n")
+	// The names, not a pointer to them: this is the one moment the author is
+	// about to write the manifest, and a vocabulary they have to go and look up
+	// is one they will guess at instead. Built from the same list `app push`
+	// refuses against, so the report cannot name a set the push disagrees with.
+	fmt.Fprintf(out, "  \"capabilities\" itself takes only these names — a push refuses any other:\n")
+	fmt.Fprintf(out, "  %s. See `ronja app init --help`.\n", strings.Join(declarableCapabilities, ", "))
 	fmt.Fprintf(out, "  Your first push creates the app as an unpublished draft only you can see;\n")
 	fmt.Fprintf(out, "  publishing promotes it in place, so its link never changes.\n")
 	fmt.Fprintf(out, "\n  Next: `ronja app status` to see where you stand.\n")

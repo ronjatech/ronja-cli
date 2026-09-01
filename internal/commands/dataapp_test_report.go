@@ -188,8 +188,11 @@ func printAppTestSteps(out *os.File, steps []api.PreviewStepResult) {
 }
 
 func formatCompileDiagnostic(d api.CompileDiagnostic) string {
-	// The path is app-authored too — it is whatever the source imported.
-	where := displayLine(d.File)
+	// The path is app-authored too — it is whatever the source imported. The
+	// bundler's namespace comes off first, in the form the SERVER wrote it and
+	// before the disarm can change the bytes, exactly as displayLine takes the
+	// untrusted envelope off first and for the same reason.
+	where := displayLine(stripBundleNamespacePath(d.File))
 	if where == "" {
 		where = "?"
 	}

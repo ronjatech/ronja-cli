@@ -1393,12 +1393,66 @@ func TestCheckPushableRefusesCaseCollisions(t *testing.T) {
 		"main.py":    "x",
 		"Helpers.py": "y",
 		"helpers.py": "z",
-	}, maxFileBytes)
+	}, wfdir.WorkflowKind, maxFileBytes)
 	if err == nil {
 		t.Fatal("accepted two paths differing only by case")
 	}
 	if !strings.Contains(err.Error(), "Helpers.py and helpers.py") {
 		t.Errorf("error = %v, want it to name both paths", err)
+	}
+}
+
+// The refusal names the folder's OWN primitive, and the workflow wording is
+// pinned unchanged.
+//
+// checkPushable runs for all three folder loops, so a data app refused for
+// holding a PNG was told "a workflow holds source code" — naming a primitive the
+// author is not working on, which reads as a bug in the CLI rather than as
+// something to act on. The hint leg is for the folder that already holds
+// artefacts a previous CLI wrote into the root: those names are NOT excluded
+// from the walk (a user's own report.json must still sync, or refuse loudly),
+// so saying what they look like after the refusal is the only help available.
+func TestCheckPushableNamesTheKindAndSpotsAppTestArtefacts(t *testing.T) {
+	binary := map[string]string{"App.tsx": "x", "blob.dat": "abc\x00def"}
+	artefacts := map[string]string{"App.tsx": "x", "screenshot-1.png": "\x89PNG\x00"}
+
+	for _, tc := range []struct {
+		name     string
+		files    map[string]string
+		kind     wfdir.Kind
+		want     string
+		wantHint bool
+	}{
+		{"workflow", binary, wfdir.WorkflowKind, "a workflow holds source code, not data or binaries", false},
+		{"data app", binary, wfdir.DataAppKind, "a data app holds source code, not data or binaries", false},
+		{"pipeline", binary, wfdir.PipelineKind, "a pipeline holds source code, not data or binaries", false},
+		{"app test artefacts", artefacts, wfdir.DataAppKind, "a data app holds source code, not data or binaries", true},
+		// The hint is the data-app loop's, and only that loop's. A workflow
+		// folder holding a screenshot-1.png is holding something else's output:
+		// `ronja wf` has no `test --out-dir` to move it with, so pointing the
+		// author at one would be the same wrong-primitive answer the refusal
+		// above it exists to stop giving.
+		{"artefact-shaped file in a workflow folder", artefacts, wfdir.WorkflowKind, "a workflow holds source code, not data or binaries", false},
+		{"artefact-shaped file in a pipeline folder", artefacts, wfdir.PipelineKind, "a pipeline holds source code, not data or binaries", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkPushable(tc.files, tc.kind, maxFileBytes)
+			if err == nil {
+				t.Fatal("accepted a file holding null bytes")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the refusal should name this folder's primitive (%q), got: %v", tc.want, err)
+			}
+			hinted := strings.Contains(err.Error(), "ronja app test")
+			if hinted != tc.wantHint {
+				t.Errorf("hint present = %v, want %v; got: %v", hinted, tc.wantHint, err)
+			}
+			// The remedy is the last line either way — the hint goes above it, not
+			// in place of it.
+			if !strings.HasSuffix(err.Error(), "Remove them from the folder (or keep them out of it) and try again") {
+				t.Errorf("the refusal must still end on what to do about it, got: %v", err)
+			}
+		})
 	}
 }
 

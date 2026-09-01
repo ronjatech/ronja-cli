@@ -82,10 +82,19 @@ The flags added to `ronja api` since — `--jq`, `-F`, `-o`, `--retry`,
 actually is. **None of them describes an endpoint.** `--jq` shapes output, `-F`
 sets a content-type, `--retry` re-sends, `--wait-until` re-issues a request the
 caller already wrote. Not one has to be extended when a route is added, which is
-the property the doctrine is really protecting. Compare a hypothetical
-`ronja workflow run --wait`: that one *would* have to know a route, a poll
-endpoint and a status vocabulary, and would need a sibling for every other
-asynchronous primitive.
+the property the doctrine is really protecting. A *generic* run verb per
+asynchronous primitive — one that takes any resource id — would be exactly the
+wrapper this rules out: it would have to know a route, a poll endpoint and a
+status vocabulary, and would need a sibling for every primitive that gained one.
+
+`ronja wf run` is not that, and the line between them is worth being precise
+about because it is where the next command will be argued. It takes **no
+workflow id** — it runs the row *this folder* is bound to, the step after
+`publish` in a loop that already owns the folder's state — and it refuses a
+positional id outright, pointing at `ronja api` instead. That is the whole
+distinction: **folder-bound, in-loop verification is a sync verb; running an
+arbitrary id is transport**, and for that `ronja api ... --wait-until` remains
+the answer.
 
 Neither one moves the line on discovery. There is still no `list`, no `browse`,
 no `delete`: finding out what exists stays on plain HTTP behind `/llms.txt`.
@@ -828,7 +837,7 @@ not worth coupling to this.
 ## Workflow folders (`ronja wf`)
 
 `ronja workflow`, aliased `wf`, develops one workflow from a local folder:
-clone → edit → validate → push → test → publish. The code lives in the
+clone → edit → validate → push → test → publish → run. The code lives in the
 customer's own repo and their own editor; Ronja holds the draft.
 
 ```bash
@@ -838,6 +847,7 @@ ronja wf validate                      # server-side check, saves nothing
 ronja wf push                          # validates, then syncs the folder into YOUR draft
 ronja wf test --param month=2026-07
 ronja wf publish                       # commit, or submit for review, and say which happened
+ronja wf run --param month=2026-07     # run what is now live, and wait for it
 ```
 
 A **durable** workflow (`ronja wf init --runtime 2`) adds one verb to that loop:
@@ -989,6 +999,7 @@ The verbs:
 | `push` | validates, ensures a draft (`checkout`, or `POST /workflow` on a first push), syncs files | `--no-validate`, `--force` |
 | `test` | runs the draft and polls to completion | `--param k=v`, `--write-live`, `--stale-ok`, `--resume`, `--timeout`, `--logs` |
 | `publish` | publishes a parentless draft, commits an attached one, or submits it for review | `--no-request-review`, `--overwrite-remote` |
+| `run` | runs the LIVE workflow this folder is bound to and polls to completion. Takes no workflow id | `--param k=v`, `--timeout`, `--logs` |
 | `discard` | deletes your draft; the live workflow and your local files are untouched. A workflow that has never been published *is* its draft, so removing it needs `--delete-workflow` (a soft delete — it sits in the trash for 30 days) | `--yes`, `--delete-workflow` |
 
 Four behaviours are deliberate and easy to undo by accident:
@@ -1025,11 +1036,81 @@ Four behaviours are deliberate and easy to undo by accident:
   from `wf test`, automations and data apps alike; the configured approvers and
   delivery carry over unchanged.
 - **Exit zero means the thing did not fail.** `validate` exits non-zero on error
-  findings; `test` exits non-zero on a failed run, on a timeout, and on a status
-  it does not recognise — but zero on a run that finished AND on a durable run
-  that parked (`waiting`) or was handed to a successor (`resuming`), neither of
-  which is a failure. Ctrl-C during `test` stops the waiting, not the run — it is
-  caught explicitly so the person is told that.
+  findings; `test` and `run` exit non-zero on a failed run, on a timeout, and on
+  a status they do not recognise — but zero on a run that finished AND on a
+  durable run that parked (`waiting`) or was handed to a successor (`resuming`),
+  neither of which is a failure. That verdict is one function (`runVerdict`), so
+  the two commands cannot come to disagree about what a park is worth. Ctrl-C
+  during either stops the waiting, not the run — it is caught explicitly so the
+  person is told that.
+
+### `wf run` — the step after publish
+
+`run` is the only verb that touches the **live** workflow, and it is a sync verb
+rather than a wrapper because it takes **no workflow id**: it runs the row this
+folder's binding names, resolved exactly as `status` and `publish` resolve it. A
+positional id is refused with that argument and a pointer at `ronja api`. See
+"Transport is not a wrapper" above.
+
+Everything that can refuse does so before the POST, and one of those refusals is
+not obvious enough to lose by accident:
+
+- **An open draft refuses the run.** The sync baseline describes the row this
+  folder last synced with, which for a folder with a draft is the *draft* — so
+  after publish → edit → push, a folder that is perfectly clean against its own
+  baseline would green-light a run of the live version the author stopped looking
+  at two commands ago. The staleness check cannot see that; only "you have a
+  draft, `wf test` runs it, publish or discard first" can.
+- **Then staleness, against live.** With no draft in play the baseline *is* the
+  live row — `publish` and `discard` both refresh it from live — so the ordinary
+  local-changes comparison answers "live is not this folder". A baseline it
+  cannot compare refuses rather than guesses: "I cannot tell" has to stop a live
+  run, because the claim this command makes is that it ran the code in front of
+  you. That is **two refusals with two messages**, not one: *no baseline at all*
+  is a copy taken from git and the remedy is a fresh `clone`, while *a baseline
+  naming another row* is the review path — `publish` on a shared workflow
+  submits the draft and returns without re-anchoring, so once an admin commits
+  it the folder names a draft that is gone and holds files that are usually
+  exactly what went live. Telling that author to re-clone a perfectly good
+  folder is what the split exists to stop.
+- **Then the legacy approval gate**, refused with the same wording `test` uses
+  and, like it, naming the conversion to a mid-run approval rather than the
+  off-switch.
+
+Two server refusals are rendered rather than passed through as a status code. A
+**403** is the shared-feature admin gate (`requireWorkflowAccess(write=true)`) —
+it names the gate and the two ways forward, ask an admin or let the automation
+trigger it — and a **409** is the `skip` concurrency policy: it leads with the
+fact that *nothing ran*, and names the blocking run from the response's own
+`blockingRunId` detail, never out of the message (see `api.AsRunInFlight`, and
+`gt.NewRunInFlightConflict` on the server for why the prose cannot be trusted to
+carry it). Everything else — the credit kill-stop above all — arrives in the
+server's own words.
+
+A **timed-out run POST is not a refusal.** The server commits the `workflow_runs`
+row and only then dispatches asynchronously, so a deadline of *ours* says nothing
+about whether the run started — and reported as a failure, the operator's natural
+retry fires a second live run into replace-mode output tables. So a timeout reads
+the run history back and adopts the newest run stamped at or after the moment we
+asked (`adoptTimedOutRun`), then follows it exactly as if the POST had answered.
+The comparison is against the *server's* clock, so a server running behind ours
+matches nothing and falls through to a message that says the run **may still be
+running** and how to check — never that it did not start, which is the sentence
+that makes somebody run it again.
+
+A waiting run exits **zero**, exactly as it does for `test`, so the report says
+`WAITING:` and "NOT a completed verification" out loud: this is the run somebody
+is about to record a green tick against. `WAITING` and `CONTINUED` are the
+product's words for the two durable-wait states (`docs-site/TERMINOLOGY.md`,
+which bans "parked" and "resuming" for them); the engineering prose in these
+files still says "park", because that is internal vocabulary and not what the
+reader sees.
+
+There is deliberately **no `--write-live`**. That flag exists on `test` because a
+draft's output tables are the live workflow's, and testing would replace a
+production table by surprise. The live workflow writing its own bound output
+tables is not a surprise — it is what publishing it meant — and a flag everybody
+types every time guards nothing.
 
 ### Durable workflows (`--runtime 2`)
 
@@ -1301,10 +1382,21 @@ Do not lean on that check. It is a deliberately LOOSE scan — it passes as soon
 `document.body`, `innerHTML`), because a false positive would refuse to publish a
 working app while a false negative costs one visible white screen. So a
 multi-file app with a stray `querySelector` in some helper and no real mount call
-compiles green and ships a blank page. And nothing static can promise that
-`Compiles: yes` renders anyway — a component that mounts and returns `null`, or
-throws on first render, publishes green too. `status` prints the app's URL; open
-it.
+compiles green and ships a blank page.
+
+**A name nothing imports or declares is refused too.** A hook you call without
+adding it to the `react` import line, a misspelt component, a `<Missing />` tag,
+a `import type { Foo }` used as a value — each used to bundle green and throw
+`ReferenceError` in the browser, and now comes back from `push` as
+`Compiles: NO` naming the file, the line and the identifier, plus the import to
+add when it is a React export. The escapes are the ones a type-checker would
+demand as well: reach a script-provided global as `window.X`, or introduce it
+with `declare const X: SomeType`.
+
+And nothing static can promise that `Compiles: yes` renders anyway — the
+compiler does not check types, so a mistyped prop, a hook called after an early
+return, a wrong table id, or a component that mounts and returns `null`
+publishes green too. `status` prints the app's URL; open it.
 
 **Forking a kit component is a local file copy.** Every app compiles against an
 embedded component kit (the shadcn/ui primitives and Ronja's operator
@@ -1346,6 +1438,25 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
     "allowedCodexIDs": [], "allowedMetricIDs": [], "capabilities": []
   }
   ```
+
+  Only four names ever belong in `capabilities` — `ai`, `query_external`,
+  `write_external`, `upload_file` — one per SDK call that is not derived from
+  an allowlist (completeAI, queryExternal, executeExternal, uploadFile).
+  Everything else — reading tables, running an allowed agent or workflow,
+  evaluating an allowed metric, codex search, HTTP fetch through an allowed
+  secret — is granted by the `allowed*IDs` lists themselves, and the org
+  roster (`users()`) needs neither. `ronja app init --help` names the same
+  four, so the vocabulary lives in the command.
+
+  **`push` refuses any other name, locally, before its first request.** The
+  server does not validate this field: an unknown capability is dropped when the
+  app's token is minted, so `"upload_fil"` used to push green, publish green and
+  show no drift, then fail in a viewer's browser with nothing pointing back at
+  the manifest. The refusal names the offending entry and the four valid names —
+  and says so if you are simply older than the server, since the vocabulary is
+  closed but not frozen (`declarableCapabilities` in
+  `internal/commands/dataapp.go`; the backend pins the correspondence in
+  `TestDataAppCaps_DeclareOnlySetIsExactlyFour`).
 
   It has the same **three states** `parameters` does — absent means "not
   managed, push never touches them", present means "push makes the row match" —
@@ -1398,7 +1509,7 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
 | `fork` | copies one built-in kit file into the folder at the same path, so it shadows the kit's. Local only — changes nothing server-side, and never overwrites an existing file | `--json` |
 | `push` | ensures a draft, syncs allowlists then files, then compiles | `--no-validate`, `--force` |
 | `validate` | recompiles your draft and reports diagnostics | `--json` |
-| `test` | renders the draft in a headless browser and writes `report.json` + the frames; a report, never a verdict | `--route`, `--viewport`, `--timeout`, `--steps`, `--out-dir`, `--fail-on-errors`, `--json` |
+| `test` | renders the draft in a headless browser and writes `report.json` + the frames into `.ronja/test/`; a report, never a verdict | `--route`, `--viewport`, `--timeout`, `--steps`, `--out-dir`, `--fail-on-errors`, `--json` |
 | `publish` | commits the draft, or submits it for review. Refuses a draft that does not compile | `--no-request-review` |
 | `discard` | deletes your draft; the live app and your local files are untouched | `--yes`, `--delete-app` |
 
@@ -1494,6 +1605,32 @@ into `--out-dir`:
 | `screenshot-<n>.png` | every captured frame, in capture order |
 | `screenshot.png` | the representative frame, under a second stable name |
 
+**`--out-dir` defaults to `.ronja/test/` inside the folder**, and the resolved
+path is printed on every run. The old default was the folder ROOT, which made
+the next command impossible: a PNG beside `App.tsx` is binary content in a
+folder of source, so `app push` refused the whole folder. `.ronja/` is the one
+place the push walk structurally cannot see — it is the folder's own
+bookkeeping, excluded by name and not even reported as skipped — and the `*`
+.gitignore living there keeps the artefacts out of git as well (`app test`
+writes that file if the folder does not have one yet; if it cannot, it warns —
+twice, once before the render and once beside the paths it wrote — and carries
+on, because refusing would throw away an observation over the way it is stored).
+A `--out-dir` you name is used exactly as given, the folder itself included.
+
+The default path is one the CLI chose, not one you typed, so it is **refused
+when a symlink leads out of the folder** — at `.ronja`, at `.ronja/test`, or
+anywhere above them. A folder is an ordinary git checkout, and a committed link
+there would let whoever wrote that repository choose where the artefacts (and
+the deletes a re-run makes) land on your machine. The same check guards
+`state.json` and the `.gitignore` itself, so it holds for `push` and `clone`
+too. It is resolved **before** the render, so nothing has been spent when it
+fires; a `--out-dir` you name is your own business and is used as given.
+
+Nothing is ignored by NAME: a folder that still holds artefacts from an older
+CLI is refused by `app push` like any other binary, and the refusal adds a line
+saying they look like `ronja app test` output. Excluding those names from the
+walk instead would silently drop a `report.json` a user wrote themselves.
+
 Everything is 0600, atomically (`--out-dir` is created 0700 when missing).
 `screenshot.png` is a copy of the numbered file already on disk, so the two
 names are guaranteed to be the same pixels and the frame is fetched once. A
@@ -1512,13 +1649,21 @@ back with an **empty** `errors` list, so a gate reading `errors` alone would pas
 the most broken state a data app can be in. Console errors are excluded (an app
 can log one on purpose).
 
-Non-zero means the render did NOT happen: a transport failure, an HTTP error, a
-bad flag, or a busy harness that stayed busy. **429 is not a verdict** — the
-shared render pool, or this credential's per-minute budget, was spent. The CLI
-waits the server's `Retry-After` (default 15s, capped at 60s) and asks **once**
-more; busy again prints a message that says nothing about your app was observed
-and exits non-zero. A client that kept retrying would add load to the thing it
-was just told is at capacity.
+Non-zero, `--fail-on-errors` aside, means the render did NOT happen: a transport
+failure, an HTTP error, a bad flag, an out-dir that cannot be written to, or a
+busy harness that stayed busy. Every local refusal — the flags, the steps file,
+the out-dir — is settled *before* the request, so it costs no round trip and
+discards no render. The one thing that can still fail afterwards is the write
+itself: a directory that cannot be created, a stale frame that cannot be
+removed, or a `report.json` that cannot be saved exits non-zero and names the
+file. A frame that cannot be *fetched* is only a warning — the answer is already
+written, and losing an illustration is not losing the observation.
+
+**429 is not a verdict** — the shared render pool, or this credential's
+per-minute budget, was spent. The CLI waits the server's `Retry-After` (default
+15s, capped at 60s) and asks **once** more; busy again prints a message that says
+nothing about your app was observed and exits non-zero. A client that kept
+retrying would add load to the thing it was just told is at capacity.
 
 ⚠️ `--steps` requires an **administrator** — and, when you are signed in with a
 narrowly scoped token, `admin:write` on top of the role — and executes for real,
@@ -2010,8 +2155,11 @@ internal/tablerefs/  the {{ ref('…') }} grammar: canonicalization to id form,
 ```
 
 The workflow commands are one file per verb (`workflow_push.go`,
-`workflow_testcmd.go`, …) with the shared folder plumbing in `workflow.go`;
-their endpoint mirrors live in `internal/api/workflow.go`, `workflow_write.go`
+`workflow_testcmd.go`, `workflow_runcmd.go`, …) with the shared folder plumbing
+in `workflow.go` — `test` carries the `…cmd` suffix because `workflow_test.go`
+is a test file to the Go toolchain, and `run` matches it rather than colliding by
+name with the api package's `workflow_run.go`.
+Their endpoint mirrors live in `internal/api/workflow.go`, `workflow_write.go`
 and `workflow_run.go`, hand-mirrored against
 `backend/api/v2/workflow/handler.go`. The data-app and pipeline commands follow
 the same shape (`dataapp_*.go`, `pipeline_*.go`, with the shared folder plumbing
