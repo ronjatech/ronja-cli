@@ -369,6 +369,43 @@ func (c *Client) GetWorkflowRun(ctx context.Context, runID string) (*RunResponse
 	return &out, nil
 }
 
+// GetWorkflowRunLineageHead reads the run currently carrying this run's resume
+// LINEAGE: the named run itself unless it parked and was resumed, in which case
+// it is the successor that took the work over.
+//
+// This is the route a follow polls, and it is polled with the ORIGINAL run id
+// every time — the server re-resolves the head on every call, so each
+// park/resume hop is picked up without the client tracking ids. That matters
+// because a parked run never finishes under its own id: the wake latch leaves
+// it at `resuming` forever by design and a successor run carries the work, so a
+// follow that polled the named run would watch a lineage that has already
+// finished sit at `resuming` until it gave up.
+//
+// The response is the same RunResponse the plain route answers with, and for a
+// run that never parked it is byte-identical to it. When it DID park, the ID
+// SHIFT is the signal: the returned `id` names the head, `resumeOfRunID` names
+// the lineage root, and status, error, body, outputs and logs all read off the
+// head row.
+//
+// Two error shapes, and the difference is the whole reason the CLI can degrade
+// on an old instance: a run id that matches nothing answers 400 (`no rows`),
+// exactly as the sibling run routes do, so a 404 from this path is never a
+// missing RUN. It means one of two other things — the route is not there (an
+// instance predating it, answering the router's plain-text breadcrumb, which is
+// why callers key the fallback on the STATUS and never on the body: that body
+// is not JSON at all), or the caller has no read access to the run's workflow,
+// which the gate refuses as a 404 so the path cannot be used to probe run ids.
+// The plain GetWorkflowRun disambiguates, because it answers if and only if the
+// caller has that access: it answering while this 404s is the route being
+// absent, and both 404ing is a run the caller may not read.
+func (c *Client) GetWorkflowRunLineageHead(ctx context.Context, runID string) (*RunResponse, error) {
+	var out RunResponse
+	if err := c.Do(ctx, "GET", "workflow/run/"+url.PathEscape(runID)+"/head", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // `wf test` also reads table NAMES, to show which tables a run would overwrite.
 // That lives on Client.GetTable in table.go — one mirror of the table row, not a
 // second minimal one here. It stays best-effort by contract for this caller: a

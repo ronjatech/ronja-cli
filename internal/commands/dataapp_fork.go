@@ -67,7 +67,7 @@ The kit is listed at <instance>/docs/api/kit.md, one line per file.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.DataAppKind)
+			f, err := openFolderLocally(resolved, wfdir.DataAppKind)
 			if err != nil {
 				return err
 			}

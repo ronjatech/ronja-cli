@@ -36,7 +36,12 @@ pushed, they are not part of what is checked, and you are told so.
 
 A data app must compile before it can be published — POST :id/commit refuses a
 draft whose last save failed — so this is the same gate ` + "`ronja app publish`" + `
-applies, run on its own.`,
+applies, run on its own.
+
+The folder's own dependency names are checked too — a name no stack binds, or
+one used under the wrong kind of marker. Those exit non-zero even when the draft
+compiles, because ` + "`ronja app push`" + ` refuses the folder. With --json, "ok" is
+the verdict and "compiles" is the draft alone.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveInstance()
@@ -56,11 +61,32 @@ applies, run on its own.`,
 			// A dirty folder is a WARNING, not a refusal: validating the draft as it
 			// stands is a reasonable thing to want. But it is also the one way to
 			// get a green verdict about code you are not looking at.
+			//
+			// The alias pre-flight is NOT in that category, and it is the reason
+			// this command has an `ok` of its own beside `compiles`. A draft that
+			// compiles perfectly says nothing about a folder whose allowlist
+			// names an alias no stack binds — `ronja app push` refuses that
+			// folder, and a CI job gating on this one would have waved it
+			// through, twice over: an unbound secret is only a WARNING on the
+			// server side too.
+			aliases, err := f.aliasReport()
+			if err != nil {
+				// Fail closed. This command's `ok` is what a CI job gates on, and
+				// a folder whose files could not be walked has not been checked —
+				// which is a different answer from "checked and clean", and only
+				// one of the two may exit zero.
+				return err
+			}
+			noteAliasErrors(aliases)
 			if err := warnIfAppDirty(f); err != nil {
 				return err
 			}
 
-			result := &appValidateResult{DataAppID: f.Binding.DataAppID, DraftID: draft.ID}
+			result := &appValidateResult{
+				DataAppID:     f.Binding.DataAppID,
+				DraftID:       draft.ID,
+				AliasRefusals: aliases.Refusals,
+			}
 			validated, verr := client.ValidateDataApp(cmd.Context(), draft.ID)
 			switch {
 			case verr == nil:
@@ -72,6 +98,7 @@ applies, run on its own.`,
 				return fmt.Errorf("check whether %s compiles: %w", draft.ID, verr)
 			}
 
+			result.OK = result.Compiles && len(result.AliasRefusals) == 0
 			if flagJSON {
 				if err := emitJSON(result); err != nil {
 					return err
@@ -79,7 +106,7 @@ applies, run on its own.`,
 			} else {
 				printAppValidateReport(result)
 			}
-			if !result.Compiles {
+			if !result.OK {
 				// Non-zero so CI notices. The message has already been printed in the
 				// caller's chosen format, so this adds nothing to it.
 				return errAlreadyReported
@@ -91,10 +118,20 @@ applies, run on its own.`,
 }
 
 type appValidateResult struct {
-	DataAppID    string            `json:"dataAppID"`
-	DraftID      string            `json:"draftID"`
+	DataAppID string `json:"dataAppID"`
+	DraftID   string `json:"draftID"`
+	// OK is the command's VERDICT and the exit code's twin: the draft compiles
+	// AND the folder is one push would accept. Separate from Compiles because
+	// the two answer different questions about different things — Compiles is
+	// about the draft on the server, and an alias refusal is about the folder in
+	// front of you — and collapsing them would make "compiles: false" a claim
+	// about a compiler that was perfectly happy.
+	OK           bool              `json:"ok"`
 	Compiles     bool              `json:"compiles"`
 	CompileError *api.CompileError `json:"compileError,omitempty"`
+	// AliasRefusals are the local findings — see validateReport.AliasRefusals,
+	// which carries the same contract for the workflow loop.
+	AliasRefusals []string `json:"aliasRefusals,omitempty"`
 }
 
 // warnIfAppDirty says so when the folder holds changes the draft does not.
@@ -117,6 +154,15 @@ func printAppValidateReport(r *appValidateResult) {
 	if r.Compiles {
 		fmt.Fprintf(out, "  Compiles: yes\n")
 		fmt.Fprintf(out, "\n  Draft:    %s\n", r.DraftID)
+		if n := len(r.AliasRefusals); n > 0 {
+			// The refusals themselves are already on stderr. What has to be said
+			// HERE is that "Compiles: yes" is not the verdict, because the next
+			// line would otherwise be an instruction to run a command that
+			// refuses.
+			fmt.Fprintf(out, "\n  %d alias %s above — `ronja app push` would refuse this folder\n",
+				n, plural(n, "problem"))
+			return
+		}
 		fmt.Fprintf(out, "\n  Next: ronja app publish\n")
 		return
 	}

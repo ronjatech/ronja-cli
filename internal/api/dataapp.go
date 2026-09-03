@@ -67,6 +67,27 @@ type DataApp struct {
 	// draft; null on every other row, and on a draft they have not submitted.
 	SubmittedForReviewAt *time.Time `json:"submittedForReviewAt"`
 	DrafterUserID        string     `json:"drafterUserID"`
+	// BaseVersionID is what the DRAFT was forked from — and ⚠️ it does NOT mean
+	// what the identically-named field on Workflow means, which is why
+	// `app clone` resolves its anchor through dataAppCloneAnchor rather than
+	// through cloneAnchor.
+	//
+	// Two writers, two meanings:
+	//
+	//   - An ordinary checkout (rdataapp.buildDraftFromParent) stamps
+	//     optional.Value(parent.ID) — the LIVE APP'S OWN ID — for every draft,
+	//     whether or not the app has committed versions. rworkflow stamps the
+	//     head VERSION row's id in the same place. So on a versioned app this
+	//     value is not a version at all, and comparing it with what
+	//     DataAppHeadVersionID answers can only ever fail.
+	//   - RestoreFromVersion stamps the real version id being restored, which is
+	//     the workflow meaning.
+	//
+	// The two are told apart by the value: equal to the app's identity id means
+	// the parent-id sentinel, anything else is a genuine version snapshot.
+	//
+	// Null on every other row.
+	BaseVersionID string `json:"baseVersionID"`
 
 	CreatedBy string    `json:"createdBy"`
 	CreatedAt time.Time `json:"createdAt"`

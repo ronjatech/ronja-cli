@@ -144,22 +144,45 @@ flow.`,
 			// The STABLE identity, not source.ID: when the files came from a draft,
 			// the draft's id dies at commit while the binding lives in the
 			// customer's git.
-			manifest.SetBinding(key, wfdir.Binding{
+			lock, err := recordFirstBinding(manifest, key, wfdir.Binding{
 				DataAppID: app.IdentityID(),
 				FeatureID: source.FeatureID,
 			})
+			if err != nil {
+				return err
+			}
+			// The committed anchor — the same decision as `wf clone`'s (a clone
+			// taken from a DRAFT never anchors on the current head), through a
+			// DIFFERENT resolver: rdataapp's base_version_id usually holds the
+			// live app's own id rather than a version, so the workflow function
+			// would record an anchor that can never match. See
+			// dataAppCloneAnchor's ⚠️.
+			if flagStack != "" {
+				anchor, err := dataAppCloneAnchor(cmd.Context(), dataAppHeadReader(client), app.IdentityID(), source.ID, source.BaseVersionID)
+				if err != nil {
+					return err
+				}
+				if anchor == "" {
+					fmt.Fprintf(os.Stderr,
+						"  Note: cloning your open draft of an app that has published versions, and the server does not record which one that draft forked from — so no version anchor was written. A fresh checkout of this folder will ask for a baseline; re-clone from the live app to get one.\n")
+				}
+				lock.SetHeadVersion(flagStack, anchor)
+			}
 			// Always written, even when the app grants nothing: a clone is a
 			// faithful copy, and a folder that came down without the key would
 			// silently not manage the allowlists it can plainly see — so the next
 			// push would leave them alone while `status` showed them.
 			manifest.SetAccess(source.DataAppAccess)
-			if err := wfdir.SaveManifest(root, manifest); err != nil {
+			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}
 			state := &wfdir.State{}
 			// The baseline records the row the files actually came from, which may
 			// be the draft even though the binding names the live app.
-			state.Set(key, baselineFromApp(source, files))
+			// No codec: `clone` refuses a destination that is not empty, so the
+			// folder it writes declares no dependencies. An empty codec is the
+			// identity — see alias.go.
+			state.Set(key, baselineFromApp(aliasCodec{}, source, files))
 			if err := wfdir.SaveState(root, state); err != nil {
 				return err
 			}

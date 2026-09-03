@@ -45,49 +45,70 @@ With --json, one object carrying all of the above.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.DataAppKind)
+			root, err := folderRootHere(wfdir.DataAppKind)
 			if err != nil {
 				return err
 			}
-
-			report := &appStatusReport{
-				Root:          f.Root,
-				URL:           resolved.URL,
-				Title:         f.Manifest.Title,
-				Entrypoint:    f.Manifest.Entrypoint,
-				ManagesAccess: f.Manifest.ManagesAccess(),
-				Access:        describeAccess(f.Manifest.DeclaredAccess()),
-				Bound:         f.Bound,
-				Ambiguous:     f.BindingErr != nil,
-				DataAppID:     f.Binding.DataAppID,
-				FeatureID:     f.Binding.FeatureID,
-			}
-
-			enumeration, err := wfdir.Enumerate(f.Root, wfdir.DataAppKind)
+			report, err := dataAppStatusReportAt(cmd.Context(), root, resolved)
 			if err != nil {
 				return err
 			}
-			baseline := f.State.For(f.Key)
-			report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
-			report.Skipped = enumeration.Skipped
-			if baseline != nil {
-				report.Baseline = &baselineReport{
-					SourceID:        baseline.SourceID,
-					SourceLifecycle: baseline.SourceLifecycle,
-					UpdatedAt:       baseline.BaselineUpdatedAt,
-				}
-			}
-
-			report.Remote, report.AppURL = appRemoteStatus(cmd.Context(), resolved, f)
 
 			if flagJSON {
 				return emitJSON(report)
 			}
 			printAppStatus(report)
+			// No verdict, deliberately, and unchanged — see the same note on
+			// `ronja wf status`.
 			return nil
 		},
 	}
 	return cmd
+}
+
+// dataAppStatusReportAt computes the report for ONE data-app folder at an
+// explicit root, and prints nothing. See pipelineStatusReportAt for why the
+// three status computations were hoisted out of their RunE closures.
+func dataAppStatusReportAt(ctx context.Context, root string, resolved *config.Resolved) (*appStatusReport, error) {
+	f, err := openFolderForStatusAt(ctx, root, resolved, wfdir.DataAppKind)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reported, never refused — see folder.noteAliases.
+	f.noteAliases()
+
+	report := &appStatusReport{
+		Root:          f.Root,
+		URL:           resolved.URL,
+		Title:         f.Manifest.Title,
+		Entrypoint:    f.Manifest.Entrypoint,
+		ManagesAccess: f.Manifest.ManagesAccess(),
+		Access:        describeAccess(f.declaredAccess()),
+		Stack:         f.declaredStack(),
+		Bound:         f.Bound,
+		Ambiguous:     f.BindingErr != nil,
+		DataAppID:     f.Binding.DataAppID,
+		FeatureID:     f.Binding.FeatureID,
+	}
+
+	enumeration, err := wfdir.Enumerate(f.Root, wfdir.DataAppKind)
+	if err != nil {
+		return nil, err
+	}
+	baseline := f.State.For(f.Key)
+	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
+	report.Skipped = enumeration.Skipped
+	if baseline != nil {
+		report.Baseline = &baselineReport{
+			SourceID:        baseline.SourceID,
+			SourceLifecycle: baseline.SourceLifecycle,
+			UpdatedAt:       baseline.BaselineUpdatedAt,
+		}
+	}
+
+	report.Remote, report.AppURL = appRemoteStatus(ctx, resolved, f)
+	return report, nil
 }
 
 // appStatusReport is the --json shape, and the same struct the human renderer
@@ -102,7 +123,12 @@ type appStatusReport struct {
 	// pointer carries, and a caller branching on Access alone would lose it.
 	ManagesAccess bool   `json:"managesAccess"`
 	Access        string `json:"access,omitempty"`
-	Bound         bool   `json:"bound"`
+	// Stack is the NAME of the environment this report is about, empty for a
+	// folder still using the unnamed legacy "instances" shape. Reported because
+	// a folder can name several and the answer to "which one am I looking at"
+	// must not be inferred from the organization id.
+	Stack string `json:"stack,omitempty"`
+	Bound bool   `json:"bound"`
 	// Ambiguous reports a folder that IS bound here, to more than one
 	// organization, with no way to tell which applies — the signed-out case.
 	Ambiguous bool   `json:"ambiguous,omitempty"`
@@ -159,6 +185,10 @@ func (r *appRemoteReport) note(format string, args ...any) {
 	r.DriftNotes = append(r.DriftNotes, fmt.Sprintf(format, args...))
 }
 
+// reasonNoAppYet is this loop's reasonNothingBound — see reasonNoWorkflowYet
+// for why it is a const. The string is unchanged from the literal it replaced.
+const reasonNoAppYet = "no data app exists on this instance yet — the first push will create it"
+
 // appRemoteStatus gathers everything server-side, degrading rather than
 // aborting. The local half of a status is worth having on a plane.
 //
@@ -170,6 +200,13 @@ func (r *appRemoteReport) note(format string, args ...any) {
 // prints as nothing at all.
 func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*appRemoteReport, string) {
 	out := &appRemoteReport{}
+	// The organization lookup failed, so this folder's binding cannot be trusted
+	// to be the right one. Reported ahead of the ambiguity below because it is
+	// the CAUSE of it whenever both are set.
+	if reason := f.orgNotCheckedReason(); reason != "" {
+		out.NotCheckedReason = reason
+		return out, ""
+	}
 	if f.BindingErr != nil {
 		out.NotCheckedReason = fmt.Sprintf("%s on %s — sign in (`ronja login`), or pass --profile to say which one",
 			f.BindingErr, resolved.URL)
@@ -184,7 +221,7 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 		return out, ""
 	}
 	if f.Binding.DataAppID == "" {
-		out.NotCheckedReason = "no data app exists on this instance yet — the first push will create it"
+		out.NotCheckedReason = reasonNoAppYet
 		return out, ""
 	}
 
@@ -229,13 +266,13 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 	}
 	out.ComparedAgainst = &comparedReport{ID: row.ID, Lifecycle: row.Lifecycle}
 	baseline := f.State.For(f.Key)
-	drift := wfdir.DiffHashes(hashAppFiles(files), baseline.Hashes())
+	drift := wfdir.DiffHashes(hashAppFiles(f.Codec, files), baseline.Hashes())
 	out.Drift = &drift
 	// Reported only for a folder that manages the allowlists: for one that does
 	// not, the row's grants are not the folder's business and flagging a
 	// difference would be advising a change push deliberately will not make.
 	if f.Manifest.ManagesAccess() {
-		out.AccessChanges = diffAccess(target.Access(), f.Manifest.DeclaredAccess())
+		out.AccessChanges = diffAccess(target.Access(), f.declaredAccess())
 	}
 	switch {
 	case baseline == nil:
@@ -253,6 +290,11 @@ func printAppStatus(r *appStatusReport) {
 	fmt.Fprintf(out, "  %s\n\n", r.Root)
 
 	fmt.Fprintf(out, "  Instance:   %s\n", r.URL)
+	if r.Stack != "" {
+		// Printed next to the instance because it answers the same question a
+		// step further in: which of this folder's environments is being reported.
+		fmt.Fprintf(out, "  Stack:      %s\n", r.Stack)
+	}
 	if r.Bound && r.DataAppID != "" {
 		fmt.Fprintf(out, "  Data app:   %s\n", r.DataAppID)
 	} else if r.Bound {

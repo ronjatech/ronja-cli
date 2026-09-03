@@ -153,7 +153,7 @@ func runPipelineDiscard(ctx context.Context, f *folder, args []string, yes bool)
 		// server still pointed at, with their content baseline still describing
 		// them, which is exactly the "Up to date with nothing staged anywhere"
 		// state this command's report promises it has not left behind.
-		if err := wfdir.SaveState(f.Root, f.State); err != nil {
+		if err := f.saveBaseline(); err != nil {
 			// A baseline that cannot be written is that same state, and it does
 			// not get better by discarding more drafts into it — a read-only
 			// .ronja/ or a full disk fails identically on every remaining file.
@@ -214,7 +214,7 @@ func discardOneTable(ctx context.Context, client *api.Client, f *folder,
 		// pointer left inst.Files holding the vanished draft's bytes, so the
 		// local file read as unchanged for ever and the next push answered "Up to
 		// date" with no draft on the server at all.
-		recordDiscarded(inst, path, out.TableID)
+		recordDiscarded(f.live(inst), path, out.TableID)
 		return out
 	}
 	out.DraftID = draft.ID
@@ -224,7 +224,7 @@ func discardOneTable(ctx context.Context, client *api.Client, f *folder,
 	out.Outcome = outcomeDiscarded
 	// The pointer goes, and the content baseline is re-pointed at the LIVE
 	// table — the only row this file is synced with now.
-	recordDiscarded(inst, path, out.TableID)
+	recordDiscarded(f.live(inst), path, out.TableID)
 	return out
 }
 

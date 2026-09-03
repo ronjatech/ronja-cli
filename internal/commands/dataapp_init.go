@@ -160,15 +160,18 @@ silently and the app would fail in the browser.`,
 			}
 			// No dataAppID: nothing exists server-side yet. The first push creates
 			// the app and fills it in.
-			manifest.SetBinding(
+			lock, err := recordFirstBinding(manifest,
 				wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID},
 				wfdir.Binding{FeatureID: featureID})
+			if err != nil {
+				return err
+			}
 			// An EMPTY declaration rather than an absent one, so the folder owns its
 			// allowlists from the start and granting the app a table is editing
 			// ronja.json rather than discovering that the key exists. Harmless on an
 			// app that does not exist yet, which is every folder init produces.
 			manifest.SetAccess(api.DataAppAccess{})
-			if err := wfdir.SaveManifest(root, manifest); err != nil {
+			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}
 			// An EMPTY baseline rather than a fabricated one. There is no

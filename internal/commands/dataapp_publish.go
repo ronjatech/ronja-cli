@@ -202,7 +202,7 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 		// since a parentless draft is promoted in place and resolveAppDraft
 		// returns that one row as both halves.
 		result.AppURL = parent.URL
-		noteBaselineRefresh(f.Kind, refreshAppBaselineFromLive(ctx, client, f, parent.ID))
+		noteBaselineRefresh(f.Kind, refreshAppBaselineFromLive(ctx, client, f, parent.ID, anchorOnLive))
 		return result, nil
 	}
 
@@ -294,7 +294,7 @@ func resolveAppDraft(ctx context.Context, client *api.Client, f *folder, noun st
 // and for every caller so far it means "note it and carry on": the server-side
 // change has already happened, and failing the command afterwards would report
 // something that did happen as something that did not.
-func refreshAppBaselineFromLive(ctx context.Context, client *api.Client, f *folder, liveID string) error {
+func refreshAppBaselineFromLive(ctx context.Context, client *api.Client, f *folder, liveID string, anchor anchorPolicy) error {
 	live, err := client.GetDataApp(ctx, liveID)
 	if err != nil {
 		return fmt.Errorf("re-read %s: %w", liveID, err)
@@ -310,11 +310,17 @@ func refreshAppBaselineFromLive(ctx context.Context, client *api.Client, f *fold
 	if err := wfdir.CheckLocalPaths(appPathsOf(files), wfdir.DataAppKind); err != nil {
 		return fmt.Errorf("the files of %s cannot all be tracked locally: %w", liveID, err)
 	}
-	f.State.Set(f.Key, baselineFromApp(live, files))
+	f.State.Set(f.Key, baselineFromApp(f.Codec, live, files))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return fmt.Errorf("write the local baseline: %w", err)
 	}
-	return nil
+	// And the COMMITTED anchor beside the local one, for the callers that just
+	// PRODUCED the live row's current version. A discard passes keepAnchor; see
+	// reanchorOnLive's ⚠️ for why.
+	if anchor != anchorOnLive {
+		return nil
+	}
+	return reanchorOnLive(ctx, dataAppHeadReader(client), f, liveID)
 }
 
 func printAppPublishReport(r *appPublishResult) {

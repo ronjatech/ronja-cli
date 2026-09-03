@@ -139,7 +139,32 @@ at the right flow.`,
 			// The STABLE identity, not source.ID: when the files came from a
 			// draft, the draft's id dies at commit while the binding lives in
 			// the customer's git.
-			manifest.SetBinding(key, wfdir.Binding{WorkflowID: wf.IdentityID(), FeatureID: source.FeatureID})
+			lock, err := recordFirstBinding(manifest, key,
+				wfdir.Binding{WorkflowID: wf.IdentityID(), FeatureID: source.FeatureID})
+			if err != nil {
+				return err
+			}
+			// The committed anchor: which live version this folder's content
+			// descends from. A clone is the cleanest moment there is to record
+			// one, and recording it here is what lets a CI checkout of the
+			// result push without --force.
+			//
+			// ⚠️ Read off the SOURCE, not off the current head, and the two are
+			// not the same when the files came from a draft: a draft forked
+			// before somebody else published sits on an OLDER version, and a
+			// folder that recorded the newer one would claim to have seen a
+			// publish whose changes it does not contain — after which the first
+			// baseline-less push would quietly overwrite it. So live clones
+			// anchor on the head, draft clones on the draft's own base, and a
+			// draft with no base (a workflow nobody has ever published) anchors
+			// on the identity id, which is what an unversioned row's head is.
+			if flagStack != "" {
+				anchor, err := cloneAnchor(cmd.Context(), workflowHeadReader(client), wf.IdentityID(), source.ID, source.BaseVersionID)
+				if err != nil {
+					return err
+				}
+				lock.SetHeadVersion(flagStack, anchor)
+			}
 			// Always written, even when the workflow declares none: a clone is a
 			// faithful copy, and a folder that came down without the key would
 			// silently not manage the parameters it can plainly see.
@@ -155,22 +180,35 @@ at the right flow.`,
 			if source.ReportingTimezone != "" {
 				manifest.SetReportingTimezone(source.ReportingTimezone)
 			}
-			// The runtime is identity, not preference. A clone of a Durable
-			// workflow whose folder is later pushed into a NEW workflow
-			// elsewhere must create runtime 2 — absent, the create defaults to
-			// runtime 1 and the v2 code's first run dies on the availability
-			// probe. Written only when non-default, matching init's shape (an
-			// absent key IS how the manifest says runtime 1).
-			if source.RuntimeVersion > wfdir.RuntimeDefault {
+			// The runtime is identity, not preference. A clone whose folder is
+			// later pushed into a NEW workflow elsewhere must create THE SAME
+			// runtime — absent, the create takes whatever default the instance
+			// has, which is nobody's choice and need not be the source's. That
+			// is why the STANDARD runtime is written down too: the instance
+			// default is no longer 1, so a v1 workflow cloned and re-pushed
+			// somewhere else would come back as something its code was not
+			// written for.
+			//
+			// Zero is the one value not recorded: an instance too old to report
+			// a runtime has told us nothing, and a folder must not declare a
+			// guess. A runtime this build does not KNOW is not recorded either,
+			// for the reason spelled out at the create write-back in
+			// workflow_push.go: recording it would write a manifest this CLI
+			// refuses to open again.
+			if source.RuntimeVersion != 0 && wfdir.ValidRuntime(source.RuntimeVersion) {
 				manifest.Runtime = source.RuntimeVersion
 			}
-			if err := wfdir.SaveManifest(root, manifest); err != nil {
+			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}
 			state := &wfdir.State{}
 			// The baseline records the row the files actually came from, which
 			// may be the draft even though the binding names the live workflow.
-			state.Set(key, baselineFrom(source, files))
+			// No codec: `clone` refuses a destination that is not empty, so the
+			// folder it writes declares no dependencies and nothing could be
+			// de-aliased. An empty codec is the identity (see alias.go), which is
+			// what makes saying so cheaper than threading one through.
+			state.Set(key, baselineFrom(aliasCodec{}, source, files))
 			if err := wfdir.SaveState(root, state); err != nil {
 				return err
 			}

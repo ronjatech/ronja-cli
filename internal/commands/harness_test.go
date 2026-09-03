@@ -54,6 +54,14 @@ type fakeInstance struct {
 	// status code to answer with instead of the real response; 0 is off.
 	failDraft int
 	failFiles int
+	// failMe answers the organization lookup with a status instead of an
+	// identity — a revoked or expired token, or an instance having a bad day.
+	// The acting commands must refuse on it and `status` must degrade.
+	failMe int
+	// noTenant answers the lookup successfully, for a user who belongs to no
+	// organization at all. A different state from failMe: the credential works,
+	// there is simply nothing to bind a folder to.
+	noTenant bool
 	// failPut maps a file path to the status a PUT of it should answer with,
 	// which is how the mid-push failure case is staged.
 	failPut map[string]int
@@ -137,6 +145,39 @@ type fakeInstance struct {
 	// failRunGets makes the next N run polls fail with a 500, so the transient-
 	// failure tolerance is testable without a flaky network.
 	failRunGets int
+
+	// headScript is runScript for GET /workflow/run/:id/head — the lineage-head
+	// route `--follow` polls — with the same last-entry-repeats-forever rule.
+	//
+	// A SEPARATE script rather than a flag on runScript, because the whole point
+	// of the route is that the two disagree: the named run sits at `resuming`
+	// while the head has moved on to a successor. Each entry carries its OWN id
+	// (serveRunPoll's id stamping is skipped here) precisely so a test can stage
+	// the id shift that tells a follower a resume happened.
+	//
+	// An entry whose Status is headRouteMiss is not a response at all: it makes
+	// THIS poll answer the route-miss 404, which is how a fleet mid-rollout is
+	// staged — an old pod and a new pod answering alternate polls of one follow.
+	headScript []api.RunResponse
+	headPolls  int
+	// headRequests counts every GET of the head route, including the ones
+	// answered as a route miss. headPolls only advances through the script, so
+	// on an instance with noHeadRoute set it never moves at all — and "did the
+	// follow keep TRYING the route" is a question only this counter answers.
+	headRequests int
+	// noHeadRoute makes the head path answer the way an instance predating it
+	// does: the router's plain-text breadcrumb 404, which is NOT JSON. That
+	// un-decodable body is the reason the CLI keys its degrade on the status.
+	//
+	// It is the WHOLE-FLEET version of the same thing headScript's
+	// headRouteMiss entry does for ONE poll — see that constant. A fleet is
+	// either all old or mid-rollout, and both have to be stageable.
+	noHeadRoute bool
+	// failHeadGets is the status the head route answers with instead of the
+	// script; 0 is off. 400 is the shape that matters — a run id matching
+	// nothing, which a new instance answers with and which must NOT be read as
+	// an old instance.
+	failHeadGets int
 	// onPoll, when set, runs after each run poll has been answered.
 	//
 	// It exists for the Ctrl-C test, which must not raise SIGINT until the
@@ -151,6 +192,32 @@ type fakeInstance struct {
 	// behind the --write-live refusal. failTableLookup makes it fail instead.
 	tableNames      map[string]string
 	failTableLookup int
+	// agentIDs / secretIDs are the ids GET /agent/:id and GET /secret/:id answer
+	// 200 for — the two reference reads `ronja sync check` makes. A SET rather
+	// than a row map because nothing reads the payload: the verifier branches on
+	// whether the call succeeded and, when it did not, on the status.
+	agentIDs  map[string]bool
+	secretIDs map[string]bool
+	// tableDrafts maps a live table id to the caller's open draft of it. Absent
+	// is the ordinary case and answers a JSON `null`, not a 404.
+	tableDrafts map[string]string
+	// tableCode is the SQL a table row serves. Empty is a real answer (a table
+	// whose code the caller cannot see), so it is a separate map from tableNames
+	// rather than a field on one.
+	tableCode map[string]string
+	// featureTables is what GET /feature/model?featureID=… answers with, keyed by
+	// feature. A pipeline folder's whole remote leg is gated on this list, so an
+	// absent feature answers an EMPTY list rather than a 404 — the real endpoint
+	// 404s only for a feature the caller cannot reach, and the CLI reads that as
+	// a broken binding.
+	featureTables map[string][]*api.TableListItem
+	// missStatus is what the three reference reads answer for an id the instance
+	// does not hold. 404 by default, and settable to 400 because BOTH are real:
+	// a row the caller may not see answers the no-enumeration 404, while a
+	// deleted, trashed or cross-tenant row surfaces as table.ErrNoRows — which is
+	// rjerr.Input, and therefore 400. A verifier keyed on one of them alone is
+	// silently blind to half the cases, so the tests stage both.
+	missStatus int
 
 	// validate is what POST /workflow/validate answers with. Nil means clean,
 	// which is what most tests want: the validate gate is not the subject.
@@ -169,6 +236,12 @@ type fakeInstance struct {
 	// This is the normal case on a plain dev box, so the silence it produces is
 	// the behaviour worth pinning, not an edge case.
 	noFrontendOrigin bool
+
+	// createRuntime is the runtime this instance stamps when a create body names
+	// none — the server's own default, which is a real number and not 1 any more.
+	// Zero keeps the fake on the older shape, where a create that said nothing
+	// produced a row reporting nothing.
+	createRuntime int
 
 	// What the fake was asked to do, for assertions.
 	created      []api.CreateWorkflowInput
@@ -272,6 +345,12 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 		runtimePatches:    map[string]int{},
 		tenantZone:        "UTC",
 		tableNames:        map[string]string{},
+		agentIDs:          map[string]bool{},
+		secretIDs:         map[string]bool{},
+		tableDrafts:       map[string]string{},
+		tableCode:         map[string]string{},
+		featureTables:     map[string][]*api.TableListItem{},
+		missStatus:        http.StatusNotFound,
 		privilegeLevel:    50,
 
 		versions:             map[string][]api.Workflow{},
@@ -377,31 +456,88 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
 
 	if r.URL.Path == "/api/v2/authentication/me" {
-		writeJSON(w, map[string]any{
+		if f.failMe != 0 {
+			http.Error(w, `{"error":"no"}`, f.failMe)
+			return
+		}
+		body := map[string]any{
 			"user": map[string]any{"id": "usr-1", "email": "dev@example.com"},
 			"role": map[string]any{"name": "user", "privilegeLevel": f.privilegeLevel},
 			// A workflow folder's binding is keyed by organization, so the wf
-			// commands ask for it whenever the credential came from the
-			// environment — which is how every test here signs in.
+			// commands ask for it whenever the credential does not already name
+			// one — which is how every test here signs in.
 			"tenant": map[string]any{"id": testTenantID, "name": "Test Org"},
-		})
+		}
+		if f.noTenant {
+			delete(body, "tenant")
+		}
+		writeJSON(w, body)
 		return
 	}
 	// The best-effort table-name lookup behind the --write-live refusal. A
 	// different route prefix entirely (/feature/model), which is the point: it
 	// is a second surface a scope-limited token may not reach, and the CLI has
 	// to survive it failing.
+	// GET /feature/model?featureID=… — the pipeline loop's first call, and the
+	// one that decides whether its whole remote leg runs. Without it every
+	// pipeline status test stops at "binding broken: feature … no longer exists",
+	// so nothing downstream of it was ever exercised.
+	if r.URL.Path == "/api/v2/feature/model" {
+		rows := f.featureTables[r.URL.Query().Get("featureID")]
+		if rows == nil {
+			rows = []*api.TableListItem{}
+		}
+		writeJSON(w, map[string]any{"token": nil, "total": len(rows), "result": rows})
+		return
+	}
 	if tableID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/model/"); ok {
+		// GET :id/draft — the caller's own open draft, answered 200 with a JSON
+		// `null` body when there is none, which is what the real route does and
+		// what the CLI's nil-pointer decode is built around. Modelled because
+		// without it every pipeline drift read fails on the draft lookup and the
+		// folder reports `unreadable` — a fake that turns every pipeline test into
+		// a test of the same error path.
+		if id, isDraft := strings.CutSuffix(tableID, "/draft"); isDraft {
+			if draftID, has := f.tableDrafts[id]; has {
+				writeJSON(w, map[string]any{"id": draftID, "parentModelID": id})
+				return
+			}
+			writeJSON(w, nil)
+			return
+		}
 		if f.failTableLookup != 0 {
 			http.Error(w, `{"error":"no"}`, f.failTableLookup)
 			return
 		}
 		name, known := f.tableNames[tableID]
 		if !known {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			http.Error(w, `{"error":"not found"}`, f.missStatus)
 			return
 		}
-		writeJSON(w, map[string]any{"id": tableID, "name": name})
+		// `code` matters for the pipeline drift legs: it is what the CLI
+		// canonicalizes, de-aliases and hashes against the recorded fingerprint.
+		// A fake that always served "" made every in-step fixture look drifted
+		// against a lock recording real SQL — and made a drifted one look in step
+		// against a lock recording "".
+		writeJSON(w, map[string]any{"id": tableID, "name": name, "code": f.tableCode[tableID]})
+		return
+	}
+	// The two reference reads `ronja sync check` makes. Neither serves a
+	// payload anything branches on — see agentIDs.
+	if agentID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/agent/"); ok {
+		if !f.agentIDs[agentID] {
+			http.Error(w, `{"error":"not found"}`, f.missStatus)
+			return
+		}
+		writeJSON(w, map[string]any{"id": agentID, "name": agentID})
+		return
+	}
+	if secretID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/secret/"); ok {
+		if !f.secretIDs[secretID] {
+			http.Error(w, `{"error":"not found"}`, f.missStatus)
+			return
+		}
+		writeJSON(w, map[string]any{"id": secretID, "name": secretID})
 		return
 	}
 	if f.serveWrites(w, r) {
@@ -413,6 +549,10 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 	// GET /workflow/run/:runID — the poll. Checked before the switch below,
 	// whose default branch would otherwise read "run/<id>" as a workflow id.
 	if runID, ok := strings.CutPrefix(path, "run/"); ok {
+		if headOf, isHead := strings.CutSuffix(runID, "/head"); isHead {
+			f.serveRunHeadPoll(w, headOf)
+			return
+		}
 		f.serveRunPoll(w, runID)
 		return
 	}
@@ -550,10 +690,19 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// answer with — not even the organization default.
 			zone = ""
 		}
+		// Echoed rather than dropped: the server stamps the runtime it was sent,
+		// and falls back to its OWN default when the body named none. A fake that
+		// answered 0 either way would let a test asserting on the created ROW
+		// pass against a create that never carried it.
+		runtimeVersion := in.RuntimeVersion
+		if runtimeVersion == 0 {
+			runtimeVersion = f.createRuntime
+		}
 		created := f.AddWorkflow(&api.Workflow{
 			ID:                id,
 			Lifecycle:         api.LifecycleDraft,
 			Title:             in.Title,
+			RuntimeVersion:    runtimeVersion,
 			Entrypoint:        entrypoint,
 			FeatureID:         in.FeatureID,
 			Parameters:        in.Parameters,
@@ -878,6 +1027,78 @@ func (f *fakeInstance) serveRunPoll(w http.ResponseWriter, runID string) {
 	writeJSON(w, resp)
 }
 
+// headRouteMiss is the headScript entry that is not an answer: staged as a
+// response's Status, it makes that ONE poll answer the route-miss 404 an
+// instance predating --follow gives. It is not a real status, and is spelled
+// with a NUL so it can never collide with one.
+//
+// A per-poll knob rather than only the whole-fleet noHeadRoute, because Ronja
+// runs many instances behind one load balancer: mid-rollout, consecutive polls
+// of a single follow are answered by pods that disagree about whether the route
+// exists, and that — not the all-old fleet — is where a one-shot old-instance
+// decision goes wrong in both directions.
+const headRouteMiss = "\x00route-miss"
+
+// writeHeadRouteMiss answers the way the router does for a path it has no route
+// for: the plain-text breadcrumb, NOT JSON. Sharing one writer keeps the
+// whole-fleet and per-poll knobs answering identically, which is the point of
+// staging them at all.
+func (f *fakeInstance) writeHeadRouteMiss(w http.ResponseWriter, runID string) {
+	http.Error(w, "no route for GET /api/v2/workflow/run/"+runID+"/head\n", http.StatusNotFound)
+}
+
+// serveRunHeadPoll answers one GET /workflow/run/:runID/head from headScript,
+// advancing through it and repeating the last entry forever.
+//
+// Three deliberate differences from serveRunPoll. The 404 branch is the ROUTE
+// being absent (an instance predating --follow) and answers plain text, not
+// JSON, exactly as the router's breadcrumb does — a fake that answered
+// `{"error":...}` would let a CLI decoding the body pass. A missing RUN is a
+// 400 instead, staged through failHeadGets, because that is what the real route
+// does and the two must not be confusable. And the scripted id is left ALONE:
+// the head's id is the payload here, not bookkeeping.
+func (f *fakeInstance) serveRunHeadPoll(w http.ResponseWriter, runID string) {
+	if f.onPoll != nil {
+		defer f.onPoll()
+	}
+	f.headRequests++
+	if f.noHeadRoute {
+		f.writeHeadRouteMiss(w, runID)
+		return
+	}
+	if f.failHeadGets != 0 {
+		// A JSON body with a JSON content type, not http.Error's text/plain: the
+		// property under test is that the CLI keys on the STATUS, and staging a
+		// body the real route would never send lets a CLI that sniffs bodies pass.
+		writeJSONStatus(w, f.failHeadGets, map[string]any{"error": "no rows in result set"})
+		return
+	}
+	if len(f.headScript) == 0 {
+		http.Error(w, `{"error":"no rows in result set"}`, http.StatusBadRequest)
+		return
+	}
+	i := f.headPolls
+	if i >= len(f.headScript) {
+		i = len(f.headScript) - 1
+	}
+	f.headPolls++
+	resp := f.headScript[i]
+	if resp.Status == headRouteMiss {
+		// This poll landed on an instance that does not have the route. The
+		// COUNTER still moved, because the script is a schedule of polls rather
+		// than of answers.
+		f.writeHeadRouteMiss(w, runID)
+		return
+	}
+	if resp.ID == "" {
+		resp.ID = runID
+	}
+	if resp.Steps == nil {
+		resp.Steps = []api.StepDTO{}
+	}
+	writeJSON(w, resp)
+}
+
 // putFile writes one file and moves the ROW's updatedAt with it, the way the
 // server does: UpsertFile re-derives the workflow's binding columns in the same
 // transaction, so a file write is a row write. That is what makes "which row
@@ -972,6 +1193,15 @@ func (f *fakeInstance) refusePrecondition(w http.ResponseWriter, id, path string
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeJSONStatus is writeJSON with a chosen status, which http.Error cannot
+// do: it forces text/plain, so a test staging an error that way proves nothing
+// about how the CLI reads a real JSON error response.
+func writeJSONStatus(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 

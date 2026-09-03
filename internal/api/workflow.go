@@ -112,6 +112,18 @@ type Workflow struct {
 	// draft; null on every other row, and on a draft they have not submitted.
 	SubmittedForReviewAt *time.Time `json:"submittedForReviewAt"`
 	DrafterUserID        string     `json:"drafterUserID"`
+	// BaseVersionID is the committed version a DRAFT was forked from — the
+	// server's own record of what this draft's content descends from
+	// (rdb.Workflow.BaseVersionID, stamped at checkout and cleared on commit).
+	//
+	// Null on every row that is not an open draft, and null on a draft of a
+	// workflow that has never been versioned, so an empty value means "no
+	// anchor" rather than "no such version". It is read ONLY by `wf clone`, to
+	// record the right head pointer when the files came from a draft rather
+	// than from live: the current head may be NEWER than the draft's base, and
+	// a folder that recorded the newer one would claim to have seen a version
+	// whose changes it does not contain.
+	BaseVersionID string `json:"baseVersionID"`
 	// FeatureScope is the joined feature's scope (private|workspace|
 	// organization), stamped at read time — the field to branch on for privacy,
 	// not the legacy scope/private columns.

@@ -200,7 +200,7 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 		// The draft's own page: publishing a parentless draft promotes that row
 		// in place, so its id — and its link — survive the publish.
 		result.URL = draft.URL
-		noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, draft.ID))
+		noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, draft.ID, anchorOnLive))
 		return result, nil
 	}
 
@@ -233,7 +233,7 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 		// The PARENT's page, not the draft's: the draft is gone the moment it
 		// commits, and what the reader wants to look at is what went live.
 		result.URL = parent.URL
-		noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, parent.ID))
+		noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, parent.ID, anchorOnLive))
 		return result, nil
 	}
 
@@ -324,7 +324,7 @@ func resolveCommitConflict(ctx context.Context, client *api.Client, f *folder,
 	result.OverwroteVersionID = head
 	result.Detail = fmt.Sprintf("committed to %q, overwriting version %s that was published after your draft was created", parent.Title, head)
 	result.URL = parent.URL
-	noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, parent.ID))
+	noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, parent.ID, anchorOnLive))
 	return result, nil
 }
 
@@ -421,7 +421,7 @@ func warnIfDirty(f *folder) error {
 // its files). The FOLDER half is not, and follows f.Kind: which paths a baseline
 // may claim is a per-kind rule, and asserting one kind's rules about another
 // kind's folder is the phantom-deletion bug CheckLocalPaths exists to prevent.
-func refreshBaselineFromLive(ctx context.Context, client *api.Client, f *folder, liveID string) error {
+func refreshBaselineFromLive(ctx context.Context, client *api.Client, f *folder, liveID string, anchor anchorPolicy) error {
 	live, err := client.GetWorkflow(ctx, liveID)
 	if err != nil {
 		return fmt.Errorf("re-read %s: %w", liveID, err)
@@ -440,11 +440,19 @@ func refreshBaselineFromLive(ctx context.Context, client *api.Client, f *folder,
 	if err := wfdir.CheckLocalPaths(pathsOf(files), f.Kind); err != nil {
 		return fmt.Errorf("the files of %s cannot all be tracked locally: %w", liveID, err)
 	}
-	f.State.Set(f.Key, baselineFrom(live, files))
+	f.State.Set(f.Key, baselineFrom(f.Codec, live, files))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return fmt.Errorf("write the local baseline: %w", err)
 	}
-	return nil
+	// And the COMMITTED anchor beside the local one, for the callers that just
+	// PRODUCED the live row's current version. A commit makes a new version, so
+	// the folder that produced it is the folder that agrees with it — and a
+	// fresh checkout of this repo has only this pointer to go on. A discard
+	// passes keepAnchor; see reanchorOnLive's ⚠️ for why.
+	if anchor != anchorOnLive {
+		return nil
+	}
+	return reanchorOnLive(ctx, workflowHeadReader(client), f, liveID)
 }
 
 // noteBaselineRefresh degrades a failed baseline refresh into a note.

@@ -93,6 +93,9 @@ type fakePipelineInstance struct {
 
 	privilegeLevel   int
 	noFrontendOrigin bool
+	// failMe answers the organization lookup with a status instead of an
+	// identity; 0 is off. See the field of the same name on fakeInstance.
+	failMe int
 	// listPageSize forces pagination; 0 answers everything in one page.
 	listPageSize int
 	// queryCSV is what POST /duckdb/query answers with.
@@ -351,6 +354,12 @@ func (f *fakePipelineInstance) serve(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case r.URL.Path == "/api/v2/authentication/me":
+		// The organization lookup, failing the way a revoked token makes it fail:
+		// `pipeline status` must degrade to a local report rather than abort.
+		if f.failMe != 0 {
+			http.Error(w, `{"error":"no"}`, f.failMe)
+			return
+		}
 		writeJSON(w, map[string]any{
 			"user":   map[string]any{"id": "usr-1", "email": "dev@example.com"},
 			"role":   map[string]any{"name": "user", "privilegeLevel": f.privilegeLevel},
@@ -468,7 +477,13 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 		}
 		row := f.tables[id]
 		if row == nil {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			// Production answers 400 {"error":"no rows"} here, NOT 404: a row the
+			// caller cannot see is invisible to RLS, so the read finds nothing and
+			// cannot tell "not yours" from "not there" — which is the point. This
+			// fake said 404 once, and explainUnreadableRefs was written against
+			// that fiction: its test passed while the real cross-organization case
+			// fell through to the wrong diagnosis. Mirror production here.
+			http.Error(w, `{"error":"no rows"}`, http.StatusBadRequest)
 			return
 		}
 		f.writeRow(w, row)

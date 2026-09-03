@@ -119,6 +119,7 @@ func newWorkflowTestCmd() *cobra.Command {
 		writeLive bool
 		staleOK   bool
 		resume    bool
+		follow    bool
 		timeout   time.Duration
 		logsMode  string
 	)
@@ -144,7 +145,7 @@ sandbox — so a draft with bound output tables refuses to run without
 {{ write }} marker — runs without it.
 
 --resume restarts the last FAILED run of this workflow instead of starting a
-fresh one. Only a durable workflow (runtime 2) has anything to resume: its
+fresh one. Only a durable workflow (runtime 2 or 3) has anything to resume: its
 journaled step results are replayed and only the work that never finished runs
 again. A resume inherits the original run's parameters, so --param is refused
 with it.
@@ -153,6 +154,14 @@ A durable workflow can also PAUSE mid-run — waiting on an agent it handed work
 to, or on a timer. This stops waiting there and reports status "waiting" with
 what ran so far: nothing failed, and the run resumes on its own, so the rest of
 it happens in Ronja rather than here.
+
+--follow keeps waiting through those pauses instead, until the run finishes or
+fails. A woken run does not finish under its own id — a successor run carries
+the work — so a follow asks the server which run now carries the lineage and
+reports that one, saying "resumed as run ..." as it hops. Parks can outlast the
+15m default: raise --timeout, or pass --timeout 0 to wait for as long as it
+takes. On an instance too old to have the route, --follow says so and reports
+the first pause, as it would without the flag.
 
 Approval-gated workflows cannot be run from here at all: an approval can only be
 produced inside an agent session, so test those from a Ronja chat.
@@ -187,11 +196,13 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 				return err
 			}
 			outcome, err := runTest(ctx, f, testOptions{
-				Params:    params,
-				WriteLive: writeLive,
-				StaleOK:   staleOK,
-				Resume:    resume,
-				Timeout:   timeout,
+				Params:        params,
+				WriteLive:     writeLive,
+				StaleOK:       staleOK,
+				Resume:        resume,
+				Follow:        follow,
+				Timeout:       timeout,
+				TimeoutChosen: cmd.Flags().Changed("timeout"),
 			})
 			// The report is emitted even on failure: a failed run IS the answer
 			// this command was asked for, and a timed-out one still has a run id
@@ -223,6 +234,7 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 		"run even though this folder has changes you have not pushed")
 	cmd.Flags().BoolVar(&resume, "resume", false,
 		"resume the last failed run instead of starting a new one (durable workflows only)")
+	cmd.Flags().BoolVar(&follow, "follow", false, followFlagHelp)
 	cmd.Flags().DurationVar(&timeout, "timeout", 15*time.Minute,
 		"give up waiting after this long (0 waits forever; the run continues either way)")
 	cmd.Flags().StringVar(&logsMode, "logs", logsTail,
@@ -235,7 +247,58 @@ type testOptions struct {
 	WriteLive bool
 	StaleOK   bool
 	Resume    bool
-	Timeout   time.Duration
+	// Follow waits through a Durable run's pauses — and across the successor
+	// runs its resumes create — rather than stopping at the first one.
+	Follow  bool
+	Timeout time.Duration
+	// TimeoutChosen reports that --timeout was typed, which is what the
+	// default-timeout note is keyed on. Carried rather than re-derived because
+	// the note is printed where the wait begins, and nothing down there has the
+	// cobra command to ask.
+	TimeoutChosen bool
+}
+
+// followFlagHelp is the one wording of --follow, shared so `wf test` and
+// `wf run` cannot describe the same flag two ways.
+const followFlagHelp = "keep waiting through durable pauses until the run finishes or fails (parks can be long — raise --timeout or pass --timeout 0)"
+
+// noteFollowTimeout warns when --follow is riding the DEFAULT --timeout.
+//
+// The two flags interact in a way nothing else about either announces: without
+// --follow the timeout bounds a burst, which finishes in seconds or parks; with
+// it, the same 15 minutes has to cover however long an agent, a timer or a
+// human approval takes, and a follow that gave up 15 minutes into a two-hour
+// park would look exactly like a run that hung. Said up front rather than at
+// the deadline, because by then the answer ("raise --timeout") costs another
+// whole run.
+//
+// Keyed on the flag having been CHANGED rather than on the value, so somebody
+// who typed the default out in full is taken at their word — which is why the
+// decision is made by the cobra layer and passed in as timeoutChosen rather
+// than re-derived here.
+//
+// Printed at the point the wait actually begins, not when the command starts:
+// everything ahead of the run POST can still refuse (an open draft, a gate, a
+// bad --param), and advice about how long a park may last is nonsense attached
+// to a run that never started.
+func noteFollowTimeout(follow bool, timeout time.Duration, timeoutChosen bool) {
+	if !follow || timeout <= 0 || timeoutChosen {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  Note: --follow with the default --timeout %s. A park can outlast it — pass --timeout 0 to wait for as long as the run takes.\n",
+		timeout)
+}
+
+// pollFunc is the shape pollRun and followRun share, so choosing between them
+// is one assignment rather than a branch around the whole tail of a run.
+type pollFunc func(context.Context, *api.Client, string, time.Duration, *testOutcome) (*api.RunResponse, error)
+
+// runWaiter picks the poll loop --follow asked for.
+func runWaiter(follow bool) pollFunc {
+	if follow {
+		return followRun
+	}
+	return pollRun
 }
 
 // testOutcome is what the reporters read. Run is the last thing the server
@@ -398,7 +461,8 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 		},
 	}
 
-	final, err := pollRun(ctx, client, started.ID, opts.Timeout, outcome)
+	noteFollowTimeout(opts.Follow, opts.Timeout, opts.TimeoutChosen)
+	final, err := runWaiter(opts.Follow)(ctx, client, started.ID, opts.Timeout, outcome)
 	if final != nil {
 		outcome.Run = final
 	}
@@ -414,9 +478,10 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 // isDurable reports whether the workflow being run journals its steps.
 //
 // The ROW is the authority — it is the thing the run funnel reads, and it is
-// right about a workflow this folder did not create (a `wf clone` records no
-// runtime at all, since the runtime is not the folder's to declare once the
-// workflow exists). The manifest is the fallback for ONE case: an instance
+// right about a workflow this folder did not create, whatever the manifest
+// says: a `wf clone` records the runtime the source reported, and somebody
+// may have raised the row in the browser since. The manifest is the fallback
+// for ONE case: an instance
 // predating durable workflows sends no runtimeVersion, which decodes to 0, and
 // 0 means "the instance did not say" rather than "runtime 1".
 func isDurable(f *folder, row *api.Workflow) bool {
@@ -517,7 +582,7 @@ func noteRemoteDrift(ctx context.Context, client *api.Client, f *folder, row *ap
 		// drift is no reason to refuse to run.
 		return
 	}
-	diff := wfdir.DiffHashes(hashFiles(files), baseline.Hashes())
+	diff := wfdir.DiffHashes(hashFiles(f.Codec, files), baseline.Hashes())
 	if !diff.Dirty() {
 		return
 	}
@@ -615,12 +680,50 @@ func writeLiveRefusal(ctx context.Context, client *api.Client, tableIDs []string
 // "still running, here is its id" is a useful answer and a timeout is not a
 // reason to throw away what we know.
 func pollRun(ctx context.Context, client *api.Client, runID string, timeout time.Duration, outcome *testOutcome) (*api.RunResponse, error) {
+	seen := map[string]string{}
+	return pollLoop(ctx, client, runID, func() string { return runCheckPath(runID) }, timeout, outcome,
+		func(ctx context.Context) (*api.RunResponse, error) {
+			return client.GetWorkflowRun(ctx, runID)
+		},
+		func(resp *api.RunResponse) bool {
+			narrateSteps(resp.Steps, seen)
+			return !resp.Running()
+		})
+}
+
+// pollLoop is the scaffolding both poll loops run on: the cadence, the
+// consecutive-failure budget, the deadline and the cancellation branch —
+// everything except WHICH route is read and WHAT counts as terminal.
+//
+// Factored rather than copied because those four are the parts a follow must
+// not get subtly different: a second loop with its own budget or its own
+// timeout sentence is a second thing to keep in step with `--timeout`, and the
+// day they drift is the day one of the two verbs reports a lost instance as a
+// finished run.
+//
+// `read` fetches one response; `observe` narrates it and reports whether it is
+// terminal. Both are closures over the follow's own state, which is what keeps
+// this function free of any opinion about lineage.
+//
+// `checkPath` is the route the give-up message tells the caller to read later,
+// and it is a function rather than a string because the right answer is only
+// known AT the deadline: a follow that has degraded onto an old instance must
+// not be told to curl the head route that instance does not have.
+func pollLoop(
+	ctx context.Context,
+	client *api.Client,
+	runID string,
+	checkPath func() string,
+	timeout time.Duration,
+	outcome *testOutcome,
+	read func(context.Context) (*api.RunResponse, error),
+	observe func(*api.RunResponse) bool,
+) (*api.RunResponse, error) {
 	var deadline time.Time
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
 	}
 
-	seen := map[string]string{}
 	var last *api.RunResponse
 	failures := 0
 	// polls counts every attempt, failed ones included: a poll that could not
@@ -632,11 +735,11 @@ func pollRun(ctx context.Context, client *api.Client, runID string, timeout time
 	for {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			outcome.TimedOut = true
-			return last, fmt.Errorf("gave up waiting for run %s after %s — it is still going, and it keeps going whether or not this command is watching.\n  Check it later with `curl -H \"Authorization: Bearer $RONJA_TOKEN\" \"$RONJA_URL/api/v2/workflow/run/%s\"`, or raise --timeout",
-				runID, timeout, runID)
+			return last, fmt.Errorf("gave up waiting for run %s after %s — it is still going, and it keeps going whether or not this command is watching.\n  Check it later with `curl -H \"Authorization: Bearer $RONJA_TOKEN\" \"$RONJA_URL%s\"`, or raise --timeout",
+				runID, timeout, checkPath())
 		}
 
-		resp, err := client.GetWorkflowRun(ctx, runID)
+		resp, err := read(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return last, interruptedError(runID, ctx.Err())
@@ -652,8 +755,7 @@ func pollRun(ctx context.Context, client *api.Client, runID string, timeout time
 			// for transient failures starts over.
 			failures = 0
 			last = resp
-			narrateSteps(resp.Steps, seen)
-			if !resp.Running() {
+			if observe(resp) {
 				return resp, nil
 			}
 		}
@@ -666,6 +768,230 @@ func pollRun(ctx context.Context, client *api.Client, runID string, timeout time
 			return last, interruptedError(runID, ctx.Err())
 		case <-time.After(interval):
 		}
+	}
+}
+
+// followRun waits for a run's LINEAGE to reach a terminal status — `--follow`.
+//
+// The difference from pollRun is one route and one terminal condition. A
+// Durable run that parks is left at `waiting`, and when it wakes the row is
+// latched at `resuming` FOREVER while a SUCCESSOR run carries the work; so the
+// head route is polled with the ORIGINAL run id (the server re-resolves the
+// head each time) and neither of those two statuses ends the wait. What ends it
+// is any other status, at which point the shared runVerdict decides the exit
+// code exactly as it does for a plain poll.
+//
+// It never REFUSES on an instance that does not have the route. See the read
+// closure: the run has already started by the time a follow gets here, so an
+// error whose remedy is "run it again" would invite the second live run
+// adoptTimedOutRun exists to prevent.
+func followRun(ctx context.Context, client *api.Client, runID string, timeout time.Duration, outcome *testOutcome) (*api.RunResponse, error) {
+	// headID is seeded with the run we started rather than left empty, so a park
+	// and resume that both complete inside the first poll interval still narrate
+	// the hop: the first head response naming a successor IS news, and a state
+	// that learned the head from that same response would print nothing.
+	state := &followState{seen: map[string]string{}, lastStatus: map[string]string{}, headID: runID}
+	// plainSeen is the fallback's own narration state, kept separate so a poll
+	// answered off the plain route narrates exactly what pollRun would.
+	plainSeen := map[string]string{}
+	// The fallback is decided PER POLL, and none of these three is a latch.
+	// Ronja runs many instances behind one load balancer, so during a rollout
+	// one follow is answered by instances that have the route and instances
+	// that do not, in either order — and a one-shot "this fleet is old"
+	// decision gets both directions wrong. Latched on a first poll that landed
+	// on an old pod, the follow reports the first park of a fleet that can
+	// follow perfectly well; never taken, every later old-pod 404 counts
+	// against the failure budget until the follow aborts with "lost contact"
+	// on a run that is fine. So every poll tries the head route FIRST and only
+	// falls back for that poll.
+	//
+	// everHead: the head route has answered at least once, so this fleet HAS it
+	// and a park is not the end of the story even on a poll that had to read
+	// the plain route.
+	// onPlain: this poll's response came from the plain route.
+	// toldFellBack: the note is once per follow, not once per old-pod poll.
+	everHead, onPlain, toldFellBack := false, false, false
+
+	read := func(ctx context.Context) (*api.RunResponse, error) {
+		onPlain = false
+		resp, err := client.GetWorkflowRunLineageHead(ctx, runID)
+		if err == nil {
+			everHead = true
+			return resp, nil
+		}
+		// ONLY a 404, and only the STATUS: an instance that has the route
+		// answers a run id matching nothing with a 400, and one that does not
+		// answers the router's plain-text breadcrumb, which is not JSON to read.
+		if api.StatusOf(err) != 404 {
+			return resp, err
+		}
+		// The plain route is the fallback and the probe at once. It answers if
+		// and only if the caller has read access to the run's workflow, which is
+		// also what makes an access refusal safe here: that gate refuses BOTH
+		// routes with a 404, so this read fails too, nothing falls back, and the
+		// refusal lands on the failure budget exactly as it does today.
+		plain, probeErr := client.GetWorkflowRun(ctx, runID)
+		if probeErr != nil {
+			// The head route's own error is the more informative one: it is what
+			// actually refused this poll.
+			return nil, err
+		}
+		onPlain = true
+		if !toldFellBack {
+			toldFellBack = true
+			fmt.Fprintf(os.Stderr, "  Note: %s answered 404 for the run-lineage route — an instance that predates --follow, or an older one still in the fleet mid-rollout.\n  Reporting what the plain run route says for this poll; if no instance here can follow, a park ends this wait and the run keeps going server-side.\n",
+				client.BaseURL)
+		}
+		return plain, nil
+	}
+	observe := func(resp *api.RunResponse) bool {
+		if !onPlain {
+			return state.observe(resp)
+		}
+		// A plain response describes the run we NAMED, not the head, so it is
+		// narrated the way pollRun narrates it: feeding an id that is not a head
+		// into followState would announce a resume backwards the moment the head
+		// route answered again.
+		narrateSteps(resp.Steps, plainSeen)
+		if everHead {
+			// A mixed fleet mid-rollout: something here CAN follow, so a park is
+			// not the end — the next poll may be answered by an instance that
+			// has the route, and the lineage carries on either way.
+			return followTerminal(resp.Status)
+		}
+		// Nothing has answered the head route yet, so behave exactly as today's
+		// documented non-follow poll and stop at the first park. Still not a
+		// latch: the next poll tries the head route first, so a rollout that
+		// completes mid-follow upgrades the follow live.
+		return !resp.Running()
+	}
+	// The fallback continues on THIS loop rather than by calling pollRun, so it
+	// inherits the cadence, the failure budget and — the one that would be wrong
+	// otherwise — the deadline already ticking.
+	return pollLoop(ctx, client, runID, func() string {
+		// Point the give-up message at a route the fleet actually answers. A
+		// follow that has seen the head route is sent to it; one that has only
+		// ever fallen back is not told to curl a 404.
+		if everHead || !toldFellBack {
+			return headCheckPath(runID)
+		}
+		return runCheckPath(runID)
+	}, timeout, outcome, read, observe)
+}
+
+// followTerminal reports whether a status ends a FOLLOW: `running`, `waiting`
+// and `resuming` all mean the lineage is still going, and everything else is
+// over.
+//
+// It exists for the one caller that has to apply the rule without narrating it
+// — a poll answered off the plain route on a fleet that can otherwise follow.
+// followState.observe is the narrating twin of the same switch; the two say the
+// same thing about which statuses are terminal, and must keep doing so.
+func followTerminal(status string) bool {
+	switch status {
+	case api.RunStatusRunning, api.RunStatusWaiting, api.RunStatusResuming:
+		return false
+	default:
+		return true
+	}
+}
+
+// runCheckPath and headCheckPath are the two routes a give-up message can point
+// at. A follow is told to read the HEAD route, because the named run is the one
+// row guaranteed to answer `resuming` forever once it has woken — sending a
+// caller there would report a finished lineage as a run that never moved.
+func runCheckPath(runID string) string  { return "/api/v2/workflow/run/" + runID }
+func headCheckPath(runID string) string { return runCheckPath(runID) + "/head" }
+
+// followState is what a follow has to remember across polls, and all of it
+// exists so the narration is TRANSITION-keyed: a line per change, not a line
+// per poll. A park can last days, and a follow that reprinted itself every
+// 10 seconds would bury the transitions that matter in its own output.
+type followState struct {
+	// seen is the last narrated status per (head run id, step id). Keyed by the
+	// run as well as the step because a successor run gets FRESH span ids, so a
+	// resume's replayed steps narrate again under the new run — which is a belt
+	// rather than a load-bearing property, and honest either way: they are
+	// printed as "replayed", the same word the report uses for them.
+	seen map[string]string
+	// headID is the run the last poll said carries the lineage; a change is a
+	// resume, and the one event a follower most needs told about. Seeded with
+	// the run the caller started — see followRun.
+	headID string
+	// lastStatus is the last narrated status per head run id, so a line is
+	// printed on each TRANSITION rather than once per status per run.
+	//
+	// Sticky per-run "already said it" booleans would be wrong, because the
+	// server's own wake path oscillates: ReleaseWakeClaim rolls a run from
+	// `resuming` BACK to `waiting` under the same id when a wake attempt has to
+	// be retried, and a follow that narrated park-then-wake once would go
+	// permanently silent while the reader believed a successor was running.
+	lastStatus map[string]string
+	// toldHowToWait gates the long "what a park is and how to wait longer"
+	// sentence to the FIRST park of the follow. A second park is news; the
+	// advice attached to the first one is not.
+	toldHowToWait bool
+}
+
+// observe narrates one head response and reports whether the lineage is over.
+func (s *followState) observe(resp *api.RunResponse) bool {
+	if resp.ID != "" && resp.ID != s.headID {
+		fmt.Fprintf(os.Stderr, "  Resumed as run %s — following that one.\n", resp.ID)
+		s.headID = resp.ID
+	}
+	s.narrateHeadSteps(resp)
+
+	// Narrate the STATUS transition, not the status: a park that lasts a day is
+	// one line, and a run that parks, wakes and parks again is three.
+	moved := s.lastStatus[resp.ID] != resp.Status
+	s.lastStatus[resp.ID] = resp.Status
+
+	switch resp.Status {
+	case api.RunStatusRunning:
+		return false
+	case api.RunStatusWaiting:
+		if moved {
+			if s.toldHowToWait {
+				fmt.Fprintf(os.Stderr, "  Run %s parked again — still watching.\n", resp.ID)
+			} else {
+				s.toldHowToWait = true
+				fmt.Fprintf(os.Stderr, "  Run %s parked — waiting on an agent, a timer or an approval; still watching.\n  Ctrl-C stops watching, not the run, and --timeout 0 waits indefinitely.\n",
+					resp.ID)
+			}
+		}
+		return false
+	case api.RunStatusResuming:
+		if moved {
+			fmt.Fprintf(os.Stderr, "  Run %s is waking — a successor run takes the work over.\n", resp.ID)
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+// narrateHeadSteps is narrateSteps keyed by (run, step) and rendering a journal
+// hit as "replayed".
+//
+// A separate function rather than a flag on narrateSteps, because a follow is
+// the only caller that needs either: pollRun watches ONE run, so a bare step id
+// is already unique there, and its narration says what the row says. The
+// "replayed" label is the report's word for the same thing (see
+// printTestReport), and it is worth saying here because a resume re-narrates
+// every journaled step — a wall of "skipped" would read as a run that did
+// nothing rather than as one that skipped work it had already done.
+func (s *followState) narrateHeadSteps(resp *api.RunResponse) {
+	for _, step := range resp.Steps {
+		key := resp.ID + "\x00" + step.ID
+		if s.seen[key] == step.Status {
+			continue
+		}
+		s.seen[key] = step.Status
+		label := step.Status
+		if step.Replayed {
+			label = "replayed"
+		}
+		fmt.Fprintf(os.Stderr, "    %-9s %s%s\n", label, step.Name, formatDuration(step.DurationMs))
 	}
 }
 

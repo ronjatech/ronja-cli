@@ -60,11 +60,21 @@ func localWork() *localWorkflow {
 		// is the manifest's `kind`, and LoadManifest refuses every other one. Ask
 		// for each in turn rather than parsing the file ourselves, so this
 		// stays honest if the refusal rules change.
-		for _, k := range []wfdir.Kind{wfdir.WorkflowKind, wfdir.DataAppKind, wfdir.PipelineKind} {
+		//
+		// The set comes from wfdir's REGISTRY, never a literal list. It was a
+		// literal list of three, and the fourth kind was added without it: an
+		// automation folder then left Kind empty, and printLocalWork's fallback
+		// announced "this is a workflow folder" and recommended `ronja wf` —
+		// exactly the misrouting Kind.Command exists to prevent, in the one
+		// message a lost caller reads.
+		for _, k := range wfdir.AllKinds() {
 			if m, err := wfdir.LoadManifest(root, k); err == nil {
 				found.Kind = k.Name
 				found.Title = m.Title
-				found.Bound = len(m.Instances) > 0
+				// Either shape counts: a stack folder's bindings live in
+				// "stacks" and a legacy one's in "instances", and a folder that
+				// has migrated is no less bound for it.
+				found.Bound = len(m.Instances) > 0 || m.UsesStacks()
 				break
 			}
 		}
@@ -137,19 +147,27 @@ func printLocalWork(l *localWorkflow) {
 	out := os.Stdout
 	fmt.Fprintf(out, "\n---\n\n## In this directory\n\n")
 
+	// The noun comes from the registry's Label, so a kind cannot be added and
+	// then described as a workflow. An UNREADABLE manifest (Kind "") keeps the
+	// old fallback: there is nothing better to call it, and the verb list below
+	// is the same one `wf init` would have offered.
 	noun := "workflow folder"
-	switch l.Kind {
-	case wfdir.KindDataApp:
-		noun = "data-app folder"
-	case wfdir.KindPipeline:
-		noun = "pipeline folder"
+	if kind, ok := wfdir.KindByName(l.Kind); ok {
+		noun = kind.Label + " folder"
 	}
 
 	switch {
 	case l.Root != "" && l.Title != "":
 		fmt.Fprintf(out, "This is the %s for %q (%s).\n\n", noun, l.Title, l.Root)
 	case l.Root != "":
-		fmt.Fprintf(out, "This is a %s (%s).\n\n", noun, l.Root)
+		// "a automation folder" — the article has to follow the Label now that
+		// it comes from the registry rather than from a literal beside it.
+		article := "a"
+		switch noun[0] {
+		case 'a', 'e', 'i', 'o', 'u':
+			article = "an"
+		}
+		fmt.Fprintf(out, "This is %s %s (%s).\n\n", article, noun, l.Root)
 	default:
 		fmt.Fprintf(out, "There is Python here (%s) but no workflow folder.\n\n", l.LoosePython)
 		fmt.Fprintf(out, "    ronja wf init --feature <feature id>    turn it into one\n\n")
@@ -177,6 +195,24 @@ func printLocalWork(l *localWorkflow) {
 		return
 	}
 
+	if l.Kind == wfdir.KindAutomation {
+		fmt.Fprintf(out, "    ronja automation status   what a push would change, and what moved\n")
+		fmt.Fprintf(out, "    ronja automation push     make each automation match its file\n\n")
+		// The two things worth knowing before the first edit, and neither is
+		// obvious from the verb list: there is no publish (nothing to commit),
+		// and a field a file leaves out is a field this folder does not manage.
+		fmt.Fprintf(out, "One .json file is one automation and its filename is the name; everything else\n")
+		fmt.Fprintf(out, "in the folder is ignored. There is no publish step — an automation has no draft\n")
+		fmt.Fprintf(out, "and no version history, so a push is the whole write. A field a file does not\n")
+		fmt.Fprintf(out, "mention is not managed here and is never touched, which is how `enabled` stays\n")
+		fmt.Fprintf(out, "under whoever paused it.\n")
+		if !l.Bound {
+			fmt.Fprintf(out, "\nNothing pushed to this instance yet; the first `automation push` creates each\n")
+			fmt.Fprintf(out, "automation and records the binding.\n")
+		}
+		return
+	}
+
 	if l.Kind == wfdir.KindDataApp {
 		fmt.Fprintf(out, "    ronja app status     local changes, remote state, and drift\n")
 		fmt.Fprintf(out, "    ronja app validate   compile the draft on the server\n")
@@ -194,6 +230,16 @@ func printLocalWork(l *localWorkflow) {
 			fmt.Fprintf(out, "\nNot pushed to this instance yet; the first `app push` creates the app as an\n")
 			fmt.Fprintf(out, "unpublished draft only you can see.\n")
 		}
+		return
+	}
+
+	if l.Kind != "" && l.Kind != wfdir.KindWorkflow {
+		// A kind the registry knows and this note has no verb list for yet.
+		// Saying nothing more is the honest answer, and it is the whole reason
+		// this branch exists: falling through to the `ronja wf` list below would
+		// hand the reader the commands for a DIFFERENT loop, which LoadManifest
+		// then refuses — the misrouting Kind.Command was introduced to stop,
+		// delivered in the one message a lost caller reads.
 		return
 	}
 

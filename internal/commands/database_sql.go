@@ -26,6 +26,7 @@ func newDatabaseSQLCmd() *cobra.Command {
 		file    string
 		out     string
 		params  string
+		env     string
 		maxRows int
 		timeout time.Duration
 	)
@@ -53,11 +54,21 @@ Output is CSV on stdout, and nothing else is written there:
   --out <file>    write the CSV to a file instead of stdout
   --json          print the whole response envelope as one JSON object
   --max-rows N    ask for at most N rows (the server caps at 100000)
+  --env dev       run against the database's dev copy instead
   --timeout       how long to wait (0 waits as long as it takes)
 
 With --out alone, stdout stays empty and the row count is reported on stderr.
 A truncated result is reported on stderr and still exits zero — the rows you
 got are real, there are simply more of them.
+
+--env dev runs the statement against the database's DEV COPY — a separate
+Postgres database with the same schema and its own data. You still name the
+production database: the copy has no id you ever see. The redirect is reported
+on stderr, never on stdout, because stdout is CSV somebody is parsing.
+
+Minting a connection role against the copy is NOT possible — the copy already
+has one for every tier the parent hands out, named "<parent> (<tier>) (dev)".
+Use those logins if you need to connect to the copy directly.
 
 This runs as the database's WRITE role, so it does DML and SELECT but cannot
 do DDL: CREATE, ALTER and DROP are refused by Postgres itself. Schema changes
@@ -84,6 +95,10 @@ Mint one with:
 			if err != nil {
 				return err
 			}
+			environment, err := parseEnvFlag(env)
+			if err != nil {
+				return err
+			}
 			if maxRows < 0 {
 				return fmt.Errorf("--max-rows cannot be negative (got %d)", maxRows)
 			}
@@ -101,10 +116,16 @@ Mint one with:
 				SQL:     sql,
 				Params:  bound,
 				MaxRows: maxRows,
-			}, timeout)
+			}, environment, timeout)
 			if err != nil {
 				return err
 			}
+
+			// Which database answered, said before anything about the rows. Same
+			// rule as the truncation notice below and for a stronger reason: a
+			// result read as production's when it came from the copy is a wrong
+			// answer, not an incomplete one. Never stdout — that is the CSV.
+			reportEnvironment(environment, result.Environment, result.DatabaseID, result.ParentDatabaseID)
 
 			// Always stderr, in every mode: a truncation notice on stdout would
 			// land in the middle of the CSV a pipeline is parsing.
@@ -139,6 +160,8 @@ Mint one with:
 		"write the CSV to this file instead of stdout")
 	cmd.Flags().StringVar(&params, "params", "",
 		`bound parameters for $1, $2 … as a JSON array (e.g. '["a@b.c", 42]'). An element may itself be a list, bound as one Postgres array — match it with 'col = ANY($1)', not 'col IN ($1)'`)
+	cmd.Flags().StringVar(&env, "env", string(api.EnvironmentProd),
+		`which copy to run against: "prod" or "dev" (the database's dev copy)`)
 	cmd.Flags().IntVar(&maxRows, "max-rows", 0,
 		"maximum rows to return (default: the server's cap)")
 	cmd.Flags().DurationVar(&timeout, "timeout", api.DefaultDatabaseSQLTimeout,

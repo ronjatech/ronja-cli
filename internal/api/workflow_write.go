@@ -21,12 +21,27 @@ import (
 // it by exact string — an error finding is what makes `wf push` refuse — so it
 // is a wire contract.
 //
-// The server's finding CODES (invalid_path, unresolved_ref, secret_dropped, …)
-// are deliberately not mirrored as constants. The CLI never branches on a code:
-// it prints Message and Path, so an unknown code is displayed as faithfully as
-// a known one, and a mirrored list would only be one more thing to keep in step
-// with backend/resource/rworkflow/validate_files.go.
+// The server's finding CODES (invalid_path, unresolved_ref, …) are deliberately
+// not mirrored WHOLESALE. The CLI prints Message and Path, so an unknown code is
+// displayed as faithfully as a known one, and a mirrored list would only be one
+// more thing to keep in step with
+// backend/resource/rworkflow/validate_files.go.
+//
+// ONE is mirrored, and only because a decision hangs on it — see
+// FindingSecretDropped.
 const SeverityError = "error"
+
+// FindingSecretDropped is the code the server reports for a binding its save
+// will FILTER OUT rather than refuse: a `{{ secret }}` marker naming a secret
+// the author cannot reach. The workflow saves, the binding is silently dropped,
+// and every run that touches the marker fails.
+//
+// Mirrored because `wf push`'s EXIT CODE turns on it, which nothing else here
+// does — see droppedBindings. Branching on the code and not the prose is the
+// whole point: the codes are a declared wire contract ("may be added to but
+// never renamed"), and a CLI matching on the sentence would start passing green
+// the day somebody reworded it.
+const FindingSecretDropped = "secret_dropped"
 
 // ValidateFile is one candidate file, mirroring rworkflow.ValidateFile.
 type ValidateFile struct {
@@ -55,8 +70,14 @@ type ValidateInput struct {
 	Parameters  []WorkflowParameter `json:"parameters,omitempty"`
 	Files       []ValidateFile      `json:"files"`
 	PipPackages []string            `json:"pipPackages,omitempty"`
-	// RuntimeVersion is 1 or 2 — the runtime the candidate would be checked
-	// against. 0 sends nothing, which the server reads as 1.
+	// RuntimeVersion is 1, 2 or 3 — the runtime the candidate is checked against.
+	//
+	// ⚠️ 0 is NOT the create default here. This endpoint reads it as "run no
+	// runtime-scoped rules", which is what every caller written before runtimes
+	// existed is asking for — deliberately unlike CreateWorkflowInput, where an
+	// absent key means "give me the current default". So a rehearsal of a CREATE
+	// has to NAME the runtime the create will produce, or it rehearses a
+	// different save. wfdir.Manifest.RuntimeForValidate is where that is decided.
 	RuntimeVersion int `json:"runtimeVersion,omitempty"`
 }
 
@@ -149,11 +170,13 @@ type CreateWorkflowInput struct {
 	// omitempty because a folder that does not manage parameters must create a
 	// workflow with none rather than assert an empty declaration.
 	Parameters []WorkflowParameter `json:"parameters,omitempty"`
-	// RuntimeVersion is 1 or 2. Stamped at CREATE here, and afterwards raisable
-	// one way (1 -> 2) through WorkflowPatch — never lowered.
+	// RuntimeVersion is 1, 2 or 3. Stamped at CREATE here, and afterwards
+	// raisable one way (1 -> 2, 1 -> 3, 2 -> 3) through WorkflowPatch — never
+	// lowered.
 	//
-	// omitempty, so a v1 folder's create body is byte-identical to the one the
-	// CLI sent before durable workflows existed — an absent key is 1 server-side.
+	// omitempty, so a folder that declares no runtime sends no key and the SERVER
+	// chooses. Its default is no longer 1, so the answer is read back off the
+	// created row rather than assumed — see resolvePushTarget.
 	RuntimeVersion int `json:"runtimeVersion,omitempty"`
 	// ReportingTimezone is the declared execution calendar, when the folder
 	// manages one. A plain string with omitempty rather than the patch's pointer,

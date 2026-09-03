@@ -10,17 +10,27 @@
 // (Parameters for a workflow, Access for a data app). The package name predates
 // data apps and is left alone rather than churning every import.
 //
-// The split is the whole design:
+// The split is the whole design, and it is a THREE-way one: what a human
+// decided, what a deploy recorded, and what belongs to one person.
 //
-//   - ronja.json describes the RESOURCE — its title, its entrypoint, and which
-//     row it maps to on each instance. It is instance-plural on
-//     purpose (one repo pushing to staging and to production is the normal CI
-//     case, not an exotic one), and it belongs in version control.
-//   - .ronja/state.json is this CHECKOUT's baseline: the hash of every file as
-//     the server last had it. Drafts are per-user, so a colleague cloning the
-//     repo must not inherit someone else's baseline — hence never committed,
-//     and hence clone/init drop a .ronja/.gitignore that excludes the whole
-//     directory rather than trusting anyone to add it.
+//   - ronja.json describes the RESOURCE — its title, its entrypoint, its
+//     parameters — plus the STACKS it deploys to: named environments, each
+//     saying where it points and which feature its resources live in. Every one
+//     of those is a decision somebody made, which is what a pull request is
+//     about. Committed, human-edited.
+//   - ronja.lock.json is what the deploys DISCOVERED: the row ids they created
+//     and the live fingerprints they last agreed with, per stack. Committed too
+//     — that is what finally gives a fresh CI checkout a baseline — but
+//     machine-owned and expected to churn.
+//   - .ronja/state.json is this CHECKOUT's per-USER baseline: which draft is
+//     mine and what did I last write into it. Drafts are per-user, so a
+//     colleague cloning the repo must not inherit someone else's — hence never
+//     committed, and hence clone/init drop a .ronja/.gitignore that excludes the
+//     whole directory rather than trusting anyone to add it.
+//
+// A folder written before stacks existed keeps its instances[] list, ids and
+// all, and no push rewrites it into the new shape: see Manifest.FormatVersion
+// and SaveLock for how "v1 stays v1" is actually enforced rather than intended.
 //
 // Nothing here talks to the network, and the only non-stdlib import is
 // internal/config — for NormalizeURL alone, because the manifest's per-instance
@@ -37,6 +47,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -44,6 +55,10 @@ import (
 const (
 	// ManifestName is the committed manifest at the folder root.
 	ManifestName = "ronja.json"
+	// LockName is the committed, machine-owned STATE file beside it. Committed,
+	// deliberately: it is what gives a fresh CI checkout a baseline at all. See
+	// Lock.
+	LockName = "ronja.lock.json"
 	// StateDirName holds everything local-only.
 	StateDirName = ".ronja"
 	// StateFileName is the sync baseline inside StateDirName.
@@ -65,6 +80,10 @@ const (
 	// carries a Tables map and why the single-id helpers refuse this kind rather
 	// than answering with a workflow's field.
 	KindPipeline = "pipeline"
+	// KindAutomation is a folder of automation .json files, one per automation.
+	// Many-resource like KindPipeline, and refused by the single-id helpers for
+	// the same reason.
+	KindAutomation = "automation"
 )
 
 // Kind is the resource a synced folder describes, plus the rules that differ
@@ -162,22 +181,105 @@ var (
 		Command: "ronja pipeline",
 		SyncExt: ".sql",
 	}
+	// AutomationKind is a folder of automation files — one .json per automation,
+	// each the curated (trigger, action) shape the create/update bodies take.
+	//
+	// No entrypoint, for PipelineKind's reason exactly: a folder of automations
+	// is a SET with no distinguished member, so there is nothing for the concept
+	// to name. Empty is carried deliberately rather than defaulted.
+	//
+	// SkipDirs is REQUIRED here, and the contrast with PipelineKind is the
+	// point: a pipeline gets away without one because `.sql` is an extension
+	// nothing else in a repository carries, so node_modules/ and dist/ are ruled
+	// out by SyncExt before anything is read. `.json` is the opposite — a
+	// JavaScript dependency tree is MADE of it. Enumerate prunes by DIRECTORY
+	// (StructuralExclusion) and only then by extension, so without this list an
+	// automation folder living anywhere in a JS repository walks the entire
+	// dependency tree and offers every package.json in it as an automation to
+	// push. Same three names DataAppKind carries, for the same reason.
+	//
+	// ⚠️ SyncExt ".json" is safe ONLY because StructuralExclusion refuses
+	// ronja.json, ronja.lock.json and .ronja/ BEFORE NotSyncable consults the
+	// extension. Without that ordering this folder would push its own manifest
+	// and its own recorded state into the customer's automations, and a later
+	// read-back would write the server's stale copy over the real lock file. The
+	// ordering is pinned by TestAutomationFolderNeverSyncsItsOwnMachinery.
+	AutomationKind = Kind{
+		Name:     KindAutomation,
+		Label:    "automation",
+		Command:  "ronja automation",
+		SkipDirs: []string{"node_modules", "dist", "build"},
+		SyncExt:  ".json",
+	}
 )
 
 // The workflow runtime versions a folder may declare.
 //
-// RuntimeDefault is what a workflow gets when the create body says nothing, and
-// its behaviour is frozen: v1 runs stay bit-identical. RuntimeDurable journals
+// RuntimeDefault is the runtime a folder may still DECLARE, and its behaviour is
+// frozen: v1 runs stay bit-identical. It is NOT what a workflow gets when the
+// create body says nothing — the server's create default is RuntimeQuery, so a
+// folder that wants v1 has to keep saying so. It stays the value an ABSENT
+// `runtime` key means to THIS CLI (see Manifest.RuntimeVersion), which is a
+// separate question from what the server stamps. RuntimeDurable journals
 // every @tools.step result, which is what makes a failed run resumable.
+// RuntimeQuery is a SUPERSET of Durable: it keeps the journal and additionally
+// withholds every table credential from the container, so the workflow's code
+// reads a Ronja table only through tools.query.
 //
-// Two values, listed rather than range-checked, because the CLI has to refuse a
-// third: the manifest is committed, and a folder declaring a runtime the
+// Listed rather than range-checked, because the CLI has to refuse a value it
+// does not know: the manifest is committed, and a folder declaring a runtime the
 // instance has never heard of would create a workflow whose runtime nobody can
-// name — discovered at the first run, not at the push.
+// name — discovered at the first run, not at the push. That refusal is
+// ValidRuntime, and LoadManifest applies it to every folder it opens.
 const (
 	RuntimeDefault = 1
 	RuntimeDurable = 2
+	RuntimeQuery   = 3
 )
+
+// RuntimeCreateDefault mirrors the runtime an instance stamps on a workflow
+// created with no runtime in the body. It is NOT what an absent `runtime` key
+// means to this CLI (that is RuntimeDefault) — it is the CLI's copy of somebody
+// else's decision, kept only so a rehearsal can name the runtime a create is
+// about to happen on. See Manifest.RuntimeForValidate, its one caller.
+const RuntimeCreateDefault = RuntimeQuery
+
+// ValidRuntime reports whether n is a runtime this CLI knows how to declare.
+//
+// Zero is valid: a manifest may simply not mention a runtime, which is what a
+// folder written before runtimes existed looks like and what a folder that
+// leaves the choice to the instance looks like. (The two are not the same
+// folder any more: a create's write-back records what the server stamped, so
+// an unpinned folder does not stay unpinned past its first push.) Everything
+// else is refused at load, so a hand-edited `"runtime": 4` fails at the push
+// that would have created it rather than at the first unattended run.
+func ValidRuntime(n int) bool {
+	return n == 0 || n == RuntimeDefault || n == RuntimeDurable || n == RuntimeQuery
+}
+
+// Runtimes is every runtime a folder may declare, for the messages that have to
+// list them. Derived from the constants so a fourth cannot be added to one
+// without the other.
+var Runtimes = []int{RuntimeDefault, RuntimeDurable, RuntimeQuery}
+
+// joinInts renders a list of runtimes for a message — "1, 2 or 3". Here rather
+// than at each call site so the refusal at load and the refusal at `wf init`
+// read identically; a reader who sees both should not have to wonder whether
+// they are the same list.
+func joinInts(ns []int) string {
+	parts := make([]string, 0, len(ns))
+	for _, n := range ns {
+		parts = append(parts, strconv.Itoa(n))
+	}
+	switch len(parts) {
+	case 0:
+		return ""
+	case 1:
+		return parts[0]
+	default:
+		return strings.Join(parts[:len(parts)-1], ", ") + " or " + parts[len(parts)-1]
+	}
+}
 
 // DefaultEntrypoint matches the server's own default for a new workflow.
 //

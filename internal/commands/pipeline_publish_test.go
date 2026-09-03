@@ -489,6 +489,59 @@ func TestPipelinePublishWarnsAboutStaleInputs(t *testing.T) {
 	}
 }
 
+// TestPipelinePublishStillWarnsAboutStaleInputsWhenTheCodecRefusesTheFile.
+//
+// The staleness check runs on RESOLVED SQL so an alias or a sibling's stem is
+// checked too — and the codec answers "" for a file it refuses, which is a file
+// with no refs at all. Taken as the answer, the warning does not degrade: it
+// DISAPPEARS for that file, silently, while the comment beside it promises it
+// only under-reports.
+//
+// Reachable in an ordinary folder, which is why it matters: two `.sql` files of
+// the same stem in different subdirectories is a legal layout (they make two
+// tables of one name, which the schema permits) and it makes every stem ref in
+// the folder ambiguous. The file as written is the fallback, so its id-form refs
+// are still checked — which is exactly the under-reporting that was claimed.
+func TestPipelinePublishStillWarnsAboutStaleInputsWhenTheCodecRefusesTheFile(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	seedFeature(f, "private")
+
+	// revenue.sql reads its upstream by ID and also names an AMBIGUOUS stem, so
+	// pipelineCodec.toWire refuses it.
+	revenue := "SELECT * FROM {{ ref('table-orders') }} JOIN {{ ref('dup') }} USING (id)"
+	root := t.TempDir()
+	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales pipeline"}
+	manifest.SetBinding(f.Key(), wfdir.Binding{
+		FeatureID: "collection-1",
+		Tables: map[string]string{
+			"revenue.sql":     "table-revenue",
+			"raw/dup.sql":     "table-dup-a",
+			"staging/dup.sql": "table-dup-b",
+		},
+	})
+	writePipelineFolder(t, root, manifest, map[string]string{
+		"revenue.sql":     revenue,
+		"raw/dup.sql":     "SELECT 1",
+		"staging/dup.sql": "SELECT 2",
+	})
+	f.AddDraft("table-revenue", "table-draft-9", revenue)
+	// The upstream moved AFTER the draft was built — the one thing the warning is
+	// about.
+	f.tables["table-orders"].UpdatedAt = f.tables["table-draft-9"].UpdatedAt.Add(time.Hour)
+	writePipelineBaseline(t, root, f.Key(), "collection-1",
+		map[string]string{"revenue.sql": revenue},
+		map[string]wfdir.TableState{"revenue.sql": {TableID: "table-revenue", DraftID: "table-draft-9"}})
+
+	_, stderr, err := runPipelineCLI(t, root, "pipeline", "publish", "revenue.sql", "--json")
+	if err != nil {
+		t.Fatalf("publish: %v\n%s", err, stderr)
+	}
+	if !strings.Contains(stderr, "table-orders") || !strings.Contains(stderr, "older upstream data") {
+		t.Fatalf("the staleness warning vanished for a file the codec refused:\n%s", stderr)
+	}
+}
+
 // TestPipelinePublishCountsTheFolderLocalCascade: committing cascades
 // server-side, which is why this loop needs no `run` verb. The number reported
 // is the FOLDER's own, counted from its ref graph — never a tenant-wide N, which

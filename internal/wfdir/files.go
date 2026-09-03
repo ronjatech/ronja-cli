@@ -98,6 +98,18 @@ func StructuralExclusion(path string, kind Kind) string {
 	if path == ManifestName {
 		return fmt.Sprintf("%s is the folder's own manifest", ManifestName)
 	}
+	if path == LockName {
+		// The lock is COMMITTED, so unlike .ronja/ it is a real file sitting in
+		// the walk's way — and a workflow or data app has no SyncExt, so without
+		// this line it is ordinary source and gets PUT into the customer's own
+		// resource. Three things then go wrong at once: the folder's machine
+		// state ships inside the workflow (and inside a data app's compiled
+		// bundle); a later clone writes the server's stale copy over the real
+		// lock file, which LoadLock then reads as authoritative — a clone
+		// inheriting another environment's ids; and the cloned folder reports
+		// `modified ronja.lock.json` for ever, because every push rewrites it.
+		return fmt.Sprintf("%s is the folder's own recorded state", LockName)
+	}
 	if path == StateDirName || strings.HasPrefix(path, StateDirName+"/") {
 		return fmt.Sprintf("%s/ is the local-only sync baseline", StateDirName)
 	}
@@ -147,10 +159,16 @@ func NotSyncable(path string, kind Kind) string {
 
 // isFolderMachinery reports whether a path is the CLI's own bookkeeping rather
 // than something the user authored. Excluded from Skipped reporting: the user
-// did not put ronja.json or .ronja/ there expecting them to sync, and naming
-// them on every single command would be pure noise.
+// did not put ronja.json, ronja.lock.json or .ronja/ there expecting them to
+// sync, and naming them on every single command would be pure noise.
+//
+// It must list exactly what StructuralExclusion rules out as machinery — the
+// two answer the same question, one saying "never syncable" and the other
+// "and do not report it". A file in one and not the other is either pushed
+// into the customer's resource or named as their mistake on every command.
 func isFolderMachinery(path string) bool {
-	return path == ManifestName || path == StateDirName || strings.HasPrefix(path, StateDirName+"/")
+	return path == ManifestName || path == LockName ||
+		path == StateDirName || strings.HasPrefix(path, StateDirName+"/")
 }
 
 // Skipped is a local file that will never be synced, and why.
@@ -181,8 +199,8 @@ type Enumeration struct {
 //
 // Three classes of exclusion, in order:
 //
-//  1. The folder's own machinery: ronja.json and .ronja/. Never syncable, and
-//     the only exclusion not reported as Skipped.
+//  1. The folder's own machinery: ronja.json, ronja.lock.json and .ronja/.
+//     Never syncable, and the only exclusion not reported as Skipped.
 //  2. Structural exclusions: dotfiles and dot-directories anywhere in the tree —
 //     .git above all, which is enormous, full of paths the server would reject,
 //     and never source — plus this Kind's SkipDirs (node_modules/, dist/ and
@@ -348,7 +366,8 @@ func WriteFile(root, path, content string) error {
 //   - A path WriteFile refuses (legacy rows, or a malicious one). Skipping it
 //     with a warning is what produced the phantom-deletion case above.
 //   - A path Enumerate excludes by NAME (NotSyncable): a dot-file or
-//     dot-directory ANYWHERE in it, the folder's own ronja.json / .ronja/, one
+//     dot-directory ANYWHERE in it, the folder's own ronja.json /
+//     ronja.lock.json / .ronja/, one
 //     of this Kind's SkipDirs, or a file outside this Kind's SyncExt — a `.md`
 //     handed to a pipeline folder is written once and then invisible to every
 //     walk. The server's path grammar allows `.` in a segment, so

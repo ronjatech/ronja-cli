@@ -48,7 +48,14 @@ func TestEveryKindNamesItsOwnCommand(t *testing.T) {
 // pipeline folder opened as a workflow refused correctly by accident (the kinds
 // differ) while pointing at `ronja wf` — the command the caller had just run.
 func TestLoadManifestRoutesEveryWrongKindToTheRightCommand(t *testing.T) {
-	kinds := []Kind{WorkflowKind, DataAppKind, PipelineKind}
+	// Derived from the registry rather than listed, for the reason
+	// TestEveryKindNamesItsOwnCommand states: a kind is added by adding a
+	// kindByName entry, and a literal list is one somebody forgets to extend —
+	// which would leave the new kind's whole wrong-kind matrix unchecked.
+	var kinds []Kind
+	for _, kind := range kindByName {
+		kinds = append(kinds, kind)
+	}
 	for _, onDisk := range kinds {
 		for _, openedAs := range kinds {
 			root := t.TempDir()

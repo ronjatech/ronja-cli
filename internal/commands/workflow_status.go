@@ -45,54 +45,79 @@ With --json, one object carrying all of the above.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.WorkflowKind)
+			root, err := folderRootHere(wfdir.WorkflowKind)
 			if err != nil {
 				return err
 			}
-
-			report := &statusReport{
-				Root:              f.Root,
-				URL:               resolved.URL,
-				Title:             f.Manifest.Title,
-				Entrypoint:        f.Manifest.Entrypoint,
-				ManagesParameters: f.Manifest.ManagesParameters(),
-				Parameters:        describeParameters(f.Manifest.DeclaredParameters()),
-				ManagesTimezone:   f.Manifest.ManagesReportingTimezone(),
-				// The zone the folder would put on the row, so what is reported is
-				// what a push would do: a declared "" is the reset, and the server
-				// stores it as the literal UTC.
-				ReportingTimezone: declaredZoneForCreate(f.Manifest),
-				Bound:             f.Bound,
-				Ambiguous:         f.BindingErr != nil,
-				WorkflowID:        f.Binding.WorkflowID,
-				FeatureID:         f.Binding.FeatureID,
-			}
-
-			enumeration, err := wfdir.Enumerate(f.Root, wfdir.WorkflowKind)
+			report, err := workflowStatusReportAt(cmd.Context(), root, resolved)
 			if err != nil {
 				return err
 			}
-			baseline := f.State.For(f.Key)
-			report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
-			report.Skipped = enumeration.Skipped
-			if baseline != nil {
-				report.Baseline = &baselineReport{
-					SourceID:        baseline.SourceID,
-					SourceLifecycle: baseline.SourceLifecycle,
-					UpdatedAt:       baseline.BaselineUpdatedAt,
-				}
-			}
-
-			report.Remote, report.WorkflowURL = remoteStatus(cmd.Context(), resolved, f)
 
 			if flagJSON {
 				return emitJSON(report)
 			}
 			printStatus(report)
+			// No verdict, deliberately, and this is unchanged: `ronja wf status`
+			// has always exited zero whether the folder is clean, drifted or
+			// unreadable. Giving it one is a scripting-visible change to a
+			// shipped command and is gated on a decision that has not been made
+			// — see folderVerdict, which computes the answer for `ronja sync`
+			// without touching this exit code.
 			return nil
 		},
 	}
 	return cmd
+}
+
+// workflowStatusReportAt computes the report for ONE workflow folder at an
+// explicit root, and prints nothing. See pipelineStatusReportAt for why the
+// three status computations were hoisted out of their RunE closures.
+func workflowStatusReportAt(ctx context.Context, root string, resolved *config.Resolved) (*statusReport, error) {
+	f, err := openFolderForStatusAt(ctx, root, resolved, wfdir.WorkflowKind)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reported, never refused — see folder.noteAliases.
+	f.noteAliases()
+
+	report := &statusReport{
+		Root:              f.Root,
+		URL:               resolved.URL,
+		Title:             f.Manifest.Title,
+		Entrypoint:        f.Manifest.Entrypoint,
+		ManagesParameters: f.Manifest.ManagesParameters(),
+		Parameters:        describeParameters(f.Manifest.DeclaredParameters()),
+		ManagesTimezone:   f.Manifest.ManagesReportingTimezone(),
+		// The zone the folder would put on the row, so what is reported is
+		// what a push would do: a declared "" is the reset, and the server
+		// stores it as the literal UTC.
+		ReportingTimezone: declaredZoneForCreate(f.Manifest),
+		Stack:             f.declaredStack(),
+		Bound:             f.Bound,
+		Ambiguous:         f.BindingErr != nil,
+		WorkflowID:        f.Binding.WorkflowID,
+		FeatureID:         f.Binding.FeatureID,
+	}
+
+	enumeration, err := wfdir.Enumerate(f.Root, wfdir.WorkflowKind)
+	if err != nil {
+		return nil, err
+	}
+	baseline := f.State.For(f.Key)
+	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
+	report.Skipped = enumeration.Skipped
+	if baseline != nil {
+		report.Baseline = &baselineReport{
+			SourceID:        baseline.SourceID,
+			SourceLifecycle: baseline.SourceLifecycle,
+			UpdatedAt:       baseline.BaselineUpdatedAt,
+		}
+	}
+
+	report.Remote, report.WorkflowURL = remoteStatus(ctx, resolved, f)
+	return report, nil
 }
 
 // statusReport is the --json shape, and the same struct the human renderer
@@ -112,7 +137,12 @@ type statusReport struct {
 	// a folder declaring UTC, and ReportingTimezone alone cannot say which it is.
 	ManagesTimezone   bool   `json:"managesTimezone"`
 	ReportingTimezone string `json:"reportingTimezone,omitempty"`
-	Bound             bool   `json:"bound"`
+	// Stack is the NAME of the environment this report is about, empty for a
+	// folder still using the unnamed legacy "instances" shape. Reported because
+	// a folder can name several and the answer to "which one am I looking at"
+	// must not be inferred from the organization id.
+	Stack string `json:"stack,omitempty"`
+	Bound bool   `json:"bound"`
 	// Ambiguous reports a folder that IS bound here, to more than one
 	// organization, with no way to tell which applies — the signed-out case.
 	// Distinct from Bound so a caller does not read "not bound" and conclude a
@@ -145,6 +175,16 @@ type baselineReport struct {
 	SourceLifecycle string `json:"sourceLifecycle,omitempty"`
 	UpdatedAt       string `json:"updatedAt,omitempty"`
 }
+
+// reasonNoWorkflowYet is this loop's reasonNothingBound: the folder is bound
+// here and the row it will own simply does not exist yet, which is a conclusion
+// rather than a failure to look. A const for the same reason the pipeline one
+// is — folderVerdict turns on the difference, and a gate that read one of these
+// as the other would go green on an instance it never reached.
+//
+// The string is unchanged from the literal it replaced; nothing a caller reads
+// moved.
+const reasonNoWorkflowYet = "no workflow exists on this instance yet — the first push will create it"
 
 // remoteReport is deliberately shaped so "we did not look" and "we looked and
 // it is fine" are different states. Problem is the one field a caller should
@@ -181,6 +221,20 @@ type remoteReport struct {
 	// ReportingTimezone follows Parameters exactly: set only when the folder
 	// manages the zone and a push would change the row's.
 	ReportingTimezone *timezoneReport `json:"reportingTimezone,omitempty"`
+	// TargetUnknown reports that the row a push would WRITE TO could not be
+	// established — the draft lookup failed, so everything below was measured
+	// against the live row while the caller may well have a draft.
+	//
+	// A field rather than a substring test on DriftNotes, because those notes are
+	// prose and two of the four are perfectly benign ("baseline came from X;
+	// comparing against Y" describes a legitimate cross-row comparison). The tree
+	// verdict has to tell "could not tell" from "compared, and here is a caveat",
+	// and grepping a sentence for that is the kind of coupling that breaks the
+	// day somebody rewords a message.
+	//
+	// ⚠️ Additive only: `ronja wf status` reads nothing from it and its exit code
+	// is unchanged. It exists for folderVerdict.
+	TargetUnknown bool `json:"targetUnknown,omitempty"`
 	// Runtime is set only when the folder and the row disagree about the
 	// workflow's runtime generation — i.e. only when a push would upgrade it, or
 	// would be REFUSED for declaring the lower one. Absent otherwise, including
@@ -244,6 +298,13 @@ type comparedReport struct {
 // reached, which prints as nothing at all.
 func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*remoteReport, string) {
 	out := &remoteReport{}
+	// The organization lookup failed, so this folder's binding cannot be trusted
+	// to be the right one. Reported ahead of the ambiguity below because it is
+	// the CAUSE of it whenever both are set.
+	if reason := f.orgNotCheckedReason(); reason != "" {
+		out.NotCheckedReason = reason
+		return out, ""
+	}
 	// Bound to several organizations here, and signed out, so which binding
 	// applies is genuinely unknown. Reported rather than guessed: picking one
 	// would show another organization's workflow as if it were this folder's.
@@ -261,7 +322,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 		return out, ""
 	}
 	if f.Binding.WorkflowID == "" {
-		out.NotCheckedReason = "no workflow exists on this instance yet — the first push will create it"
+		out.NotCheckedReason = reasonNoWorkflowYet
 		return out, ""
 	}
 
@@ -301,6 +362,9 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 			// measures drift against the LIVE row while the caller may have a
 			// draft that a push would actually write to.
 			out.note("could not check for your open draft (%v) — drift below is against the live version", err)
+			// The row a push would write to was never read, so a clean answer
+			// below is about a DIFFERENT row. See TargetUnknown.
+			out.TargetUnknown = true
 		} else if draft != nil {
 			target = draft
 		}
@@ -317,7 +381,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 	}
 	out.ComparedAgainst = &comparedReport{ID: target.ID, Lifecycle: target.Lifecycle}
 	baseline := f.State.For(f.Key)
-	drift := wfdir.DiffHashes(hashFiles(files), baseline.Hashes())
+	drift := wfdir.DiffHashes(hashFiles(f.Codec, files), baseline.Hashes())
 	out.Drift = &drift
 	// Reported only for a folder that manages parameters: for one that does not,
 	// the row's declaration is not the folder's business and flagging a
@@ -341,12 +405,15 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 			}
 		}
 	}
-	// The runtime generation. Reported for EVERY folder, managed or not: unlike
-	// parameters and the calendar there is no "this folder does not manage the
-	// runtime" state — an absent `runtime` key means 1, which is a declaration.
-	// A row that reported no runtime at all (an older instance) is the one case
-	// with nothing to compare.
-	if target.RuntimeVersion > 0 && f.Manifest.RuntimeVersion() != target.RuntimeVersion {
+	// The runtime generation, reported for a folder that DECLARES one. An
+	// absent `runtime` key declares nothing — the same reading checkRuntimeDrift
+	// applies — so there is no local value for the row to disagree with, and
+	// a push would neither raise the row nor refuse. Reporting drift there
+	// would announce a refusal that is not going to happen. A row that
+	// reported no runtime at all (an older instance) is the other case with
+	// nothing to compare.
+	if f.Manifest.Runtime != 0 && target.RuntimeVersion > 0 &&
+		f.Manifest.RuntimeVersion() != target.RuntimeVersion {
 		out.Runtime = &runtimeReport{
 			Local:   f.Manifest.RuntimeVersion(),
 			Remote:  target.RuntimeVersion,
@@ -377,6 +444,11 @@ func printStatus(r *statusReport) {
 	fmt.Fprintf(out, "  %s\n\n", r.Root)
 
 	fmt.Fprintf(out, "  Instance:   %s\n", r.URL)
+	if r.Stack != "" {
+		// Printed next to the instance because it answers the same question a
+		// step further in: which of this folder's environments is being reported.
+		fmt.Fprintf(out, "  Stack:      %s\n", r.Stack)
+	}
 	if r.Bound && r.WorkflowID != "" {
 		fmt.Fprintf(out, "  Workflow:   %s\n", r.WorkflowID)
 	} else if r.Bound {

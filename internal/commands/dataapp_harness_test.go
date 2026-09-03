@@ -41,6 +41,9 @@ type fakeAppInstance struct {
 	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
 	// ordinary user), mirroring sherlock's downward-counting scale.
 	privilegeLevel int
+	// failMe answers the organization lookup with a status instead of an
+	// identity; 0 is off. See the field of the same name on fakeInstance.
+	failMe int
 	// noFrontendOrigin models an instance with no configured frontend origin —
 	// every row comes back WITHOUT a `url`. See the field of the same name on
 	// fakeInstance.
@@ -114,6 +117,10 @@ type fakeAppInstance struct {
 	// — and failDelete, which fails before the row is touched, can only ever
 	// stage the other half.
 	failDeleteAfterWrite map[string]int
+	// versions is what GET :id/versions answers with, keyed by PARENT id, newest
+	// first — the drift anchor `app push` reads. Nil for an app nobody has ever
+	// committed, which is the state the CLI resolves to the app's own id.
+	versions map[string][]api.DataApp
 	// failCommit is the status POST :id/commit answers with; 0 is success. 400
 	// is the shape that matters — the server's needs-review rejection.
 	failCommit int
@@ -127,6 +134,27 @@ type fakeAppInstance struct {
 	// (`admin required`, `feature not found`) are what push has to translate.
 	failCreate        int
 	failCreateMessage string
+
+	// --- optimistic concurrency -------------------------------------------
+	// fileWrites records every PUT/DELETE of a file WITH the precondition it
+	// carried, which is the only way to tell "sent no precondition" from "sent
+	// an empty one" — the difference between "overwrite whatever is there" and
+	// "this file must not exist yet". Shares recordedFileWrite with the
+	// workflow fake; the field means the same thing on both.
+	fileWrites []recordedFileWrite
+	// enforcePreconditions makes the fake behave like the real server: a
+	// baseSha256 that does not describe what the TARGET row holds is answered
+	// with a 409 and the write is not applied. ON by default
+	// (newFakeAppInstance sets it), because a fake that ignored the field would
+	// let a CLI sending the WRONG hash pass every test here.
+	enforcePreconditions bool
+	// beforeFileWrite, when set, runs at the top of every file PUT/DELETE.
+	//
+	// It is the only way to stage the race the preconditions exist for: a
+	// change that lands AFTER the push read the file listing and BEFORE its own
+	// write. Nothing a test can do from the outside hits that window, because
+	// the CLI makes both calls back to back.
+	beforeFileWrite func(method, path string)
 
 	// --- what the fake was asked to do, for assertions ---------------------
 	created   []api.CreateDataAppInput
@@ -168,7 +196,10 @@ func newFakeAppInstance(t *testing.T) *fakeAppInstance {
 		failDelete:     map[string]int{},
 		kit:            map[string]string{},
 		blobs:          map[string]fakeBlob{},
+		versions:       map[string][]api.DataApp{},
 		privilegeLevel: 50,
+
+		enforcePreconditions: true,
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
@@ -271,6 +302,12 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.URL.Path == "/api/v2/authentication/me" {
+		// The organization lookup, failing the way a revoked token makes it fail:
+		// `app status` must degrade to a local report rather than abort.
+		if f.failMe != 0 {
+			http.Error(w, `{"error":"no"}`, f.failMe)
+			return
+		}
 		writeJSON(w, map[string]any{
 			"user":   map[string]any{"id": "usr-1", "email": "dev@example.com"},
 			"role":   map[string]any{"name": "user", "privilegeLevel": f.privilegeLevel},
@@ -359,6 +396,16 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 
 	case rest == "files":
 		f.serveFileList(w, id)
+
+	case rest == "versions":
+		// A LIST route: bare rows, and deliberately NOT through writeRow, since
+		// the real one stamps no `url` on a listing. Newest first, which is the
+		// order the drift anchor is read out of (element 0).
+		rows := f.versions[id]
+		if rows == nil {
+			rows = []api.DataApp{}
+		}
+		writeJSON(w, rows)
 
 	case strings.HasPrefix(rest, "files/"):
 		f.serveFile(w, r, id, strings.TrimPrefix(rest, "files/"))
@@ -631,6 +678,9 @@ func (f *fakeAppInstance) serveFileList(w http.ResponseWriter, id string) {
 }
 
 func (f *fakeAppInstance) serveFile(w http.ResponseWriter, r *http.Request, id, filePath string) {
+	if f.beforeFileWrite != nil && (r.Method == http.MethodPut || r.Method == http.MethodDelete) {
+		f.beforeFileWrite(r.Method, filePath)
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if status := f.failGetFile[filePath]; status != 0 {
@@ -646,15 +696,28 @@ func (f *fakeAppInstance) serveFile(w http.ResponseWriter, r *http.Request, id, 
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 
 	case http.MethodPut:
+		var body struct {
+			Content    string  `json:"content"`
+			BaseSha256 *string `json:"baseSha256"`
+		}
+		decodeBody(f.t, r, &body)
+		f.fileWrites = append(f.fileWrites, recordedFileWrite{Method: "PUT", Path: filePath, BaseSha256: body.BaseSha256})
 		if status := f.failPut[filePath]; status != 0 {
 			http.Error(w, `{"error":"boom"}`, status)
 			return
 		}
-		var body struct {
-			Content string `json:"content"`
-		}
-		decodeBody(f.t, r, &body)
+		// The target is resolved BEFORE the precondition is checked, because
+		// that is the server's own order: resolveMutationTarget may auto-fork a
+		// draft, and rdataapp checks the assertion against the row the write
+		// actually lands on. A fake that compared against the id in the URL
+		// would pass a CLI that asserts the wrong row's bytes.
 		target := f.mutationTarget(id)
+		// Checked BEFORE the write and rolled back by simply not doing it,
+		// which is what the server's in-transaction check amounts to from the
+		// outside.
+		if f.refusePrecondition(w, target, filePath, body.BaseSha256) {
+			return
+		}
 		saved := f.putFile(target, filePath, body.Content)
 		if status := f.failPutAfterWrite[filePath]; status != 0 {
 			// The row is already written; only the recompile/upload failed.
@@ -677,11 +740,22 @@ func (f *fakeAppInstance) serveFile(w http.ResponseWriter, r *http.Request, id, 
 		writeJSON(w, resp)
 
 	case http.MethodDelete:
+		// A DELETE legitimately carries NO body at all — that is the shape the
+		// route took before preconditions existed, and still the shape of an
+		// unconditional delete.
+		var body struct {
+			BaseSha256 *string `json:"baseSha256"`
+		}
+		decodeOptionalBody(f.t, r, &body)
+		f.fileWrites = append(f.fileWrites, recordedFileWrite{Method: "DELETE", Path: filePath, BaseSha256: body.BaseSha256})
 		if status := f.failDelete[filePath]; status != 0 {
 			http.Error(w, `{"error":"boom"}`, status)
 			return
 		}
 		target := f.mutationTarget(id)
+		if f.refusePrecondition(w, target, filePath, body.BaseSha256) {
+			return
+		}
 		f.deleteFile(target, filePath)
 		if status := f.failDeleteAfterWrite[filePath]; status != 0 {
 			// The row is already gone; only the recompile/upload failed.
@@ -811,6 +885,51 @@ func (f *fakeAppInstance) dropDraft(draftID string) {
 	delete(f.draftOf, draft.ParentDataAppID)
 	delete(f.apps, draftID)
 	delete(f.files, draftID)
+}
+
+// refusePrecondition mirrors rdataapp.checkFilePrecondition, which is the
+// point: a CLI that sends a hash of the wrong thing has to fail here the way it
+// would in production, not be waved through by a fake that ignores the field.
+//
+// `id` is the row the write LANDS on (the auto-fork target), not the id in the
+// URL — see the call site.
+//
+// It duplicates fakeInstance.refusePrecondition rather than sharing it because
+// the two fakes are separate hand-written servers all the way down and neither
+// has ever reached into the other; the shared thing is recordedFileWrite, which
+// is data. Reports whether it answered (with a 409).
+func (f *fakeAppInstance) refusePrecondition(w http.ResponseWriter, id, path string, want *string) bool {
+	if want == nil || !f.enforcePreconditions {
+		return false
+	}
+	content, exists := f.FileContents(id)[path]
+	switch {
+	case *want == "" && !exists:
+		return false
+	case *want == "":
+		http.Error(w, `{"error":"`+path+` already exists on this data app, but the write asserted it did not"}`,
+			http.StatusConflict)
+	case exists && wfdir.HashString(content) == *want:
+		return false
+	case !exists:
+		http.Error(w, `{"error":"`+path+` does not exist on this data app, but the write asserted its content hashed to `+*want+`"}`,
+			http.StatusConflict)
+	default:
+		http.Error(w, `{"error":"`+path+` changed since you last read it (it now hashes to `+
+			wfdir.HashString(content)+`, the write expected `+*want+`)"}`, http.StatusConflict)
+	}
+	return true
+}
+
+// writesFor returns the recorded file writes for one path, in order.
+func (f *fakeAppInstance) writesFor(path string) []recordedFileWrite {
+	var out []recordedFileWrite
+	for _, w := range f.fileWrites {
+		if w.Path == path {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // FileContents flattens one row's files for assertions.

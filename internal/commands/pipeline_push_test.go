@@ -1459,3 +1459,104 @@ func TestPipelinePushSkipsTheSampleOnALargeTable(t *testing.T) {
 		t.Errorf("a small table must still be sampled: %v", f.queries)
 	}
 }
+
+// A cross-organization `{{ ref }}` and a non-admin create both come back as 403
+// from POST /feature/model, and the CLI used to report BOTH as "creating a NEW
+// table needs an admin". Verified false in the field: with an admin token in the
+// target organization, the refusal was rmodelv2.AssertTablesReadable declining a
+// ref that belongs elsewhere — and rjerr.Forbiddenf withholds the id on purpose,
+// so the message had nothing to go on and always guessed.
+//
+// The bar is `ronja wf validate`'s unresolved_ref finding: name the id, quote
+// the marker, say what to do about it.
+// TestPipelinePushNamesTheOrganizationWhenTheFolderBelongsToAnother pins the
+// pipeline half of the same defect featureIDFor fixes for workflows: a folder
+// cloned from another organization arrives here with entries that all have a
+// featureID, so "add featureID to the <url> entry" describes a line the reader
+// is looking straight at.
+func TestPipelinePushNamesTheOrganizationWhenTheFolderBelongsToAnother(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	f.AddFeature("collection-1", "Sales", "private")
+
+	root := t.TempDir()
+	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales"}
+	// Bound to a DIFFERENT organization on this same instance, with a featureID
+	// present — which is what a clone from elsewhere looks like.
+	manifest.SetBinding(wfdir.InstanceKey{URL: f.URL(), TenantID: "ten-elsewhere"},
+		wfdir.Binding{FeatureID: "collection-elsewhere"})
+	writePipelineFolder(t, root, manifest, map[string]string{
+		"revenue.sql": "SELECT 1",
+	})
+
+	_, stderr, err := runPipelineCLI(t, root, "pipeline", "push")
+	if err == nil {
+		t.Fatal("push accepted a folder with no feature for this organization")
+	}
+	// This refusal is the command's own error, not a per-file stderr line, so
+	// read both — the reader sees whichever the runner prints.
+	said := err.Error() + stderr
+	if !strings.Contains(said, "ten-elsewhere") {
+		t.Errorf("refusal does not name the organization the folder DOES have:\n%s", said)
+	}
+	if strings.Contains(said, `Add "featureID" to the`) {
+		t.Errorf("still tells the reader to add a featureID that is already there:\n%s", said)
+	}
+}
+
+func TestPipelinePushNamesTheRefItCouldNotRead(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	f.AddFeature("collection-1", "Sales", "private")
+	f.failCreate = 403
+
+	root := t.TempDir()
+	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales"}
+	manifest.SetBinding(f.Key(), wfdir.Binding{FeatureID: "collection-1"})
+	// table-elsewhere exists in no organization this token can see, which is what
+	// a folder cloned from another organization carries in its SQL.
+	writePipelineFolder(t, root, manifest, map[string]string{
+		"revenue.sql": "SELECT * FROM {{ ref('table-elsewhere') }}",
+	})
+
+	_, stderr, err := runPipelineCLI(t, root, "pipeline", "push")
+	if err == nil {
+		t.Fatal("push accepted a table whose ref it cannot read")
+	}
+	if !strings.Contains(stderr, "table-elsewhere") {
+		t.Errorf("refusal does not name the id:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "{{ ref('table-elsewhere') }}") {
+		t.Errorf("refusal does not quote the marker:\n%s", stderr)
+	}
+	// The wrong guess must not survive beside the right answer.
+	if strings.Contains(stderr, "needs an admin") {
+		t.Errorf("still reported as an admin problem:\n%s", stderr)
+	}
+}
+
+// ...and the admin explanation survives for the case where it IS the cause. A
+// 403 whose refs all read fine is a create the caller is not allowed to make,
+// and replacing one wrong guess with another would be no better than the bug.
+func TestPipelinePushStillBlamesAdminWhenTheRefsAreFine(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	f.AddFeature("collection-1", "Sales", "private")
+	f.AddTable(&api.Table{ID: "table-orders", Name: "Orders", FeatureID: "collection-1", Code: "SELECT 0"})
+	f.failCreate = 403
+
+	root := t.TempDir()
+	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales"}
+	manifest.SetBinding(f.Key(), wfdir.Binding{FeatureID: "collection-1"})
+	writePipelineFolder(t, root, manifest, map[string]string{
+		"revenue.sql": "SELECT * FROM {{ ref('table-orders') }}",
+	})
+
+	_, stderr, err := runPipelineCLI(t, root, "pipeline", "push")
+	if err == nil {
+		t.Fatal("push accepted a refused create")
+	}
+	if !strings.Contains(stderr, "needs an admin") {
+		t.Errorf("the admin explanation was lost:\n%s", stderr)
+	}
+}

@@ -105,10 +105,13 @@ Every .sql file in the folder is one derived table. Anything else is ignored.`,
 			}
 			// No tables: nothing exists server-side yet. The first push of each
 			// file creates its table and records the binding.
-			manifest.SetBinding(
+			lock, err := recordFirstBinding(manifest,
 				wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID},
 				wfdir.Binding{FeatureID: featureID})
-			if err := wfdir.SaveManifest(root, manifest); err != nil {
+			if err != nil {
+				return err
+			}
+			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}
 			// An EMPTY baseline rather than a fabricated one. There is no

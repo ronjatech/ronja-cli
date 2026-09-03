@@ -225,9 +225,16 @@ func TestPushSendsTheDeclaredRuntimeAtCreate(t *testing.T) {
 	}
 }
 
-// A v1 folder's create body has to stay what it was: no runtimeVersion key at
-// all, so an instance that predates durable workflows sees the same request.
-func TestPushOfADefaultRuntimeFolderSendsNoRuntimeVersion(t *testing.T) {
+// A folder that declares no runtime sends no runtimeVersion on the CREATE: the
+// key is absent because the folder has no opinion, and the instance stamps its
+// own default — which is also what keeps the request byte-identical to the one
+// an instance predating durable workflows saw.
+//
+// VALIDATE is the deliberate asymmetry. It is a pre-creation endpoint with no
+// row to read the runtime from, and it takes 0 as "check nothing runtime-scoped"
+// — so a create rehearsed with 0 would rehearse a different save from the one
+// about to happen. See Manifest.RuntimeForValidate.
+func TestPushOfADefaultRuntimeFolderSendsNoRuntimeVersionOnTheCreate(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	root := initFolder(t, f, map[string]string{"main.py": "print('hi')\n"})
@@ -241,8 +248,8 @@ func TestPushOfADefaultRuntimeFolderSendsNoRuntimeVersion(t *testing.T) {
 	if got := f.created[0].RuntimeVersion; got != 0 {
 		t.Errorf("create sent runtimeVersion %d, want it absent", got)
 	}
-	if got := f.validated[0].RuntimeVersion; got != 0 {
-		t.Errorf("validate sent runtimeVersion %d, want it absent", got)
+	if got := f.validated[0].RuntimeVersion; got != wfdir.RuntimeCreateDefault {
+		t.Errorf("validate sent runtimeVersion %d, want %d — the runtime the create will produce", got, wfdir.RuntimeCreateDefault)
 	}
 }
 
@@ -709,7 +716,7 @@ func TestReconcileTimedOutPutRecordsOnlyWhatItMeantToWrite(t *testing.T) {
 	client := api.New(f.URL(), "test-token")
 
 	landed := map[string]string{}
-	if !reconcileTimedOutPut(context.Background(), client, "wf-1", "main.py", "landed\n", landed) {
+	if !reconcileTimedOutPut(context.Background(), client, aliasCodec{}, "wf-1", "main.py", "landed\n", landed) {
 		t.Error("the server holds exactly what the write was trying to leave behind — that is a write that landed")
 	}
 	if landed["main.py"] != "landed\n" {
@@ -719,7 +726,7 @@ func TestReconcileTimedOutPutRecordsOnlyWhatItMeantToWrite(t *testing.T) {
 	// The server holds something else, so the write did NOT land — and that
 	// something else is nobody's business of ours to acknowledge.
 	other := map[string]string{}
-	if reconcileTimedOutPut(context.Background(), client, "wf-1", "theirs.py", "mine\n", other) {
+	if reconcileTimedOutPut(context.Background(), client, aliasCodec{}, "wf-1", "theirs.py", "mine\n", other) {
 		t.Error("a file holding somebody else's content was reported as a write that landed")
 	}
 	if len(other) != 0 {
@@ -730,7 +737,7 @@ func TestReconcileTimedOutPutRecordsOnlyWhatItMeantToWrite(t *testing.T) {
 	// baseline already acknowledged, rather than claiming a write that may not
 	// have happened.
 	unknown := map[string]string{"gone.py": "acknowledged\n"}
-	reconcileTimedOutPut(context.Background(), client, "wf-1", "gone.py", "mine\n", unknown)
+	reconcileTimedOutPut(context.Background(), client, aliasCodec{}, "wf-1", "gone.py", "mine\n", unknown)
 	if unknown["gone.py"] != "acknowledged\n" {
 		t.Errorf("landed = %+v — a failed re-read rewrote the baseline", unknown)
 	}
@@ -986,9 +993,12 @@ func TestPushRefusesOnValidationErrorsAndWritesNothing(t *testing.T) {
 
 func TestPushWarningsDoNotBlockAndRideAlongInTheResult(t *testing.T) {
 	f := newFakeInstance(t)
+	// Deliberately NOT secret_dropped: that one code is a dropped BINDING, and a
+	// push that lands with one exits non-zero (see the tests below). Every other
+	// warning is advice, and advice does not fail a deploy.
 	f.validate = &api.ValidateResult{Findings: []api.ValidateFinding{{
-		Severity: "warning", Code: "secret_dropped",
-		Message: "secret sec-1 isn't reachable to you", Path: "main.py",
+		Severity: "warning", Code: "invalid_params",
+		Message: "parameter \"month\" has no label", Path: "main.py",
 	}}}
 	signIn(t, f)
 	root := initFolder(t, f, map[string]string{"main.py": "x\n"})
@@ -1006,6 +1016,103 @@ func TestPushWarningsDoNotBlockAndRideAlongInTheResult(t *testing.T) {
 	}
 	if payload["error"] != nil {
 		t.Errorf("error = %v on a push that succeeded", payload["error"])
+	}
+	if payload["droppedBindings"] != nil {
+		t.Errorf("droppedBindings = %v on a warning that is not a dropped binding", payload["droppedBindings"])
+	}
+}
+
+// A `{{ secret }}` marker naming a secret the author cannot reach is the
+// server's SOFT tier: the workflow saves, the binding is filtered out, and every
+// run that touches the marker fails. The push used to exit ZERO through that —
+// so a CI job passed and shipped a workflow that cannot run.
+//
+// The severity stays a warning (it is the right tier for a person about to
+// create the secret); the EXIT CODE is what was wrong, because it is the only
+// thing CI reads.
+func TestPushExitsNonZeroWhenTheSaveDropsABinding(t *testing.T) {
+	f := newFakeInstance(t)
+	f.validate = &api.ValidateResult{Findings: []api.ValidateFinding{{
+		Severity: "warning", Code: api.FindingSecretDropped,
+		Message: `secret "secret-other-org" isn't reachable to you`, Path: "main.py",
+	}}}
+	signIn(t, f)
+	root := initFolder(t, f, map[string]string{"main.py": "x\n"})
+
+	out, err := runCLI(t, root, "wf", "push", "--json")
+	if err == nil {
+		t.Fatal("push exited zero with a dropped binding — CI would ship a workflow that fails at run time")
+	}
+	if !strings.Contains(err.Error(), "--allow-dropped-bindings") {
+		t.Errorf("error = %v, want the opt-out named", err)
+	}
+	payload := decodeJSON(t, out)
+	// The push LANDED. This is an exit code, not a refusal: the workflow was
+	// created and the files written, and a report that said otherwise would send
+	// the author looking for work that is on the server.
+	if payload["created"] != true {
+		t.Errorf("created = %v — the push should still have landed", payload["created"])
+	}
+	if len(f.created) != 1 {
+		t.Errorf("created workflows = %+v, want the push to have landed", f.created)
+	}
+	dropped, ok := payload["droppedBindings"].([]any)
+	if !ok || len(dropped) != 1 {
+		t.Fatalf("droppedBindings = %v, want the one drop: %s", payload["droppedBindings"], out)
+	}
+	if !strings.Contains(dropped[0].(string), "secret-other-org") {
+		t.Errorf("droppedBindings = %v, want the id named", dropped)
+	}
+}
+
+// The opt-out, for the "I will bind it later" flow. A flag, never a TTY test or
+// a --json test: the exit code has to mean the same thing wherever it is read.
+func TestPushAllowsDroppedBindingsWhenAsked(t *testing.T) {
+	f := newFakeInstance(t)
+	f.validate = &api.ValidateResult{Findings: []api.ValidateFinding{{
+		Severity: "warning", Code: api.FindingSecretDropped,
+		Message: `secret "secret-later" isn't reachable to you`, Path: "main.py",
+	}}}
+	signIn(t, f)
+	root := initFolder(t, f, map[string]string{"main.py": "x\n"})
+
+	out, err := runCLI(t, root, "wf", "push", "--json", "--allow-dropped-bindings")
+	if err != nil {
+		t.Fatalf("--allow-dropped-bindings did not accept the drop: %v", err)
+	}
+	payload := decodeJSON(t, out)
+	// Still REPORTED. The flag accepts the drop; it does not hide it.
+	if got, ok := payload["droppedBindings"].([]any); !ok || len(got) != 1 {
+		t.Errorf("droppedBindings = %v, want the drop still reported: %s", payload["droppedBindings"], out)
+	}
+	if payload["droppedBindingsAllowed"] != true {
+		t.Errorf("droppedBindingsAllowed = %v, want true", payload["droppedBindingsAllowed"])
+	}
+}
+
+// A second push of an unchanged folder is the shape CI actually runs: the
+// re-run of the deploy that just failed. It has nothing to write, and the
+// workflow is still broken, so it must not go green.
+func TestPushUpToDateStillRefusesADroppedBinding(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
+		api.WorkflowFile{Path: "main.py", Content: "x\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	f.validate = &api.ValidateResult{Findings: []api.ValidateFinding{{
+		Severity: "warning", Code: api.FindingSecretDropped,
+		Message: `secret "secret-other-org" isn't reachable to you`, Path: "main.py",
+	}}}
+
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err == nil {
+		t.Fatal("the first push exited zero with a dropped binding")
+	}
+	out, err := runCLI(t, root, "wf", "push", "--json")
+	if err == nil {
+		t.Fatal("the up-to-date re-push went green on a workflow that still carries the drop")
+	}
+	if payload := decodeJSON(t, out); payload["upToDate"] != true {
+		t.Errorf("upToDate = %v, want the second push to have written nothing", payload["upToDate"])
 	}
 }
 
@@ -1370,8 +1477,13 @@ func TestPushRefusesBinaryAndOversizedFiles(t *testing.T) {
 	if !strings.Contains(err.Error(), "blob.dat") {
 		t.Errorf("error = %v, want it to name the file", err)
 	}
-	if len(f.Requests) != 0 {
-		t.Errorf("made %d request(s) before refusing: %v", len(f.Requests), f.Requests)
+	// The refusal is still LOCAL — no workflow was read, no draft opened, no file
+	// written. The one request is the organization lookup openFolderLocally owes
+	// an environment token before it may trust this folder's binding: without it
+	// the binding is matched on URL alone and another organization's is adopted.
+	// A stored profile makes even this one disappear.
+	if got := requestsMatching(f, "GET /api/v2/authentication/me"); len(f.Requests) != len(got) {
+		t.Errorf("made a request beyond the organization lookup before refusing: %v", f.Requests)
 	}
 
 	if err := os.Remove(filepath.Join(root, "blob.dat")); err != nil {

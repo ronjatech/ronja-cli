@@ -142,7 +142,7 @@ func runAppDiscard(ctx context.Context, f *folder, yes, deleteApp bool) (*appDis
 	// no longer exists, and leaving it in place would make every local file read
 	// as drift against a row that is gone. A failure here is noted, not returned
 	// — the discard itself succeeded.
-	noteBaselineRefresh(f.Kind, refreshAppBaselineFromLive(ctx, client, f, target.App.ID))
+	noteBaselineRefresh(f.Kind, refreshAppBaselineFromLive(ctx, client, f, target.App.ID, keepAnchor))
 	return &appDiscardResult{
 		Outcome:   outcomeDiscarded,
 		DataAppID: target.App.ID,
@@ -172,8 +172,8 @@ func deleteUnpublishedApp(ctx context.Context, client *api.Client, f *folder, ap
 
 	// Keep the feature, drop the app: the folder should behave exactly as it did
 	// after `init`, so the next push creates a fresh app in the same place.
-	f.Manifest.SetBinding(f.Key, wfdir.Binding{FeatureID: f.Binding.FeatureID})
-	if err := wfdir.SaveManifest(f.Root, f.Manifest); err != nil {
+	f.recordBinding(wfdir.Binding{FeatureID: f.Binding.FeatureID})
+	if err := f.saveFolder(); err != nil {
 		return nil, fmt.Errorf("data app %s was DELETED, but %s still names it: %w\n  Remove the dataAppID from that file by hand, or the next push will look for an app that is gone",
 			app.ID, wfdir.ManifestPath(f.Root), err)
 	}

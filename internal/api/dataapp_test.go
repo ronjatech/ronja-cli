@@ -169,7 +169,7 @@ func TestPutDataAppFileDecodesCompileError(t *testing.T) {
 		}`))
 	})
 
-	saved, err := client.PutDataAppFile(context.Background(), "data_app-1", "App.tsx", "broken")
+	saved, err := client.PutDataAppFile(context.Background(), "data_app-1", "App.tsx", "broken", nil)
 	if err != nil {
 		t.Fatalf("a compile failure must not be a request failure: %v", err)
 	}

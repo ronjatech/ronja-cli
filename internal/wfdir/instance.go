@@ -55,12 +55,44 @@ var ErrAmbiguousInstance = fmt.Errorf("this folder is bound to several organizat
 // against the instance it is plainly bound to, which a first push would "fix"
 // by creating a second workflow.
 func Find[T any](items []T, keyOf func(T) InstanceKey, want InstanceKey) (int, error) {
+	matches := FindAll(items, keyOf, want)
+	switch {
+	case len(matches) == 1:
+		return matches[0], nil
+	case len(matches) == 0:
+		return -1, nil
+	case !want.Known():
+		return -1, ErrAmbiguousInstance
+	default:
+		// Several EXACT matches on one (instance, organization). The shapes this
+		// searches are all supposed to hold at most one — SetBinding replaces
+		// rather than appends, and Manifest.selectNamed refuses to CREATE a
+		// second stack on an organization this folder already names — so
+		// reaching here means a hand-edited or merged file, which is not
+		// refused at load precisely so the folder stays openable (see
+		// checkStacks). The FIRST is answered rather than an error, because that is what
+		// this has always done and every caller of Find treats "no entry" as
+		// "never pushed here", which for a duplicate would create a second
+		// resource. Manifest.Select is where the duplicate is reported.
+		return matches[0], nil
+	}
+}
+
+// FindAll lists every entry matching want, by exactly the rules Find documents
+// — which is the point of it existing: Find is written in terms of this, so the
+// two can never disagree about what "matches" means.
+//
+// It reports MATCHES, not a verdict. Deciding that two of them is an ambiguity
+// worth refusing is the caller's, because the two callers disagree: Find's
+// contract is one answer or none, while Manifest.Select has a --stack flag to
+// offer and can name what it found.
+func FindAll[T any](items []T, keyOf func(T) InstanceKey, want InstanceKey) []int {
 	wantURL, err := config.NormalizeURL(want.URL)
 	if err != nil {
-		return -1, nil
+		return nil
 	}
 
-	onURL := []int{}
+	var exact, onURL []int
 	for i, item := range items {
 		key := keyOf(item)
 		norm, err := config.NormalizeURL(key.URL)
@@ -69,20 +101,42 @@ func Find[T any](items []T, keyOf func(T) InstanceKey, want InstanceKey) (int, e
 		}
 		if want.Known() {
 			if key.TenantID == want.TenantID {
-				return i, nil
+				exact = append(exact, i)
 			}
 			continue
 		}
 		onURL = append(onURL, i)
 	}
-
-	switch {
-	case !want.Known() && len(onURL) == 1:
-		return onURL[0], nil
-	case !want.Known() && len(onURL) > 1:
-		return -1, ErrAmbiguousInstance
+	if want.Known() {
+		return exact
 	}
-	return -1, nil
+	return onURL
+}
+
+// KeysOn lists the keys of every item bound to one instance, in slice order.
+//
+// It folds URL spelling exactly as Find does, and lives beside it for that
+// reason. Two callers depend on the two agreeing: the refusal that enumerates
+// the organizations a folder names on an instance, and the check that decides
+// whether resolving the caller's own organization is worth a round trip. A
+// rawer comparison here would name a different set from the one the lookup saw
+// — the worst kind of disagreement, since it is invisible until the spellings
+// differ.
+func KeysOn[T any](items []T, keyOf func(T) InstanceKey, url string) []InstanceKey {
+	wantURL, err := config.NormalizeURL(url)
+	if err != nil {
+		return nil
+	}
+	var out []InstanceKey
+	for _, item := range items {
+		key := keyOf(item)
+		norm, err := config.NormalizeURL(key.URL)
+		if err != nil || norm != wantURL {
+			continue
+		}
+		out = append(out, key)
+	}
+	return out
 }
 
 // Matches reports whether two keys name the same instance and organization,

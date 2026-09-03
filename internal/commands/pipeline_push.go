@@ -197,6 +197,19 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	if err := checkPushable(local, wfdir.PipelineKind, maxFileBytes); err != nil {
 		return nil, err
 	}
+	// The names this folder's code may use: its own files' stems, and whatever
+	// ronja.json declares. Built once, read live — a sibling's table id only
+	// exists after that sibling's own create, which happens inside the loop below.
+	codec := newPipelineCodec(f, local)
+	// The alias pre-flight, still with no network in sight. The stems go in
+	// because a pipeline folder is the one kind whose files claim local names, and
+	// a dependency declared under one of them is dead text that reads as if it
+	// were in force.
+	aliases := checkAliases(f.Manifest, f.selection(), f.Codec, local, folderStems(f.Kind, local), folderFieldRefs(f.Kind, local))
+	if err := aliases.err(); err != nil {
+		return nil, err
+	}
+	noteAliasWarnings(aliases)
 
 	baseline := f.State.For(f.Key)
 	// A baseline entry for a file that has left BOTH the folder and the binding
@@ -243,7 +256,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		// with nothing left to push. Saved here or the note is printed on every
 		// run for ever, having dropped nothing that survives the process.
 		if len(pruned) > 0 {
-			if err := wfdir.SaveState(f.Root, f.State); err != nil {
+			if err := f.saveBaseline(); err != nil {
 				fmt.Fprintf(os.Stderr, "  Note: could not record the pruned baseline (%v) — it will be reported again next time.\n", err)
 			}
 		}
@@ -253,7 +266,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 
 	// 3. Dependency order, over the WHOLE folder, so a cycle is caught wherever
 	// it is rather than only inside the pushed subset.
-	ordered, err := topoOrder(local, f.Binding, targets)
+	ordered, err := topoOrder(codec, local, targets)
 	if err != nil {
 		return nil, err
 	}
@@ -278,8 +291,22 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		}
 		creating = true
 		if f.Binding.FeatureID == "" {
-			return nil, fmt.Errorf("%s has no table yet and this folder names no feature, so there is nowhere to create one.\n  Add \"featureID\" to the %s entry in %s, or start from `ronja pipeline init --feature <id>` or `ronja pipeline clone <feature-id>`",
-				path, f.Resolved.URL, wfdir.ManifestPath(f.Root))
+			// The ORGANIZATION is part of the answer whenever this folder has NO
+			// entry here and names another organization instead — the same reason
+			// featureIDFor says so for a workflow. "Add featureID to the <url>
+			// entry" sends the reader to a line that already has one, which is
+			// what they see and why they stop believing the message. A folder
+			// cloned from another organization is the ordinary way to arrive here.
+			//
+			// A folder that IS bound here and merely left "featureID" out gets the
+			// plain wording: it has a line to add the field to, and the
+			// cross-organization sentence would be wrong advice one case over.
+			if others := f.otherOrganizationsOn(); !f.Bound && len(others) > 0 {
+				return nil, fmt.Errorf("%s has no table yet, and this folder names no feature for organization %s on %s in %s — the entries there name %s instead, and a table's ids belong to the organization that holds them.\n  %s, or start from `ronja pipeline clone <feature-id>` against this organization",
+					path, f.Key.TenantID, f.Resolved.URL, wfdir.ManifestPath(f.Root), strings.Join(others, ", "), f.featureAdviceForAnotherOrganization())
+			}
+			return nil, fmt.Errorf("%s has no table yet and this folder names no feature, so there is nowhere to create one.\n  %s, or start from `ronja pipeline init --feature <id>` or `ronja pipeline clone <feature-id>`",
+				path, f.featureAdvice())
 		}
 	}
 	// A create WRITES a binding, and a binding must name its organization
@@ -310,8 +337,8 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 			result.Error = interruptedMessage
 			return result, errors.New(interruptedMessage)
 		}
-		file := pushOneTable(ctx, client, f, inst, path, local[path],
-			upstreamsInPush(local[path], f.Binding, pushing), created, opts)
+		file := pushOneTable(ctx, client, f, codec, inst, path, local[path],
+			upstreamsInPush(codec, local[path], pushing), created, opts)
 		result.Files = append(result.Files, file)
 		if file.Created {
 			created[path] = true
@@ -320,7 +347,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		// has really created tables and really staged drafts, and a baseline that
 		// does not know about them makes the retry read its own work as somebody
 		// else's drift.
-		if err := wfdir.SaveState(f.Root, f.State); err != nil {
+		if err := f.saveBaseline(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
 		}
 		if file.Outcome != pushOutcomePushed {
@@ -335,6 +362,56 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	return result, nil
 }
 
+// explainUnreadableRefs names the `{{ ref }}` ids in this file that the caller
+// cannot read, rendered as the marker lines a refusal quotes — or "" when every
+// ref reads fine.
+//
+// It exists because a 403 from a table write has two causes and the status
+// cannot tell them apart. rmodelv2.AssertTablesReadable refuses code whose refs
+// the caller cannot reach, and rjerr.Forbiddenf deliberately withholds WHICH id
+// — a message naming it would answer "does table-X exist?" for anyone who can
+// guess an id. So the CLI, which is entitled to ask on its own behalf, asks:
+// GET /feature/model/:id refuses an id the caller cannot reach, and that is the
+// same reach question the refusal asked. An id that reads fine is not the cause,
+// and the caller's admin explanation stands.
+//
+// ⚠️ THE REFUSAL IS A 400, not a 404, and that is the whole cross-organization
+// case. A row the caller cannot see is not "forbidden" and is not "missing" —
+// RLS makes it invisible, so the read finds no row and the handler answers
+// `400 {"error":"no rows"}`. Reachability and existence are indistinguishable
+// here by design (see rjerr.Forbiddenf above: naming the difference would answer
+// "does table-X exist?"), which is exactly why all three statuses count as "not
+// reachable by you" and none of them claims to know which.
+//
+// This was wrong once and shipped green: the fake instance answered 404 for an
+// unknown table where the real one answers 400, so the test passed against a
+// server that does not exist. The fake now mirrors production.
+//
+// A round trip PER REF, and NONE of it on the happy path — this runs only after
+// a write has already been refused, where the requests are cheap and a second
+// wrong diagnosis is not. Bounded by the refs in one file.
+//
+// An id that fails for any OTHER reason is left out rather than accused: a
+// transport error says nothing about reachability, and a refusal that named a
+// table for being unreadable during a network blip would be the same wrong
+// guess in nicer words.
+//
+// The wording matches `ronja wf validate`'s unresolved_ref finding on purpose.
+// One root cause reported in two vocabularies is how the reader learns that
+// neither is to be trusted.
+func explainUnreadableRefs(ctx context.Context, client *api.Client, inputs []string) string {
+	var out strings.Builder
+	for _, id := range inputs {
+		if _, err := client.GetTable(ctx, id); err == nil {
+			continue
+		} else if status := api.StatusOf(err); status != 400 && status != 403 && status != 404 {
+			continue
+		}
+		fmt.Fprintf(&out, "      {{ ref('%s') }} — %q isn't a table reachable through your feature membership\n", id, id)
+	}
+	return out.String()
+}
+
 // upstreamsInPush names the folder files this one reads from that are ALSO being
 // pushed in this run.
 //
@@ -344,11 +421,14 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 // describes a build that read the upstream as it is TODAY — not as it will be
 // once the upstream is published. Draft-overlay chaining is a follow-up; until
 // then the honest thing is to say which upstream it was.
-func upstreamsInPush(code string, binding wfdir.Binding, pushing map[string]bool) []string {
-	byID := tablePaths(binding)
+func upstreamsInPush(c pipelineCodec, code string, pushing map[string]bool) []string {
 	var out []string
-	for _, id := range tablerefs.DeriveInputModels(code) {
-		if path, inFolder := byID[id]; inFolder && pushing[path] {
+	// folderUpstreams, so a ref spelled as a sibling's stem counts — see
+	// topoOrder, which builds its edges from the same answer. A note that fired
+	// only for the id spelling would go quiet for exactly the folders this slice
+	// exists to make possible.
+	for _, path := range c.folderUpstreams(code) {
+		if pushing[path] {
 			out = append(out, path)
 		}
 	}
@@ -362,10 +442,13 @@ func upstreamsInPush(code string, binding wfdir.Binding, pushing map[string]bool
 // on to the next file, and exits non-zero at the end. A push of twelve tables
 // that stopped dead on the third would leave nine perfectly pushable files
 // unattempted for no reason.
-func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdir.InstanceState,
+func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipelineCodec, inst *wfdir.InstanceState,
 	path, content string, upstreams []string, created map[string]bool, opts pipelinePushOptions) pipelineFileResult {
 
 	out := pipelineFileResult{Path: path, TableID: f.Binding.Tables[path]}
+	// Where this folder's LIVE fingerprints live — the lock file on a named
+	// stack, the local baseline on a legacy one. See liveHashes.
+	liveHash := f.live(inst)
 	refuse := func(format string, args ...any) pipelineFileResult {
 		out.Outcome = pushOutcomeRefused
 		out.Error = fmt.Sprintf(format, args...)
@@ -373,7 +456,19 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 		return out
 	}
 
-	inputs := tablerefs.DeriveInputModels(content)
+	// `content` is DISK form — the names the author committed. Everything SENT
+	// from here on is `wire`, and everything COMPARED or RECORDED stays disk form.
+	// Resolved here, inside the loop, because a sibling's id only exists once that
+	// sibling's own create has returned earlier in this same run.
+	wire, wireErr := codec.toWire(path, content)
+	if wireErr != nil {
+		return refuse("%s", wireErr)
+	}
+	// Derived from the RESOLVED code, never from the disk form: input_models is a
+	// list of real table ids, and deriving it from names would declare an empty
+	// lineage for a folder written entirely against aliases — which the server
+	// then fills in by its own derivation, or refuses.
+	inputs := tablerefs.DeriveInputModels(wire)
 
 	// --- 0. Is the baseline even about this row? ----------------------------
 	// The manifest says one table and the baseline was taken from another, so
@@ -403,7 +498,7 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 			FeatureID:   f.Binding.FeatureID,
 			Kind:        api.TableKindDerived,
 			Engine:      api.TableEngineDuckDB,
-			Code:        content,
+			Code:        wire,
 			InputModels: inputs,
 		})
 		switch {
@@ -415,7 +510,7 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 			// plain failure the table stays unbound, and the NEXT push creates a
 			// second live table with the same name beside the first — the one
 			// mistake this loop cannot undo, because it has no delete verb.
-			adopted, why := reconcileTimedOutCreate(ctx, client, f.Binding, name, content)
+			adopted, why := reconcileTimedOutCreate(ctx, client, f.Binding, name, wire)
 			if adopted == nil {
 				return refuse("creating the table for %s in feature %s timed out, and %s: %v\n    Look at the feature in the web app before pushing again — if the table IS there and holds this file's SQL, add its id to \"tables\" in %s, or the next push creates a second one beside it",
 					path, f.Binding.FeatureID, why, err, wfdir.ManifestName)
@@ -424,13 +519,20 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 			out.TableID = adopted.ID
 			adoptedRow = adopted
 		case api.StatusOf(err) == 403:
-			// The one refusal in this loop that is about WHO you are rather than
-			// what you sent, and whose bare message sends people to the wrong fix.
-			// Creating a table is admin-only by design (POST /feature/model);
-			// EDITING the tables that exist is not — the whole draft-and-review
-			// path this folder drives is open to a non-admin. So a push that
-			// refuses here is not a push that cannot run: it is one file that
-			// needs an admin once.
+			// TWO refusals wear this status, and the CLI used to report both as
+			// the second one. See explainUnreadableRefs: an unreachable
+			// {{ ref }} is checked first, because it is the answer the message
+			// cannot guess and the one an admin token still gets.
+			if why := explainUnreadableRefs(ctx, client, inputs); why != "" {
+				return refuse("creating the table for %s in feature %s was refused, and it reads a table you cannot:\n%s    Point the ref at a table in this organization, or get access to the feature it lives in. A folder cloned from another organization carries that organization's ids in its SQL",
+					path, f.Binding.FeatureID, why)
+			}
+			// The other one, and it is about WHO you are rather than what you
+			// sent. Creating a table is admin-only by design (POST
+			// /feature/model); EDITING the tables that exist is not — the whole
+			// draft-and-review path this folder drives is open to a non-admin. So
+			// a push that refuses here is not a push that cannot run: it is one
+			// file that needs an admin once.
 			return refuse("creating the table for %s in feature %s was refused (%v).\n    Creating a NEW table needs an admin. Editing tables that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin to create %q in that feature (or to run this one push), then add its id to \"tables\" in %s and push again",
 				path, f.Binding.FeatureID, err, name, wfdir.ManifestName)
 		default:
@@ -442,9 +544,8 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 		// push that died before saving the manifest would leave a table nobody
 		// can find and the next push would create a second one beside it. That is
 		// worse here than for a workflow, whose create makes a hidden draft.
-		f.Binding = f.Binding.WithTable(path, out.TableID)
-		f.Manifest.SetBinding(f.Key, f.Binding)
-		if err := wfdir.SaveManifest(f.Root, f.Manifest); err != nil {
+		f.recordBinding(f.Binding.WithTable(path, out.TableID))
+		if err := f.saveFolder(); err != nil {
 			out.Outcome = pushOutcomeRefused
 			out.Error = fmt.Sprintf("table %s was CREATED, but %s does not name it: %v", out.TableID, wfdir.ManifestPath(f.Root), err)
 			fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n  Add it by hand, or the next push will create a second table for this file.\n", path, out.Error)
@@ -472,7 +573,12 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 	// LiveSHA256, leg (b) our own draft against DraftSHA256. One shared hash
 	// refused an ordinary push → edit → push, because the bytes we had written
 	// into the draft are not the bytes live holds and never were.
-	liveCode := content // a row we just created holds exactly what we sent
+	// `content` is the DISK form, and the baseline has to be disk form — but a
+	// row we just created holds the RESOLVED wire form, not this. The two are
+	// the same fingerprint by construction: what we sent is this file with its
+	// aliases substituted, so de-aliasing the row would return exactly these
+	// bytes, and the round trip is skipped rather than performed.
+	liveCode := content
 	liveKnown := out.Created
 	if adoptedRow != nil {
 		// A reconciled create is the one place "what we sent" is a claim about
@@ -480,7 +586,7 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 		// read back. The reconcile adopts only on an exact match, so this is the
 		// same bytes — read from the copy that is actually going to be compared
 		// against, rather than from the file that hopes to be it.
-		if code, unresolved := adoptedRow.CanonicalCode(); !unresolved {
+		if code, unresolved := codec.canonicalDisk(content, adoptedRow); !unresolved {
 			liveCode = code
 		}
 	}
@@ -490,12 +596,12 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 		if err != nil {
 			return refuse("read %s: %v", out.TableID, err)
 		}
-		if code, unresolved := live.CanonicalCode(); !unresolved {
+		if code, unresolved := codec.canonicalDisk(content, live); !unresolved {
 			liveCode, liveKnown = code, true
 		}
 		var drifted []string
 		// (a) The LIVE table moved: a colleague committed while we were away.
-		if reason := driftReason("the live table", live, recorded.LiveSHA256); reason != "" {
+		if reason := driftReason(codec, content, "the live table", live, liveHash.get(path)); reason != "" {
 			drifted = append(drifted, reason)
 		}
 		// (b) Our OWN draft moved. Not paranoia: the chat agent's editDerivedTable
@@ -521,7 +627,7 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 				// unsynced work, which is exactly what this leg is for.
 				against = wfdir.HashString(liveCode)
 			}
-			if reason := driftReason("your draft "+draft.ID, draft, against); reason != "" {
+			if reason := driftReason(codec, content, "your draft "+draft.ID, draft, against); reason != "" {
 				drifted = append(drifted, reason)
 			}
 		}
@@ -546,8 +652,8 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 		// difference is re-reported on every subsequent push and --force becomes
 		// a permanent part of the command line — which trains it past the one time
 		// it means something.
-		if liveKnown && (forced || recorded.LiveSHA256 == "") {
-			recordLiveAgreement(inst, path, out.TableID, liveCode)
+		if liveKnown && (forced || liveHash.get(path) == "") {
+			recordLiveAgreement(liveHash, path, out.TableID, liveCode)
 		}
 	}
 
@@ -559,7 +665,7 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 		// A fresh draft forks from live, so this is the moment the two rows agree
 		// and the fingerprint leg (a) will compare against from now on.
 		if liveKnown {
-			recordLiveAgreement(inst, path, out.TableID, liveCode)
+			recordLiveAgreement(liveHash, path, out.TableID, liveCode)
 		}
 	}
 	out.DraftID = draft.ID
@@ -569,7 +675,18 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdi
 	recordDraftPointer(inst, path, out.TableID, draft.ID)
 
 	// --- 4. Write, sync, wait ----------------------------------------------
-	if err := client.UpdateTableCode(ctx, draft.ID, content, inputs); err != nil {
+	if err := client.UpdateTableCode(ctx, draft.ID, wire, inputs); err != nil {
+		// Same refusal as the create's, reached by the other door: a folder whose
+		// binding already names a table here still writes SQL whose refs may not
+		// be readable. Diagnosed here too, or the second push of a promotion
+		// reports the same cross-organization ref as a bare 403 with nothing in
+		// it — which is how one root cause grew two qualities of diagnosis.
+		if api.StatusOf(err) == 403 {
+			if why := explainUnreadableRefs(ctx, client, inputs); why != "" {
+				return refuse("writing the SQL of %s into draft %s was refused, and it reads a table you cannot:\n%s    Point the ref at a table in this organization, or get access to the feature it lives in",
+					path, draft.ID, why)
+			}
+		}
 		return refuse("write the SQL of %s into draft %s: %v", path, draft.ID, err)
 	}
 	// The draft now holds these bytes whatever the build makes of them, so leg (b)
@@ -721,6 +838,11 @@ func buildRunning(ctx context.Context, client *api.Client, id string) bool {
 // Comparing canonical SQL is sound because push refuses to send a positional ref
 // at all, so what was sent is already in the form the row stores.
 //
+// ⚠️ `content` here is the RESOLVED code — what the create actually sent — and the
+// comparison is against the row's canonical code in ID form, deliberately NOT
+// de-aliased. Both sides are then in the one vocabulary the server stores, which
+// is the vocabulary the question is about: did this push write this row.
+//
 // One read plus one row read, no retry loop: the question has a single answer
 // and it is worth exactly that. A read that ALSO fails leaves the create
 // unreconciled, which is the conservative half of the same choice.
@@ -840,11 +962,14 @@ func pipelineNoDataHint(message string, inputs []string, binding wfdir.Binding,
 // this folder has never recorded what the server held — a copy cloned from git,
 // whose .ronja/ was correctly never committed — and refusing every such push
 // would be refusing the normal way a colleague joins a pipeline.
-func driftReason(what string, row *api.Table, baselineHash string) string {
+func driftReason(c pipelineCodec, local, what string, row *api.Table, baselineHash string) string {
 	if baselineHash == "" {
 		return ""
 	}
-	code, unresolved := row.CanonicalCode()
+	// Canonicalized and THEN de-aliased, in that order — see
+	// pipelineCodec.canonicalDisk — because baselineHash is a hash of the bytes on
+	// disk, which are in name form.
+	code, unresolved := c.canonicalDisk(local, row)
 	if unresolved {
 		return fmt.Sprintf("%s carries a positional ref that cannot be resolved, so its SQL cannot be compared", what)
 	}

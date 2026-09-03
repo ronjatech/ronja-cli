@@ -88,6 +88,7 @@ production without either overwriting the other's binding.`,
 		newPipelineInitCmd(), newPipelineCloneCmd(), newPipelineStatusCmd(),
 		newPipelinePushCmd(), newPipelinePublishCmd(), newPipelineDiscardCmd(),
 	)
+	addStackFlag(pl)
 	return pl
 }
 
@@ -279,6 +280,58 @@ func recordDraftWrite(inst *wfdir.InstanceState, path, tableID, draftID, content
 	})
 }
 
+// liveHashes is where one pipeline folder's LIVE fingerprints live, which is
+// not the same place for every folder — and routing that decision through one
+// value is what keeps the fork from being spelled at every site that reads or
+// writes one — the two legs of push's drift guard, status's, the three moments
+// an agreement is recorded, and discard's re-point.
+//
+// A NAMED STACK keeps them in ronja.lock.json, committed. "The live table held
+// these bytes when this folder last agreed with it" is a fact about the
+// ENVIRONMENT, true for everybody, and committing it is the only thing that ever
+// gave a fresh CI checkout something to compare against — which is why a push
+// from CI has had to reach for --force.
+//
+// A LEGACY instances[] folder keeps them exactly where they were, in
+// .ronja/state.json. That is the whole of "v1 stays v1": a folder nobody has
+// named a stack in behaves, byte for byte, as it did before stacks existed.
+//
+// The two do not overlap: on a named stack the lock is the ONLY source, and a
+// folder that migrates has its fingerprints carried across once, at the moment
+// it is named (folder.adoptLiveHashes). A permanent read-through to the local
+// baseline was the alternative and is worse — it would leave a committed file's
+// answer quietly depending on a per-user one that a colleague does not have, so
+// the guard would behave differently for the person who ran the migration than
+// for everybody else.
+type liveHashes struct {
+	lock  *wfdir.Lock
+	stack string
+	inst  *wfdir.InstanceState
+}
+
+// live is this folder's live-fingerprint store for the stack it is acting on.
+func (f *folder) live(inst *wfdir.InstanceState) liveHashes {
+	return liveHashes{lock: f.Lock, stack: f.Stack, inst: inst}
+}
+
+func (h liveHashes) get(path string) string {
+	if h.stack != "" {
+		return h.lock.TableLive(h.stack, path)
+	}
+	return h.inst.TableStateFor(path).LiveSHA256
+}
+
+func (h liveHashes) set(path, tableID, liveCode string) {
+	if h.stack != "" {
+		h.lock.SetTableLive(h.stack, path, tableID, wfdir.HashString(liveCode))
+		return
+	}
+	mutateTable(h.inst, path, func(s *wfdir.TableState) {
+		s.TableID = tableID
+		s.LiveSHA256 = wfdir.HashString(liveCode)
+	})
+}
+
 // recordLiveAgreement records the LIVE row's canonical SQL as the one this
 // folder agrees with. The three moments that is true: a clone, the fork of a
 // fresh draft, and a publish that just committed onto it.
@@ -286,11 +339,14 @@ func recordDraftWrite(inst *wfdir.InstanceState, path, tableID, draftID, content
 // Never called with a draft's SQL. Live is the row leg (a) compares, and a draft
 // hash recorded here would refuse every subsequent push as drift on a table that
 // had not moved — the bug this split exists to fix.
-func recordLiveAgreement(inst *wfdir.InstanceState, path, tableID, liveCode string) {
-	mutateTable(inst, path, func(s *wfdir.TableState) {
-		s.TableID = tableID
-		s.LiveSHA256 = wfdir.HashString(liveCode)
-	})
+//
+// ⚠️ It writes the fingerprint to wherever liveHashes says, but the TABLE ID
+// still goes to the local baseline in every case: the baseline has to say which
+// row it describes (see wfdir.TableState.TableID), and that is a statement about
+// this checkout's own records, not about the environment.
+func recordLiveAgreement(live liveHashes, path, tableID, liveCode string) {
+	mutateTable(live.inst, path, func(s *wfdir.TableState) { s.TableID = tableID })
+	live.set(path, tableID, liveCode)
 }
 
 // recordSynced records a COMPLETE push of one file: written to the draft AND
@@ -313,14 +369,13 @@ func recordSynced(inst *wfdir.InstanceState, path, content string) {
 // With no live baseline recorded (an old state file, or a clone that could not
 // canonicalize the live row) the ENTRY GOES: no baseline means every local file
 // reads as changed, which re-stages it just the same and is the honest answer.
-func recordDiscarded(inst *wfdir.InstanceState, path, tableID string) {
-	live := inst.Tables[path].LiveSHA256
-	if live == "" {
-		delete(inst.Files, path)
+func recordDiscarded(live liveHashes, path, tableID string) {
+	if sha := live.get(path); sha == "" {
+		delete(live.inst.Files, path)
 	} else {
-		inst.Files[path] = wfdir.FileState{SHA256: live}
+		live.inst.Files[path] = wfdir.FileState{SHA256: sha}
 	}
-	recordDraftPointer(inst, path, tableID, "")
+	recordDraftPointer(live.inst, path, tableID, "")
 }
 
 // prunePhantoms drops baseline entries for files that are neither on disk nor
@@ -391,18 +446,23 @@ func tablePaths(binding wfdir.Binding) map[string]string {
 // b.sql`) in the same relative order a full one would use.
 //
 // Ties break on path, so a push is reproducible request-for-request.
-func topoOrder(files map[string]string, binding wfdir.Binding, want []string) ([]string, error) {
-	byID := tablePaths(binding)
-
+// The edges come from pipelineCodec.folderUpstreams rather than from
+// DeriveInputModels, so a ref spelled as a SIBLING'S STEM is an edge too. It has
+// to be: on a first push the stem is the only spelling available — the id does
+// not exist yet — so a graph built from ids alone would see no edges at all and
+// order the folder alphabetically, which is the exact failure the paragraph above
+// describes.
+func topoOrder(c pipelineCodec, files map[string]string, want []string) ([]string, error) {
 	// upstream[path] = the folder files it reads from.
 	upstream := make(map[string][]string, len(files))
 	for _, path := range sortedPaths(files) {
 		var deps []string
-		for _, id := range tablerefs.DeriveInputModels(files[path]) {
-			if dep, inFolder := byID[id]; inFolder && dep != path {
-				if _, present := files[dep]; present {
-					deps = append(deps, dep)
-				}
+		for _, dep := range c.folderUpstreams(files[path]) {
+			if dep == path {
+				continue
+			}
+			if _, present := files[dep]; present {
+				deps = append(deps, dep)
 			}
 		}
 		sort.Strings(deps)

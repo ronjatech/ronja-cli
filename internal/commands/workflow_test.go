@@ -2,12 +2,15 @@ package commands
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
@@ -395,7 +398,8 @@ func TestInitRejectsAnUnknownRuntime(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 
-	for _, value := range []string{"0", "3", "-1"} {
+	// 3 is a real runtime now; 4 is the next one this build has not heard of.
+	for _, value := range []string{"0", "4", "-1"} {
 		dir := t.TempDir()
 		_, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", value)
 		if err == nil {
@@ -410,9 +414,81 @@ func TestInitRejectsAnUnknownRuntime(t *testing.T) {
 	}
 }
 
-// The v1 folder is the one that must not move: no runtime key, no scaffold,
-// byte-for-byte what `wf init` produced before durable workflows existed.
-func TestInitDefaultRuntimeWritesNeitherKeyNorScaffold(t *testing.T) {
+// A runtime the CLI DOES know is accepted, writes the key, and scaffolds — the
+// positive half of the refusal above. Runtime 3 is durable (a superset of 2), so
+// it gets the same starter rather than an empty file.
+func TestInitAcceptsTheQueryRuntime(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	dir := t.TempDir()
+
+	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime",
+		strconv.Itoa(wfdir.RuntimeQuery), "--json")
+	if err != nil {
+		t.Fatalf("init --runtime %d: %v", wfdir.RuntimeQuery, err)
+	}
+	if payload := decodeJSON(t, out); payload["runtime"] != float64(wfdir.RuntimeQuery) {
+		t.Errorf("reported runtime = %v want %d", payload["runtime"], wfdir.RuntimeQuery)
+	}
+
+	m, err := wfdir.LoadManifest(dir, wfdir.WorkflowKind)
+	if err != nil {
+		t.Fatalf("load the manifest the init just wrote: %v", err)
+	}
+	if m.RuntimeVersion() != wfdir.RuntimeQuery {
+		t.Errorf("manifest runtime = %d want %d", m.RuntimeVersion(), wfdir.RuntimeQuery)
+	}
+	// v3 is Durable plus a withheld table credential, so everything that branches
+	// on "does this journal every step" must say yes.
+	if !m.IsDurable() {
+		t.Error("runtime 3 must read as durable — it journals every step exactly like runtime 2")
+	}
+	if body := readFile(t, dir, "main.py"); !strings.Contains(body, "@tools.step") {
+		t.Errorf("a durable runtime with no --from must scaffold a durable main.py, got %q", body)
+	}
+}
+
+// A manifest declaring a runtime this build has never heard of is refused at
+// LOAD, not at the first unattended run. Nothing used to validate it on push, so
+// a hand-edited value sailed through and was modelled by IsDurable's `>=` on
+// nothing but its number.
+func TestLoadManifestRejectsAnUnknownRuntime(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	dir := t.TempDir()
+
+	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--json"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	raw := readFile(t, dir, wfdir.ManifestName)
+	edited := strings.Replace(raw, "{", "{\n  \"runtime\": 4,", 1)
+	if edited == raw {
+		t.Fatal("could not hand-edit the manifest — this test needs re-aiming, not deleting")
+	}
+	writeLocal(t, dir, wfdir.ManifestName, edited)
+
+	_, err := wfdir.LoadManifest(dir, wfdir.WorkflowKind)
+	if err == nil {
+		t.Fatal("a runtime this CLI does not know must be refused at load")
+	}
+	if !strings.Contains(err.Error(), "runtime") {
+		t.Errorf("the refusal must name the runtime: %v", err)
+	}
+}
+
+// A plain `wf init` — no --runtime at all — has to scaffold and report for the
+// runtime it is ABOUT TO CREATE, which is RuntimeCreateDefault and not the
+// flag's own default of 1. Reading the flag there gave the author an empty
+// main.py and a report that named no runtime, while the first push created the
+// workflow on 3: they then wrote a v1-shaped `con.execute("... {{ ref }} ...")`
+// table read into a runtime that refuses it, and found out at the first run —
+// on an automation, at 03:00.
+//
+// The manifest key stays ABSENT, and that half is load-bearing rather than
+// incidental: it is what lets the first push write back whatever the server
+// actually stamped, which is the fix for the second-push brick. Scaffolding for
+// 3 must not pin the folder to 3.
+func TestInitWithNoRuntimeFlagScaffoldsForTheCreateDefault(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	dir := t.TempDir()
@@ -421,14 +497,38 @@ func TestInitDefaultRuntimeWritesNeitherKeyNorScaffold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	if payload := decodeJSON(t, out); payload["runtime"] != float64(wfdir.RuntimeDefault) {
-		t.Errorf("runtime = %v, want %d", payload["runtime"], wfdir.RuntimeDefault)
+	payload := decodeJSON(t, out)
+	if payload["runtime"] != float64(wfdir.RuntimeCreateDefault) {
+		t.Errorf("runtime = %v, want %d", payload["runtime"], wfdir.RuntimeCreateDefault)
+	}
+	if payload["scaffolded"] != true {
+		t.Errorf("scaffolded = %v, want true", payload["scaffolded"])
 	}
 	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, "runtime") {
-		t.Errorf("a v1 manifest carries a runtime key: %s", raw)
+		t.Errorf("init pinned a runtime nobody asked for — the first push can no longer write back what the server stamped: %s", raw)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "main.py")); !os.IsNotExist(err) {
-		t.Error("a v1 init wrote a scaffold — v1 folders start empty, as they always have")
+	// The scaffold is the create default's, not merely "a durable one": under
+	// runtime 3 the table rule is the one thing an author cannot infer from an
+	// empty file, and it is exactly what the failure above turned on.
+	scaffold := readFile(t, dir, "main.py")
+	if !strings.Contains(scaffold, "@tools.step") {
+		t.Errorf("a plain init wrote no durable scaffold:\n%s", scaffold)
+	}
+	if !strings.Contains(scaffold, "Read a Ronja table ONLY with tools.query") {
+		t.Errorf("the scaffold does not state the table rule of the runtime it will be created on:\n%s", scaffold)
+	}
+
+	// And the human report says which runtime that is, in the same words the
+	// --runtime 3 report uses.
+	reportDir := t.TempDir()
+	report, err := runCLI(t, reportDir, "wf", "init", "--feature", "feat-1")
+	if err != nil {
+		t.Fatalf("init (report): %v", err)
+	}
+	_, sentence := runtimeInfo(wfdir.RuntimeCreateDefault)
+	want := fmt.Sprintf("  Runtime:    %d — %s\n", wfdir.RuntimeCreateDefault, sentence)
+	if !strings.Contains(report, want) {
+		t.Errorf("the init report does not name the runtime it will create (%q):\n%s", want, report)
 	}
 }
 
@@ -464,6 +564,17 @@ func TestInitDurableRuntimeWritesTheKeyAndAScaffold(t *testing.T) {
 	// The scaffold is checked by the PROPERTIES that make a resume work, not by
 	// its prose: decorated steps, a keyless loop, and a journaled clock.
 	scaffold := readFile(t, dir, "main.py")
+	// The HEADER is the exception, and it is pinned rather than sampled: it is
+	// the one part of the template that varies by runtime, and every property
+	// checked below lives in the shared body — so a header that named the wrong
+	// runtime, or leaked runtime 3's table rule into a runtime-2 folder (a rule
+	// that does not apply to it), would pass every other assertion here.
+	if want := "# Durable workflow (runtime 2). Every @tools.step result is journaled, so\n"; !strings.HasPrefix(scaffold, want) {
+		t.Errorf("the durable scaffold does not open with %q:\n%s", want, scaffold)
+	}
+	if strings.Contains(scaffold, "Read a Ronja table ONLY") {
+		t.Errorf("a runtime-2 scaffold carries runtime 3's table rule:\n%s", scaffold)
+	}
 	for _, want := range []string{"@tools.step", "for order_id in load_orders():", "tools.now()"} {
 		if !strings.Contains(scaffold, want) {
 			t.Errorf("the durable scaffold is missing %q:\n%s", want, scaffold)
@@ -675,6 +786,49 @@ func TestStatusDegradesWhenSignedOut(t *testing.T) {
 	}
 }
 
+// ...and so does a status whose organization LOOKUP failed, which is the same
+// promise one credential further along.
+//
+// The scenario is a CI pre-flight running `wf status --json` under a token that
+// has since been rotated. Resolving the organization is a request, and a request
+// can fail; making that fatal turned the one command you run when you are
+// already suspicious into the one that stops answering. The local half needs no
+// server and must arrive whatever the server says.
+func TestStatusDegradesWhenTheOrganizationLookupFails(t *testing.T) {
+	f, root := clonedFolder(t)
+	f.failMe = 401
+	f.Requests = nil // the clone's, not this command's
+
+	out, err := runCLI(t, root, "wf", "status", "--json")
+	if err != nil {
+		t.Fatalf("status aborted on a failed organization lookup: %v", err)
+	}
+	report := decodeJSON(t, out)
+	if report["local"].(map[string]any)["unchanged"].(float64) != 2 {
+		t.Errorf("local half missing: %v", report["local"])
+	}
+	remote := report["remote"].(map[string]any)
+	if remote["checked"] != false {
+		t.Errorf("remote checked = %v, want false", remote["checked"])
+	}
+	reason, _ := remote["notCheckedReason"].(string)
+	if !strings.Contains(reason, "which organization") {
+		t.Errorf("notCheckedReason = %q, want the failed lookup named", reason)
+	}
+	// And it stopped there: reading the binding's workflow under a credential
+	// whose organization is unknown is the adoption bug, not a degradation.
+	if got := requestsMatching(f, "GET /api/v2/authentication/me"); len(f.Requests) != len(got) {
+		t.Errorf("looked at the server anyway: %v", f.Requests)
+	}
+
+	// The other half of the same rule: a command that ACTS still refuses. There
+	// the answer is load-bearing — without it the binding is matched on URL
+	// alone, which is how another organization's ids reach this token.
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err == nil {
+		t.Fatal("push proceeded without knowing which organization it was pushing to")
+	}
+}
+
 // Signed out AND bound to two organizations on one instance: there is no way to
 // tell which binding applies, so status must say so rather than show one
 // organization's workflow as if it were this folder's.
@@ -751,6 +905,228 @@ func TestStatusDisambiguatesByProfile(t *testing.T) {
 	if got := report["workflowID"]; got != "wf-other" {
 		t.Errorf("workflowID = %v, want the named organization's wf-other", got)
 	}
+}
+
+// rebindFolderTo replaces every instance entry with ONE, the way a colleague in
+// another organization would have committed it.
+func rebindFolderTo(t *testing.T, root string, key wfdir.InstanceKey, binding wfdir.Binding) {
+	t.Helper()
+	manifest, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	manifest.Instances = nil
+	manifest.SetBinding(key, binding)
+	if err := wfdir.SaveManifest(root, manifest); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+}
+
+// An ENVIRONMENT token — the documented CI credential — carries no organization,
+// and the binding lookup falls back to matching on URL alone when it does not
+// know one. So a folder committed by a colleague in ANOTHER organization used to
+// be adopted whole: their workflow id, their feature id, sent under this token.
+//
+// End-to-end rather than against the lookup, because the defect was never in the
+// lookup: InstanceKey has always refused to adopt another organization's entry.
+// What was missing is that nothing ASKED which organization the token belongs to
+// before the lookup ran.
+func TestPushUnderAnEnvironmentTokenDoesNotAdoptAnotherOrganizationsBinding(t *testing.T) {
+	f, root := clonedFolder(t)
+	// Their workflow, on this instance, in their organization. Ours is ten-test.
+	f.AddWorkflow(&api.Workflow{ID: "wf-other", Lifecycle: api.LifecycleLive, FeatureID: "feat-other"},
+		api.WorkflowFile{Path: "main.py", Content: "THEIRS\n"})
+	rebindFolderTo(t, root, wfdir.InstanceKey{URL: f.URL(), TenantID: "ten-other"},
+		wfdir.Binding{WorkflowID: "wf-other", FeatureID: "feat-other"})
+	writeLocal(t, root, "main.py", "OURS\n")
+
+	_, err := runCLI(t, root, "wf", "push", "--json")
+	if err == nil {
+		t.Fatal("push accepted a folder bound only to another organization")
+	}
+	// Nothing of theirs may be touched, and nothing of ours created in their
+	// feature — the failure this refusal exists to prevent is a WRITE, so the
+	// requests are the assertion.
+	for _, req := range f.Requests {
+		if strings.Contains(req, "wf-other") && !strings.HasPrefix(req, "GET ") {
+			t.Errorf("wrote to another organization's workflow: %v", f.Requests)
+		}
+	}
+	if len(f.created) != 0 {
+		t.Errorf("created a workflow anyway: %+v", f.created)
+	}
+	if got := f.files["wf-other"][0].Content; got != "THEIRS\n" {
+		t.Errorf("their main.py = %q, want it untouched", got)
+	}
+	// And the refusal has to be about the ORGANIZATION. The old one said this
+	// folder named no feature, which reads as "add featureID" — a key the entry
+	// they are looking at already has.
+	if !strings.Contains(err.Error(), "ten-other") || !strings.Contains(err.Error(), testTenantID) {
+		t.Errorf("error = %v, want both organizations named", err)
+	}
+}
+
+// The same adoption, one door along: a STORED profile with no organization.
+//
+// An environment token is not the only credential that arrives without one —
+// login writes an empty tenantID for a user who belonged to no organization at
+// the time, and deliberately never rewrites it, so the profile still carries
+// none long after they joined one. Gating the lookup on the environment token
+// alone left this profile matching on URL alone, which is the same adoption with
+// a different credential in front of it.
+func TestPushWithAnOrganizationlessProfileDoesNotAdoptAnotherOrganization(t *testing.T) {
+	f, root := clonedFolder(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-other", Lifecycle: api.LifecycleLive, FeatureID: "feat-other"},
+		api.WorkflowFile{Path: "main.py", Content: "THEIRS\n"})
+	rebindFolderTo(t, root, wfdir.InstanceKey{URL: f.URL(), TenantID: "ten-other"},
+		wfdir.Binding{WorkflowID: "wf-other", FeatureID: "feat-other"})
+	writeLocal(t, root, "main.py", "OURS\n")
+	signOut(t, f)
+	writeProfile(t, "orgless", f.URL(), "", "test-token")
+
+	_, err := runCLI(t, root, "wf", "push", "--json")
+	if err == nil {
+		t.Fatal("push accepted a folder bound only to another organization")
+	}
+	for _, req := range f.Requests {
+		if strings.Contains(req, "wf-other") && !strings.HasPrefix(req, "GET ") {
+			t.Errorf("wrote to another organization's workflow: %v", f.Requests)
+		}
+	}
+	if len(f.created) != 0 {
+		t.Errorf("created a workflow anyway: %+v", f.created)
+	}
+	if got := f.files["wf-other"][0].Content; got != "THEIRS\n" {
+		t.Errorf("their main.py = %q, want it untouched", got)
+	}
+	if !strings.Contains(err.Error(), "ten-other") || !strings.Contains(err.Error(), testTenantID) {
+		t.Errorf("error = %v, want both organizations named", err)
+	}
+}
+
+// A credential whose organization cannot be established never reads a binding.
+//
+// This used to be an AMBIGUITY test: two organizations in the folder, a
+// credential naming none, and the push refusing by name. The lookup now runs for
+// any credential that does not already name one, so the folder's two entries are
+// no longer what decides it — the refusal happens one step earlier, at the
+// question "which organization is this token in", and a user who is in none has
+// nowhere to push whatever their folder says. What it still pins is the part
+// that mattered: the push stops, nothing is written, and the diagnosis is not
+// the old "add featureID" — advice to add a key the entry already carries.
+func TestPushRefusesACredentialWithNoOrganization(t *testing.T) {
+	f, root := clonedFolder(t)
+	f.noTenant = true
+	signOut(t, f)
+	writeProfile(t, "orgless", f.URL(), "", "test-token")
+
+	manifest, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	manifest.SetBinding(
+		wfdir.InstanceKey{URL: f.URL(), TenantID: "ten-other"},
+		wfdir.Binding{WorkflowID: "wf-other", FeatureID: "feat-other"})
+	if err := wfdir.SaveManifest(root, manifest); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+
+	_, err = runCLI(t, root, "wf", "push", "--json")
+	if err == nil {
+		t.Fatal("push proceeded under a credential belonging to no organization")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "no organization") {
+		t.Errorf("error = %v, want the missing organization named", err)
+	}
+	// The old, wrong diagnosis. It must not come back.
+	if strings.Contains(msg, "featureID") {
+		t.Errorf("error = %v — still reported as a missing featureID", err)
+	}
+	if len(f.created) != 0 || len(requestsMatching(f, "PUT ")) != 0 {
+		t.Errorf("wrote something anyway: %v", f.Requests)
+	}
+}
+
+// The ambiguity refusal's own wording, unit-tested because it is now a backstop:
+// an acting command resolves the organization before it gets here, or is refused
+// by the lookup, so nothing routine reaches it. It stays because "the
+// organization is unknown" must never reach a binding read — and if it ever does
+// again, the message has to name the choices and the one selector, not send the
+// reader back to featureID.
+func TestRequireOneOrganizationNamesTheChoicesAndTheSelector(t *testing.T) {
+	m := &wfdir.Manifest{Kind: wfdir.KindWorkflow}
+	m.SetBinding(wfdir.InstanceKey{URL: "http://x.test", TenantID: "ten-a"},
+		wfdir.Binding{WorkflowID: "wf-a", FeatureID: "feat-a"})
+	m.SetBinding(wfdir.InstanceKey{URL: "http://x.test", TenantID: "ten-b"},
+		wfdir.Binding{WorkflowID: "wf-b", FeatureID: "feat-b"})
+	f := &folder{
+		Root: t.TempDir(), Kind: wfdir.WorkflowKind, Manifest: m,
+		Resolved: &config.Resolved{URL: "http://x.test"},
+	}
+	f.matchBinding()
+
+	err := f.requireOneOrganization()
+	if err == nil {
+		t.Fatal("an unknown organization on a folder naming two was accepted")
+	}
+	msg := err.Error()
+	for _, want := range []string{"ten-a", "ten-b", "--profile"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error = %v, want it to name %s", err, want)
+		}
+	}
+	if strings.Contains(msg, "featureID") {
+		t.Errorf("error = %v — the old, wrong diagnosis", err)
+	}
+}
+
+// featureIDFor's cross-organization wording belongs to ONE case: this folder has
+// no entry here and names other organizations instead. A folder that IS bound
+// here and merely left "featureID" out has a line to add the field to, and
+// telling it the entries "name X instead" is the same species of wrong advice
+// the cross-organization wording exists to remove.
+func TestFeatureIDForNamesOtherOrganizationsOnlyWhenUnbound(t *testing.T) {
+	build := func(bindHere bool) *folder {
+		m := &wfdir.Manifest{Kind: wfdir.KindWorkflow}
+		if bindHere {
+			m.SetBinding(wfdir.InstanceKey{URL: "http://x.test", TenantID: testTenantID},
+				wfdir.Binding{WorkflowID: "wf-1"})
+		}
+		m.SetBinding(wfdir.InstanceKey{URL: "http://x.test", TenantID: "ten-other"},
+			wfdir.Binding{WorkflowID: "wf-other", FeatureID: "feat-other"})
+		f := &folder{
+			Root: t.TempDir(), Kind: wfdir.WorkflowKind, Manifest: m,
+			Resolved: &config.Resolved{URL: "http://x.test", TenantID: testTenantID},
+		}
+		f.matchBinding()
+		return f
+	}
+	// known carries no feature, so neither leg above the message can answer and
+	// no request is made — nil client is the assertion that none is.
+	known := &api.Workflow{ID: "wf-1"}
+
+	t.Run("unbound", func(t *testing.T) {
+		_, err := featureIDFor(t.Context(), nil, build(false), known)
+		if err == nil {
+			t.Fatal("a folder with no feature anywhere was accepted")
+		}
+		if !strings.Contains(err.Error(), "ten-other") {
+			t.Errorf("error = %v, want the organization the entries DO name", err)
+		}
+	})
+	t.Run("bound but missing the field", func(t *testing.T) {
+		_, err := featureIDFor(t.Context(), nil, build(true), known)
+		if err == nil {
+			t.Fatal("a binding with no featureID was accepted")
+		}
+		if strings.Contains(err.Error(), "ten-other") {
+			t.Errorf("error = %v — a bound folder was told its entries name another organization", err)
+		}
+		if !strings.Contains(err.Error(), "featureID") {
+			t.Errorf("error = %v, want the field it is missing named", err)
+		}
+	})
 }
 
 func TestStatusReportsBrokenBinding(t *testing.T) {

@@ -36,6 +36,7 @@ import (
 func newWorkflowRunCmd() *cobra.Command {
 	var (
 		params   []string
+		follow   bool
 		timeout  time.Duration
 		logsMode string
 	)
@@ -71,6 +72,15 @@ A Durable workflow can PAUSE mid-run — waiting on an agent, an approval or a
 timer. This stops waiting there and says so loudly: the run has NOT finished,
 and this is not a completed verification.
 
+--follow keeps waiting through those pauses instead, until the run finishes or
+fails, which is what makes a live run verifiable end to end. A woken run does
+not finish under its own id — a successor run carries the work — so a follow
+asks the server which run now carries the lineage and reports that one, saying
+"resumed as run ..." as it hops. Parks can outlast the 15m default: raise
+--timeout, or pass --timeout 0 to wait for as long as it takes. On an instance
+too old to have the route, --follow says so and reports the first pause, as it
+would without the flag.
+
 Exits non-zero when the run FAILED. With --json, the run as last read — row,
 steps and health — as one object on stdout, with progress on stderr.
 
@@ -103,7 +113,10 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 			if err != nil {
 				return err
 			}
-			outcome, err := runLive(ctx, f, runOptions{Params: params, Timeout: timeout})
+			outcome, err := runLive(ctx, f, runOptions{
+				Params: params, Follow: follow, Timeout: timeout,
+				TimeoutChosen: cmd.Flags().Changed("timeout"),
+			})
 			// The report is emitted even on failure, exactly as `wf test` emits
 			// it: a failed run IS the answer, and a timed-out one still carries a
 			// run id somebody needs.
@@ -124,6 +137,7 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 	}
 	cmd.Flags().StringArrayVar(&params, "param", nil,
 		"a parameter value as key=value (repeat for each parameter)")
+	cmd.Flags().BoolVar(&follow, "follow", false, followFlagHelp)
 	cmd.Flags().DurationVar(&timeout, "timeout", 15*time.Minute,
 		"give up waiting after this long (0 waits forever; the run continues either way)")
 	cmd.Flags().StringVar(&logsMode, "logs", logsTail,
@@ -132,8 +146,13 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 }
 
 type runOptions struct {
-	Params  []string
+	Params []string
+	// Follow waits through a Durable run's pauses — see testOptions.Follow.
+	Follow  bool
 	Timeout time.Duration
+	// TimeoutChosen reports that --timeout was typed — see
+	// testOptions.TimeoutChosen.
+	TimeoutChosen bool
 }
 
 // runLive is the whole command, ordered — like runTest — so that everything
@@ -244,7 +263,8 @@ func runLive(ctx context.Context, f *folder, opts runOptions) (*testOutcome, err
 		},
 	}
 
-	final, err := pollRun(ctx, client, started.ID, opts.Timeout, outcome)
+	noteFollowTimeout(opts.Follow, opts.Timeout, opts.TimeoutChosen)
+	final, err := runWaiter(opts.Follow)(ctx, client, started.ID, opts.Timeout, outcome)
 	if final != nil {
 		outcome.Run = final
 	}

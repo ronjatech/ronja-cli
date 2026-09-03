@@ -51,9 +51,14 @@ binding that no longer resolves. "I could not look" is not the same answer as
 credential.
 
 Zero for everything local, and for a folder with nothing to compare against yet:
-a file you have only changed on disk, a file with no table behind it, and a fresh
-clone whose .ronja/ baseline was correctly never committed. Run a push to record
-one.`,
+a file you have only changed on disk, a file with no table behind it, and — in a
+folder that names no stacks — a fresh clone whose .ronja/ baseline was correctly
+never committed. Run a push to record one.
+
+A folder that names stacks is different, and a gate should expect it: the SQL
+each table last held is in the committed ronja.lock.json, so a fresh clone still
+compares against the live tables and can exit non-zero. Only your own open draft
+reads as unknown there, and the report says so.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
@@ -63,41 +68,14 @@ one.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.PipelineKind)
+			root, err := folderRootHere(wfdir.PipelineKind)
 			if err != nil {
 				return err
 			}
-
-			report := &pipelineStatusReport{
-				Root:      f.Root,
-				URL:       resolved.URL,
-				Title:     f.Manifest.Title,
-				Bound:     f.Bound,
-				Ambiguous: f.BindingErr != nil,
-				FeatureID: f.Binding.FeatureID,
-				Tables:    len(f.Binding.Tables),
-			}
-
-			enumeration, err := enumerateFolder(f.Root, wfdir.PipelineKind)
+			report, err := pipelineStatusReportAt(cmd.Context(), root, resolved)
 			if err != nil {
 				return err
 			}
-			baseline := f.State.For(f.Key)
-			// In memory only — status writes nothing. It exists so that removing a
-			// file's entry from ronja.json makes the phantom disappear from THIS
-			// report rather than only from the one after the next push.
-			prunePhantoms(baseline, f.Binding, enumeration.Files)
-			report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
-			report.Skipped = enumeration.Skipped
-			report.WillCreate = []string{}
-			for path := range enumeration.Files {
-				if f.Binding.Tables[path] == "" {
-					report.WillCreate = append(report.WillCreate, path)
-				}
-			}
-			sort.Strings(report.WillCreate)
-
-			report.Remote = pipelineRemoteStatus(cmd.Context(), resolved, f)
 
 			// The report is emitted FIRST and the verdict decides only the exit
 			// code: a caller reading --json gets its payload whatever the answer,
@@ -115,12 +93,73 @@ one.`,
 	return cmd
 }
 
+// pipelineStatusReportAt computes the report for ONE pipeline folder at an
+// explicit root, and prints nothing.
+//
+// Hoisted out of the RunE closure above so `ronja sync` can ask the same
+// question of every folder in a tree. The split is between COMPUTING the answer
+// and DECIDING what to do with it: this function returns the report, and the
+// caller owns rendering and the exit code — which is why the tree command can
+// apply its own verdict (see folderVerdict) without the per-folder command's
+// behaviour changing at all.
+func pipelineStatusReportAt(ctx context.Context, root string, resolved *config.Resolved) (*pipelineStatusReport, error) {
+	f, err := openFolderForStatusAt(ctx, root, resolved, wfdir.PipelineKind)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reported, never refused — see folder.noteAliases.
+	f.noteAliases()
+
+	report := &pipelineStatusReport{
+		Root:      f.Root,
+		URL:       resolved.URL,
+		Title:     f.Manifest.Title,
+		Stack:     f.declaredStack(),
+		Bound:     f.Bound,
+		Ambiguous: f.BindingErr != nil,
+		FeatureID: f.Binding.FeatureID,
+		Tables:    len(f.Binding.Tables),
+	}
+
+	enumeration, err := enumerateFolder(f.Root, wfdir.PipelineKind)
+	if err != nil {
+		return nil, err
+	}
+	baseline := f.State.For(f.Key)
+	// In memory only — status writes nothing. It exists so that removing a
+	// file's entry from ronja.json makes the phantom disappear from THIS
+	// report rather than only from the one after the next push.
+	prunePhantoms(baseline, f.Binding, enumeration.Files)
+	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
+	report.Skipped = enumeration.Skipped
+	report.WillCreate = []string{}
+	for path := range enumeration.Files {
+		if f.Binding.Tables[path] == "" {
+			report.WillCreate = append(report.WillCreate, path)
+		}
+	}
+	sort.Strings(report.WillCreate)
+
+	// The stems come from the enumeration, whose KEYS are the folder's
+	// files — see newPipelineCodec, which reads nothing else from the map.
+	// A status that read every .sql file a second time to learn the same
+	// thing would be paying for the alias layer on every folder.
+	report.Remote = pipelineRemoteStatus(ctx, resolved, f, newPipelineCodec(f, enumeration.Files))
+	return report, nil
+}
+
 // pipelineStatusReport is the --json shape, and the same struct the human
 // renderer reads — so the two can never describe different things.
 type pipelineStatusReport struct {
 	Root  string `json:"root"`
 	URL   string `json:"url"`
 	Title string `json:"title"`
+	// Stack is the NAME of the environment this report is about, empty for a
+	// folder still using the unnamed legacy "instances" shape. Reported because
+	// a folder can name several and the answer to "which one am I looking at"
+	// must not be inferred from the organization id.
+	Stack string `json:"stack,omitempty"`
 	Bound bool   `json:"bound"`
 	// Ambiguous reports a folder that IS bound here, to more than one
 	// organization, with no way to tell which applies — the signed-out case.
@@ -244,8 +283,17 @@ const pipelineStatusConcurrency = 8
 // Drift is remote-vs-BASELINE, never remote-vs-local: the question is whether
 // anything moved underneath us, and a file the author edited locally is exactly
 // what a push is for.
-func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) *pipelineRemoteReport {
+func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder, codec pipelineCodec) *pipelineRemoteReport {
 	out := &pipelineRemoteReport{}
+	// The organization lookup failed, so this folder's binding cannot be trusted
+	// to be the right one. Reported ahead of the ambiguity below because it is
+	// the CAUSE of it whenever both are set — and it is a "could not look", so
+	// the exit-code verdict below is non-zero, exactly as for an unreadable
+	// table.
+	if reason := f.orgNotCheckedReason(); reason != "" {
+		out.NotCheckedReason = reason
+		return out
+	}
 	// Bound to several organizations here, and signed out, so which binding
 	// applies is genuinely unknown. Reported rather than guessed: picking one
 	// would show another organization's tables as if they were this folder's.
@@ -299,6 +347,19 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 	}
 	sort.Strings(paths)
 
+	// The local files, read for their SPELLING and nothing else: a sibling's
+	// table id has two legitimate disk forms, and which one a file uses is what
+	// the remote code has to be de-aliased back into. See pipelineCodec.disk.
+	//
+	// Read HERE rather than in the caller, so a status whose remote half stops at
+	// one of the early returns above pays for no second walk of the folder. A read
+	// that fails degrades to no spellings — every declared alias still resolves,
+	// and a folder using sibling stems reads as drifted, which the rest of this
+	// report is about to explain properly.
+	local, _, readErr := readPipelineFiles(f.Root)
+	if readErr != nil {
+		local = nil
+	}
 	baseline := f.State.For(f.Key)
 	known := baseline.Hashes()
 	reports := make([]pipelineTableReport, len(paths))
@@ -326,6 +387,7 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 	// Tier two, concurrently. Each worker writes only its own slot, so no lock is
 	// needed for the results themselves.
 	work := make(chan int)
+	live := f.live(baseline)
 	var wg sync.WaitGroup
 	workers := pipelineStatusConcurrency
 	if len(needCode) < workers {
@@ -336,7 +398,8 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 		go func() {
 			defer wg.Done()
 			for i := range work {
-				fillTableDrift(ctx, client, &reports[i], baseline.TableStateFor(reports[i].Path))
+				fillTableDrift(ctx, client, codec, local[reports[i].Path], &reports[i],
+					baseline.TableStateFor(reports[i].Path), live.get(reports[i].Path))
 			}
 		}()
 	}
@@ -348,7 +411,17 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 
 	out.Tables = reports
 	if baseline == nil {
-		out.note("no local baseline — every table reads as unknown (this folder was never synced from here)")
+		// ⚠️ Say WHICH half is unknown. On a stack folder the committed lock still
+		// carries the live fingerprints, so the live-drift line above is a real
+		// answer even here — this note used to say "every table reads as unknown",
+		// which read as "nothing was checked" and is the one reading a CI operator
+		// must not take from a report that just exited non-zero on real drift.
+		// Only the DRAFT half is per-user, and only that half is missing.
+		if f.Stack != "" {
+			out.note("no local baseline — your own draft reads as unknown (this folder was never synced from here); the live comparison comes from " + wfdir.LockName)
+		} else {
+			out.note("no local baseline — every table reads as unknown (this folder was never synced from here)")
+		}
 	}
 	for _, path := range paths {
 		// `known` is the BASELINE's hashes, not the folder's contents: a missing
@@ -382,7 +455,7 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 //
 // An empty fingerprint is reported as its own answer (driftNoBaseline) rather
 // than as drift.
-func fillTableDrift(ctx context.Context, client *api.Client, report *pipelineTableReport, state wfdir.TableState) {
+func fillTableDrift(ctx context.Context, client *api.Client, codec pipelineCodec, local string, report *pipelineTableReport, state wfdir.TableState, liveSHA string) {
 	draft, err := client.GetTableDraft(ctx, report.TableID)
 	if err != nil {
 		report.Drift = driftUnreadable
@@ -398,8 +471,11 @@ func fillTableDrift(ctx context.Context, client *api.Client, report *pipelineTab
 		report.Problem = fmt.Sprintf("could not read %s: %v", report.TableID, err)
 		return
 	}
-	liveCode, liveUnresolved := live.CanonicalCode()
-	liveDrift, liveProblem := compareDrift(liveCode, liveUnresolved, state.LiveSHA256)
+	// Canonicalized and then de-aliased, in that order — see
+	// pipelineCodec.canonicalDisk. Both fingerprints this is compared against are
+	// hashes of the bytes on disk, which are in name form.
+	liveCode, liveUnresolved := codec.canonicalDisk(local, live)
+	liveDrift, liveProblem := compareDrift(liveCode, liveUnresolved, liveSHA)
 
 	if draft == nil {
 		report.URL = live.URL
@@ -433,7 +509,7 @@ func fillTableDrift(ctx context.Context, client *api.Client, report *pipelineTab
 	if against == "" && !liveUnresolved {
 		against = wfdir.HashString(liveCode)
 	}
-	draftCode, draftUnresolved := staged.CanonicalCode()
+	draftCode, draftUnresolved := codec.canonicalDisk(local, staged)
 	report.Drift, report.Problem = compareDrift(draftCode, draftUnresolved, against)
 	if report.Problem == "" && liveProblem != "" {
 		report.Problem = liveProblem
@@ -465,6 +541,11 @@ func printPipelineStatus(r *pipelineStatusReport) {
 	fmt.Fprintf(out, "  %s\n\n", r.Root)
 
 	fmt.Fprintf(out, "  Instance:   %s\n", r.URL)
+	if r.Stack != "" {
+		// Printed next to the instance because it answers the same question a
+		// step further in: which of this folder's environments is being reported.
+		fmt.Fprintf(out, "  Stack:      %s\n", r.Stack)
+	}
 	switch {
 	case r.Bound && r.FeatureID != "":
 		fmt.Fprintf(out, "  Feature:    %s\n", r.FeatureID)

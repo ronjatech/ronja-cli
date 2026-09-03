@@ -258,7 +258,11 @@ func TestManifestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if !reflect.DeepEqual(in, out) {
+	// Compared without the forward-compatibility sidecars, which are by
+	// construction unequal here and are not part of the value: `in` was built in
+	// code and has read no file, `out` remembers the key order it was read in.
+	// What this asserts is that every DECLARED field survives the round trip.
+	if !reflect.DeepEqual(withoutSidecars(in), withoutSidecars(out)) {
 		t.Fatalf("round trip mismatch:\n in: %+v\nout: %+v", in, out)
 	}
 
@@ -1008,5 +1012,31 @@ func TestEnumerateReportsNonRegularFiles(t *testing.T) {
 	}
 	if !strings.Contains(reasons[".env"], "dot-name") {
 		t.Errorf("reason for .env = %q", reasons[".env"])
+	}
+}
+
+// A candidate is checked against the runtime it will actually run on, which is
+// not always the one the folder declares. Validate is a pre-creation endpoint
+// with no row to read: it takes 0 as "check nothing runtime-scoped", so a create
+// rehearsed with 0 would rehearse a different save from the one about to happen.
+func TestRuntimeForValidate(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		declared int
+		live     *api.Workflow
+		want     int
+	}{
+		{"a declared runtime wins, unbound", 2, nil, 2},
+		{"a declared runtime wins over the row it will raise", 3, &api.Workflow{RuntimeVersion: 1}, 3},
+		{"undeclared, creating: the runtime the create will produce", 0, nil, RuntimeCreateDefault},
+		{"undeclared, bound: the row's own runtime", 0, &api.Workflow{RuntimeVersion: 2}, 2},
+		{"undeclared, bound to a row that reports none: nothing runtime-scoped", 0, &api.Workflow{}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Manifest{Runtime: tc.declared}
+			if got := m.RuntimeForValidate(tc.live); got != tc.want {
+				t.Errorf("RuntimeForValidate = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

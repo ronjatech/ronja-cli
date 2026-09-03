@@ -86,6 +86,7 @@ production without either overwriting the other's binding.`,
 		newDataAppForkCmd(), newDataAppPushCmd(), newDataAppValidateCmd(),
 		newDataAppTestCmd(), newDataAppPublishCmd(), newDataAppDiscardCmd(),
 	)
+	addStackFlag(app)
 	return app
 }
 
@@ -225,6 +226,17 @@ func (t appTarget) Row() *api.DataApp {
 	return nil
 }
 
+// AnchoredDraft reports that the row a push writes to is one the committed head
+// anchor can speak for — the data-app half of existingTarget.AnchoredDraft, and
+// documented there and on headAgreement.AnchoredDraft.
+func (t appTarget) AnchoredDraft() bool {
+	row := t.Row()
+	if row == nil {
+		return true
+	}
+	return row.ParentDataAppID == ""
+}
+
 // FilesRow is the row whose files describe this folder's current server state:
 // the draft when there is one, else the live app. This is the id every file read
 // must be addressed to.
@@ -245,6 +257,23 @@ func (t appTarget) Access() api.DataAppAccess {
 		return t.App.DataAppAccess
 	}
 	return api.DataAppAccess{}
+}
+
+// declaredAccess is the manifest's `access` block resolved for THIS stack:
+// every entry that is a declared alias of its slot's kind replaced by the id
+// this organization uses for it, and everything else left exactly as found.
+//
+// The ONE accessor every command reads, and it exists for the reason alias.go's
+// transport-edge comment gives about content: inside this package a folder is in
+// DISK form, so an access set is only correct once it has crossed the codec. A
+// caller reaching past this to f.Manifest.DeclaredAccess() would send one
+// organization's allowlist to another — or, worse and quieter, diff alias names
+// against the server's ids and re-patch the app's privileges on every push.
+//
+// Identity for a folder that declares no dependencies, which is every folder in
+// the field today.
+func (f *folder) declaredAccess() api.DataAppAccess {
+	return f.Codec.accessToWire(f.Manifest.DeclaredAccess())
 }
 
 // inspectAppTarget reads the binding's current state without changing anything,
@@ -294,19 +323,26 @@ func inspectAppRow(ctx context.Context, client *api.Client, f *folder) (appTarge
 
 // hashAppFiles fingerprints a fetched file set for baseline and drift
 // comparison.
-func hashAppFiles(files []api.DataAppFile) map[string]string {
+//
+// De-aliased FIRST, for the reason hashFiles records: these hashes are compared
+// against hashes of the bytes on disk, and disk form is alias form.
+func hashAppFiles(codec aliasCodec, files []api.DataAppFile) map[string]string {
 	out := make(map[string]string, len(files))
 	for _, f := range files {
-		out[f.Path] = wfdir.HashString(f.Content)
+		out[f.Path] = wfdir.HashString(codec.toDisk(f.Content))
 	}
 	return out
 }
 
 // appContentByPath flattens a fetched file set for content comparison.
-func appContentByPath(files []api.DataAppFile) map[string]string {
+//
+// De-aliased at the point the map is built, exactly as contentByPath is: every
+// reader of it — the drift guard, the skip-if-identical test, the `landed` map
+// that becomes the baseline — is comparing it against local content.
+func appContentByPath(codec aliasCodec, files []api.DataAppFile) map[string]string {
 	out := make(map[string]string, len(files))
 	for _, f := range files {
-		out[f.Path] = f.Content
+		out[f.Path] = codec.toDisk(f.Content)
 	}
 	return out
 }
@@ -334,7 +370,9 @@ func baselineAccess(source *api.DataApp) *api.DataAppAccess {
 // Title and Entrypoint come from the ROW, never from the manifest: the
 // baseline's job is to say what the server held at the last sync, and recording
 // what we WANTED it to be would make the drift guard agree with itself forever.
-func baselineFromApp(source *api.DataApp, files []api.DataAppFile) *wfdir.InstanceState {
+//
+// codec de-aliases the fetched content before it is hashed — see hashAppFiles.
+func baselineFromApp(codec aliasCodec, source *api.DataApp, files []api.DataAppFile) *wfdir.InstanceState {
 	inst := &wfdir.InstanceState{
 		SourceID:          source.ID,
 		SourceLifecycle:   source.Lifecycle,
@@ -346,7 +384,7 @@ func baselineFromApp(source *api.DataApp, files []api.DataAppFile) *wfdir.Instan
 	}
 	for _, f := range files {
 		inst.Files[f.Path] = wfdir.FileState{
-			SHA256:    wfdir.HashString(f.Content),
+			SHA256:    wfdir.HashString(codec.toDisk(f.Content)),
 			UpdatedAt: f.UpdatedAt.UTC().Format(time.RFC3339),
 		}
 	}
@@ -355,6 +393,10 @@ func baselineFromApp(source *api.DataApp, files []api.DataAppFile) *wfdir.Instan
 
 // baselineFromAppLocal is baselineFromApp for content the CLI just WROTE rather
 // than read back: after a push, the server holds exactly the bytes we sent.
+//
+// It takes NO codec, and that is the invariant rather than an omission: `files`
+// is the folder's own content, already in disk form, and the baseline is a
+// fingerprint of exactly that.
 //
 // Per-file UpdatedAt is left empty — the field is diagnostics only (drift is
 // decided on the hash), and inventing timestamps we did not receive would be

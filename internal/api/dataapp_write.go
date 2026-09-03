@@ -167,16 +167,55 @@ func (c *Client) CheckoutDataApp(ctx context.Context, id string, patch DataAppPa
 	return &out, nil
 }
 
+// putDataAppFileInput is the body of PUT /dataapp/:id/files/*path, mirroring
+// the anonymous input struct on that route in
+// backend/api/v2/dataapp/handler.go.
+//
+// BaseSha256 is a POINTER for the reason the server's is: the field has THREE
+// meanings and a plain string carries two.
+//
+//	nil          no precondition — the write always applies (previous behaviour)
+//	Ptr("")      assert the file does NOT exist yet (a create that must not clobber)
+//	Ptr(<64 hex>) assert the stored content hashes to exactly this
+//
+// The digest is sha256 over the raw bytes, lowercase hex — the same function
+// wfdir.Hash computes, which is what lets the CLI send its local sync
+// baseline's hashes as preconditions. The server's rdataapp.ContentSHA256 names
+// wfdir.Hash in its own doc comment as the thing it must match; changing either
+// without the other turns every push into a 409 storm.
+//
+// omitempty keeps the wire bytes of an unconditional write byte-identical to
+// what the CLI sent before preconditions existed.
+type putDataAppFileInput struct {
+	Content    string  `json:"content"`
+	BaseSha256 *string `json:"baseSha256,omitempty"`
+}
+
+// deleteDataAppFileInput is the OPTIONAL body of DELETE
+// /dataapp/:id/files/*path — same three-state pointer as the PUT above.
+//
+// The route accepted no body at all until preconditions existed, and gt decodes
+// an empty body to the zero value, so a bodyless DELETE still means "no
+// precondition". DeleteDataAppFile therefore sends no body rather than `{}`
+// when it has nothing to assert.
+type deleteDataAppFileInput struct {
+	BaseSha256 *string `json:"baseSha256,omitempty"`
+}
+
 // PutDataAppFile creates or replaces one file, returning the saved row plus the
 // recompile's diagnostics when it failed. See DataAppFileSaveResponse.
 //
+// baseSha256 is the optional compare-and-swap precondition described on
+// putDataAppFileInput. A failed precondition is a 409 raised INSIDE the write's
+// transaction, before the file row is touched — so unlike most failures on this
+// route the file certainly kept its previous content, which is why the push
+// loop treats a 409 as definite rather than reconciling it.
+//
 // SLOW: every write recompiles the whole bundle with esbuild and uploads a fresh
 // bundle to S3, so this is seconds of real work rather than a row write.
-func (c *Client) PutDataAppFile(ctx context.Context, id, path, content string) (*DataAppFileSaveResponse, error) {
+func (c *Client) PutDataAppFile(ctx context.Context, id, path, content string, baseSha256 *string) (*DataAppFileSaveResponse, error) {
 	var out DataAppFileSaveResponse
-	body := struct {
-		Content string `json:"content"`
-	}{Content: content}
+	body := putDataAppFileInput{Content: content, BaseSha256: baseSha256}
 	if err := c.doSlow(ctx, "PUT", dataAppFilePath(id, path), body, &out); err != nil {
 		return nil, err
 	}
@@ -200,9 +239,17 @@ func (c *Client) GetDataAppFile(ctx context.Context, id, path string) (*DataAppF
 
 // DeleteDataAppFile removes one file. The server refuses to delete the
 // entrypoint; its message is passed through rather than second-guessed.
-func (c *Client) DeleteDataAppFile(ctx context.Context, id, path string) (*DataAppFileDeleteResponse, error) {
+//
+// baseSha256 asserts what is being deleted, and nil sends NO BODY AT ALL rather
+// than `{}` — the route took none before preconditions existed, and an
+// unconditional delete has no reason to start sending one.
+func (c *Client) DeleteDataAppFile(ctx context.Context, id, path string, baseSha256 *string) (*DataAppFileDeleteResponse, error) {
 	var out DataAppFileDeleteResponse
-	if err := c.doSlow(ctx, "DELETE", dataAppFilePath(id, path), nil, &out); err != nil {
+	var body any
+	if baseSha256 != nil {
+		body = deleteDataAppFileInput{BaseSha256: baseSha256}
+	}
+	if err := c.doSlow(ctx, "DELETE", dataAppFilePath(id, path), body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -277,6 +324,51 @@ func (c *Client) CommitDataAppDraft(ctx context.Context, draftID string) (*DataA
 		return nil, err
 	}
 	return &out, nil
+}
+
+// ListDataAppVersions reads an app's committed version snapshots, newest first.
+//
+// The server orders them (committed_at DESC, id DESC) — the same TOTAL order
+// rworkflow uses, and for the same reason. committed_at alone is not total:
+// rdataapp.commitDraftInTx stamps it from one `now` taken before the parent row
+// lock, so two commits the lock serialized can share a timestamp, and two reads
+// of an untiebroken list could then disagree about which is the head. The drift
+// guard reads a differing head as "somebody published" and refuses — safe, but
+// a deploy refused for a reason no message can explain. The id tiebreak removes
+// the case.
+//
+// Like ListWorkflowVersions this is a LIST route: the rows carry no `url` and
+// should be treated as identity and timing only.
+func (c *Client) ListDataAppVersions(ctx context.Context, parentID string) ([]DataApp, error) {
+	var out []DataApp
+	if err := c.Do(ctx, "GET", "dataapp/"+url.PathEscape(parentID)+"/versions", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DataAppHeadVersionID resolves the drift anchor for a live data app: its most
+// recently committed version, or — when it has never been versioned — the app's
+// OWN id.
+//
+// The parent-id fallback matches HeadVersionID's, and here it is a CONVENTION
+// of this client rather than a mirror of a server-side resolver: rdataapp has no
+// commit CAS to have one. What it does mirror is the ORDER — rdataapp's
+// versionHeadOrder is total — so element 0 is an identity two readers agree on
+// and not merely whichever tied row the plan produced. The value is compared for
+// equality against a value this same function produced, and it is a real id
+// rather than "", so "never versioned" stays
+// distinguishable from "nothing recorded", which is the difference between an
+// anchor that vouches and one that refuses.
+func (c *Client) DataAppHeadVersionID(ctx context.Context, parentID string) (string, error) {
+	versions, err := c.ListDataAppVersions(ctx, parentID)
+	if err != nil {
+		return "", err
+	}
+	if len(versions) == 0 {
+		return parentID, nil
+	}
+	return versions[0].ID, nil
 }
 
 // DiscardDataAppDraft deletes a draft, throwing its uncommitted changes away.

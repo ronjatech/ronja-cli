@@ -131,6 +131,15 @@ type appPushResult struct {
 	// Error describes a push that stopped part-way. The result above then
 	// describes what DID happen before it stopped.
 	Error string `json:"error,omitempty"`
+	// Conflict reports that what stopped this push was a file precondition
+	// refusing — somebody wrote to the row between the listing this push
+	// compared against and its own write.
+	//
+	// It exists because Error is PROSE. A caller that has to tell "somebody got
+	// there first, re-read and re-apply" from "this file was rejected" has
+	// otherwise only substring-matching to do it with, and that breaks the day
+	// the server rewords a message. Same field, same reason, as pushResult's.
+	Conflict bool `json:"conflict"`
 	// Target names the instance and organization this push landed in.
 	Target string `json:"target,omitempty"`
 	// URL is the frontend page for the draft this push wrote to, as the SERVER
@@ -182,10 +191,17 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// an unknown name is dropped at token-mint time, so a typo publishes green
 	// and fails in a viewer's browser. Checked here, before anything is sent.
 	if f.Manifest.ManagesAccess() {
-		if err := checkDeclaredCapabilities(f.Manifest.DeclaredAccess(), wfdir.ManifestPath(f.Root)); err != nil {
+		if err := checkDeclaredCapabilities(f.declaredAccess(), wfdir.ManifestPath(f.Root)); err != nil {
 			return nil, err
 		}
 	}
+	// The alias pre-flight, still with no network in sight — see runPush. A data
+	// app's files claim no local names, so there are no stems to collide with.
+	aliases := checkAliases(f.Manifest, f.selection(), f.Codec, local, nil, nil)
+	if err := aliases.err(); err != nil {
+		return nil, err
+	}
+	noteAliasWarnings(aliases)
 
 	// 2. Read what is already on the server, resolving the draft explicitly.
 	existing, err := inspectAppTarget(ctx, client, f)
@@ -229,13 +245,27 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	if err != nil {
 		return nil, fmt.Errorf("read files of %s: %w", target.ID, err)
 	}
-	remoteFiles := appContentByPath(files)
+	remoteFiles := appContentByPath(f.Codec, files)
 
 	baselineClean := false
+	preconditions := filePreconditions{}
+	head := headAgreement{}
 	if !result.Created {
-		baselineClean, err = checkAppDrift(f, remoteFiles, opts.Force)
+		// The committed anchor, read once — see appTarget.AnchoredDraft. (A push
+		// that CREATED the app anchors it in resolveAppPushTarget, in the same
+		// write that records the binding.)
+		head = readHeadAgreement(ctx, dataAppHeadReader(client), f, existing.App.ID,
+			existing.AnchoredDraft())
+		verdict, err := checkAppDrift(f, remoteFiles, opts.Force, head, target.ID)
 		if err != nil {
 			return nil, err
+		}
+		baselineClean = verdict.BaselineClean
+		// Server-side preconditions are armed EXACTLY where the drift guard
+		// vouched for the baseline, and suppressed everywhere it was bypassed.
+		// See filePreconditions for why that equivalence is the whole rule.
+		if !verdict.Bypassed {
+			preconditions = filePreconditions{Armed: true, Hashes: verdict.Preconditions}
 		}
 	}
 
@@ -261,10 +291,10 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// grant is new. Saying nothing there would make the one command that shows
 	// privileges silent on the occasion they are all being handed out.
 	if result.Created && f.Manifest.ManagesAccess() {
-		result.AccessChanges = diffAccess(api.DataAppAccess{}, f.Manifest.DeclaredAccess())
+		result.AccessChanges = diffAccess(api.DataAppAccess{}, f.declaredAccess())
 	}
 	if !result.Created && f.Manifest.ManagesAccess() {
-		declared := f.Manifest.DeclaredAccess()
+		declared := f.declaredAccess()
 		changes := diffAccess(target.DataAppAccess, declared)
 		if len(changes) > 0 {
 			var patch api.DataAppPatch
@@ -293,12 +323,12 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// 7. Files: everything but the entrypoint, then the entrypoint, then the
 	// deletions. See the command comment for why the entrypoint goes last and
 	// not first as a workflow's does.
-	compileErr, err := putAppFiles(ctx, client, target.ID, entrypoint, local, remoteFiles, landed, result)
+	compileErr, err := putAppFiles(ctx, client, f.Codec, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
 	if err != nil {
 		return stop(err)
 	}
 
-	if err := deleteAppFiles(ctx, client, target.ID, local, remoteFiles, landed, result); err != nil {
+	if err := deleteAppFiles(ctx, client, f.Codec, target.ID, local, remoteFiles, landed, preconditions, result); err != nil {
 		return stop(err)
 	}
 
@@ -313,6 +343,9 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 			if err := wfdir.SaveState(f.Root, f.State); err != nil {
 				return result, err
 			}
+		}
+		if err := anchorAfterPush(f, head, opts.Force); err != nil {
+			return result, err
 		}
 		return result, nil
 	}
@@ -344,6 +377,9 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// these bytes.
 	f.State.Set(f.Key, baselineFromAppLocal(target, local))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
+		return result, err
+	}
+	if err := anchorAfterPush(f, head, opts.Force); err != nil {
 		return result, err
 	}
 	if result.Compiles != nil && !*result.Compiles {
@@ -388,8 +424,15 @@ func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, ex
 		// A first push is the one path here that WRITES a binding, so this is
 		// where the organization has to be authoritative rather than adopted from
 		// an entry that does not exist yet.
-		if _, err := f.bindNew(ctx); err != nil {
-			return nil, err
+		//
+		// Only when this folder is NOT bound here — a folder that declares a
+		// stack but has no row yet is creating and bound at once, and already
+		// names the organization and the stack the create belongs to. Same
+		// condition as `wf push` and `pipeline push`; see folder.bindNew.
+		if !f.Bound {
+			if _, err := f.bindNew(ctx); err != nil {
+				return nil, err
+			}
 		}
 		created, err := client.CreateDataApp(ctx, api.CreateDataAppInput{
 			FeatureID: featureID,
@@ -398,7 +441,7 @@ func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, ex
 			// round trip, and the compiler checks secret references against
 			// allowed_secret_ids on the very first file write, so the grants have to
 			// be on the row before any file reaches it.
-			DataAppAccess: f.Manifest.DeclaredAccess(),
+			DataAppAccess: f.declaredAccess(),
 		})
 		if err != nil {
 			return nil, explainCreateFailure(err, featureID, f.Resolved.URL)
@@ -406,10 +449,15 @@ func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, ex
 		// Recorded IMMEDIATELY, before any file is written: the app now exists —
 		// live and visible — and a push that died before saving the manifest would
 		// leave an orphan the next push could not find and would create again.
-		f.Manifest.SetBinding(f.Key, wfdir.Binding{DataAppID: created.ID, FeatureID: featureID})
-		if err := wfdir.SaveManifest(f.Root, f.Manifest); err != nil {
-			return nil, fmt.Errorf("record the new data app %s in %s: %w\n  The app EXISTS on %s. Re-run the push once %s is writable, or delete it with `ronja api -X DELETE /api/v2/dataapp/%s`",
-				created.ID, wfdir.ManifestPath(f.Root), err, f.Resolved.URL, wfdir.ManifestName, created.ID)
+		f.recordBinding(wfdir.Binding{DataAppID: created.ID, FeatureID: featureID})
+		// A data app that has just been created has never been committed, and an
+		// unversioned row IS its own head — the convention
+		// api.DataAppHeadVersionID resolves. Recorded in the same write as the
+		// binding it describes; see `wf push`'s create for why they are one fact.
+		f.setHeadVersion(created.ID)
+		if err := f.saveFolder(); err != nil {
+			return nil, fmt.Errorf("record the new data app %s in %s: %w\n  The app EXISTS on %s. Re-run the push once this folder is writable, or delete it with `ronja api -X DELETE /api/v2/dataapp/%s`",
+				created.ID, f.bindingFiles(), err, f.Resolved.URL, created.ID)
 		}
 		result.Created = true
 		result.DataAppID = created.ID
@@ -471,9 +519,20 @@ func explainCreateFailure(err error, featureID, instanceURL string) error {
 // access diff — which is strictly more informative than a drift line saying
 // they moved.
 //
-// Reports whether the baseline was CLEAN — an existing baseline that already
-// described the server exactly.
-func checkAppDrift(f *folder, remote map[string]string, force bool) (bool, error) {
+// head is the committed anchor and is consulted in ONE place, the branch where
+// there is no local baseline at all — the fresh-checkout path that made --force
+// the documented CI answer. See checkDrift, which draws the same line for a
+// workflow, and headAgreement for what the pointer can and cannot vouch for.
+//
+// It answers with checkDrift's own driftVerdict rather than a shape of its own.
+// The two guards ask the same question of the same kind of folder and hand
+// their answer to the same filePreconditions, so a second type here would be
+// two places for "was the baseline bypassed?" to come to mean different things
+// — and the whole rule on filePreconditions is that the guard and the
+// preconditions are one answer. HeadVouched is the one field this path fills
+// that nothing here reads; it is set because the verdict describes what the
+// guard decided, not what today's caller happens to consult.
+func checkAppDrift(f *folder, remote map[string]string, force bool, head headAgreement, targetID string) (driftVerdict, error) {
 	baseline := f.State.For(f.Key)
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
@@ -481,18 +540,42 @@ func checkAppDrift(f *folder, remote map[string]string, force bool) (bool, error
 	}
 	drift := wfdir.DiffHashes(remoteHashes, baseline.Hashes())
 	if !drift.Dirty() {
-		return baseline != nil, nil
+		// Bypassed still tracks --force here, even though nothing needed
+		// bypassing — see checkDrift's copy of this branch for why a clean
+		// baseline does not make the flag conditional.
+		return driftVerdict{BaselineClean: baseline != nil, Bypassed: force, Preconditions: baseline.Hashes()}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %d file(s) that changed on the server since your last sync.\n",
 			drift.Total())
-		return false, nil
+		return driftVerdict{Bypassed: true}, nil
 	}
 	if baseline == nil {
-		return false, fmt.Errorf("this folder has no sync baseline for %s, and the data app already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the app into a fresh folder to get one, or push --force to overwrite the remote files with what you have here",
+		if head.Vouches() {
+			noteHeadAnchored(targetID, head.Current)
+			// Armed on the REMOTE listing rather than bypassed: see
+			// driftVerdict.Preconditions. The anchor established that these
+			// bytes are the live row's, unchanged since this folder forked from
+			// it, so asserting them is asserting agreement rather than a guess.
+			return driftVerdict{HeadVouched: true, Preconditions: remoteHashes}, nil
+		}
+		if head.Moved() {
+			return driftVerdict{}, refuseHeadMoved("data app", f.Binding.DataAppID, head,
+				"`ronja app clone "+f.Binding.DataAppID+"`")
+		}
+		// ⚠️ Reachable only for a draft forked from a LIVE app — a parentless
+		// draft vouches (appTarget.AnchoredDraft) — which is what makes
+		// `app discard` a safe remedy to name here: on a never-published app it
+		// is refused and routed to --delete-app, which deletes the app. See the
+		// same branch in checkDrift.
+		if head.Recorded != "" && head.Recorded == head.Current {
+			return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and you already have a draft of %s open there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  Run `ronja app discard` to throw the draft away and push onto the live version, or push --force to overwrite it",
+				f.Resolved.URL, f.Binding.DataAppID, wfdir.LockName)
+		}
+		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the data app already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the app into a fresh folder to get one, or push --force to overwrite the remote files with what you have here",
 			f.Resolved.URL, len(remote))
 	}
-	return false, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja app status` to see the detail, or push --force to overwrite",
+	return driftVerdict{}, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja app status` to see the detail, or push --force to overwrite",
 		driftSummary(drift, nil))
 }
 
@@ -506,7 +589,7 @@ func checkAppDrift(f *folder, remote map[string]string, force bool) (bool, error
 // (api.DataAppFileSaveResponse) — because pushing a multi-file app walks through
 // states that cannot compile by construction. So diagnostics are collected and
 // the sync continues; anything else stops it.
-func putAppFiles(ctx context.Context, client *api.Client, targetID, entrypoint string, local, remote, landed map[string]string, result *appPushResult) (*api.CompileError, error) {
+func putAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targetID, entrypoint string, local, remote, landed map[string]string, pre filePreconditions, result *appPushResult) (*api.CompileError, error) {
 	order := []string{}
 	for _, path := range sortedPaths(local) {
 		if path != entrypoint {
@@ -527,8 +610,26 @@ func putAppFiles(ctx context.Context, client *api.Client, targetID, entrypoint s
 		// upload, so a folder of any size sits here for a while and silence would
 		// read as a hang.
 		fmt.Fprintf(os.Stderr, "  pushing %s\n", path)
-		saved, err := client.PutDataAppFile(ctx, targetID, path, local[path])
+		saved, err := client.PutDataAppFile(ctx, targetID, path, codec.toWire(local[path]), pre.ForWrite(path))
 		if err != nil {
+			// A 409 is the precondition refusing: the file moved between the
+			// listing this push compared against and this write. It is raised
+			// inside the write's own transaction before the row is touched, so
+			// nothing landed and nothing needs reconciling — which is why this
+			// is handled ahead of writeOutcomeUncertain rather than left to it.
+			// (It would answer correctly on its own, a 409 being a 4xx; saying
+			// so here is what stops the next person widening that split from
+			// silently turning a conflict into a reconciling read that hands
+			// the baseline somebody else's content.)
+			//
+			// Never retried and never escalated to --force on the author's
+			// behalf: the whole value of the refusal is that a human decides
+			// what happens to the change it just protected.
+			if api.StatusOf(err) == api.StatusConflict {
+				result.Conflict = true
+				noteFileConflict("app", "app", "overwritten", path)
+				return lastCompileErr, fmt.Errorf("push %s: %w", path, err)
+			}
 			// Whether the write LANDED is a different question from whether the
 			// request succeeded, and the answer decides what the baseline may say.
 			//
@@ -548,7 +649,7 @@ func putAppFiles(ctx context.Context, client *api.Client, targetID, entrypoint s
 			// asking after one is worse than not asking.
 			if writeOutcomeUncertain(err) {
 				want := local[path]
-				switch reconcileUncertainAppWrite(ctx, client, targetID, path, &want, landed) {
+				switch reconcileUncertainAppWrite(ctx, client, codec, targetID, path, &want, landed) {
 				case appWriteLanded:
 					// It did land after all, so the report has to say so — a
 					// report that disagrees with the baseline beside it is worse
@@ -630,7 +731,7 @@ const (
 // things: content nobody here has acknowledged must stay unacknowledged, or a
 // stopped --force push hands its own retry a baseline containing the very change
 // it was forcing past.
-func reconcileUncertainAppWrite(ctx context.Context, client *api.Client, targetID, path string, want *string, landed map[string]string) appWriteVerdict {
+func reconcileUncertainAppWrite(ctx context.Context, client *api.Client, codec aliasCodec, targetID, path string, want *string, landed map[string]string) appWriteVerdict {
 	saved, err := client.GetDataAppFile(ctx, targetID, path)
 	if err != nil {
 		if api.StatusOf(err) == 404 {
@@ -646,7 +747,10 @@ func reconcileUncertainAppWrite(ctx context.Context, client *api.Client, targetI
 		}
 		return appWriteUnknown
 	}
-	if want != nil && acknowledgeIntendedWrite(landed, path, *want, saved.Content) {
+	// `want` is DISK form; saved.Content came from the server. They are compared
+	// — and the winner recorded as the baseline — in disk form, because that is
+	// what the baseline is a fingerprint of.
+	if want != nil && acknowledgeIntendedWrite(landed, path, *want, codec.toDisk(saved.Content)) {
 		return appWriteLanded
 	}
 	return appWriteMissed
@@ -661,7 +765,7 @@ func reconcileUncertainAppWrite(ctx context.Context, client *api.Client, targetI
 //
 // The entrypoint is never in this set — it is in `local` by the guard at the top
 // of the push — which matters because the server refuses to delete it.
-func deleteAppFiles(ctx context.Context, client *api.Client, targetID string, local, remote, landed map[string]string, result *appPushResult) error {
+func deleteAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targetID string, local, remote, landed map[string]string, pre filePreconditions, result *appPushResult) error {
 	deletions := []string{}
 	for path := range remote {
 		if _, ok := local[path]; !ok {
@@ -670,13 +774,21 @@ func deleteAppFiles(ctx context.Context, client *api.Client, targetID string, lo
 	}
 	sort.Strings(deletions)
 	for _, path := range deletions {
-		if _, err := client.DeleteDataAppFile(ctx, targetID, path); err != nil {
+		if _, err := client.DeleteDataAppFile(ctx, targetID, path, pre.ForDelete(path)); err != nil {
+			// A 409 is the precondition refusing — see putAppFiles. Its own
+			// wording, because a delete's 409 has two causes the CLI cannot tell
+			// apart (the content moved, or somebody deleted it first).
+			if api.StatusOf(err) == api.StatusConflict {
+				result.Conflict = true
+				noteFileConflict("app", "app", "deleted", path)
+				return fmt.Errorf("delete %s: %w", path, err)
+			}
 			// Same split as a failed PUT, for the same reason: the row is removed
 			// before the recompile runs, so a 5xx or a lost answer may well have
 			// deleted the file — while a rejection certainly did not. See
 			// writeOutcomeUncertain and reconcileUncertainAppWrite.
 			if writeOutcomeUncertain(err) {
-				switch reconcileUncertainAppWrite(ctx, client, targetID, path, nil, landed) {
+				switch reconcileUncertainAppWrite(ctx, client, codec, targetID, path, nil, landed) {
 				case appWriteLanded:
 					result.Deleted = append(result.Deleted, path)
 				case appWriteUnknown:

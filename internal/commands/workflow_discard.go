@@ -161,7 +161,7 @@ func runDiscard(ctx context.Context, f *folder, yes, deleteWorkflow bool) (*disc
 	// file read as drift against a row that is gone. A failure here is noted,
 	// not returned — the discard itself succeeded, and reporting it as failed
 	// would send the caller looking for a draft that is already gone.
-	noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, wf.ID))
+	noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, wf.ID, keepAnchor))
 	return &discardResult{Outcome: outcomeDiscarded, WorkflowID: wf.ID, DraftID: draft.ID}, nil
 }
 
@@ -187,8 +187,8 @@ func deleteUnpublishedWorkflow(ctx context.Context, client *api.Client, f *folde
 
 	// Keep the feature, drop the workflow: the folder should behave exactly as
 	// it did after `init`, so the next push creates a fresh one in the same place.
-	f.Manifest.SetBinding(f.Key, wfdir.Binding{FeatureID: f.Binding.FeatureID})
-	if err := wfdir.SaveManifest(f.Root, f.Manifest); err != nil {
+	f.recordBinding(wfdir.Binding{FeatureID: f.Binding.FeatureID})
+	if err := f.saveFolder(); err != nil {
 		return nil, fmt.Errorf("workflow %s was DELETED, but %s still names it: %w\n  Remove the workflowID from that file by hand, or the next push will look for a workflow that is gone",
 			wf.ID, wfdir.ManifestPath(f.Root), err)
 	}

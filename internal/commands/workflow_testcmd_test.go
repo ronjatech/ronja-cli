@@ -1172,6 +1172,389 @@ func TestPollIntervalBacksOffButStartsPrompt(t *testing.T) {
 	}
 }
 
+// --- --follow ---------------------------------------------------------------
+
+// The whole point of the flag: a Durable run parks, a successor run picks the
+// work up, and the follow reports the SUCCESSOR's terminal status rather than
+// stopping at the park. The named run's own route is never consulted — it would
+// sit at `resuming` forever.
+//
+// The script walks the whole wake path rather than jumping park → successor,
+// because two of its states are only reachable there. `resuming` must not be
+// terminal — a follow that treated it as one would stop one poll before the
+// work resumed — and the server's wake is allowed to OSCILLATE: ReleaseWakeClaim
+// rolls a run from `resuming` back to `waiting` under the same id when the wake
+// has to be retried, so the second park has to narrate too.
+func TestTestFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
+	f := newFakeInstance(t)
+	f.headScript = []api.RunResponse{
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusRunning}, Health: api.RunHealthDone,
+			Steps: []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "running"}}},
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusWaiting}, Health: api.RunHealthWaiting,
+			Steps: []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "done", DurationMs: ptr(int64(900))}}},
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusResuming}, Health: api.RunHealthWaiting,
+			Steps: []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "done", DurationMs: ptr(int64(900))}}},
+		// The rollback: the wake claim was released, and the run is parked again
+		// under the same id waiting for the next attempt.
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusWaiting}, Health: api.RunHealthWaiting,
+			Steps: []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "done", DurationMs: ptr(int64(900))}}},
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusResuming}, Health: api.RunHealthWaiting,
+			Steps: []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "done", DurationMs: ptr(int64(900))}}},
+		{WorkflowRun: api.WorkflowRun{ID: "run-2", Status: api.RunStatusRunning, ResumeOfRunID: ptr("run-1")}, Health: api.RunHealthDone,
+			Steps: []api.StepDTO{
+				{ID: "s9", Name: "Ask the agent", Status: "skipped", Replayed: true},
+				{ID: "s10", Name: "Write report", Status: "running"},
+			}},
+		{WorkflowRun: api.WorkflowRun{ID: "run-2", Status: api.RunStatusDone, ResumeOfRunID: ptr("run-1"), Logs: "all good\n"}, Health: api.RunHealthDone,
+			Steps: []api.StepDTO{
+				{ID: "s9", Name: "Ask the agent", Status: "skipped", Replayed: true},
+				{ID: "s10", Name: "Write report", Status: "done", DurationMs: ptr(int64(300))},
+			}},
+	}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() {
+		out, err = runCLI(t, root, "wf", "test", "--follow")
+	})
+	if err != nil {
+		t.Fatalf("a followed run that finished exited non-zero: %v", err)
+	}
+	// The park was narrated with the two things a reader needs at that moment:
+	// what it is waiting on, and that Ctrl-C does not stop the run. The wake and
+	// the SECOND park are narrated too: sticky per-run flags would have printed
+	// each of those once and then gone silent through the retry.
+	for _, want := range []string{
+		"parked — waiting on an agent",
+		"Ctrl-C stops watching, not the run",
+		"is waking",
+		"parked again — still watching",
+		"Resumed as run run-2",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("narration missing %q:\n%s", want, stderr)
+		}
+	}
+	// The long advice is once per FOLLOW; the park line itself is once per park.
+	if got := strings.Count(stderr, "Ctrl-C stops watching, not the run"); got != 1 {
+		t.Errorf("how-to-wait advice printed %d times, want once per follow:\n%s", got, stderr)
+	}
+	// The other half of the seeded head: the run we STARTED is not a hop, so the
+	// first poll — which names it — announces nothing.
+	if strings.Contains(stderr, "Resumed as run run-1") {
+		t.Errorf("the run we started was announced as a resume of itself:\n%s", stderr)
+	}
+	// A replayed step reads as replayed rather than as "skipped" — the same
+	// word the report uses — so a resume's re-narration does not look like a
+	// run that did nothing.
+	if !strings.Contains(stderr, "replayed  Ask the agent") {
+		t.Errorf("a journaled step was narrated as a bare skip:\n%s", stderr)
+	}
+	// The REPORT is the head run, not the run that was started.
+	if !strings.Contains(out, "run-2") {
+		t.Errorf("report named the parked run rather than the head:\n%s", out)
+	}
+	// And the plain run route was never polled: the follow asks only the head.
+	if f.runPolls != 0 {
+		t.Errorf("polled the named run %d times under --follow", f.runPolls)
+	}
+	if f.headPolls < 7 {
+		t.Errorf("head polls = %d, want at least 7 (it stopped before the successor finished)", f.headPolls)
+	}
+}
+
+// A park and its resume can both happen inside one poll interval, and then the
+// FIRST head response already names the successor. The hop is still news, so it
+// is still narrated — which is why the follow seeds its head with the run it
+// started rather than learning it from the first response.
+func TestTestFollowNarratesAResumeItLearnsOnTheFirstPoll(t *testing.T) {
+	f := newFakeInstance(t)
+	f.headScript = []api.RunResponse{
+		{WorkflowRun: api.WorkflowRun{ID: "run-2", Status: api.RunStatusDone, ResumeOfRunID: ptr("run-1")}, Health: api.RunHealthDone},
+	}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	var err error
+	stderr := captureStderr(t, func() {
+		_, err = runCLI(t, root, "wf", "test", "--follow")
+	})
+	if err != nil {
+		t.Fatalf("a followed run that finished exited non-zero: %v", err)
+	}
+	if !strings.Contains(stderr, "Resumed as run run-2") {
+		t.Errorf("a resume seen on the first poll was silent:\n%s", stderr)
+	}
+}
+
+// The negative control: a lineage that ends in failure is still a failure.
+func TestTestFollowExitsNonZeroWhenTheHeadFails(t *testing.T) {
+	f := newFakeInstance(t)
+	f.headScript = []api.RunResponse{
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusWaiting}, Health: api.RunHealthWaiting},
+		{WorkflowRun: api.WorkflowRun{ID: "run-2", Status: api.RunStatusError, ResumeOfRunID: ptr("run-1"),
+			Error: ptr("ZeroDivisionError: division by zero")}, Health: api.RunHealthFailed},
+	}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	var out string
+	var err error
+	captureStderr(t, func() {
+		out, err = runCLI(t, root, "wf", "test", "--follow")
+	})
+	if err == nil {
+		t.Fatal("a followed run that failed exited zero")
+	}
+	if !strings.Contains(out, "ZeroDivisionError") {
+		t.Errorf("report did not carry the head run's error:\n%s", out)
+	}
+}
+
+// A fleet where NOTHING has the route falls back, and never refuses. The run
+// has already started by the time a follow gets here, so an error whose remedy
+// is "run it again" would invite a second live run — which is the failure
+// adoptTimedOutRun exists to prevent. What the fallback reports is today's
+// documented non-follow answer: the first park, reported as a park.
+//
+// Three polls rather than one, so "the note is printed once per follow" is a
+// claim this script can falsify — the fallback is decided per poll now, and a
+// note attached to the decision would print on every one of them.
+func TestTestFollowFallsBackOnAFleetWithoutTheHeadRoute(t *testing.T) {
+	f := newFakeInstance(t)
+	f.noHeadRoute = true
+	f.runScript = []api.RunResponse{runningRun(), runningRun(), finishedRun(api.RunStatusWaiting, api.RunHealthWaiting)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() {
+		out, err = runCLI(t, root, "wf", "test", "--follow")
+	})
+	if err != nil {
+		t.Fatalf("the fallback refused instead of reporting the plain route: %v", err)
+	}
+	if got := strings.Count(stderr, "answered 404 for the run-lineage route"); got != 1 {
+		t.Errorf("fallback note printed %d times, want once per follow:\n%s", got, stderr)
+	}
+	// The answer came from the plain route, and the follow stopped where a plain
+	// poll stops: the park.
+	if f.runPolls != 3 {
+		t.Errorf("plain polls = %d, want 3 (one per poll, stopping at the park)", f.runPolls)
+	}
+	// Every poll still TRIED the head route first, which is what makes a
+	// rollout that completes mid-follow pick itself up.
+	if f.headRequests != 3 {
+		t.Errorf("head requests = %d, want 3 — the fallback latched instead of retrying the route", f.headRequests)
+	}
+	if !strings.Contains(out, "waiting") {
+		t.Errorf("report did not carry the plain poll's answer:\n%s", out)
+	}
+}
+
+// Ronja runs many instances behind one load balancer, so a follow that starts
+// mid-rollout can have its FIRST poll answered by an old pod and every later
+// one by a new pod. A one-shot "this fleet is old" decision taken on that first
+// 404 would report the first park of a fleet that follows perfectly well — and
+// the park is exactly where the plain route's answer stops.
+func TestTestFollowUpgradesWhenTheHeadRouteAnswersAfterAMiss(t *testing.T) {
+	f := newFakeInstance(t)
+	f.headScript = []api.RunResponse{
+		{WorkflowRun: api.WorkflowRun{Status: headRouteMiss}},
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusWaiting}, Health: api.RunHealthWaiting},
+		{WorkflowRun: api.WorkflowRun{ID: "run-2", Status: api.RunStatusDone, ResumeOfRunID: ptr("run-1")}, Health: api.RunHealthDone},
+	}
+	// What the old pod answers on the fallback poll, and then the park a latched
+	// follow would have called the end of the run.
+	f.runScript = []api.RunResponse{runningRun(), finishedRun(api.RunStatusWaiting, api.RunHealthWaiting)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() {
+		out, err = runCLI(t, root, "wf", "test", "--follow")
+	})
+	if err != nil {
+		t.Fatalf("a followed run that finished exited non-zero: %v", err)
+	}
+	if !strings.Contains(out, "run-2") {
+		t.Errorf("the follow stopped at the fallback's park instead of following the lineage:\n%s", out)
+	}
+	if !strings.Contains(stderr, "Resumed as run run-2") {
+		t.Errorf("narration missing the resume hop:\n%s", stderr)
+	}
+	// Only the missed poll fell back; the rest were answered by the route.
+	if f.runPolls != 1 {
+		t.Errorf("plain polls = %d, want 1 (only the poll that missed the route)", f.runPolls)
+	}
+	if got := strings.Count(stderr, "answered 404 for the run-lineage route"); got != 1 {
+		t.Errorf("fallback note printed %d times, want once per follow:\n%s", got, stderr)
+	}
+}
+
+// The other half of the same fleet fact: a 404 mid-follow is an OLDER POD, not
+// a failed poll. A follow that never concluded anything from a 404 would spend
+// its failure budget on pods that merely predate the route and abort with "lost
+// contact" on a run that is perfectly healthy — so the misses staged here
+// outnumber the budget on purpose, and consecutively.
+//
+// Meanwhile the plain route reports the run we started, parked: proof that
+// FOLLOW semantics survive the fallback on a fleet that has answered the head
+// route once, since a park read off the plain route must not end the wait.
+func TestTestFollowSurvivesHeadRouteMissesMidFollow(t *testing.T) {
+	f := newFakeInstance(t)
+	misses := maxConsecutivePollFailures + 1
+	script := []api.RunResponse{
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusRunning}, Health: api.RunHealthDone},
+	}
+	for i := 0; i < misses; i++ {
+		script = append(script, api.RunResponse{WorkflowRun: api.WorkflowRun{Status: headRouteMiss}})
+	}
+	f.headScript = append(script, api.RunResponse{
+		WorkflowRun: api.WorkflowRun{ID: "run-2", Status: api.RunStatusDone, ResumeOfRunID: ptr("run-1")},
+		Health:      api.RunHealthDone,
+	})
+	f.runScript = []api.RunResponse{finishedRun(api.RunStatusWaiting, api.RunHealthWaiting)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() {
+		out, err = runCLI(t, root, "wf", "test", "--follow")
+	})
+	if err != nil {
+		t.Fatalf("%d route misses ended the follow: %v", misses, err)
+	}
+	if !strings.Contains(out, "run-2") {
+		t.Errorf("the follow stopped on a parked plain read rather than following through it:\n%s", out)
+	}
+	if f.runPolls != misses {
+		t.Errorf("plain polls = %d, want %d (one per missed poll, and none after)", f.runPolls, misses)
+	}
+	if got := strings.Count(stderr, "answered 404 for the run-lineage route"); got != 1 {
+		t.Errorf("fallback note printed %d times, want once per follow:\n%s", got, stderr)
+	}
+}
+
+// The other 404-shaped thing that is not one: a run id matching nothing is a
+// 400 from a new instance, and must fall through the ordinary failure budget
+// rather than be read as an old instance and degrade.
+func TestTestFollowTreatsAMissingRunAsAFailedPollNotAnOldInstance(t *testing.T) {
+	f := newFakeInstance(t)
+	f.failHeadGets = http.StatusBadRequest
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	var err error
+	stderr := captureStderr(t, func() {
+		_, err = runCLI(t, root, "wf", "test", "--follow")
+	})
+	if err == nil {
+		t.Fatal("a head route answering 400 forever exited zero")
+	}
+	if !strings.Contains(err.Error(), "polls in a row failed") {
+		t.Errorf("a 400 did not land on the failure budget: %v", err)
+	}
+	if strings.Contains(stderr, "answered 404 for the run-lineage route") {
+		t.Errorf("a missing run was mistaken for an old instance:\n%s", stderr)
+	}
+	if f.runPolls != 0 {
+		t.Errorf("a 400 sent the follow down the old-instance fallback (%d plain polls)", f.runPolls)
+	}
+}
+
+// --follow riding the DEFAULT timeout says so up front, because by the deadline
+// the advice costs another whole run — and says nothing when the caller has
+// already chosen a timeout.
+func TestTestFollowNotesTheDefaultTimeoutOnlyWhenItWasNotChosen(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"default", []string{"wf", "test", "--follow"}, true},
+		{"chosen", []string{"wf", "test", "--follow", "--timeout", "1h"}, false},
+		{"forever", []string{"wf", "test", "--follow", "--timeout", "0"}, false},
+		{"no follow", []string{"wf", "test"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeInstance(t)
+			f.headScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
+			f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
+			signIn(t, f)
+			withFastPolling(t)
+			root := durableFolder(t, f, nil)
+
+			var err error
+			stderr := captureStderr(t, func() {
+				_, err = runCLI(t, root, tc.args...)
+			})
+			if err != nil {
+				t.Fatalf("%v: %v", tc.args, err)
+			}
+			if got := strings.Contains(stderr, "A park can outlast it"); got != tc.want {
+				t.Errorf("default-timeout note present = %v, want %v:\n%s", got, tc.want, stderr)
+			}
+		})
+	}
+}
+
+// Without the flag, nothing changed: the head route is not touched at all.
+func TestTestWithoutFollowNeverAsksForTheLineageHead(t *testing.T) {
+	f := newFakeInstance(t)
+	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	if _, err := runCLI(t, root, "wf", "test"); err != nil {
+		t.Fatalf("test: %v", err)
+	}
+	if f.headPolls != 0 {
+		t.Errorf("a plain `wf test` polled the head route %d times", f.headPolls)
+	}
+}
+
+// `wf run` carries the same flag, and it is the verb --follow was asked for: a
+// live run that parks is the one somebody is about to call verified.
+func TestRunFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
+	f := newFakeInstance(t)
+	f.headScript = []api.RunResponse{
+		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusWaiting}, Health: api.RunHealthWaiting},
+		{WorkflowRun: api.WorkflowRun{ID: "run-2", Status: api.RunStatusDone, ResumeOfRunID: ptr("run-1")}, Health: api.RunHealthDone},
+	}
+	signIn(t, f)
+	withFastPolling(t)
+	root := liveFolder(t, f, nil)
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() {
+		out, err = runCLI(t, root, "wf", "run", "--follow")
+	})
+	if err != nil {
+		t.Fatalf("a followed live run that finished exited non-zero: %v", err)
+	}
+	if !strings.Contains(stderr, "Resumed as run run-2") {
+		t.Errorf("narration missing the resume hop:\n%s", stderr)
+	}
+	if !strings.Contains(out, "run-2") {
+		t.Errorf("report named the parked run rather than the head:\n%s", out)
+	}
+}
+
 // --- unit: the step narrator ------------------------------------------------
 
 // The live timeline goes to stderr, so it is exercised directly: the property

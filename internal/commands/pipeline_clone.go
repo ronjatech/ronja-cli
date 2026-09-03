@@ -140,6 +140,11 @@ directory must be empty or absent.`,
 				Files:    map[string]wfdir.FileState{},
 				Tables:   map[string]wfdir.TableState{},
 			}
+			// The live fingerprints go wherever this folder's shape puts them:
+			// the lock file for a --stack clone, the local baseline otherwise.
+			// See liveHashes.
+			lock := &wfdir.Lock{}
+			liveHash := liveHashes{lock: lock, stack: flagStack, inst: baseline}
 			for _, s := range sources {
 				// The STABLE identity, never the draft's id: a draft dies at commit
 				// while the binding lives in the customer's git.
@@ -151,7 +156,7 @@ directory must be empty or absent.`,
 				// compared the live table against the draft's bytes and refused a
 				// folder that had done nothing wrong.
 				if s.LiveCode != "" {
-					recordLiveAgreement(baseline, s.Path, s.TableID, s.LiveCode)
+					recordLiveAgreement(liveHash, s.Path, s.TableID, s.LiveCode)
 				}
 				if s.DraftID != "" {
 					recordDraftWrite(baseline, s.Path, s.TableID, s.DraftID, s.Code)
@@ -160,8 +165,10 @@ directory must be empty or absent.`,
 				}
 				recordSynced(baseline, s.Path, s.Code)
 			}
-			manifest.SetBinding(key, binding)
-			if err := wfdir.SaveManifest(root, manifest); err != nil {
+			if err := recordFirstBindingInto(manifest, lock, key, binding); err != nil {
+				return err
+			}
+			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}
 			state := &wfdir.State{}
@@ -338,6 +345,11 @@ func fetchCloneSources(ctx context.Context, client *api.Client, items []*api.Tab
 			draftID = draft.ID
 		}
 
+		// Canonicalized and NOT de-aliased, deliberately: `clone` refuses a
+		// destination that is not empty, so the folder this writes declares no
+		// dependencies and claims no stems — there is nothing an alias codec here
+		// could translate. The ids it writes to disk are what a later `ronja bind`
+		// converts into names.
 		code, unresolved := source.CanonicalCode()
 		if unresolved {
 			refused = append(refused, fmt.Sprintf("%s (%s): %s",

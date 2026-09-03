@@ -52,19 +52,52 @@ against the instance you intend to push to (--url, or your last login).
 --runtime 2 makes it a DURABLE workflow: every @tools.step result is journaled,
 and so is every SEND (email, event, upload, tools.http call), so a failed run can
 be resumed (` + "`ronja wf test --resume`" + `) instead of re-run from the top — without
-repeating what already went out. The runtime is stamped when the first push
-creates the workflow and cannot be changed afterwards. Without --from you also
-get a durable main.py to start from.`,
+repeating what already went out.
+
+--runtime 3 is durable too, and additionally gives the workflow a container that
+holds no credential for Ronja's table storage: its code reads a table only
+through ` + "`tools.query(\"SELECT ... FROM {{ ref('tbl::...') }}\")`" + `, never by
+reading a parquet file itself.
+
+Without --runtime the folder declares none and the instance chooses, which today
+means runtime 3. Name one to pin it: --runtime 1 writes the key too, so a folder
+that asks for the standard runtime gets it whatever the instance defaults to.
+
+The runtime is stamped when the first push creates the workflow and can only be
+raised afterwards, never lowered. With a durable runtime and no --from you also
+get a durable main.py to start from — and saying nothing IS a durable runtime,
+so a plain init scaffolds for the one it is about to create.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Two values, checked here rather than range-checked, because the
-			// manifest is committed: a folder declaring a runtime this instance
-			// has never heard of would fail at the first push, in a message
-			// about a create body rather than about the flag that caused it.
-			if runtime != wfdir.RuntimeDefault && runtime != wfdir.RuntimeDurable {
-				return fmt.Errorf("--runtime must be %d or %d (got %d) — %d is the default runtime, %d is the durable one whose steps are journaled",
-					wfdir.RuntimeDefault, wfdir.RuntimeDurable, runtime,
-					wfdir.RuntimeDefault, wfdir.RuntimeDurable)
+			// Checked against the enumerated set rather than a range, because
+			// the manifest is committed: a folder declaring a runtime this
+			// instance has never heard of would fail at the first push, in a
+			// message about a create body rather than about the flag that
+			// caused it. Zero is excluded HERE even though ValidRuntime admits
+			// it — an absent key means 1, but `--runtime 0` is a typo.
+			if runtime == 0 || !wfdir.ValidRuntime(runtime) {
+				return fmt.Errorf("--runtime must be %d, %d or %d (got %d) — %d is the default runtime, %d is the durable one whose steps are journaled, and %d is durable plus a container that reads tables only through tools.query",
+					wfdir.RuntimeDefault, wfdir.RuntimeDurable, wfdir.RuntimeQuery, runtime,
+					wfdir.RuntimeDefault, wfdir.RuntimeDurable, wfdir.RuntimeQuery)
+			}
+
+			// The runtime this folder will actually be CREATED at, which is not
+			// the flag's default: an unnamed --runtime means "the instance
+			// chooses", and its choice is RuntimeCreateDefault. Everything that
+			// TELLS the author what they are getting — the scaffold and the init
+			// report — has to speak about that one. Reading `runtime` there
+			// instead handed a plain `wf init` an empty file and a report that
+			// said nothing about the runtime, while the first push created a
+			// workflow on 3: the author then wrote v1-shaped table reads into a
+			// runtime that refuses them, and found out at the first run.
+			//
+			// The manifest key stays ABSENT either way (see below). Writing it
+			// because we scaffolded for 3 would pin the folder to 3 and take the
+			// first push's ability to write back whatever the server stamped.
+			runtimeNamed := cmd.Flags().Changed("runtime")
+			effectiveRuntime := runtime
+			if !runtimeNamed {
+				effectiveRuntime = wfdir.RuntimeCreateDefault
 			}
 
 			// MarkFlagRequired only asserts the flag was PASSED, so `--feature
@@ -131,11 +164,12 @@ get a durable main.py to start from.`,
 			//
 			// Only when there is nothing to overwrite: --from means the author
 			// brought their own code, and an existing entrypoint is somebody's
-			// work. v1 writes no scaffold at all, exactly as before, so an
-			// ordinary `wf init` produces the folder it always did.
+			// work. An explicit --runtime 1 still writes no scaffold at all, so a
+			// folder that asked for the standard runtime gets the empty file it
+			// always did.
 			scaffolded := false
-			if runtime == wfdir.RuntimeDurable && fromPath == "" {
-				scaffolded, err = writeDurableScaffold(root, entrypoint)
+			if effectiveRuntime >= wfdir.RuntimeDurable && fromPath == "" {
+				scaffolded, err = writeDurableScaffold(root, entrypoint, effectiveRuntime)
 				if err != nil {
 					return err
 				}
@@ -150,18 +184,26 @@ get a durable main.py to start from.`,
 				Title:      title,
 				Entrypoint: entrypoint,
 			}
-			// Written only for the durable runtime. The key is absent for v1 —
-			// which is what the server reads as v1 anyway — so a folder created
-			// without --runtime is byte-identical on disk to one created before
-			// durable workflows existed.
-			if runtime != wfdir.RuntimeDefault {
+			// Written whenever the author NAMED a runtime, --runtime 1 included:
+			// an absent key no longer means the standard runtime, it means "the
+			// instance chooses", and its choice is not 1 any more. A folder that
+			// asked for 1 and said nothing on disk would be created on whatever
+			// the instance defaults to — the flag silently doing nothing.
+			//
+			// Absent when the flag was not passed at all, which keeps that
+			// folder's manifest byte-identical to one written before runtimes
+			// existed and leaves the choice where the author left it.
+			if runtimeNamed {
 				manifest.Runtime = runtime
 			}
 			// No workflowID: nothing exists server-side yet. The first push
 			// creates the workflow and fills it in.
-			manifest.SetBinding(
+			lock, err := recordFirstBinding(manifest,
 				wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID},
 				wfdir.Binding{FeatureID: featureID})
+			if err != nil {
+				return err
+			}
 			// An empty declaration rather than an absent one, so the folder owns
 			// its parameters from the start and adding one is editing ronja.json
 			// rather than discovering that the key exists. Harmless on a workflow
@@ -176,7 +218,7 @@ get a durable main.py to start from.`,
 			// UTC", so every fresh folder would silently override its organization's
 			// default. Absent means "inherit it", and `wf clone` records whatever
 			// the row ends up with.
-			if err := wfdir.SaveManifest(root, manifest); err != nil {
+			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}
 			// An EMPTY baseline rather than a fabricated one. There is no
@@ -207,9 +249,10 @@ get a durable main.py to start from.`,
 					"created":    false,
 					"copiedFrom": fromPath,
 					// The EFFECTIVE runtime, always, rather than the manifest key
-					// — which is absent for 1. A caller asking what this folder
-					// will create wants the answer, not the spelling.
-					"runtime":    runtime,
+					// — which is absent when nobody named one. A caller asking
+					// what this folder will create wants the answer, not the
+					// spelling.
+					"runtime":    effectiveRuntime,
 					"scaffolded": scaffolded,
 				}
 				if len(warnings) > 0 {
@@ -217,7 +260,7 @@ get a durable main.py to start from.`,
 				}
 				return emitJSON(payload)
 			}
-			printInitReport(root, resolved.URL, title, entrypoint, featureID, fromPath, copied, runtime, scaffolded)
+			printInitReport(root, resolved.URL, title, entrypoint, featureID, fromPath, copied, effectiveRuntime, scaffolded)
 			for _, w := range warnings {
 				fmt.Fprintf(os.Stderr, "  Note: %s\n", w)
 			}
@@ -232,7 +275,7 @@ get a durable main.py to start from.`,
 	cmd.Flags().StringVar(&title, "title", "",
 		"workflow title (default: derived from --from, or the directory name)")
 	cmd.Flags().IntVar(&runtime, "runtime", wfdir.RuntimeDefault,
-		"workflow runtime: 1, or 2 for a durable workflow whose steps are journaled and whose failed runs can be resumed")
+		"workflow runtime to pin in the manifest: 1, 2 for a durable workflow whose steps are journaled and whose failed runs can be resumed, or 3 for durable plus a container that reads tables only through tools.query (unset: the folder declares none and the instance chooses)")
 	_ = cmd.MarkFlagRequired("feature")
 	return cmd
 }
@@ -332,16 +375,40 @@ func deriveTitle(fromPath, root string) string {
 	return string(unicode.ToUpper(first)) + base[size:]
 }
 
-// durableScaffold is the starting main.py for a durable workflow.
+// durableScaffoldHeader opens the starter main.py, and is the ONE part of it
+// that depends on which journaling runtime the folder declares: runtime 3 adds
+// the rule that a Ronja table is read through tools.query and nothing else,
+// which is the one thing an author cannot infer from the body below.
 //
-// It is not a tutorial: every line is a shape a v2 workflow has to be written
-// in for a resume to work at all, and the comments state the constraint rather
-// than narrate the code. The server seeds its own one-line placeholder into
-// every new workflow, so this is what the first push overwrites it with.
-const durableScaffold = `# Durable workflow (runtime 2). Every @tools.step result is journaled, so
-# ` + "`ronja wf test --resume`" + ` replays the steps that already finished and re-runs
+// The rule is stated, not demonstrated: a commented-out tools.query call would
+// have to name a table id, and a fake id is a line nobody can run.
+func durableScaffoldHeader(runtime int) string {
+	header := fmt.Sprintf(`# Durable workflow (runtime %d). Every @tools.step result is journaled, so
+# `+"`ronja wf test --resume`"+` replays the steps that already finished and re-runs
 # only the work that never did.
+`, runtime)
+	if runtime >= wfdir.RuntimeQuery {
+		header += `#
+# Read a Ronja table ONLY with tools.query("… FROM {{ ref('tbl-id') }} …") — the
+# marker goes inside the SQL string, and the container holds no credential for
+# the table's files.
+`
+	}
+	return header
+}
 
+// durableScaffoldBody is the rest of the starting main.py for a journaling
+// workflow — everything below the header, and identical for every runtime that
+// journals.
+//
+// It is not a tutorial: every line is a shape a durable workflow has to be
+// written in for a resume to work at all, and the comments state the constraint
+// rather than narrate the code. The server seeds its own one-line placeholder
+// into every new workflow, so this is what the first push overwrites it with.
+//
+// It makes no table access at all, which is exactly what keeps it pushable as
+// written under runtime 3's marker rules.
+const durableScaffoldBody = `
 
 @tools.step
 def load_orders():
@@ -395,6 +462,15 @@ summary = f"{count} orders, started {started}"
 summary
 `
 
+// durableScaffold is the starter main.py for the runtime the author asked for:
+// a header that names it, and the shared body. Built rather than duplicated —
+// runtime 3 is a superset of Durable and every shape in the body still applies,
+// and a second copy would be a second place to keep the four structuring rules
+// right.
+func durableScaffold(runtime int) string {
+	return durableScaffoldHeader(runtime) + durableScaffoldBody
+}
+
 // writeDurableScaffold writes the durable starter into the folder, reporting
 // whether it wrote anything.
 //
@@ -403,14 +479,14 @@ summary
 // you have, and the one thing worse than an init that scaffolds nothing is one
 // that ate the file it found. Nothing else in init depends on the scaffold, so
 // there is no failure to report — only a note.
-func writeDurableScaffold(root, entrypoint string) (bool, error) {
+func writeDurableScaffold(root, entrypoint string, runtime int) (bool, error) {
 	dest := filepath.Join(root, entrypoint)
 	if _, err := os.Stat(dest); err == nil {
 		return false, nil
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("read %s: %w", dest, err)
 	}
-	if err := wfdir.WriteFile(root, entrypoint, durableScaffold); err != nil {
+	if err := wfdir.WriteFile(root, entrypoint, durableScaffold(runtime)); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -422,8 +498,8 @@ func printInitReport(root, url, title, entrypoint, featureID, fromPath string, c
 	fmt.Fprintf(out, "  Title:      %s\n", title)
 	fmt.Fprintf(out, "  Entrypoint: %s\n", entrypoint)
 	fmt.Fprintf(out, "  Feature:    %s\n", featureID)
-	if runtime != wfdir.RuntimeDefault {
-		fmt.Fprintf(out, "  Runtime:    %d (durable — steps are journaled, failed runs resume)\n", runtime)
+	if _, sentence := runtimeInfo(runtime); sentence != "" {
+		fmt.Fprintf(out, "  Runtime:    %d — %s\n", runtime, sentence)
 	}
 	fmt.Fprintf(out, "  Instance:   %s (not pushed yet)\n", url)
 	if copied {

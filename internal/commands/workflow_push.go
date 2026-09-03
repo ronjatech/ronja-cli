@@ -23,8 +23,9 @@ import (
 // does so before the first byte is persisted.
 func newWorkflowPushCmd() *cobra.Command {
 	var (
-		noValidate bool
-		force      bool
+		noValidate   bool
+		force        bool
+		allowUnbound bool
 	)
 	cmd := &cobra.Command{
 		Use:   "push",
@@ -43,6 +44,11 @@ error that names the right file. --no-validate skips it.
 It also refuses when the draft changed on the server since your last sync (the
 web builder edits the same draft), listing what moved. --force overwrites.
 
+A push that lands with a DROPPED binding — a {{ secret }} marker naming a secret
+you cannot reach — writes the files and then exits non-zero: the workflow is
+saved, and every run that touches the marker fails. Use
+--allow-dropped-bindings if you mean to bind it later.
+
 Publishing is a separate step:
 
   ronja wf publish                 commit the draft, or submit it for review`,
@@ -56,7 +62,9 @@ Publishing is a separate step:
 			if err != nil {
 				return err
 			}
-			result, err := runPush(cmd.Context(), f, pushOptions{Validate: !noValidate, Force: force})
+			result, err := runPush(cmd.Context(), f, pushOptions{
+				Validate: !noValidate, Force: force, AllowDroppedBindings: allowUnbound,
+			})
 			// The report is emitted even on failure: a push that stopped
 			// halfway has already written files, and "which ones" is the first
 			// thing anyone needs to know.
@@ -76,12 +84,21 @@ Publishing is a separate step:
 		"skip the server-side validation pass before pushing")
 	cmd.Flags().BoolVar(&force, "force", false,
 		"push even though the draft changed on the server since your last sync")
+	cmd.Flags().BoolVar(&allowUnbound, "allow-dropped-bindings", false,
+		"exit zero even though the save dropped a binding it could not reach")
 	return cmd
 }
 
 type pushOptions struct {
 	Validate bool
 	Force    bool
+	// AllowDroppedBindings accepts a push that lands with a binding the save
+	// filtered out. See droppedBindings for why the default is to refuse, and
+	// why this is a FLAG rather than a TTY or --json test: the exit code has to
+	// mean the same thing wherever it is read, and a flag nobody types by
+	// accident is how this CLI already spells "I know, and I mean it"
+	// (--force, --write-live, --no-validate).
+	AllowDroppedBindings bool
 }
 
 // pushResult is the --json shape and the human renderer's input, so the two
@@ -129,6 +146,20 @@ type pushResult struct {
 	// without DisallowUnknownFields), so nothing else about the response
 	// distinguishes "applied" from "ignored".
 	ReportingTimezoneIgnored bool `json:"reportingTimezoneIgnored,omitempty"`
+	// DroppedBindings names the bindings this candidate's save FILTERS OUT — a
+	// {{ secret }} marker naming a secret the author cannot reach. The push
+	// LANDS: the workflow is written, the binding is not, and runs that touch
+	// the marker fail. It is why the command exits non-zero, and it is a field
+	// of its own rather than a substring of Warnings because that exit code is
+	// the only thing CI reads.
+	//
+	// Empty under --no-validate, which is the pass that reports them: skipping
+	// the check skips the verdict, exactly as it skips every other one.
+	DroppedBindings []string `json:"droppedBindings,omitempty"`
+	// DroppedBindingsAllowed reports that --allow-dropped-bindings was given, so
+	// the drops above were accepted rather than refused. Without it the report
+	// would tell a push that deliberately accepted them to go and fix them.
+	DroppedBindingsAllowed bool `json:"droppedBindingsAllowed,omitempty"`
 	// Warnings are the server's soft save-time notices, verbatim.
 	Warnings []string              `json:"warnings"`
 	Findings []api.ValidateFinding `json:"findings,omitempty"`
@@ -204,6 +235,16 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return nil, fmt.Errorf("the entrypoint %q is not in this folder — create it, or point \"entrypoint\" in %s at one of the files that is",
 			entrypoint, wfdir.ManifestPath(f.Root))
 	}
+	// The alias pre-flight, still with no network in sight: an unbound
+	// declaration, a bind that answers nothing, or a source writing an id some
+	// alias already owns. Each one is a folder this push would deploy wrong, and
+	// each is answerable from the manifest and the files on disk. A workflow
+	// folder's files claim no local names, so there are no stems to collide with.
+	aliases := checkAliases(f.Manifest, f.selection(), f.Codec, local, nil, nil)
+	if err := aliases.err(); err != nil {
+		return nil, err
+	}
+	noteAliasWarnings(aliases)
 
 	// 2. Read what is already on the server for this binding. Pure reads, and
 	// deliberately BEFORE the validate gate: the target's persisted parameters
@@ -247,18 +288,22 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 			FeatureID:  featureID,
 			Entrypoint: entrypoint,
 			Parameters: validateParams,
-			Files:      validateFilesOf(local),
+			Files:      validateFilesOf(f.Codec, local),
 			// The runtime the folder DECLARES, including on a push to a workflow
 			// that already exists — where it is both what the metadata patch may
-			// RAISE the row to (1 -> 2, never lowered) and, either way, the
-			// runtime this candidate's author wrote for. Validating against the
-			// row's instead would check the code about to be upgraded past.
-			RuntimeVersion: f.Manifest.Runtime,
+			// RAISE the row to (never lowered) and, either way, the runtime this
+			// candidate's author wrote for. Validating against the row's instead
+			// would check the code about to be upgraded past. A folder that
+			// declares none names the runtime this push will actually produce; see
+			// Manifest.RuntimeForValidate.
+			RuntimeVersion: f.Manifest.RuntimeForValidate(existing.Workflow),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("validate before pushing: %w (use --no-validate to skip this check)", err)
 		}
 		result.Findings = validated.Findings
+		result.DroppedBindings = droppedBindings(validated.Findings)
+		result.DroppedBindingsAllowed = opts.AllowDroppedBindings
 		if !validated.OK() {
 			result.Error = countErrors(validated)
 			return result, fmt.Errorf("%s", result.Error)
@@ -295,15 +340,23 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	if err != nil {
 		return nil, fmt.Errorf("read files of %s: %w", target.ID, err)
 	}
-	remoteFiles := contentByPath(files)
+	remoteFiles := contentByPath(f.Codec, files)
 
 	// The drift GUARD is what a fresh create skips, and only that: nothing on
 	// the server is older than this push, so there is nothing anyone could have
 	// changed underneath it.
 	baselineClean := false
 	preconditions := filePreconditions{}
+	head := headAgreement{}
 	if !result.Created {
-		verdict, err := checkDrift(f, target, remoteFiles, opts.Force)
+		// The committed anchor, read once. AnchoredDraft is derived from what
+		// the caller already knows rather than reported back out of
+		// resolvePushTarget — see existingTarget.AnchoredDraft. (A push that
+		// CREATED the row anchors it in resolvePushTarget, in the same write
+		// that records the binding.)
+		head = readHeadAgreement(ctx, workflowHeadReader(client), f, existing.Workflow.ID,
+			existing.AnchoredDraft())
+		verdict, err := checkDrift(f, target, remoteFiles, opts.Force, head)
 		if err != nil {
 			return nil, err
 		}
@@ -312,7 +365,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		// vouched for the baseline, and suppressed everywhere it was bypassed.
 		// See filePreconditions for why that equivalence is the whole rule.
 		if !verdict.Bypassed {
-			preconditions = filePreconditions{Armed: true, Hashes: f.State.For(f.Key).Hashes()}
+			preconditions = filePreconditions{Armed: true, Hashes: verdict.Preconditions}
 		}
 	}
 
@@ -351,7 +404,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// the workflow's shape against, a half-finished sync still has a coherent
 	// entrypoint — and the metadata patch below cannot name an entrypoint the
 	// row holds no file for.
-	warnings, err := putFiles(ctx, client, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
+	warnings, err := putFiles(ctx, client, f.Codec, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
 	result.Warnings = append(result.Warnings, warnings...)
 	if err != nil {
 		return stop(err)
@@ -421,7 +474,14 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 				return result, err
 			}
 		}
-		return result, nil
+		if err := anchorAfterPush(f, head, opts.Force); err != nil {
+			return result, err
+		}
+		// An up-to-date push is refused for a dropped binding just like one that
+		// wrote something. Nothing landed THIS time, but the workflow on the
+		// server still carries the drop, and a CI job that went green on the
+		// re-run of the deploy it just failed would be worse than useless.
+		return result, refuseDroppedBindings(result)
 	}
 
 	// A re-read: PUT :id answers with nothing and drops the save-time warnings,
@@ -440,7 +500,48 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return result, err
 	}
-	return result, nil
+	if err := anchorAfterPush(f, head, opts.Force); err != nil {
+		return result, err
+	}
+	return result, refuseDroppedBindings(result)
+}
+
+// droppedBindings names the bindings the validate pass says this candidate's
+// SAVE will filter out rather than refuse — today only unreachable secrets,
+// which are the server's soft tier.
+//
+// Read off the finding CODE, never the prose: see api.FindingSecretDropped.
+//
+// The SEVERITY stays a warning and is not this function's business. Warning is
+// the right tier for a person who is about to create the secret and can see the
+// line go by; what was wrong is the EXIT CODE, which is the only thing CI reads
+// — a workflow that fails at run time shipped, and the deploy reported success.
+func droppedBindings(findings []api.ValidateFinding) []string {
+	var out []string
+	for _, f := range findings {
+		if f.Code != api.FindingSecretDropped {
+			continue
+		}
+		// Path first, the way printFindings groups them: the marker is in a
+		// file, and "which file" is the first thing anyone needs.
+		out = append(out, fmt.Sprintf("%s — %s", f.Path, f.Message))
+	}
+	return out
+}
+
+// refuseDroppedBindings is the non-zero exit a landed-but-broken push owes its
+// caller, or nil when there is nothing to refuse.
+//
+// The push is NOT undone. The files are written, the report above says so, and
+// this is the exit code alone: the workflow exists, it is simply not the
+// workflow the author described, and no CLI can put back a binding the server
+// declined to store.
+func refuseDroppedBindings(r *pushResult) error {
+	if len(r.DroppedBindings) == 0 || r.DroppedBindingsAllowed {
+		return nil
+	}
+	return fmt.Errorf("%d binding(s) were DROPPED — the workflow is saved, and runs that touch them will fail. Make them reachable and push again, or push --allow-dropped-bindings to accept that",
+		len(r.DroppedBindings))
 }
 
 // acknowledgedRemote seeds the map that becomes the baseline if this push stops
@@ -524,7 +625,11 @@ func describePatch(patch api.WorkflowPatch) string {
 		parts = append(parts, fmt.Sprintf("the reporting timezone to %q", effectiveDeclaredZone(*patch.ReportingTimezone)))
 	}
 	if patch.RuntimeVersion != 0 {
-		parts = append(parts, fmt.Sprintf("the runtime to %d (Durable)", patch.RuntimeVersion))
+		if label, _ := runtimeInfo(patch.RuntimeVersion); label != "" {
+			parts = append(parts, fmt.Sprintf("the runtime to %d (%s)", patch.RuntimeVersion, label))
+		} else {
+			parts = append(parts, fmt.Sprintf("the runtime to %d", patch.RuntimeVersion))
+		}
 	}
 	return strings.Join(parts, " and ")
 }
@@ -572,6 +677,26 @@ func (e existingTarget) Row() *api.Workflow {
 		return e.Workflow
 	}
 	return nil
+}
+
+// AnchoredDraft reports that the row a push writes to is one the committed head
+// anchor can speak for — see headAgreement.AnchoredDraft, which documents the
+// two qualifying shapes and the one they exclude.
+//
+// The parentless leg is not a relaxation of the guard, it is the guard applied
+// to the right row. A workflow that has never been published has no live version
+// to protect: the draft IS the workflow, this folder created it, and refusing
+// its own fresh checkout left the author a message whose remedy — `wf discard` —
+// is refused on a parentless draft and routed to a flag that DELETES the
+// workflow. The push still runs under per-file preconditions built from the
+// listing it just read, so a concurrent editor is refused with a 409 rather than
+// overwritten.
+func (e existingTarget) AnchoredDraft() bool {
+	row := e.Row()
+	if row == nil {
+		return true
+	}
+	return row.ParentWorkflowID == ""
 }
 
 // Parameters are the target's PERSISTED parameters — what a save is checked
@@ -637,8 +762,17 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 		// A first push is the one path here that WRITES a binding, so this is
 		// where the organization has to be authoritative rather than adopted
 		// from an entry that does not exist yet.
-		if _, err := f.bindNew(ctx); err != nil {
-			return nil, err
+		//
+		// Only when this folder is NOT bound here. A folder that declares a
+		// stack (or carries a legacy entry) but has no row yet is creating and
+		// bound at once, and it already names both the organization and the
+		// stack the create belongs to — re-deriving them writes the new id into
+		// a second, unnamed entry beside the stack. Same condition as
+		// `pipeline push` and `app push`; see folder.bindNew.
+		if !f.Bound {
+			if _, err := f.bindNew(ctx); err != nil {
+				return nil, err
+			}
 		}
 		created, err := client.CreateWorkflow(ctx, api.CreateWorkflowInput{
 			FeatureID:  featureID,
@@ -651,10 +785,14 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 			Parameters: f.Manifest.DeclaredParameters(),
 			// The runtime, stamped at create. This is the only request that can
 			// pick it FREELY: afterwards it moves one way only, so a push to a
-			// workflow that already exists sends runtimeVersion 2 as a metadata
-			// patch when the folder declares 2 against a runtime-1 row (reported
-			// as an upgrade), and refuses the reverse before writing anything —
+			// workflow that already exists sends runtimeVersion 3 as a metadata
+			// patch when the folder declares 3 against a lower row (reported as
+			// an upgrade), and refuses the reverse before writing anything —
 			// there is no downgrade, on the server or here.
+			//
+			// Zero when the folder declares nothing, and omitempty drops the key:
+			// the SERVER then picks, and its default is no longer 1. What it
+			// picked is read back off the created row below.
 			RuntimeVersion: f.Manifest.Runtime,
 			// Same round-trip saving for the declared calendar, but the value is
 			// the EFFECTIVE one: create refuses an explicit "" outright (unlike
@@ -670,10 +808,42 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 		// Recorded IMMEDIATELY, before any file is written: the workflow now
 		// exists, and a push that died before saving the manifest would leave
 		// an orphan the next push could not find and would create again.
-		f.Manifest.SetBinding(f.Key, wfdir.Binding{WorkflowID: created.ID, FeatureID: featureID})
-		if err := wfdir.SaveManifest(f.Root, f.Manifest); err != nil {
+		f.recordBinding(wfdir.Binding{WorkflowID: created.ID, FeatureID: featureID})
+		// A workflow that has just been created has never been versioned, and an
+		// unversioned row IS its own head — the same fallback
+		// api.HeadVersionID resolves, and the same one rworkflow's commit CAS
+		// resolves. Recorded here rather than by a round trip, in the write that
+		// records the binding it describes: they are one fact and a folder
+		// holding half of it is a folder with an anchor pointing at nothing.
+		f.setHeadVersion(created.ID)
+		// The runtime the SERVER stamped, recorded in the committed manifest the
+		// same way and for the same reason as the binding above: this folder said
+		// nothing, the server picked, and the folder now has to remember what was
+		// picked. Its create default is no longer 1, so an absent key leaves the
+		// committed folder silent about the runtime its code is written for, and
+		// a folder later re-pushed into a NEW workflow elsewhere would create
+		// whatever that instance's default happens to be — the same reason
+		// `wf clone` records the runtime it cloned. Only above the default, and
+		// only when the folder had no opinion: an instance too old to report a
+		// runtime answers 0 and leaves the manifest exactly as it was.
+		//
+		// And only a runtime THIS BUILD KNOWS. The day a server's create default
+		// becomes 4, an older CLI's SUCCESSFUL push would otherwise write
+		// "runtime": 4 into the committed manifest, and LoadManifest — which
+		// refuses an unknown runtime, for good reasons of its own — would then
+		// hard-fail every later command on that folder, recoverable only by
+		// upgrading the CLI or re-cloning. A push that worked must not brick the
+		// folder it just created, so an unknown runtime degrades to the behaviour
+		// this CLI had before the write-back existed: record nothing. The folder
+		// is then unpinned, which checkRuntimeDrift, RuntimeForValidate and
+		// `wf status` all read as "no opinion" and defer to the row for.
+		if f.Manifest.Runtime == 0 && created.RuntimeVersion > wfdir.RuntimeDefault &&
+			wfdir.ValidRuntime(created.RuntimeVersion) {
+			f.Manifest.Runtime = created.RuntimeVersion
+		}
+		if err := f.saveFolder(); err != nil {
 			return nil, fmt.Errorf("record the new workflow %s in %s: %w",
-				created.ID, wfdir.ManifestPath(f.Root), err)
+				created.ID, f.bindingFiles(), err)
 		}
 		result.Created = true
 		result.WorkflowID = created.ID
@@ -710,6 +880,23 @@ type driftVerdict struct {
 	// a precondition armed on a clean baseline refuses precisely the mid-push
 	// race --force exists to proceed past, with advice to run --force.
 	Bypassed bool
+	// HeadVouched reports that this push had NO local baseline and was let
+	// through by the committed head-version anchor instead — a fresh checkout,
+	// which is the case the anchor exists for.
+	HeadVouched bool
+	// Preconditions are the hashes the per-file compare-and-swap should assert,
+	// and it is the guard that says which set rather than the caller: the two
+	// have to be the same answer to the same question, which is the whole rule
+	// on filePreconditions.
+	//
+	// Normally the local baseline's. On the HeadVouched path there is no
+	// baseline, so it is the REMOTE listing this check just read — which is
+	// legitimate there and nowhere else: the anchor established that those bytes
+	// are the live row's, unchanged since this folder forked from it, so
+	// asserting them is asserting agreement rather than asserting a guess. It is
+	// also strictly stronger than what a fresh checkout had before, which was
+	// --force and therefore no preconditions at all.
+	Preconditions map[string]string
 }
 
 // checkDrift refuses a push that would overwrite server-side changes made since
@@ -726,7 +913,11 @@ type driftVerdict struct {
 // why the writes that follow carry their own per-file preconditions: those
 // close the window between this comparison and the byte that overwrites
 // something, which nothing local can see.
-func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force bool) (driftVerdict, error) {
+// head is the committed anchor, and it is consulted in ONE place: the branch
+// where there is no local baseline at all. Everywhere else the baseline is a
+// finer-grained answer to a question the anchor cannot address — the anchor is
+// about the LIVE row, and a baseline is about the draft this push writes to.
+func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force bool, head headAgreement) (driftVerdict, error) {
 	baseline := f.State.For(f.Key)
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
@@ -743,7 +934,7 @@ func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force
 		// to override — a remote that moved AFTER this comparison read it —
 		// and answer it with a 409 whose advice is to run --force, which is
 		// what the caller just did.
-		return driftVerdict{BaselineClean: baseline != nil, Bypassed: force}, nil
+		return driftVerdict{BaselineClean: baseline != nil, Bypassed: force, Preconditions: baseline.Hashes()}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s that changed on the server since your last sync.\n",
@@ -763,6 +954,42 @@ func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force
 		// draft with a file set someone actually built, and still refuses.
 		if isUntouchedFirstPush(target, remote) {
 			return driftVerdict{Bypassed: true}, nil
+		}
+		// THE FRESH-CHECKOUT PATH. `.ronja/` is git-ignored, so this is what CI
+		// and every colleague's `git clone` looks like, and until the lock file
+		// carried an anchor the only way through it was --force — which is also
+		// the flag that disarms the per-file preconditions below. The committed
+		// head pointer replaces that with an actual answer.
+		if head.Vouches() {
+			noteHeadAnchored(target.ID, head.Current)
+			// Armed on the REMOTE listing rather than bypassed: see
+			// driftVerdict.Preconditions. This is the one place they differ, and
+			// it makes a CI push safer than the --force it replaces rather than
+			// merely quieter.
+			return driftVerdict{HeadVouched: true, Preconditions: remoteHashes}, nil
+		}
+		if head.Moved() {
+			return driftVerdict{}, refuseHeadMoved("workflow", f.Binding.WorkflowID, head,
+				"`ronja wf clone "+f.Binding.WorkflowID+"`")
+		}
+		// The anchor agreed about the LIVE row and still could not vouch, which
+		// leaves exactly one cause: an EDIT SHADOW over the live row was already
+		// open when this push started. It may hold an edit made in the web
+		// builder that nothing here has ever seen, so the anchor says nothing
+		// about it — but naming it is the difference between an actionable
+		// refusal and a puzzling one, and the remedy is a command rather than a
+		// flag.
+		//
+		// ⚠️ Reachable ONLY for a draft forked from a live workflow, and that is
+		// what makes `wf discard` a safe thing to suggest: a PARENTLESS draft
+		// vouches (existingTarget.AnchoredDraft) and never arrives here, which
+		// matters because `wf discard` REFUSES a parentless draft and routes to
+		// --delete-workflow, which deletes the resource. Widening the vouch
+		// condition without widening this message would advertise a remedy that
+		// destroys the thing it was asked to protect.
+		if head.Recorded != "" && head.Recorded == head.Current {
+			return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and you already have a draft of %s open there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  Run `ronja wf discard` to throw the draft away and push onto the live version, or push --force to overwrite it",
+				f.Resolved.URL, f.Binding.WorkflowID, wfdir.LockName)
 		}
 		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the workflow already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the workflow into a fresh folder to get one, or push --force to overwrite the remote files with what you have here",
 			f.Resolved.URL, len(remote))
@@ -852,14 +1079,22 @@ func (p filePreconditions) ForDelete(path string) *string {
 // what it actually knows — that this push did not do it — and leads with the
 // remedy that covers the already-gone case for free, since the next push reads
 // a listing without the file and does not try to delete it at all.
-func noteFileConflict(verb, path string) {
+//
+// `cmd` is the sync loop's verb (`wf` / `app`) and `noun` is what it syncs
+// ("workflow" / "data app"), because both loops raise the identical refusal and
+// the only thing that differs is the commands the remedy names. Telling a data
+// app author to run `ronja wf status` is worse than saying nothing — it is a
+// command that fails in their folder — while a second copy of this would be two
+// places for "never retry, never escalate to --force" to come to mean different
+// things.
+func noteFileConflict(cmd, noun, verb, path string) {
 	if verb == "deleted" {
 		fmt.Fprintf(os.Stderr, "  Conflict: %s is not what your last sync recorded — somebody changed or removed it while this push was running, so this push did not delete it.\n", path)
-		fmt.Fprintf(os.Stderr, "  Run `ronja wf push` again: if they deleted it too, the retry simply moves on. Otherwise `ronja wf status` shows what moved, and push --force overwrites.\n")
+		fmt.Fprintf(os.Stderr, "  Run `ronja %s push` again: if they deleted it too, the retry simply moves on. Otherwise `ronja %s status` shows what moved, and push --force overwrites.\n", cmd, cmd)
 		return
 	}
 	fmt.Fprintf(os.Stderr, "  Conflict: %s changed on the server while this push was running — it was NOT %s.\n", path, verb)
-	fmt.Fprintf(os.Stderr, "  Run `ronja wf status` to see what moved, clone the workflow into a fresh folder to re-apply your change on top of it, or push --force to overwrite.\n")
+	fmt.Fprintf(os.Stderr, "  Run `ronja %s status` to see what moved, clone the %s into a fresh folder to re-apply your change on top of it, or push --force to overwrite.\n", cmd, noun)
 }
 
 // metadataDrift is one metadata field that moved on the server since the last
@@ -999,7 +1234,7 @@ func joinAnd(parts []string) string {
 // holding only what was already acknowledged and gains an entry per successful
 // write, so it describes the folder's honest position whether the sync finishes
 // or stops.
-func putFiles(ctx context.Context, client *api.Client, targetID, entrypoint string, local, remote, landed map[string]string, pre filePreconditions, result *pushResult) ([]string, error) {
+func putFiles(ctx context.Context, client *api.Client, codec aliasCodec, targetID, entrypoint string, local, remote, landed map[string]string, pre filePreconditions, result *pushResult) ([]string, error) {
 	var warnings []string
 
 	order := []string{}
@@ -1016,7 +1251,7 @@ func putFiles(ctx context.Context, client *api.Client, targetID, entrypoint stri
 			result.Unchanged++
 			continue
 		}
-		saved, err := client.PutWorkflowFile(ctx, targetID, path, local[path], pre.ForWrite(path))
+		saved, err := client.PutWorkflowFile(ctx, targetID, path, codec.toWire(local[path]), pre.ForWrite(path))
 		if err != nil {
 			// A 409 is the precondition refusing: the file moved between the
 			// listing this push compared against and this write. Nothing
@@ -1024,14 +1259,14 @@ func putFiles(ctx context.Context, client *api.Client, targetID, entrypoint stri
 			// — never retried and never escalated to --force automatically.
 			if api.StatusOf(err) == api.StatusConflict {
 				result.Conflict = true
-				noteFileConflict("overwritten", path)
+				noteFileConflict("wf", "workflow", "overwritten", path)
 				return warnings, fmt.Errorf("push %s: %w", path, err)
 			}
 			// A PUT that TIMED OUT may still have committed: the deadline was
 			// ours, the transaction was the server's. A rejection is different —
 			// the server considered the write and refused it, and the file
 			// certainly kept its previous content.
-			if api.IsTimeout(err) && reconcileTimedOutPut(ctx, client, targetID, path, local[path], landed) {
+			if api.IsTimeout(err) && reconcileTimedOutPut(ctx, client, codec, targetID, path, local[path], landed) {
 				// It landed after all, so the report has to say so — a report
 				// that disagrees with the baseline written beside it is worse
 				// than either of them being wrong on its own.
@@ -1069,12 +1304,17 @@ func putFiles(ctx context.Context, client *api.Client, targetID, entrypoint stri
 //
 // Reports whether the write is now known to have landed, so the push's report
 // and the baseline written beside it describe the same set of files.
-func reconcileTimedOutPut(ctx context.Context, client *api.Client, targetID, path, want string, landed map[string]string) bool {
+func reconcileTimedOutPut(ctx context.Context, client *api.Client, codec aliasCodec, targetID, path, want string, landed map[string]string) bool {
 	saved, err := client.GetWorkflowFile(ctx, targetID, path)
 	if err != nil {
 		return false
 	}
-	return acknowledgeIntendedWrite(landed, path, want, saved.Content)
+	// `want` is DISK form and saved.Content came from the server, so the compare
+	// only means anything with the two in one form — and it must be disk form,
+	// because what acknowledgeIntendedWrite records is the baseline, which is
+	// hashed against the bytes on disk. Getting this one wrong is expensive: it
+	// is the function that decides whether a write is treated as landed.
+	return acknowledgeIntendedWrite(landed, path, want, codec.toDisk(saved.Content))
 }
 
 // deleteFiles removes what the server holds and the folder does not.
@@ -1104,7 +1344,7 @@ func deleteFiles(ctx context.Context, client *api.Client, targetID string, local
 			// ronja.json at a file you are keeping) is its message to give.
 			if api.StatusOf(err) == api.StatusConflict {
 				result.Conflict = true
-				noteFileConflict("deleted", path)
+				noteFileConflict("wf", "workflow", "deleted", path)
 			}
 			return warnings, fmt.Errorf("delete %s: %w", path, err)
 		}
@@ -1116,10 +1356,16 @@ func deleteFiles(ctx context.Context, client *api.Client, targetID string, local
 }
 
 // contentByPath flattens a fetched file set for content comparison.
-func contentByPath(files []api.WorkflowFile) map[string]string {
+//
+// De-aliased HERE, at the point the map is built, so everything downstream of it
+// — the drift guard, the skip-if-identical test in putFiles, the `landed` map
+// that becomes the baseline — compares remote content against local content in
+// the one form both are in. Doing it at each of those instead would be four
+// places to forget it, and forgetting it in any of them reads as permanent drift.
+func contentByPath(codec aliasCodec, files []api.WorkflowFile) map[string]string {
 	out := make(map[string]string, len(files))
 	for _, f := range files {
-		out[f.Path] = f.Content
+		out[f.Path] = codec.toDisk(f.Content)
 	}
 	return out
 }
@@ -1143,16 +1389,19 @@ func printPushReport(r *pushResult) {
 	if r.UpToDate {
 		fmt.Fprintf(out, "  Up to date — the draft %s already holds this folder.\n", r.DraftID)
 		printResourceURL(out, reportKeyWidth, r.URL)
+		printDroppedBindings(out, r)
 		return
 	}
 
 	if r.Created {
 		fmt.Fprintf(out, "  Created workflow %s\n", r.WorkflowID)
-		// Said only for the durable runtime, and only here: this is the moment
-		// it was stamped.
-		if r.RuntimeVersion >= wfdir.RuntimeDurable {
-			fmt.Fprintf(out, "    runtime  %d — steps are journaled; a failed run resumes with `ronja wf test --resume`\n",
-				r.RuntimeVersion)
+		// Said only for a runtime that has something to say, and only here: this
+		// is the moment it was stamped. The gate is the SENTENCE rather than a
+		// comparison against RuntimeDurable, because the two journaling runtimes
+		// do not mean the same thing and neither does a runtime this build has
+		// never heard of — see runtimeInfo.
+		if _, sentence := runtimeInfo(r.RuntimeVersion); sentence != "" {
+			fmt.Fprintf(out, "    runtime  %d — %s\n", r.RuntimeVersion, sentence)
 		}
 	}
 	// The conversion of an EXISTING workflow, which lands on the draft and takes
@@ -1160,8 +1409,13 @@ func printPushReport(r *pushResult) {
 	// than as a value because that is the change the author is making, and it is
 	// the one metadata change on this report that cannot be undone.
 	if r.RuntimeUpgradedFrom != 0 {
-		fmt.Fprintf(out, "    runtime  %d → %d (Durable) — one way; takes effect for live runs at `ronja wf publish`\n",
-			r.RuntimeUpgradedFrom, r.RuntimeVersion)
+		if label, _ := runtimeInfo(r.RuntimeVersion); label != "" {
+			fmt.Fprintf(out, "    runtime  %d → %d (%s) — one way; takes effect for live runs at `ronja wf publish`\n",
+				r.RuntimeUpgradedFrom, r.RuntimeVersion, label)
+		} else {
+			fmt.Fprintf(out, "    runtime  %d → %d — one way; takes effect for live runs at `ronja wf publish`\n",
+				r.RuntimeUpgradedFrom, r.RuntimeVersion)
+		}
 	}
 	for _, path := range r.Pushed {
 		fmt.Fprintf(out, "    pushed   %s\n", path)
@@ -1196,5 +1450,29 @@ func printPushReport(r *pushResult) {
 		fmt.Fprintf(out, "  Bindings: %s\n", describeBindings(*r.Bindings))
 	}
 	printResourceURL(out, reportKeyWidth, r.URL)
+	printDroppedBindings(out, r)
 	fmt.Fprintf(out, "\n  Next: ronja wf publish\n")
+}
+
+// printDroppedBindings says what the exit code is about.
+//
+// It runs on a SUCCESSFUL report, after the files and the draft link, because
+// that is what happened: the push landed and the workflow is broken. Rendering
+// it through the "stopped part-way" branch instead would tell the author their
+// files are not on the server, which is the opposite of true.
+func printDroppedBindings(out *os.File, r *pushResult) {
+	if len(r.DroppedBindings) == 0 {
+		return
+	}
+	verb := "were DROPPED"
+	if r.DroppedBindingsAllowed {
+		verb = "were dropped, and accepted (--allow-dropped-bindings)"
+	}
+	fmt.Fprintf(out, "\n  %d binding(s) %s — runs that touch them will fail:\n", len(r.DroppedBindings), verb)
+	for _, dropped := range r.DroppedBindings {
+		fmt.Fprintf(out, "    %s\n", dropped)
+	}
+	if !r.DroppedBindingsAllowed {
+		fmt.Fprintf(out, "  Make them reachable and push again, or push --allow-dropped-bindings to accept that.\n")
+	}
 }

@@ -159,3 +159,32 @@ func TestKeyMatchingToleratesURLSpelling(t *testing.T) {
 		t.Errorf("URL = %q, want the canonical spelling", m.Instances[0].URL)
 	}
 }
+
+// KeysOn answers two questions whose disagreement is invisible: "which
+// organizations does this folder name here" (what a refusal enumerates) and "is
+// there anything here to adopt" (what decides whether the caller pays for an
+// organization lookup). Both have to see exactly what Find sees, spelling
+// included — a rawer comparison would leave a folder that Find matches looking
+// empty, and the lookup would go unguarded.
+func TestKeysOnSeesWhatFindSees(t *testing.T) {
+	instances := []Instance{
+		{URL: "https://APP.ronja.tech/", TenantID: "ten-acme"},
+		{URL: "https://app.ronja.tech", TenantID: "ten-northwind"},
+		{URL: "https://other.ronja.tech", TenantID: "ten-elsewhere"},
+	}
+	got := KeysOn(instances, Instance.Key, "https://app.ronja.tech/")
+	if len(got) != 2 {
+		t.Fatalf("KeysOn = %+v, want both spellings of the same instance", got)
+	}
+	if got[0].TenantID != "ten-acme" || got[1].TenantID != "ten-northwind" {
+		t.Errorf("KeysOn = %+v, want slice order preserved", got)
+	}
+	// The pairing that matters: an unknown organization on this URL is ambiguous
+	// exactly when KeysOn reports more than one.
+	if _, err := Find(instances, Instance.Key, InstanceKey{URL: "https://app.ronja.tech"}); err != ErrAmbiguousInstance {
+		t.Errorf("Find err = %v, want the ambiguity KeysOn just enumerated", err)
+	}
+	if none := KeysOn(instances, Instance.Key, "https://nothing.ronja.tech"); len(none) != 0 {
+		t.Errorf("KeysOn = %+v on an instance the folder does not name", none)
+	}
+}

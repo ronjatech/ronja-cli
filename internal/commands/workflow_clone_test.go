@@ -9,9 +9,10 @@ import (
 
 // A clone of a Durable workflow must record the runtime in the manifest: the
 // folder may later be pushed into a NEW workflow elsewhere, and an absent key
-// creates runtime 1 under v2 code — the availability probe then fails the
-// first run. The key is written only when non-default (absent IS "runtime 1"),
-// so cloning a standard workflow stays byte-identical to a pre-durable clone.
+// leaves that create on whatever runtime the instance defaults to — which is not
+// the one this code was written for, in either direction. The key is written for
+// every runtime the instance actually reports, the standard one included; only a
+// row that reports NOTHING leaves it absent.
 func TestCloneRecordsTheDurableRuntimeInTheManifest(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -39,10 +40,11 @@ func TestCloneRecordsTheDurableRuntimeInTheManifest(t *testing.T) {
 	}
 }
 
-// Negative control: the standard runtime writes NO key. Asserting on the raw
-// field (not the accessor, which defaults absent to 1) is what would catch a
-// regression to always-writing.
-func TestCloneOfAStandardWorkflowWritesNoRuntimeKey(t *testing.T) {
+// Negative control: a row that reports NO runtime writes no key. An instance
+// too old to have the field has told us nothing, and a folder must not declare a
+// guess on its behalf. Asserting on the raw field (not the accessor, which
+// defaults absent to 1) is what would catch a regression to always-writing.
+func TestCloneOfAWorkflowReportingNoRuntimeWritesNoKey(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	f.AddWorkflow(&api.Workflow{

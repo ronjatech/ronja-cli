@@ -694,6 +694,89 @@ func TestPipelineStatusWorksSignedOut(t *testing.T) {
 	}
 }
 
+// TestPipelinePushNamesOtherOrganizationsOnlyWhenUnbound: the cross-organization
+// wording belongs to ONE case — this folder has no entry here and names other
+// organizations instead.
+//
+// A folder that IS bound here and merely left "featureID" out has a line to add
+// the field to. Telling it "the entries there name X instead", and to add an
+// entry it already has, is the same species of wrong advice the
+// cross-organization wording was written to remove.
+func TestPipelinePushNamesOtherOrganizationsOnlyWhenUnbound(t *testing.T) {
+	seed := func(t *testing.T, f *fakePipelineInstance, bindHere bool) string {
+		manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales pipeline"}
+		if bindHere {
+			// Bound, with a table already — and no featureID, the field a
+			// hand-written entry is most likely to be missing.
+			manifest.SetBinding(f.Key(), wfdir.Binding{Tables: map[string]string{"orders.sql": "table-orders"}})
+		}
+		manifest.SetBinding(wfdir.InstanceKey{URL: f.URL(), TenantID: "ten-other"},
+			wfdir.Binding{FeatureID: "collection-other"})
+		return writePipelineFolder(t, t.TempDir(), manifest, map[string]string{"new.sql": "SELECT 1"})
+	}
+
+	t.Run("unbound", func(t *testing.T) {
+		f := newFakePipelineInstance(t)
+		signInPipeline(t, f)
+		_, _, err := runPipelineCLI(t, seed(t, f, false), "pipeline", "push", "--json")
+		if err == nil {
+			t.Fatal("push accepted a folder with no feature anywhere")
+		}
+		if !strings.Contains(err.Error(), "ten-other") {
+			t.Errorf("error = %v, want the organization the entries DO name", err)
+		}
+	})
+	t.Run("bound but missing the field", func(t *testing.T) {
+		f := newFakePipelineInstance(t)
+		signInPipeline(t, f)
+		_, _, err := runPipelineCLI(t, seed(t, f, true), "pipeline", "push", "--json")
+		if err == nil {
+			t.Fatal("push accepted a binding with no featureID")
+		}
+		if strings.Contains(err.Error(), "ten-other") {
+			t.Errorf("error = %v — a bound folder was told its entries name another organization", err)
+		}
+		if !strings.Contains(err.Error(), "featureID") {
+			t.Errorf("error = %v, want the field it is missing named", err)
+		}
+	})
+}
+
+// TestPipelineStatusDegradesWhenTheOrganizationLookupFails: the same promise one
+// credential further along.
+//
+// Resolving the organization is a request, and a request can fail — a rotated
+// token, a 5xx, no network. The scenario is a CI job running `pipeline status
+// --json` as a pre-flight: it must still print the local diff plus a reason, and
+// still exit non-zero, because "I could not look" is not "nothing moved".
+// Aborting produced neither.
+func TestPipelineStatusDegradesWhenTheOrganizationLookupFails(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedBoundFolder(t, f)
+	f.failMe = 401
+
+	out, _, err := runPipelineCLI(t, root, "pipeline", "status", "--json")
+	if err == nil {
+		t.Fatal("an unchecked remote must exit non-zero")
+	}
+	payload := decodeJSON(t, out)
+	if payload["local"] == nil {
+		t.Error("the local diff was not reported")
+	}
+	remote := payload["remote"].(map[string]any)
+	if remote["checked"] == true {
+		t.Error("remote reported itself as checked without an organization")
+	}
+	reason, _ := remote["notCheckedReason"].(string)
+	if !strings.Contains(reason, "which organization") {
+		t.Errorf("notCheckedReason = %q, want the failed lookup named", reason)
+	}
+	if f.listCalls != 0 {
+		t.Errorf("read %d listings under a credential whose organization is unknown", f.listCalls)
+	}
+}
+
 // TestPipelineStatusExitsZeroOnAFreshClone: .ronja/ is correctly never
 // committed, so a colleague who has just cloned the repo has no baseline for any
 // file — the normal way somebody joins a pipeline, and the state push's own

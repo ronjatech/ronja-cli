@@ -62,6 +62,38 @@ func TestAppStatusReadsTheDraftNotTheLiveApp(t *testing.T) {
 	}
 }
 
+// TestAppStatusDegradesWhenTheOrganizationLookupFails: resolving the
+// organization is a request, and a request can fail — a rotated token, a 5xx, no
+// network. `app status` answers its local half without a server at all, so a
+// failed lookup is a REASON on the remote half, never the end of the command.
+// Aborting made the one command you run when you are already suspicious the one
+// that stops answering.
+func TestAppStatusDegradesWhenTheOrganizationLookupFails(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"}, api.DataAppFile{Path: "App.tsx", Content: "x"})
+	signInApp(t, f)
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "x"})
+	f.failMe = 401
+
+	out, err := runCLI(t, root, "app", "status", "--json")
+	if err != nil {
+		t.Fatalf("status aborted on a failed organization lookup: %v", err)
+	}
+	var report appStatusReport
+	decodeJSONInto(t, out, &report)
+	// No baseline here — a folder that has never been pushed — so the local half
+	// is the whole file set, and it still arrives.
+	if len(report.Local.Added) != 1 {
+		t.Errorf("local half missing: %+v", report.Local)
+	}
+	if report.Remote.Checked {
+		t.Error("remote reported itself as checked without an organization")
+	}
+	if !strings.Contains(report.Remote.NotCheckedReason, "which organization") {
+		t.Errorf("notCheckedReason = %q, want the failed lookup named", report.Remote.NotCheckedReason)
+	}
+}
+
 // TestAppCloneReadsTheDraftNotTheLiveApp is the same invariant for clone, which
 // has its own reason to reach for files.
 func TestAppCloneReadsTheDraftNotTheLiveApp(t *testing.T) {
@@ -505,7 +537,7 @@ func TestAppPushNeverAcknowledgesContentItDidNotWrite(t *testing.T) {
 			// A baseline recording what this folder last synced, so the colleague's
 			// edit to lib/chart.tsx is drift — the drift --force runs past.
 			state := &wfdir.State{}
-			state.Set(f.Key(), baselineFromApp(draft, []api.DataAppFile{
+			state.Set(f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
 				{Path: "App.tsx", Content: "entry"},
 				{Path: "lib/chart.tsx", Content: "what I last synced"},
 			}))
@@ -689,7 +721,7 @@ func TestAppPushReconcilesAnUncertainDelete(t *testing.T) {
 			// A baseline that already describes the draft exactly, so nothing here
 			// is drift and the deletion is the only thing this push does.
 			state := &wfdir.State{}
-			state.Set(f.Key(), baselineFromApp(draft, []api.DataAppFile{
+			state.Set(f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
 				{Path: "App.tsx", Content: "entry"},
 				{Path: "lib/old.tsx", Content: "old"},
 			}))
@@ -758,7 +790,7 @@ func TestAppPushSyncsAccessBeforeFiles(t *testing.T) {
 	}
 	// A baseline that matches the live file, so the push is not refused as drift.
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(live, []api.DataAppFile{{Path: "App.tsx", Content: "old"}}))
+	state.Set(f.Key(), baselineFromApp(aliasCodec{}, live, []api.DataAppFile{{Path: "App.tsx", Content: "old"}}))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)
 	}
@@ -964,7 +996,7 @@ func TestAppPushRefusesDrift(t *testing.T) {
 	}
 	// A baseline recording a DIFFERENT content, so the remote has moved since.
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(f.apps["data_app-draft-1"],
+	state.Set(f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-draft-1"],
 		[]api.DataAppFile{{Path: "App.tsx", Content: "what I last synced"}}))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)
@@ -1491,7 +1523,7 @@ func appFolderBoundTo(t *testing.T, f *fakeAppInstance, liveID string, files map
 		baseline = append(baseline, api.DataAppFile{Path: path, Content: content})
 	}
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(f.apps[draftID], baseline))
+	state.Set(f.Key(), baselineFromApp(aliasCodec{}, f.apps[draftID], baseline))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)
 	}

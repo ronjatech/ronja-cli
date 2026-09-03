@@ -30,6 +30,39 @@ import (
 // differently-worded line printed underneath it by Execute.
 var errAlreadyReported = errors.New("already reported")
 
+// exitCodeError is a failure that names its OWN process exit code, for a
+// command whose answer has more than two values.
+//
+// Every command until now has had a two-valued answer — it worked, or it did
+// not — so `run` mapping every error to 1 was the whole contract. `ronja sync
+// status` does not: "something drifted" is an actionable finding a CI job fixes
+// by pushing, and "I could not tell" is a broken credential or a folder that
+// would not open, which the same job must NOT treat as drift. Collapsing them
+// into one non-zero makes the difference unreadable to the caller that most
+// needs it (see syncExitDrifted / syncExitUnknown).
+//
+// Deliberately additive: nothing else returns one, so every existing command
+// keeps exiting exactly 0 or 1 as it always has.
+type exitCodeError struct {
+	code int
+	err  error
+}
+
+func (e *exitCodeError) Error() string { return e.err.Error() }
+
+// Unwrap keeps errors.Is working through the wrapper — errAlreadyReported above
+// is matched that way, and a coded error that has already spoken for itself
+// must still suppress the second line `run` would otherwise print.
+func (e *exitCodeError) Unwrap() error { return e.err }
+
+// withExitCode tags an error with the process exit code it should produce.
+func withExitCode(code int, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &exitCodeError{code: code, err: err}
+}
+
 // Version is stamped at build time by the release pipeline:
 //
 //	go install -ldflags "-X github.com/ronjatech/ronja-cli/internal/commands.Version=$(git describe --tags)" ./cmd/ronja
@@ -83,7 +116,28 @@ var (
 	flagURL     string
 	flagProfile string
 	flagJSON    bool
+	// flagStack names the STACK — the environment in the folder's committed
+	// manifest — that a folder command acts on. Registered on the three folder
+	// command groups rather than at the root, because it means nothing to
+	// `login`, `query` or `api`: those talk to an instance, not to a folder.
+	//
+	// TWO selectors and no third: --stack names an environment (shared, in the
+	// repo), --profile names a credential (local, on this machine). Keeping them
+	// separate is the whole reason ronja.json can be committed at all — see
+	// wfdir.Stack.
+	flagStack string
 )
+
+// addStackFlag registers --stack on a folder command group.
+//
+// One function rather than three copies of the same line, so the three loops
+// cannot drift on the flag's name or its help text — the CLI has been bitten by
+// exactly that shape before (wfdir.Kind.Command exists because a per-kind string
+// was spelled twice and a third kind was routed to the wrong one by both).
+func addStackFlag(cmd *cobra.Command) {
+	cmd.PersistentFlags().StringVar(&flagStack, "stack", "",
+		"stack in ronja.json to act on (default: the one matching this credential)")
+}
 
 func Execute() {
 	if code := run(nil); code != 0 {
@@ -129,6 +183,13 @@ func run(args []string) int {
 		// the RunE path. Keep it on stderr so --json output stays parseable.
 		if !errors.Is(err, errAlreadyReported) {
 			fmt.Fprintln(os.Stderr, "error:", err)
+		}
+		// A command that named its own exit code gets it. Checked AFTER the
+		// reporting above rather than instead of it, so a coded failure is still
+		// explained on stderr like every other one.
+		var coded *exitCodeError
+		if errors.As(err, &coded) {
+			return coded.code
 		}
 		return 1
 	}
@@ -179,6 +240,18 @@ JSON body:
   ronja pipeline       develop a feature's derived tables from a local folder
                        (init, clone, status, push, publish, discard)
 
+A folder of any of those three kinds can name the rows it reads but does not
+own, so the same folder deploys to more than one organization:
+
+  ronja bind           point this folder's declared dependencies at the rows
+                       this organization calls by those names
+
+And a repository holds many folders, so one command asks about all of them:
+
+  ronja sync status    walk a directory for every folder and report which ones
+                       have drifted — read-only, and a CI gate on its own
+                       (0 clean, 1 drifted, 2 could not tell)
+
 Each login is stored as a named PROFILE — one instance, one organization, one
 token. An access token belongs to a single organization, so belonging to two
 means two profiles, and a local backend and production can be signed in at the
@@ -203,9 +276,20 @@ credentials entirely and never touch disk.`,
 	root.PersistentFlags().BoolVar(&flagJSON, "json", false,
 		"emit machine-readable JSON on stdout")
 
+	// `bind` sits at the ROOT rather than inside one of the three folder groups,
+	// and that is not a filing preference: `dependencies` is a manifest key every
+	// folder kind carries, so the command is kind-agnostic and works in whichever
+	// folder it is run from. Registering it three times would be three commands
+	// that have to stay identical, and the kind it acted on would be decided by
+	// which verb somebody happened to type.
+	// `sync` sits at the ROOT for the same reason `bind` does, one level up: it
+	// is about a TREE of folders rather than the one you are standing in, and
+	// the folders in it are of several kinds. Filing it under any single kind's
+	// verb would be filing a repository-wide question under one of its answers.
 	root.AddCommand(newLoginCmd(), newLogoutCmd(), newWhoamiCmd(), newProfileCmd(),
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
-		newPipelineCmd(), newAPICmd(), newQueryCmd(), newDatabaseCmd())
+		newPipelineCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(),
+		newAPICmd(), newQueryCmd(), newDatabaseCmd())
 	return root
 }
 

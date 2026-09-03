@@ -74,8 +74,12 @@ func metadataPatch(manifest *wfdir.Manifest, target *api.Workflow) api.WorkflowP
 	// instance that did not say (the field predates this CLI's contract with it),
 	// and patching a runtime on that guess would be changing semantics on a hunch.
 	// The DOWNGRADE half is not expressible here at all — checkRuntimeDrift
-	// refuses it before the push writes anything, because a folder that declares
+	// refuses it before the push writes anything, because a folder that DECLARES
 	// runtime 1 against a Durable row is a mistake to report, not a patch to skip.
+	// A folder declaring NOTHING never reaches either branch: RuntimeVersion()
+	// answers RuntimeDefault for an absent key, and RuntimeDefault is the lowest
+	// runtime there is, so the `>` below cannot hold against any row the server
+	// actually reported.
 	if target.RuntimeVersion > 0 && manifest.RuntimeVersion() > target.RuntimeVersion {
 		patch.RuntimeVersion = manifest.RuntimeVersion()
 	}
@@ -96,18 +100,36 @@ func metadataPatch(manifest *wfdir.Manifest, target *api.Workflow) api.WorkflowP
 // Runs against the LIVE row, before the push writes anything — the point is to
 // fail before a file lands, not after.
 //
-// A row reporting runtime 0 said nothing (an instance older than this contract),
-// and an unbound folder has no row at all: both answer "no opinion" rather than
-// a refusal built on a missing value.
+// THREE states answer "no opinion" rather than a refusal built on a missing
+// value: a row reporting runtime 0 said nothing (an instance older than this
+// contract), an unbound folder has no row at all, and a manifest with no
+// `runtime` key DECLARES nothing — which is the state this guard reads through
+// Manifest.Runtime rather than RuntimeVersion(). RuntimeVersion() substitutes
+// RuntimeDefault for an absent key, and reading that substitution as a
+// declaration made every unpinned folder bound to a runtime-3 row refuse EVERY
+// push until somebody hand-edited ronja.json — a downgrade nobody asked for,
+// reported as if they had. Which runtime such a folder's candidate is checked
+// against is a separate question, and RuntimeForValidate already answers it: the
+// live row's.
 func checkRuntimeDrift(f *folder, live *api.Workflow) error {
 	if live == nil || live.RuntimeVersion == 0 {
+		return nil
+	}
+	if f.Manifest.Runtime == 0 {
 		return nil
 	}
 	if f.Manifest.RuntimeVersion() >= live.RuntimeVersion {
 		return nil
 	}
-	return fmt.Errorf("this folder declares runtime %d, but %s is already runtime %d (Durable) on the server — the runtime is a one-way upgrade and cannot be lowered.\n  Set \"runtime\": %d in %s to match, or clone the workflow again into a fresh folder",
-		f.Manifest.RuntimeVersion(), live.ID, live.RuntimeVersion,
+	// The server's runtime is NAMED, not just numbered — the message asks the
+	// author to adopt that value, and one that mis-describes it (every runtime
+	// above 1 used to read "(Durable)") is asking them to adopt something else.
+	served := fmt.Sprintf("%d", live.RuntimeVersion)
+	if label, _ := runtimeInfo(live.RuntimeVersion); label != "" {
+		served = fmt.Sprintf("%d (%s)", live.RuntimeVersion, label)
+	}
+	return fmt.Errorf("this folder declares runtime %d, but %s is already runtime %s on the server — the runtime is a one-way upgrade and cannot be lowered.\n  Set \"runtime\": %d in %s to match, or clone the workflow again into a fresh folder",
+		f.Manifest.RuntimeVersion(), live.ID, served,
 		live.RuntimeVersion, wfdir.ManifestPath(f.Root))
 }
 

@@ -144,6 +144,10 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 	if err != nil {
 		return nil, err
 	}
+	codec := newPipelineCodec(f, local)
+	// Reported, never refused: publish acts on drafts that are already staged and
+	// built, and a bind that has gone missing since the push cannot un-build them.
+	noteAliasReport(checkAliases(f.Manifest, f.selection(), f.Codec, local, folderStems(f.Kind, local), folderFieldRefs(f.Kind, local)))
 	inst := pipelineBaseline(f)
 
 	var targets []string
@@ -169,7 +173,7 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 	// input-staleness warning below fire or not fire depending on nothing more
 	// than the alphabet. Ordered, the warning at least means the same thing every
 	// run.
-	targets = orderPublishTargets(local, f.Binding, targets)
+	targets = orderPublishTargets(codec, local, targets)
 
 	// The route is decided UP FRONT from the two facts that decide it
 	// server-side — the feature's scope and the caller's role — rather than by
@@ -240,9 +244,9 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 			result.Error = interruptedMessage
 			return result, errors.New(interruptedMessage)
 		}
-		file := publishOneTable(ctx, client, f, inst, path, local, byID, routing)
+		file := publishOneTable(ctx, client, f, codec, inst, path, local, byID, routing)
 		result.Files = append(result.Files, file)
-		if err := wfdir.SaveState(f.Root, f.State); err != nil {
+		if err := f.saveBaseline(); err != nil {
 			// A commit is irreversible server-side, and a baseline that cannot be
 			// written does not get better by committing more drafts into it — a
 			// read-only .ronja/ or a full disk fails identically on every remaining
@@ -290,7 +294,7 @@ type publishRouting struct {
 	NoRequestReview bool
 }
 
-func publishOneTable(ctx context.Context, client *api.Client, f *folder, inst *wfdir.InstanceState,
+func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec pipelineCodec, inst *wfdir.InstanceState,
 	path string, local map[string]string, byID map[string]*api.TableListItem, routing publishRouting) pipelinePublishedFile {
 
 	out := pipelinePublishedFile{Path: path, TableID: f.Binding.Tables[path]}
@@ -360,7 +364,28 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, inst *w
 		out.Warnings = append(out.Warnings, warning)
 		fmt.Fprintf(os.Stderr, "  Warning: %s\n", warning)
 	}
-	if stale := staleInputs(local[path], byID, draft.UpdatedAt); len(stale) > 0 {
+	// Resolved, so a ref spelled as an alias or a sibling's stem is checked too. A
+	// name that could not be resolved is simply dropped by DeriveInputModels, which
+	// is the right way for a heuristic warning to degrade — it under-reports rather
+	// than naming a table nobody referenced.
+	//
+	// The FALLBACK is what keeps that true. toWire refuses a whole file on a
+	// folder-level problem (an ambiguous stem, a self-reference, one sibling
+	// spelled two ways) and answers "" when it does — and "" holds no refs at all,
+	// so taking it would make this warning VANISH for that file rather than
+	// under-report, which is the opposite of what the paragraph above promises.
+	// An ambiguous stem needs nothing more than two same-named .sql files in
+	// different subdirectories, so this is an ordinary folder, not a corrupt one.
+	// The file as written is the honest substitute: its id-form refs are still
+	// checked, and only the names this codec could not resolve go unexamined.
+	wire := local[path]
+	if resolved, wireErr := codec.toWire(path, wire); wireErr == nil {
+		wire = resolved
+	} else {
+		fmt.Fprintf(os.Stderr, "  Note: %v — the upstream-staleness check for %s ran on the file as written, so it may miss a table named by an alias or by a sibling's stem.\n",
+			wireErr, path)
+	}
+	if stale := staleInputs(wire, byID, draft.UpdatedAt); len(stale) > 0 {
 		// GetDependents excludes shadow rows, so a staged draft is never
 		// invalidated by an upstream publish: the confidence report silently
 		// decays between push and publish, and nothing else would say so.
@@ -450,7 +475,11 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, inst *w
 	live, liveErr := client.GetTable(ctx, out.TableID)
 	liveCode, unresolved := "", true
 	if liveErr == nil {
-		liveCode, unresolved = live.CanonicalCode()
+		// De-aliased, because liveCode is what recordSynced writes as this file's
+		// content baseline below — and that baseline is compared against the hash
+		// of the bytes on disk. Recording the server's id form there would make
+		// every aliased file read as modified the instant it was published.
+		liveCode, unresolved = codec.canonicalDisk(local[path], live)
 	}
 	// The only proof a commit whose request timed out actually landed: the live
 	// table holds what the draft held. Reported honestly when it does not, rather
@@ -458,7 +487,7 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, inst *w
 	// rejecting the draft, and an author told they published is an author who
 	// stops looking.
 	if unconfirmed {
-		stagedCode, stagedUnresolved := staged.CanonicalCode()
+		stagedCode, stagedUnresolved := codec.canonicalDisk(local[path], staged)
 		switch {
 		case liveErr != nil:
 			return refuse("committing %s timed out and your draft is gone, but %s could not be read to find out whether it landed (%v) — look at it in the web app before publishing again",
@@ -470,7 +499,7 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, inst *w
 	}
 	out.Outcome = outcomePublished
 	out.Detail = fmt.Sprintf("committed onto %s", out.TableID)
-	out.Cascade = folderDependents(local, f.Binding, out.TableID)
+	out.Cascade = folderDependents(codec, local, out.TableID)
 	// Both fingerprints now describe the same thing, and it is the LIVE table:
 	// the draft they were taken from does not exist any more. Best-effort — the
 	// server-side change has already happened, and failing the command afterwards
@@ -481,7 +510,7 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, inst *w
 	case unresolved:
 		fmt.Fprintf(os.Stderr, "  Note: %s was published, but its stored SQL canonicalizes to something this client cannot read, so the baseline was left alone.\n", path)
 	default:
-		recordLiveAgreement(inst, path, out.TableID, liveCode)
+		recordLiveAgreement(f.live(inst), path, out.TableID, liveCode)
 		recordSynced(inst, path, liveCode)
 		out.URL = live.URL
 	}
@@ -497,8 +526,8 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, inst *w
 // — a file that has left the folder but still has a staged draft — is appended
 // rather than DROPPED. Dropping it would silently publish fewer drafts than the
 // caller asked for.
-func orderPublishTargets(local map[string]string, binding wfdir.Binding, targets []string) []string {
-	ordered, err := topoOrder(local, binding, targets)
+func orderPublishTargets(c pipelineCodec, local map[string]string, targets []string) []string {
+	ordered, err := topoOrder(c, local, targets)
 	if err != nil {
 		return targets
 	}
@@ -558,9 +587,9 @@ func staleInputs(code string, byID map[string]*api.TableListItem, builtAt time.T
 // entirely, a mid-build dependent is skipped, a dependent with a dangling input
 // is parked) mean a confident tenant-wide N would be wrong in ways nobody could
 // check. What this folder holds is a number the reader can verify by looking.
-func folderDependents(local map[string]string, binding wfdir.Binding, tableID string) int {
+func folderDependents(c pipelineCodec, local map[string]string, tableID string) int {
 	self := ""
-	for path, id := range binding.Tables {
+	for path, id := range c.f.Binding.Tables {
 		if id == tableID {
 			self = path
 		}
@@ -570,11 +599,26 @@ func folderDependents(local map[string]string, binding wfdir.Binding, tableID st
 		if path == self {
 			continue
 		}
+		reads := false
 		for _, id := range tablerefs.DeriveInputModels(code) {
 			if id == tableID {
-				count++
+				reads = true
 				break
 			}
+		}
+		// The other spelling: a sibling ref by STEM names no id at all, so the
+		// scan above cannot see it. Only meaningful when the table is one this
+		// folder builds — a stem names a file, and a table with no file has none.
+		if !reads && self != "" {
+			for _, dep := range c.folderUpstreams(code) {
+				if dep == self {
+					reads = true
+					break
+				}
+			}
+		}
+		if reads {
+			count++
 		}
 	}
 	return count
