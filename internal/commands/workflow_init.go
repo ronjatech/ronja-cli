@@ -16,11 +16,14 @@ import (
 // optionally a script you already have) into a workflow folder WITHOUT creating
 // anything server-side.
 //
-// Nothing remote is the point. Converting an existing script into a workflow is
-// an iterate-to-green process — markers to add, parameters to declare, secrets
-// to bind — and doing that against a half-built workflow row means every failed
-// attempt leaves state behind for someone to clean up. Here the first push is
-// the first thing that exists.
+// It CREATES nothing remote, which is the point. Converting an existing script
+// into a workflow is an iterate-to-green process — markers to add, parameters to
+// declare, secrets to bind — and doing that against a half-built workflow row
+// means every failed attempt leaves state behind for someone to clean up. Here
+// the first push is the first thing that exists.
+//
+// It does READ: one GET confirming --feature names a feature this credential can
+// reach, before anything is written. See confirmFeatureIn.
 func newWorkflowInitCmd() *cobra.Command {
 	var fromPath string
 	var featureID string
@@ -132,6 +135,15 @@ so a plain init scaffolds for the one it is about to create.`,
 				return fmt.Errorf("read %s: %w", wfdir.ManifestPath(root), err)
 			}
 
+			// The one thing about --feature this command can actually settle,
+			// and it settles it before a single byte is written: not the copied
+			// entrypoint, not the scaffold, not the manifest. A refusal here
+			// leaves the directory as it found it, so there is nothing to clean
+			// up before running init again with the right id.
+			if err := confirmFeatureIn(cmd.Context(), featureID, resolved); err != nil {
+				return err
+			}
+
 			entrypoint := wfdir.DefaultEntrypoint
 			copied := false
 			var warnings []string
@@ -231,13 +243,19 @@ so a plain init scaffolds for the one it is about to create.`,
 
 			if flagJSON {
 				payload := map[string]any{
-					"root":       root,
-					"manifest":   wfdir.ManifestPath(root),
-					"url":        resolved.URL,
-					"kind":       wfdir.KindWorkflow,
-					"title":      title,
-					"entrypoint": entrypoint,
-					"featureID":  featureID,
+					"root":     root,
+					"manifest": wfdir.ManifestPath(root),
+					"url":      resolved.URL,
+					// The organization the binding names, alongside the instance.
+					// `url` alone was never the whole target — a folder is bound to
+					// (instance, organization), and a script reading back what init
+					// just wrote had to go and ask for the half init already knew.
+					"tenantID":     resolved.TenantID,
+					"organization": describeOrganization(resolved),
+					"kind":         wfdir.KindWorkflow,
+					"title":        title,
+					"entrypoint":   entrypoint,
+					"featureID":    featureID,
 					// bound carries `wf status`'s meaning, not a second one:
 					// the folder HAS an entry for this instance, which init just
 					// wrote. The two commands disagreeing about the same folder
@@ -260,7 +278,7 @@ so a plain init scaffolds for the one it is about to create.`,
 				}
 				return emitJSON(payload)
 			}
-			printInitReport(root, resolved.URL, title, entrypoint, featureID, fromPath, copied, effectiveRuntime, scaffolded)
+			printInitReport(root, describeTarget(resolved), title, entrypoint, featureID, fromPath, copied, effectiveRuntime, scaffolded)
 			for _, w := range warnings {
 				fmt.Fprintf(os.Stderr, "  Note: %s\n", w)
 			}
@@ -492,7 +510,7 @@ func writeDurableScaffold(root, entrypoint string, runtime int) (bool, error) {
 	return true, nil
 }
 
-func printInitReport(root, url, title, entrypoint, featureID, fromPath string, copied bool, runtime int, scaffolded bool) {
+func printInitReport(root, target, title, entrypoint, featureID, fromPath string, copied bool, runtime int, scaffolded bool) {
 	out := os.Stdout
 	fmt.Fprintf(out, "  Workflow folder ready in %s\n\n", root)
 	fmt.Fprintf(out, "  Title:      %s\n", title)
@@ -501,7 +519,7 @@ func printInitReport(root, url, title, entrypoint, featureID, fromPath string, c
 	if _, sentence := runtimeInfo(runtime); sentence != "" {
 		fmt.Fprintf(out, "  Runtime:    %d — %s\n", runtime, sentence)
 	}
-	fmt.Fprintf(out, "  Instance:   %s (not pushed yet)\n", url)
+	fmt.Fprintf(out, "  Target:     %s (not pushed yet)\n", target)
 	if copied {
 		fmt.Fprintf(out, "\n  Copied %s -> %s\n", fromPath, entrypoint)
 	} else if scaffolded {

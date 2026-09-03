@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -111,7 +112,159 @@ func ensureTenant(ctx context.Context, resolved *config.Resolved) error {
 		return fmt.Errorf("this token belongs to no organization, so there is nothing to work with — join one in the web app first")
 	}
 	resolved.TenantID = me.Tenant.ID
+	// The NAME, from the one call that already asked. describeTarget prints an
+	// id when it has nothing better, and "organization ten-8f21… has no feature"
+	// is a sentence nobody can act on; a second request to make it readable
+	// would not be worth it, but the answer is already in this response.
+	resolved.TenantName = me.Tenant.Name
 	return nil
+}
+
+// featureProbeTimeout bounds the advisory feature-reachability probe. It is
+// deliberately much shorter than a request deadline: the probe only ever warns,
+// so a slow instance must not make starting a folder slow.
+const featureProbeTimeout = 3 * time.Second
+
+// confirmFeatureIn asks whether --feature names a feature this credential can
+// reach in the organization it is about to be bound to.
+//
+// One GET, and it is the only request `init` makes beyond the organization
+// lookup. The folder records a feature id that nothing reads until the first
+// push, so before this the whole loop — init, write code, push — could run to
+// the end against a feature in another organization and fail there, with the
+// binding already committed to a file under review.
+//
+// Called BEFORE the manifest is written, so a refusal leaves the directory
+// exactly as it found it.
+//
+// It refuses only on an ANSWER ABOUT THE FEATURE. An instance that does not
+// answer earns a warning and nothing more: init already needs a credential, and
+// making it also need a live instance would turn an outage into "cannot start a
+// folder" — the class of message this exists to remove.
+//
+// A 401/403 is the second such case, and it is not an outage — it is an answer
+// about the CREDENTIAL rather than about the feature. GET /api/v2/feature/:id
+// carries ScopeStructure while the folder loops are ScopeAutomation and
+// ScopeData, so a PAT minted with only `automation:write` can push this folder
+// perfectly well and still be refused the probe. Refusing init there would stop
+// a loop that was going to work, over a question the credential was never
+// allowed to ask.
+func confirmFeatureIn(ctx context.Context, featureID string, resolved *config.Resolved) error {
+	if featureID == "" {
+		return nil
+	}
+	// The probe gets its OWN short deadline, shorter than any request deadline
+	// the caller is working under.
+	//
+	// init and bind wrote files and nothing else before this; against an
+	// unreachable instance the probe turned an instant local scaffold into a
+	// wait for the full request timeout with nothing printed. Every non-answer
+	// here already warns and carries on, so the only thing a longer wait can
+	// buy is a slower path to the same warning — and this is advisory: what it
+	// establishes, the first push establishes again. A couple of seconds is
+	// enough to tell a reachable instance from an unreachable one.
+	//
+	// A deadline this short is still a context.DeadlineExceeded, which
+	// api.IsTimeout reports and the arm below turns into the ordinary
+	// warn-and-continue — so hitting it never reads as a verdict on the
+	// feature.
+	ctx, cancel := context.WithTimeout(ctx, featureProbeTimeout)
+	defer cancel()
+	// newClient rather than api.New, for the reason it is a var at all: it is
+	// the seam a test uses to make this one request behave like a real network
+	// — a deadline especially, which is the arm below and cannot otherwise be
+	// reached without waiting a real timeout out.
+	_, err := newClient(resolved.URL, resolved.Token).GetFeature(ctx, featureID)
+	if err == nil {
+		return nil
+	}
+	if api.Unanswered(err) {
+		fmt.Fprintf(os.Stderr, "  Note: could not confirm feature %s is reachable in %s — the instance did not answer (%v); the first push will check.\n",
+			featureID, describeTarget(resolved), err)
+		return nil
+	}
+	// A deadline is deliberately NOT api.Unanswered — it stopped at our end, not
+	// the instance's, and the callers that ask about a WRITE have to go and look
+	// rather than assume. This probe is not one of them: it writes nothing, and
+	// what it wanted was an answer about the feature. A request that ran out of
+	// time produced none, which is exactly the case the arm above exists for —
+	// init must not need a live instance, and a slow instance is no more an
+	// answer about the feature than a dead one is. The wording keeps them apart
+	// so the reader can tell "nothing came back" from "not in time", which is
+	// the difference between an outage and a --timeout worth raising.
+	if api.IsTimeout(err) {
+		fmt.Fprintf(os.Stderr, "  Note: could not confirm feature %s is reachable in %s — the instance did not answer in time (%v); the first push will check.\n",
+			featureID, describeTarget(resolved), err)
+		return nil
+	}
+	if status := api.StatusOf(err); status == http.StatusUnauthorized || status == http.StatusForbidden {
+		fmt.Fprintf(os.Stderr, "  Note: could not confirm feature %s is reachable in %s — this credential may not read features (HTTP %d); the first push will check.\n",
+			featureID, describeTarget(resolved), status)
+		return nil
+	}
+	if message, ok := explainFeatureUnreachable(err, featureID, resolved); ok {
+		return fmt.Errorf("%s\n  %s", message, signedInAdvice(resolved))
+	}
+	return fmt.Errorf("check feature %s on %s: %w", featureID, describeTarget(resolved), err)
+}
+
+// signedInAdvice names the credential in play, so the reader can tell "wrong
+// feature" from "right feature, wrong organization" without going and looking.
+func signedInAdvice(resolved *config.Resolved) string {
+	switch {
+	case resolved.FromEnv:
+		return fmt.Sprintf("Your $RONJA_TOKEN reaches %s. If the feature is in another organization, use that organization's token and run init again.",
+			describeTarget(resolved))
+	case resolved.Profile != "":
+		return fmt.Sprintf("You are signed in as profile %q, which reaches %s. If the feature is in another organization: `ronja profile use <name>` (or `ronja login` there) and run init again.",
+			resolved.Profile, describeTarget(resolved))
+	default:
+		return fmt.Sprintf("You are signed in to %s. If the feature is in another organization, sign in there and run init again.",
+			describeTarget(resolved))
+	}
+}
+
+// explainFeatureUnreachable recognises the one server answer that means "that
+// feature id is not one you can use here", and says so in words.
+//
+// THREE codes, because the CLI ships on its own tag and has to be right against
+// every backend still in the field. A backend deployed before the message fix
+// answers the raw table.ErrNoRows sentinel ("no rows"); a current one answers
+// "feature not found", hoisted into rfeature.MapLookupError so every route that
+// resolves a feature says the same thing. The bare "not found" arm is for the
+// generation in between: POST /api/v2/workflow and /workflow/validate answered
+// gt.NewNotfoundError("not found") for a same-organization feature the caller
+// cannot read, and without this arm a push against one of those prints
+// "validate before pushing: not found (HTTP 404)" — a sentence with nothing in
+// it about features at all.
+//
+// That last arm is STATUS-GATED to 404 on purpose. "not found" is a sentinel
+// generic enough for any route to answer, and reading a 400 carrying it as an
+// answer about the feature would put a confident feature story in front of a
+// reader whose actual refusal was about something else entirely. The other two
+// codes name the feature themselves, so they are safe on either status.
+//
+// The message deliberately does not claim the feature is in another
+// organization. The CLI cannot know: RLS makes "another organization", "another
+// user's private feature" and "mistyped" one answer by design, and picking one
+// of the three would be the same species of confident-and-wrong the raw sentinel
+// already was.
+func explainFeatureUnreachable(err error, featureID string, resolved *config.Resolved) (string, bool) {
+	status := api.StatusOf(err)
+	switch api.CodeOf(err) {
+	case "no rows", "feature not found":
+		if status != 400 && status != 404 {
+			return "", false
+		}
+	case "not found":
+		if status != 404 {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	return fmt.Sprintf("organization %s has no feature %s you can reach — it belongs to another organization, it is someone else's private feature, or the id is mistyped.",
+		describeTarget(resolved), featureID), true
 }
 
 // folder is an opened synced folder — a workflow's or a data app's — plus the
@@ -854,11 +1007,80 @@ func (f *folder) featureAdvice() string {
 // featureAdviceForAnotherOrganization is featureAdvice for the case where this
 // folder names OTHER organizations here and none for this one — where the fix is
 // a whole new entry rather than one more key on an existing line.
+//
+// `ronja bind --stack <name> --feature <id>` first, because it is the one
+// command that does the whole thing: it declares the stack, records the
+// organization, and records the feature its resources are created in. Hand
+// editing the manifest is still named, since a folder that predates stacks has
+// no stack to declare.
 func (f *folder) featureAdviceForAnotherOrganization() string {
 	if f.Manifest.UsesStacks() {
-		return fmt.Sprintf("Name this one with --stack <name> on the next push, or add a stack for it to %s with its own \"featureID\"", wfdir.ManifestPath(f.Root))
+		return fmt.Sprintf("Add it with `ronja bind --stack <name> --feature <a feature in %s>`, which declares the stack and the feature its resources are created in", describeOrganization(f.Resolved))
 	}
-	return fmt.Sprintf("Add an entry with \"tenantID\": %q and its own \"featureID\"", f.Key.TenantID)
+	return fmt.Sprintf("Add it with `ronja bind --stack <name> --feature <a feature in %s>`, or add an entry with \"tenantID\": %q and its own \"featureID\" by hand",
+		describeOrganization(f.Resolved), f.Key.TenantID)
+}
+
+// featureFixAdvice says what to do about a feature id this credential cannot
+// reach — which is a different problem from a folder with no feature id at all,
+// and takes a different fix.
+//
+// It names the manifest when the id is COMMITTED there: it is not something the
+// reader typed on this command, and telling them to "check the id" without
+// saying where it is written sends them looking.
+//
+// Only when it really is, though. featureIDFor falls back to the workflow row's
+// own featureID for a hand-written manifest that names a workflow and no
+// feature, and pointing that reader at a manifest key that is not in their file
+// is the same sending-them-looking one case over — worse, because they will go
+// and read the file to check.
+func (f *folder) featureFixAdvice() string {
+	source := fmt.Sprintf("That id comes from this folder's binding for %s in %s.",
+		describeOrganization(f.Resolved), wfdir.ManifestPath(f.Root))
+	if f.Binding.FeatureID == "" {
+		source = fmt.Sprintf("This folder's binding for %s in %s records no feature, so the id came from the %s it is bound to.",
+			describeOrganization(f.Resolved), wfdir.ManifestPath(f.Root), f.Kind.Label)
+	}
+	return fmt.Sprintf("%s To create the %s there instead, point the binding at a feature %s can reach: `ronja bind --stack <name> --feature <id>`. To push where the feature actually lives, sign in to that organization and start a folder there.",
+		source, f.Kind.Label, describeOrganization(f.Resolved))
+}
+
+// describeOrganizationID names an organization this folder's manifest records,
+// which is an id on the page and a name only if a stored profile happens to
+// hold one for it.
+//
+// A credential file lookup rather than a request: naming the OTHER organization
+// in a refusal is worth a map read, and is not worth a round trip on a path that
+// is already refusing. An id is the honest answer when nothing here has ever
+// been signed in to that organization.
+//
+// The credential file is passed IN rather than loaded here: this is a per-id
+// helper, and reading and parsing the whole file once per organization named in
+// one sentence is work nobody asked for. A nil file is the read having failed,
+// which is the same answer as a file with nothing in it — the id.
+func (f *folder) describeOrganizationID(file *config.File, tenantID string) string {
+	if file == nil {
+		return tenantID
+	}
+	if _, profile := file.FindIdentity(f.Resolved.URL, tenantID); profile != nil && profile.TenantName != "" {
+		return fmt.Sprintf("%s (%s)", profile.TenantName, tenantID)
+	}
+	return tenantID
+}
+
+// describeOrganizationIDs is describeOrganizationID over a list, for the
+// refusals that name every organization a folder does have an entry for. It is
+// the only caller, and it is where the one credential-file read happens.
+func (f *folder) describeOrganizationIDs(tenantIDs []string) string {
+	file, err := config.Load()
+	if err != nil {
+		file = nil
+	}
+	out := make([]string, 0, len(tenantIDs))
+	for _, id := range tenantIDs {
+		out = append(out, f.describeOrganizationID(file, id))
+	}
+	return strings.Join(out, ", ")
 }
 
 // describeTarget names where a command just wrote, as instance plus
@@ -870,12 +1092,16 @@ func (f *folder) featureAdviceForAnotherOrganization() string {
 // actually happens, and it is worth one line to make that visible at the moment
 // it occurs.
 //
-// The organization's NAME when a profile recorded one, its id otherwise (an
-// environment token was never introduced to us).
+// The organization's NAME when a profile recorded one or the /me call ensureTenant
+// makes has since supplied one, its id otherwise (an environment token on a
+// command that never had to ask).
 func describeTarget(resolved *config.Resolved) string {
 	org := ""
 	if resolved.Entry != nil && !resolved.FromEnv {
 		org = resolved.Entry.TenantName
+	}
+	if org == "" {
+		org = resolved.TenantName
 	}
 	if org == "" {
 		org = resolved.TenantID
@@ -884,6 +1110,22 @@ func describeTarget(resolved *config.Resolved) string {
 		return resolved.URL
 	}
 	return fmt.Sprintf("%s on %s", org, resolved.URL)
+}
+
+// describeOrganization is describeTarget's organization half on its own, for the
+// --json payloads that already carry `url` and would otherwise repeat it inside
+// a second string.
+//
+// The NAME when anything knows one, the id otherwise — never empty in practice,
+// since every caller has resolved the organization by the time it reports.
+func describeOrganization(resolved *config.Resolved) string {
+	if resolved.Entry != nil && !resolved.FromEnv && resolved.Entry.TenantName != "" {
+		return resolved.Entry.TenantName
+	}
+	if resolved.TenantName != "" {
+		return resolved.TenantName
+	}
+	return resolved.TenantID
 }
 
 // refuseUnclonable reports why a workflow row cannot back a folder, or nil when

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -438,6 +439,533 @@ func TestAppPushReportsFinalCompileFailure(t *testing.T) {
 	}
 	if base := appStateOf(t, root).For(f.Key()); base == nil || len(base.Files) != 1 {
 		t.Errorf("the baseline should record the pushed file, got %+v", base)
+	}
+}
+
+// TestAppPushSaysTheCompilerDidNotAnswer pins the third outcome of the closing
+// validate, between "compiles" and "does not compile": the compiler never
+// answered at all.
+//
+// Before this, a 5xx from POST :id/validate fell into the push's generic stop,
+// which sets Error with a nil Compiles — the exact key the report reads as
+// "Push stopped part-way … fix the problem and push again". Every byte had in
+// fact landed, and nothing had looked at the author's files, so the CLI turned
+// an outage into a verdict about authorship. The files must be reported as
+// saved, the verdict as unknown, and the exit code non-zero — a push that
+// promised a verdict and did not deliver one is not a green CI step.
+func TestAppPushSaysTheCompilerDidNotAnswer(t *testing.T) {
+	f := newFakeAppInstance(t)
+	signInApp(t, f)
+	f.validateFails = "Internal server error"
+	f.validateStatus = http.StatusInternalServerError
+
+	root := writeAppFolder(t, t.TempDir(),
+		&wfdir.Manifest{Title: "App"},
+		map[string]string{"App.tsx": "entry"})
+	m := appManifestOf(t, root)
+	m.SetBinding(f.Key(), wfdir.Binding{FeatureID: "feat-1"})
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runCLI(t, root, "app", "push")
+	if err == nil {
+		t.Fatal("a push whose compile check never answered must exit non-zero")
+	}
+	if !strings.Contains(out, "did not answer") {
+		t.Errorf("expected the report to say the compiler did not answer, got:\n%s", out)
+	}
+	if !strings.Contains(out, "not a verdict on your files") {
+		t.Errorf("expected the report to disclaim a verdict, got:\n%s", out)
+	}
+	// The two false attributions this replaces.
+	if strings.Contains(out, "fix the problem and push again") {
+		t.Errorf("an outage must not be reported as a push the author has to fix:\n%s", out)
+	}
+	if strings.Contains(out, "not checked (--no-validate)") {
+		t.Errorf("the check WAS made; it came back empty:\n%s", out)
+	}
+	// The files really are saved, and the report has to list them as such.
+	if !strings.Contains(out, "pushed   App.tsx") {
+		t.Errorf("expected the pushed file to be listed, got:\n%s", out)
+	}
+
+	// A SECOND push, deliberately without --force, and it is an assertion in its
+	// own right: the outage must not have wedged the loop. The baseline is
+	// written before the unanswered verdict is returned, so the folder still
+	// knows what the server holds, and an ordinary push goes through.
+	//
+	// What it prints is the other half: nothing changed, so this is "Up to date"
+	// and not "1 unchanged". The outage says nothing at all about whether the
+	// files match — the push wrote nothing either way — and reporting an
+	// up-to-date folder as a push with one unchanged file is the same class of
+	// wrong statement as the one this test exists for, one degree quieter.
+	out, err = runCLI(t, root, "app", "push")
+	if err == nil {
+		t.Fatal("the compiler still is not answering; the second push must exit non-zero too")
+	}
+	if !strings.Contains(out, "Up to date") {
+		t.Errorf("a push that wrote nothing should read as up to date:\n%s", out)
+	}
+	if strings.Contains(out, "1 unchanged") {
+		t.Errorf("an up-to-date folder must not be reported as a push:\n%s", out)
+	}
+	if !strings.Contains(out, "did not answer") {
+		t.Errorf("the verdict is still unknown and the report must still say so:\n%s", out)
+	}
+
+	// And the baseline really is intact: `app status` sees no local changes and
+	// no drift. An outage that silently left the folder looking dirty would send
+	// the next reader to --force, which is the one flag that overwrites a
+	// colleague's work.
+	status, err := runCLI(t, root, "app", "status")
+	if err != nil {
+		t.Fatalf("app status after an unanswered push: %v", err)
+	}
+	if !strings.Contains(status, "clean (1 file(s) match the last sync)") {
+		t.Errorf("the baseline did not survive the outage:\n%s", status)
+	}
+	if !strings.Contains(status, "Drift since last sync") || !strings.Contains(status, "none") {
+		t.Errorf("expected no drift after the push landed:\n%s", status)
+	}
+
+	outJSON, err := runCLI(t, root, "app", "push", "--json")
+	if err == nil {
+		t.Fatal("the JSON form must exit non-zero too")
+	}
+	var raw map[string]any
+	decodeJSONInto(t, outJSON, &raw)
+	// Explicitly null, not absent: a machine reader has to be able to SEE that
+	// there is no verdict.
+	if value, present := raw["compiles"]; !present || value != nil {
+		t.Errorf("expected compiles to be present and null, got %#v (present=%v)", value, present)
+	}
+	check, ok := raw["compileCheck"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a compileCheck object, got %#v", raw["compileCheck"])
+	}
+	if check["answered"] != false {
+		t.Errorf("expected answered=false, got %#v", check["answered"])
+	}
+	if check["status"] != float64(http.StatusInternalServerError) {
+		t.Errorf("expected status=500, got %#v", check["status"])
+	}
+	// The exit code is non-zero, so `error` has to say why. It used to be "",
+	// which every consumer that branches on `.error != ""` reads as success —
+	// the same outage-as-green-build this whole path exists to stop, arriving by
+	// a different door.
+	if text, _ := raw["error"].(string); text == "" {
+		t.Errorf("a non-zero push must say why in `error`: %#v", raw["error"])
+	}
+	if raw["upToDate"] != true {
+		t.Errorf("a push that wrote nothing is up to date, verdict or no verdict: %#v", raw["upToDate"])
+	}
+}
+
+// TestAppPushSaysTheValidateNeverReachedTheInstance is the OTHER shape of "no
+// verdict": nothing came back at all, so there is no status to quote.
+//
+// api.StatusOf is 0 here while api.Unanswered is still true, and the two have to
+// be rendered differently — "HTTP 0 from POST …/validate" names a status code
+// that does not exist, and a reader checking their instance's logs for it finds
+// nothing, because the request never got there to be logged.
+func TestAppPushSaysTheValidateNeverReachedTheInstance(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "entry"})
+	signInApp(t, f)
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "entry"})
+	writeLocal(t, root, "App.tsx", "changed")
+	failOnceWithAConnectionError(t, "POST", "/api/v2/dataapp/data_app-draft-1/validate")
+
+	out, err := runCLI(t, root, "app", "push")
+	if err == nil {
+		t.Fatal("a push whose compile check never reached the instance must exit non-zero")
+	}
+	if !strings.Contains(out, "never reached the instance") {
+		t.Errorf("expected the report to say the request never landed, got:\n%s", out)
+	}
+	if strings.Contains(out, "HTTP 0") {
+		t.Errorf("there is no such status; nothing answered:\n%s", out)
+	}
+	if !strings.Contains(out, "not a verdict on your files") {
+		t.Errorf("expected the report to disclaim a verdict, got:\n%s", out)
+	}
+	// The files still landed — the writes finished before the validate — and the
+	// report has to say so.
+	if !strings.Contains(out, "pushed   App.tsx") {
+		t.Errorf("expected the pushed file to be listed, got:\n%s", out)
+	}
+
+	// The interception fires ONCE, so the next push is an ordinary one — which is
+	// itself the assertion: an outage at the verdict must not wedge the loop, and
+	// the baseline written before the unanswered return is what lets a plain
+	// push (no --force) go through. The verdict that comes back is a real one,
+	// and it carries no compileCheck.
+	outJSON, err := runCLI(t, root, "app", "push", "--json")
+	if err != nil {
+		t.Fatalf("the loop was wedged by an outage at the verdict: %v", err)
+	}
+	var raw map[string]any
+	decodeJSONInto(t, outJSON, &raw)
+	if raw["compiles"] != true {
+		t.Errorf("expected a real verdict on the retry, got %#v", raw["compiles"])
+	}
+	if _, present := raw["compileCheck"]; present {
+		t.Errorf("an answered validate must carry no compileCheck: %#v", raw["compileCheck"])
+	}
+}
+
+// TestAppPushSaysTheCompileCheckRanPastTheDeadline is the THIRD way the closing
+// validate can end without a verdict, and the one that used to be reported
+// worst of all.
+//
+// A deadline is ours, not the instance's: the compile was still running when we
+// stopped listening, and may well have finished a moment later. It used to fall
+// into the push's generic stop — "Push stopped part-way: check whether <id>
+// compiles: …" followed by "fix the problem and push again" — which is the same
+// false attribution as the unanswered case, on the failure where the compiler
+// had said nothing at all because it had not finished speaking. Every byte had
+// landed, and nothing had refused anything.
+//
+// It is told apart from an outage rather than folded into it because the two
+// have different remedies: one is "ask again", the other is "look at your
+// instance".
+func TestAppPushSaysTheCompileCheckRanPastTheDeadline(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "entry"})
+	signInApp(t, f)
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "entry"})
+	writeLocal(t, root, "App.tsx", "changed")
+	failOnceWithATimeout(t, "POST", "/api/v2/dataapp/data_app-draft-1/validate")
+
+	out, err := runCLI(t, root, "app", "push")
+	if err == nil {
+		t.Fatal("a push whose compile check timed out must exit non-zero")
+	}
+	if !strings.Contains(out, "ran past the CLI's deadline") {
+		t.Errorf("expected the deadline to be named, got:\n%s", out)
+	}
+	if strings.Contains(out, "did not answer") {
+		t.Errorf("a deadline at our end is not the instance failing to answer:\n%s", out)
+	}
+	// The two false attributions, and the reason this test changed shape.
+	if strings.Contains(out, "Push stopped part-way") {
+		t.Errorf("the push did not stop — every byte landed before the check:\n%s", out)
+	}
+	if strings.Contains(out, "fix the problem") {
+		t.Errorf("nothing refused the author's files:\n%s", out)
+	}
+	if strings.Contains(out, "not checked (--no-validate)") {
+		t.Errorf("the check WAS made; it outran our patience:\n%s", out)
+	}
+	// The files really are saved, and the report has to list them as such.
+	if !strings.Contains(out, "pushed   App.tsx") {
+		t.Errorf("expected the pushed file to be listed, got:\n%s", out)
+	}
+
+	// The --json half, on a second timed-out check. The push writes nothing this
+	// time, which is an assertion of its own: a verdict that never arrived says
+	// nothing about whether the folder matches, so upToDate stands.
+	failOnceWithATimeout(t, "POST", "/api/v2/dataapp/data_app-draft-1/validate")
+	outJSON, err := runCLI(t, root, "app", "push", "--json")
+	if err == nil {
+		t.Fatal("the JSON form must exit non-zero too")
+	}
+	var raw map[string]any
+	decodeJSONInto(t, outJSON, &raw)
+	if value, present := raw["compiles"]; !present || value != nil {
+		t.Errorf("expected compiles to be present and null, got %#v (present=%v)", value, present)
+	}
+	check, ok := raw["compileCheck"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a compileCheck object, got %#v", raw["compileCheck"])
+	}
+	if check["answered"] != false || check["timedOut"] != true {
+		t.Errorf("expected answered=false timedOut=true, got %#v", check)
+	}
+	// A non-zero exit with an empty `error` is a green result to every consumer
+	// that branches on `.error != ""` — the exact reading this exit code exists
+	// to prevent.
+	if text, _ := raw["error"].(string); text == "" {
+		t.Errorf("a non-zero push must say why in `error`: %#v", raw["error"])
+	}
+	if raw["upToDate"] != true {
+		t.Errorf("a push that wrote nothing is up to date, verdict or no verdict: %#v", raw["upToDate"])
+	}
+}
+
+// TestAppPushDoesNotBlameTheAuthorForAFailedFileWrite pins the closing sentence
+// of a push that stopped on the instance rather than on the folder.
+//
+// A 500 from PUT :id/files/:path is the server's own failure — and, for a data
+// app, one that may well have committed the file before it happened, since
+// rdataapp commits and only then recompiles and uploads. "Fix the problem and
+// push again" is a claim about the author's files on a request nothing refused,
+// and it is the last line they read.
+func TestAppPushDoesNotBlameTheAuthorForAFailedFileWrite(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "entry"})
+	f.failPut = map[string]int{"App.tsx": http.StatusInternalServerError}
+	signInApp(t, f)
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "entry"})
+	writeLocal(t, root, "App.tsx", "changed")
+
+	out, err := runCLI(t, root, "app", "push")
+	if err == nil {
+		t.Fatal("a push whose file write failed must exit non-zero")
+	}
+	if strings.Contains(out, "fix the problem") {
+		t.Errorf("a 5xx is not the author's problem to fix:\n%s", out)
+	}
+	if !strings.Contains(out, "The instance did not answer while App.tsx was being sent") {
+		t.Errorf("expected the stop to name the file in flight, got:\n%s", out)
+	}
+	if !strings.Contains(out, "not a verdict on your files") {
+		t.Errorf("expected the report to disclaim a verdict, got:\n%s", out)
+	}
+	// Still a stop, and still reported as one — the push really did not finish.
+	if !strings.Contains(out, "Push stopped part-way") {
+		t.Errorf("expected the stop to be named, got:\n%s", out)
+	}
+	// And it must say WHICH of the two definite outcomes the reconciling read
+	// found. This branch is only reached once that read has answered — the
+	// genuinely-open case is reported through the "unknown" list above it — so
+	// "that file's state is not known" understated what was in hand, and for a
+	// file that had landed it also contradicted the pushed list printed
+	// directly above.
+	if !strings.Contains(out, "Asking again showed") {
+		t.Errorf("the report did not say what the reconciling read established:\n%s", out)
+	}
+	if strings.Contains(out, "state is not known") {
+		t.Errorf("the report claimed not to know an outcome the reconciling read had settled:\n%s", out)
+	}
+}
+
+// TestAppPushWithNoValidateReportsThatNobodyAsked pins the OTHER null: nobody
+// asked. It is the control for the compileCheck field — without this half, a
+// reader could not tell that its absence means "skipped" rather than "there was
+// nothing to say".
+func TestAppPushWithNoValidateReportsThatNobodyAsked(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "entry"})
+	signInApp(t, f)
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "entry"})
+	writeLocal(t, root, "App.tsx", "changed")
+
+	out, err := runCLI(t, root, "app", "push", "--no-validate")
+	if err != nil {
+		t.Fatalf("a skipped check is not a failure: %v", err)
+	}
+	if !strings.Contains(out, "not checked (--no-validate)") {
+		t.Errorf("expected the skip to be named, got:\n%s", out)
+	}
+	if strings.Contains(out, "did not answer") {
+		t.Errorf("nothing was asked, so nothing failed to answer:\n%s", out)
+	}
+	if len(f.validated) != 0 {
+		t.Errorf("--no-validate asked anyway: %v", f.validated)
+	}
+
+	writeLocal(t, root, "App.tsx", "changed again")
+	outJSON, err := runCLI(t, root, "app", "push", "--no-validate", "--json")
+	if err != nil {
+		t.Fatalf("a skipped check is not a failure: %v", err)
+	}
+	var raw map[string]any
+	decodeJSONInto(t, outJSON, &raw)
+	// Present and null, exactly as on the unanswered path: the two are told
+	// apart by compileCheck, which is absent here because nobody asked.
+	if value, present := raw["compiles"]; !present || value != nil {
+		t.Errorf("expected compiles to be present and null, got %#v (present=%v)", value, present)
+	}
+	if _, present := raw["compileCheck"]; present {
+		t.Errorf("nobody asked, so there is no check to report: %#v", raw["compileCheck"])
+	}
+}
+
+// TestAppValidateSaysTheCompilerDidNotAnswer is the same failure on the command
+// whose entire job is the verdict. It used to surface as cobra's bare
+// "check whether <id> compiles: Internal server error (HTTP 500)", which names
+// the draft and not the outage.
+func TestAppValidateSaysTheCompilerDidNotAnswer(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "entry"})
+	f.validateFails = "Internal server error"
+	f.validateStatus = http.StatusInternalServerError
+	signInApp(t, f)
+
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "entry"})
+
+	out, err := runCLI(t, root, "app", "validate")
+	if err == nil {
+		t.Fatal("a validate that got no verdict must exit non-zero")
+	}
+	if !strings.Contains(out, "The compiler did not answer") {
+		t.Errorf("expected the outage to be named, got:\n%s", out)
+	}
+	if !strings.Contains(out, "not a verdict on your files") {
+		t.Errorf("expected the report to disclaim a verdict, got:\n%s", out)
+	}
+	if strings.Contains(out, "Compiles: NO") {
+		t.Errorf("no compiler said no:\n%s", out)
+	}
+
+	outJSON, err := runCLI(t, root, "app", "validate", "--json")
+	if err == nil {
+		t.Fatal("the JSON form must exit non-zero too")
+	}
+	var raw map[string]any
+	decodeJSONInto(t, outJSON, &raw)
+	if value, present := raw["compiles"]; !present || value != nil {
+		t.Errorf("expected compiles to be present and null, got %#v (present=%v)", value, present)
+	}
+	check, ok := raw["compileCheck"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a compileCheck object, got %#v", raw["compileCheck"])
+	}
+	if check["answered"] != false || check["status"] != float64(http.StatusInternalServerError) {
+		t.Errorf("expected answered=false status=500, got %#v", check)
+	}
+}
+
+// TestAppValidateSaysTheCompileCheckRanPastTheDeadline is the deadline half on
+// the command whose entire job is the verdict.
+//
+// It used to surface as cobra's bare "check whether <id> compiles: … context
+// deadline exceeded" — a sentence that names the draft, so it reads as a fact
+// about the author's code, when all that happened is that we stopped waiting.
+//
+// The test can only be written because this command builds its client through
+// the newClient seam: a deadline cannot be staged by a fake HTTP handler, only
+// by a transport, and waiting a real 120-second one out is not a test.
+func TestAppValidateSaysTheCompileCheckRanPastTheDeadline(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "entry"})
+	signInApp(t, f)
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "entry"})
+	failOnceWithATimeout(t, "POST", "/api/v2/dataapp/data_app-draft-1/validate")
+
+	out, err := runCLI(t, root, "app", "validate")
+	if err == nil {
+		t.Fatal("a validate that got no verdict must exit non-zero")
+	}
+	if !strings.Contains(out, "ran past the CLI's deadline") {
+		t.Errorf("expected the deadline to be named, got:\n%s", out)
+	}
+	if !strings.Contains(out, "not a verdict on your files") {
+		t.Errorf("expected the report to disclaim a verdict, got:\n%s", out)
+	}
+	if strings.Contains(out, "Compiles: NO") {
+		t.Errorf("no compiler said no:\n%s", out)
+	}
+	if strings.Contains(out, "did not answer") {
+		t.Errorf("a deadline at our end is not the instance failing to answer:\n%s", out)
+	}
+
+	failOnceWithATimeout(t, "POST", "/api/v2/dataapp/data_app-draft-1/validate")
+	outJSON, err := runCLI(t, root, "app", "validate", "--json")
+	if err == nil {
+		t.Fatal("the JSON form must exit non-zero too")
+	}
+	var raw map[string]any
+	decodeJSONInto(t, outJSON, &raw)
+	if value, present := raw["compiles"]; !present || value != nil {
+		t.Errorf("expected compiles to be present and null, got %#v (present=%v)", value, present)
+	}
+	if raw["ok"] != false {
+		t.Errorf("no verdict is not an ok verdict: %#v", raw["ok"])
+	}
+	check, ok := raw["compileCheck"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a compileCheck object, got %#v", raw["compileCheck"])
+	}
+	if check["answered"] != false || check["timedOut"] != true {
+		t.Errorf("expected answered=false timedOut=true, got %#v", check)
+	}
+}
+
+// TestAppValidateNamesAnAliasRefusalWhenTheCompilerDidNotAnswer pins the one
+// finding this command makes WITHOUT an instance.
+//
+// An alias refusal is local: it is about the folder in front of the author, and
+// it is the reason `ok` exists beside `compiles`. It used to be printed inside
+// the "Compiles: yes" branch alone, below the unanswered early return — so on
+// the one run where the server said nothing, the CLI also said nothing about
+// the problem it had found on its own, and the reader was left with "not known"
+// as though there were nothing else to report.
+func TestAppValidateNamesAnAliasRefusalWhenTheCompilerDidNotAnswer(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "const x = 1;\n"})
+	f.validateFails = "Internal server error"
+	f.validateStatus = http.StatusInternalServerError
+	signInApp(t, f)
+
+	// The access block names stack "dev"'s own row id literally, which is the
+	// refusal `app push` raises — see TestAppPushRefusesAnAccessEntryNamingABoundIdLiterally.
+	root := aliasAppFolder(t, f, tableDep(), map[string]string{"orders": "table-orders"},
+		api.DataAppAccess{AllowedTableIDs: []string{"table-orders"}},
+		map[string]string{"App.tsx": "const x = 1;\n"})
+	if err := wfdir.SaveLock(root, &wfdir.Lock{
+		Stacks: map[string]wfdir.LockStack{"dev": {DataAppID: live.ID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runCLI(t, root, "app", "validate")
+	if err == nil {
+		t.Fatal("a folder push would refuse must exit non-zero")
+	}
+	if !strings.Contains(out, "did not answer") {
+		t.Errorf("expected the outage to be named, got:\n%s", out)
+	}
+	if !strings.Contains(out, "would refuse this folder") {
+		t.Errorf("the local finding was swallowed by the outage:\n%s", out)
+	}
+}
+
+// TestAppStatusDoesNotCallAnUnvalidatedDraftBroken pins the wording of the one
+// line `app status` says about compiling.
+//
+// The wire carries a single column, validated_at: every file write clears it in
+// the same transaction and only a successful compile re-stamps it. So NULL is
+// "no clean build stands for these files" — equally true after a failed
+// compile, after a push with --no-validate, and after a compile check that
+// never answered. "NO" was never a measured fact about the author's code, and
+// no compile status is persisted anywhere for it to have been read from.
+func TestAppStatusDoesNotCallAnUnvalidatedDraftBroken(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	draft := f.AddDraft(live.ID, "data_app-draft-1", api.DataAppFile{Path: "App.tsx", Content: "entry"})
+	signInApp(t, f)
+	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "entry"})
+
+	// Stamped: the verdict exists and is a real yes.
+	out, err := runCLI(t, root, "app", "status")
+	if err != nil {
+		t.Fatalf("app status: %v", err)
+	}
+	if !strings.Contains(out, "compiles:   yes (ready to publish)") {
+		t.Errorf("a validated draft should read as ready:\n%s", out)
+	}
+
+	// Cleared, exactly as any file write clears it.
+	draft.ValidatedAt = nil
+	out, err = runCLI(t, root, "app", "status")
+	if err != nil {
+		t.Fatalf("app status: %v", err)
+	}
+	if !strings.Contains(out, "no clean build since the last change") {
+		t.Errorf("expected the wire truth, got:\n%s", out)
+	}
+	if strings.Contains(out, "compiles:   NO") {
+		t.Errorf("nothing on the wire says the draft failed to compile:\n%s", out)
 	}
 }
 
@@ -1016,6 +1544,10 @@ func TestAppPushRefusesDrift(t *testing.T) {
 // TestAppPushExplainsCreateRefusals: rdataapp.Create answers a private feature
 // the caller does not own with a deliberately opaque "feature not found", which
 // is right for the API and wrong as the last thing a CLI says.
+//
+// The unreachable-feature case carries BOTH server spellings: an instance
+// predating the message fix answers the raw table.ErrNoRows sentinel, and the
+// CLI ships on its own tag, so it has to be right against either.
 func TestAppPushExplainsCreateRefusals(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1023,7 +1555,8 @@ func TestAppPushExplainsCreateRefusals(t *testing.T) {
 		want    string
 	}{
 		{"shared feature", "admin required to create a data app in a shared feature", "needs an admin"},
-		{"private feature", "feature not found", "another user's private feature"},
+		{"private feature", "feature not found", "has no feature feat-1 you can reach"},
+		{"older backend", "no rows", "has no feature feat-1 you can reach"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1174,8 +1707,8 @@ func TestAppValidateReportsDiagnostics(t *testing.T) {
 	}
 	var result appValidateResult
 	decodeJSONInto(t, out, &result)
-	if result.Compiles {
-		t.Error("expected compiles=false")
+	if result.Compiles == nil || *result.Compiles {
+		t.Errorf("expected compiles=false, got %+v", result.Compiles)
 	}
 	if result.CompileError == nil || !strings.Contains(result.CompileError.Message, "Unexpected end of file") {
 		t.Errorf("expected the diagnostics, got %+v", result.CompileError)

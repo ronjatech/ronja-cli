@@ -911,6 +911,143 @@ func removeFile(root, path string) error {
 // draft. A single hash cannot be both, and the four ordinary workflows below are
 // exactly where the difference shows.
 
+// TestPipelinePushSendsTheWireFingerprintAsThePrecondition is the same
+// invariant one layer out, and the reason TableState carries a THIRD hash.
+//
+// The server's baseCodeSha256 is compared against what the ROW stores, and what
+// the row stores is the WIRE form — the file with its sibling stems and declared
+// aliases substituted for ids. DraftSHA256 is the DISK form, so sending it would
+// 409 every push from any folder that spells a ref by name, which is the
+// ordinary pipeline folder. The two hashes here are deliberately DIFFERENT
+// values: a test whose file happened to be pure id-ref SQL would pass under
+// either implementation and would be pinning nothing.
+func TestPipelinePushSendsTheWireFingerprintAsThePrecondition(t *testing.T) {
+	// A SIBLING STEM, not an id. On disk this is `orders`; on the wire it is
+	// `table-orders`, and the fake stores what it was sent. The folder is seeded
+	// in stem form from the start, because switching a file from id form to stem
+	// form is itself a change leg (a) reports — a different property, with its
+	// own tests.
+	const disk = "SELECT * FROM {{ ref('orders') }}"
+	const wire = "SELECT * FROM {{ ref('table-orders') }}"
+
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	seedFeature(f, "private")
+	root := t.TempDir()
+	files := map[string]string{"orders.sql": "SELECT * FROM raw", "revenue.sql": disk}
+	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales pipeline"}
+	manifest.SetBinding(f.Key(), wfdir.Binding{
+		FeatureID: "collection-1",
+		Tables:    map[string]string{"orders.sql": "table-orders", "revenue.sql": "table-revenue"},
+	})
+	writePipelineFolder(t, root, manifest, files)
+	writePipelineBaseline(t, root, f.Key(), "collection-1", files,
+		map[string]wfdir.TableState{
+			"orders.sql":  {TableID: "table-orders"},
+			"revenue.sql": {TableID: "table-revenue"},
+		})
+
+	editFile(t, root, "revenue.sql", disk+" WHERE ok")
+	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "revenue.sql"); err != nil {
+		t.Fatalf("first push: %v\n%s", err, stderr)
+	}
+	state := pipelineStateOf(t, root, f.Key()).Tables["revenue.sql"]
+	if state.DraftSHA256 != wfdir.HashString(disk+" WHERE ok") {
+		t.Errorf("disk fingerprint = %q, want the bytes on disk", state.DraftSHA256)
+	}
+	if state.DraftWireSHA256 != wfdir.HashString(wire+" WHERE ok") {
+		t.Errorf("wire fingerprint = %q, want the bytes that went over the PUT", state.DraftWireSHA256)
+	}
+	if state.DraftWireSHA256 == state.DraftSHA256 {
+		t.Fatal("the two fingerprints are equal, so this test cannot tell the implementations apart")
+	}
+
+	// The second push is where a disk-form precondition dies: the fake compares
+	// the digest against what it STORES, exactly as the server does, so a client
+	// that sent DraftSHA256 here is refused with a 409 on a draft only it has
+	// ever written to.
+	editFile(t, root, "revenue.sql", disk+" WHERE ok AND more")
+	out, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "revenue.sql", "--json")
+	if err != nil {
+		t.Fatalf("a second push of a folder that names a sibling by its stem must not 409: %v\n%s", err, stderr)
+	}
+	if file := decodeJSON(t, out)["files"].([]any)[0].(map[string]any); file["outcome"] != pushOutcomePushed {
+		t.Fatalf("file = %+v\n%s", file, stderr)
+	}
+	// And it really did assert something — an implementation that quietly sent no
+	// precondition at all would also pass everything above.
+	last := f.updates[len(f.updates)-1]
+	if last.BaseCodeSha256 == nil {
+		t.Fatal("the second push sent no precondition, so nothing was asserted")
+	}
+	if *last.BaseCodeSha256 != wfdir.HashString(wire+" WHERE ok") {
+		t.Errorf("precondition = %q, want the wire fingerprint of the previous push", *last.BaseCodeSha256)
+	}
+}
+
+// TestPipelinePushForceDropsThePrecondition: --force is the author saying they
+// have seen what is on the server and mean to write over it. Sending the
+// precondition anyway would make the flag refuse the one thing it exists to
+// permit — and the drift it is being used to overrule is very often exactly the
+// draft edit the precondition would catch.
+func TestPipelinePushForceDropsThePrecondition(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedBoundFolder(t, f)
+
+	editFile(t, root, "orders.sql", "SELECT 1 FROM raw")
+	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "orders.sql"); err != nil {
+		t.Fatalf("first push: %v\n%s", err, stderr)
+	}
+	// Somebody edits the draft from the web app. Without --force this is refused
+	// by leg (b) of the client-side guard before the write is even attempted.
+	f.tables[f.draftOf["table-orders"]].Code = "SELECT theirs FROM raw"
+	editFile(t, root, "orders.sql", "SELECT 2 FROM raw")
+	if _, _, err := runPipelineCLI(t, root, "pipeline", "push", "orders.sql"); err == nil {
+		t.Fatal("a draft edited on the server must be refused without --force")
+	}
+	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "orders.sql", "--force"); err != nil {
+		t.Fatalf("--force must be able to overwrite: %v\n%s", err, stderr)
+	}
+	if last := f.updates[len(f.updates)-1]; last.BaseCodeSha256 != nil {
+		t.Errorf("--force sent a precondition (%q), which the server would refuse", *last.BaseCodeSha256)
+	}
+}
+
+// TestPipelinePushRefusesADraftEditedBetweenTheReadAndTheWrite: the gap layer 1
+// exists to close. The client-side guard compares the draft at one instant; the
+// write happens at another, and an edit landing in between used to win silently.
+func TestPipelinePushRefusesADraftEditedBetweenTheReadAndTheWrite(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedBoundFolder(t, f)
+
+	editFile(t, root, "orders.sql", "SELECT 1 FROM raw")
+	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "orders.sql"); err != nil {
+		t.Fatalf("first push: %v\n%s", err, stderr)
+	}
+	// The recorded fingerprint still describes the previous write, so leg (b)
+	// waves this through — the state a folder is in when the chat agent edits the
+	// draft while the push is in flight. Only the server's precondition can see it.
+	draftID := f.draftOf["table-orders"]
+	f.stateAfterRead = func() { f.tables[draftID].Code = "SELECT theirs FROM raw" }
+	editFile(t, root, "orders.sql", "SELECT 2 FROM raw")
+
+	_, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "orders.sql")
+	if err == nil {
+		t.Fatalf("the write landed over an edit nobody had seen:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "nothing was written") {
+		t.Errorf("the refusal did not say the draft was left alone:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "--force") {
+		t.Errorf("the refusal did not say what to do next:\n%s", stderr)
+	}
+	if f.CodeOf(draftID) != "SELECT theirs FROM raw" {
+		t.Errorf("the draft was overwritten anyway: %q", f.CodeOf(draftID))
+	}
+}
+
 // TestPipelinePushEditThenPushAgain: the commonest sequence there is, and the
 // one a shared fingerprint refused outright — after the first push the baseline
 // held the bytes written into the DRAFT, and leg (a) compared them against the
@@ -1038,6 +1175,86 @@ func TestPipelineCloneFromDraftThenPush(t *testing.T) {
 	}
 	if file["draftID"] != "table-draft-8" {
 		t.Errorf("push did not resume the cloned draft: %v", file["draftID"])
+	}
+}
+
+// TestPipelineCloneOfLossyDraftThenPush pins the OTHER half of the clone's
+// fingerprint contract: the WIRE one it deliberately leaves EMPTY.
+//
+// recordDraftWrite's comment says exactly why it must stay empty — a clone READ
+// somebody's draft rather than writing it, and the disk form it kept cannot be
+// turned back into the bytes that row stores, because canonicalDisk is LOSSY: a
+// positional ref and an id ref both land on the same stem. Recording a
+// fingerprint we cannot vouch for would 409 the first push against a difference
+// nobody made.
+//
+// Nothing was pinning it. TestPipelineCloneFromDraftThenPush clones ref-free
+// SQL, where disk form and wire form are the same bytes, so writing the disk
+// hash into the wire slot passed every assertion there — the B1 bug class
+// arriving through the clone door instead of the push one.
+//
+// So: a draft whose stored SQL addresses its input POSITIONALLY. On disk the
+// clone writes the resolved `{{ ref('table-orders') }}`; the row still holds
+// `{{ ref('0') }}`, and the two do not hash alike. The push that follows must
+// send NO precondition at all.
+func TestPipelineCloneOfLossyDraftThenPush(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	f.AddFeature("collection-1", "Sales", "private")
+	f.AddTable(&api.Table{ID: "table-orders", Name: "Orders", FeatureID: "collection-1",
+		Code: "SELECT live FROM raw"})
+	f.AddTable(&api.Table{ID: "table-revenue", Name: "Revenue", FeatureID: "collection-1",
+		Code: "SELECT live FROM {{ ref('0') }}", InputModels: []string{"table-orders"}})
+	f.AddDraft("table-revenue", "table-draft-9", "SELECT drafted FROM {{ ref('0') }}")
+
+	dir := t.TempDir()
+	if _, stderr, err := runPipelineCLI(t, dir, "pipeline", "clone", "collection-1", "out"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, stderr)
+	}
+	root := filepath.Join(dir, "out")
+	// The premise of the whole case: what the clone put on disk and what the row
+	// holds are DIFFERENT bytes. If this stopped holding, everything below would
+	// go back to proving nothing.
+	if got := readFile(t, root, "Revenue.sql"); got != "SELECT drafted FROM {{ ref('table-orders') }}" {
+		t.Fatalf("the clone did not resolve the positional ref onto disk: %q", got)
+	}
+	if f.CodeOf("table-draft-9") != "SELECT drafted FROM {{ ref('0') }}" {
+		t.Fatalf("the row no longer holds the positional form, so disk and wire no longer differ: %q",
+			f.CodeOf("table-draft-9"))
+	}
+	state := pipelineStateOf(t, root, f.Key()).Tables["Revenue.sql"]
+	if state.DraftWireSHA256 != "" {
+		t.Fatalf("a clone READ that draft, it did not write it — there are no sent bytes to vouch for, "+
+			"so the wire fingerprint must be empty; got %q", state.DraftWireSHA256)
+	}
+
+	// Edited in the id form the clone wrote, so the LOCAL drift guard has
+	// nothing to say and the only thing left that can refuse this push is the
+	// server's precondition — which is the point of the case.
+	editFile(t, root, "Revenue.sql", "SELECT edited FROM {{ ref('table-orders') }}")
+	_, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json")
+	if err != nil {
+		t.Fatalf("the first push after a clone must write unconditionally, not 409 against a hash of "+
+			"bytes the row never held: %v\n%s", err, stderr)
+	}
+	var wrote *recordedTableUpdate
+	for i := range f.updates {
+		if f.updates[i].ID == "table-draft-9" {
+			wrote = &f.updates[i]
+		}
+	}
+	if wrote == nil {
+		t.Fatalf("the push never wrote the cloned draft: %+v", f.updates)
+	}
+	// ABSENT, not the empty string: the server answers 400 to "" (a precondition
+	// that promises a check and performs none), so the two are not
+	// interchangeable and only one of them means "write unconditionally".
+	if wrote.BaseCodeSha256 != nil {
+		t.Errorf("the push sent baseCodeSha256=%q; a clone has no wire-form fingerprint to send",
+			*wrote.BaseCodeSha256)
+	}
+	if wrote.Code != "SELECT edited FROM {{ ref('table-orders') }}" {
+		t.Errorf("the push sent %q, not the wire form", wrote.Code)
 	}
 }
 

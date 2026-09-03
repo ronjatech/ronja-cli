@@ -38,6 +38,12 @@ type fakeAppInstance struct {
 	// featureScope answers GET /feature/:id, which is how `app publish` learns
 	// whether committing is admin-only.
 	featureScope map[string]string
+	// featureStatus is the status GET /feature/:id answers with, per id — the
+	// existence check `app init` makes before it writes a manifest naming the
+	// feature. Absent (0) is 200, since a reachable feature is the ordinary
+	// case and a fake that defaulted otherwise would turn every init test into
+	// a test of one refusal.
+	featureStatus map[string]int
 	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
 	// ordinary user), mirroring sherlock's downward-counting scale.
 	privilegeLevel int
@@ -90,8 +96,14 @@ type fakeAppInstance struct {
 	// write still SUCCEEDS — that is the whole point of the 200 — so this
 	// models an author's syntax error, not a rejected request.
 	compileFails map[string]string
-	// validateFails, when non-empty, makes POST :id/validate answer 400 with it.
-	validateFails string
+	// validateFails, when non-empty, makes POST :id/validate answer with it.
+	// The status is validateStatus, defaulting to 400 — a compile refusal, which
+	// is what almost every test wants. Setting validateStatus to a 5xx models
+	// the OTHER failure: an instance that never delivers a verdict at all, which
+	// is not a statement about the author's files and must not be rendered as
+	// one.
+	validateFails  string
+	validateStatus int
 	// failPut / failDelete map a path to a status code, for genuine request
 	// failures as opposed to compile failures.
 	failPut    map[string]int
@@ -191,6 +203,7 @@ func newFakeAppInstance(t *testing.T) *fakeAppInstance {
 		files:          map[string][]api.DataAppFile{},
 		draftOf:        map[string]string{},
 		featureScope:   map[string]string{},
+		featureStatus:  map[string]int{},
 		compileFails:   map[string]string{},
 		failPut:        map[string]int{},
 		failDelete:     map[string]int{},
@@ -332,6 +345,18 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 
 	// GET /feature/:id — how publish learns whether the feature is shared.
 	if featureID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/"); ok {
+		switch status := f.featureStatus[featureID]; status {
+		case 0:
+		case http.StatusBadRequest:
+			http.Error(w, `{"error":"no rows"}`, status)
+			return
+		case http.StatusNotFound:
+			http.Error(w, `{"error":"feature not found"}`, status)
+			return
+		default:
+			http.Error(w, `{"error":"Internal server error"}`, status)
+			return
+		}
 		scope, known := f.featureScope[featureID]
 		if !known {
 			scope = "private"
@@ -646,7 +671,11 @@ func (f *fakeAppInstance) serveValidate(w http.ResponseWriter, id string) {
 		return
 	}
 	if f.validateFails != "" {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, f.validateFails), http.StatusBadRequest)
+		status := f.validateStatus
+		if status == 0 {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, f.validateFails), status)
 		return
 	}
 	stamped := app.UpdatedAt.Add(time.Second)

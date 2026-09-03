@@ -292,7 +292,7 @@ func (m *Manifest) CheckDeclarations() error {
 			// Names the possibility that this build is simply older than the
 			// file, because that is the likelier cause than a typo once the set
 			// has grown once.
-			return fmt.Errorf("%s declares dependency %q with kind %q, and this ronja resolves only: %s. Check the spelling, or upgrade the CLI if the kind is newer than this build (`ronja --version` reports what you are running)",
+			return fmt.Errorf("%s declares dependency %q with kind %q, and this ronja resolves only: %s. Check the spelling, or upgrade the CLI if the kind is newer than this build — run: ronja update (`ronja --version` reports what you are running)",
 				ManifestName, alias, kind, strings.Join(markers.Kinds(), ", "))
 		}
 		// The marker-less half of ValidAliasName's id-shape rule, scoped to the

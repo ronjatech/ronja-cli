@@ -638,6 +638,172 @@ func TestTestFailedDurableRunPrintsTheResumeInvocationAndTheJournalSize(t *testi
 	}
 }
 
+// TestTestSaysNothingRanWhenTheFailureWasSetup is the other half of the resume
+// hint: it must NOT be offered when the workflow's code never ran.
+//
+// "Fix the code and push first if the failure was a bug" is advice about the
+// author's files. A run that died fetching S3 credentials failed before the
+// container had them — the Python harness stamps processing_started_at
+// immediately before it execs the code, and compiles the entrypoint inside that
+// exec — so nothing the author wrote was ever evaluated, and telling them to fix
+// their code is an outage rendered as bad authorship.
+//
+// Accepted edge, pinned here rather than left to be rediscovered: a durable run
+// from before migration 000389 has no exec_run (steps [], NULL stamp) and no
+// journal, so it prints this message too. That is the cost of reading the only
+// signal that exists, and it errs toward "re-run it" rather than toward blaming
+// files nobody looked at.
+func TestTestSaysNothingRanWhenTheFailureWasSetup(t *testing.T) {
+	f := newFakeInstance(t)
+	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
+	// No stamp, no steps, no journal, no captured output: the container never
+	// got as far as producing any of them.
+	failed.Logs = ""
+	failed.Error = ptr("get S3 credentials: assume role: AccessDenied\n  at the presign step")
+	f.runScript = []api.RunResponse{failed}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err == nil {
+		t.Fatal("a failed run exited zero")
+	}
+	if strings.Contains(out, "--resume") {
+		t.Errorf("a setup failure offered a resume, which is advice about files nothing read:\n%s", out)
+	}
+	if !strings.Contains(out, "Nothing in your code ran") {
+		t.Errorf("expected the report to say the code never ran:\n%s", out)
+	}
+	// It reports where the run died, not whose fault that is — see
+	// printNothingRanNotice. Some pre-execution failures really are the author's.
+	if strings.Contains(out, "not a bug in your files") {
+		t.Errorf("the notice claimed the author's files are innocent, which it cannot know:\n%s", out)
+	}
+	// The first line only, in the notice — the Error: line above already carries
+	// the whole message, and repeating it would bury the sentence that matters.
+	if !strings.Contains(out, "(get S3 credentials: assume role: AccessDenied).") {
+		t.Errorf("expected the first line of the error in the notice:\n%s", out)
+	}
+	if !strings.Contains(out, "at the presign step") {
+		t.Errorf("the Error: line must still carry the full message:\n%s", out)
+	}
+}
+
+// The pre-execution failure that IS the author's, and the reason the notice no
+// longer says "that is not a bug in your files".
+//
+// A package list the folder's ronja.json declares is validated before ExecV2 is
+// ever called (manalysis fails the run with "invalid pip packages: …"), so the
+// run arrives here with nothing executed and every signal userCodeRan reads
+// absent — indistinguishable, to this report, from a container that could not
+// get its credentials. The generic "re-run it" is useless advice for a list that
+// will be refused identically every time, so this one failure gets a line naming
+// the file that holds it.
+func TestTestNamesPipPackagesWhenTheSetupFailureWasTheFolder(t *testing.T) {
+	f := newFakeInstance(t)
+	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
+	failed.Logs = ""
+	failed.Error = ptr("invalid pip packages: pandas==NOPE is not a valid requirement")
+	f.runScript = []api.RunResponse{failed}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err == nil {
+		t.Fatal("a failed run exited zero")
+	}
+	if !strings.Contains(out, "Nothing in your code ran") {
+		t.Errorf("expected the report to say the code never ran:\n%s", out)
+	}
+	if !strings.Contains(out, "This one is about the folder's pipPackages — check them in ronja.json.") {
+		t.Errorf("an author-caused setup failure did not name the file that caused it:\n%s", out)
+	}
+	if strings.Contains(out, "not a bug in your files") {
+		t.Errorf("the notice absolved the very file that failed the run:\n%s", out)
+	}
+}
+
+// The three signals that outvote a missing stamp. The check-in is best-effort —
+// a background worker that gives up on a network failure — so a run that really
+// did execute can arrive unstamped, and concluding "nothing ran" there would
+// hide a genuine bug from its author.
+//
+// A journal count is NOT among them — see the test below this one.
+func TestTestStillOffersTheResumeWhenSomethingProvesTheCodeRan(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		with func(*api.RunResponse)
+	}{
+		{"a processing stamp", func(r *api.RunResponse) { r.ProcessingStartedAt = ptr(time.Now()) }},
+		{"captured logs", func(r *api.RunResponse) { r.Logs = "starting\n" }},
+		{"a Python traceback", func(r *api.RunResponse) {
+			r.Error = ptr("Traceback (most recent call last):\n  File \"main.py\", line 3\nKeyError: 'x'")
+		}},
+		{"a step", func(r *api.RunResponse) {
+			r.Steps = []api.StepDTO{{ID: "span-1", Name: "Load orders", Status: "failed"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeInstance(t)
+			failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
+			failed.Logs = ""
+			failed.Error = ptr("boom")
+			tc.with(&failed)
+			f.runScript = []api.RunResponse{failed}
+			signIn(t, f)
+			withFastPolling(t)
+			root := durableFolder(t, f, nil)
+
+			out, err := runCLI(t, root, "wf", "test")
+			if err == nil {
+				t.Fatal("a failed run exited zero")
+			}
+			if !strings.Contains(out, "ronja wf test --resume") {
+				t.Errorf("%s proves the code ran, so the resume must still be offered:\n%s", tc.name, out)
+			}
+			if strings.Contains(out, "Nothing in your code ran") {
+				t.Errorf("%s proves the code ran:\n%s", tc.name, out)
+			}
+		})
+	}
+}
+
+// A journal count alone does NOT prove that THIS run executed the author's
+// code, and must not suppress the notice.
+//
+// journalEntries counts what the resume LINEAGE has journaled and is derived on
+// read, so a `wf test --resume` inherits a non-zero count from the runs before
+// it. The failure this notice exists for — the container dying before it
+// starts, on an S3 credential or a launch error — then arrives with no stamp,
+// no steps and no logs, and treating the inherited count as evidence handed the
+// author a bare infrastructure error on the one run that needed the notice
+// most. Every other signal here is a fact about the run in hand; this one is a
+// fact about its ancestors.
+func TestTestSaysNothingRanWhenOnlyTheLineageHasAJournal(t *testing.T) {
+	f := newFakeInstance(t)
+	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
+	failed.Logs = ""
+	failed.ProcessingStartedAt = nil
+	failed.Steps = nil
+	// Inherited from earlier runs of the same lineage, not produced by this one.
+	failed.JournalEntries = 2
+	failed.Error = ptr("failed to assume role for object storage")
+	f.runScript = []api.RunResponse{failed}
+	signIn(t, f)
+	withFastPolling(t)
+	root := durableFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err == nil {
+		t.Fatal("a failed run exited zero")
+	}
+	if !strings.Contains(out, "Nothing in your code ran") {
+		t.Errorf("an inherited journal count suppressed the notice on a run that never started:\n%s", out)
+	}
+}
+
 // The same hint on a folder whose INSTANCE never sends a runtimeVersion: the
 // row decodes as 0, and the folder's own declaration is the fallback.
 func TestTestFailedRunUsesTheManifestWhenTheRowSaysNothing(t *testing.T) {
@@ -675,6 +841,37 @@ func TestTestFailedDefaultRuntimeRunOffersNoResume(t *testing.T) {
 	if err == nil {
 		t.Fatal("a failed run exited zero")
 	}
+	if strings.Contains(out, "--resume") {
+		t.Errorf("a v1 failure offered a resume:\n%s", out)
+	}
+}
+
+// A v1 run that never reached the interpreter says so too. The notice is about
+// the RUN, not about what a resume could skip, so the runtime it ran on has
+// nothing to do with whether it is true — and a v1 author reading a bare
+// "AccessDenied" has exactly the same reason to go looking through their own
+// files for a bug that is not there.
+func TestTestSaysNothingRanOnADefaultRuntimeRunToo(t *testing.T) {
+	f := newFakeInstance(t)
+	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
+	failed.Logs = ""
+	failed.Error = ptr("start container: image pull failed")
+	f.runScript = []api.RunResponse{failed}
+	signIn(t, f)
+	withFastPolling(t)
+	root := draftFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "test")
+	if err == nil {
+		t.Fatal("a failed run exited zero")
+	}
+	if !strings.Contains(out, "Nothing in your code ran") {
+		t.Errorf("a v1 setup failure did not say the code never ran:\n%s", out)
+	}
+	if !strings.Contains(out, "Run `ronja wf test` again") {
+		t.Errorf("the notice did not name the command that produced this run:\n%s", out)
+	}
+	// Still no resume: v1 journals nothing, so there is nothing to skip.
 	if strings.Contains(out, "--resume") {
 		t.Errorf("a v1 failure offered a resume:\n%s", out)
 	}

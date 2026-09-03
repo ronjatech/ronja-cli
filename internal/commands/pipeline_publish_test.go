@@ -12,9 +12,10 @@ import (
 // `ronja pipeline publish`.
 //
 // The command is mostly a DECISION — commit, or ask an admin to — taken up front
-// from the two server facts that decide it, plus two warnings about staleness
-// that exist because a table commit is last-writer-wins with no compare-and-swap
-// anywhere behind it.
+// from the two server facts that decide it, plus two warnings about staleness.
+// One of those warnings is now backed by a server-side refusal: a commit onto a
+// table that has moved since the draft forked is a 409, and --overwrite-remote is
+// the deliberate way through it.
 
 // seedStagedFolder is seedBoundFolder plus an open, built draft of orders.sql,
 // recorded in the baseline the way a successful push would have left it.
@@ -422,10 +423,12 @@ func TestPipelinePublishDoesNotResubmitADraftAlreadyInReview(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishWarnsAboutAStaleBase: commit is LAST-WRITER-WINS and there
-// is no compare-and-swap on this route, so the review payload's baseStale is the
-// only warning that exists anywhere.
-func TestPipelinePublishWarnsAboutAStaleBase(t *testing.T) {
+// TestPipelinePublishRefusesAStaleBase: the commit carries a base-version CAS,
+// so a table that has been published to since this draft forked is REFUSED and
+// nothing is committed. The review payload's baseStale still runs first and is
+// still worth the round trip — it names the intervening versions, where the
+// server's 409 can only name the head.
+func TestPipelinePublishRefusesAStaleBase(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedStagedFolder(t, f, "private")
@@ -434,20 +437,86 @@ func TestPipelinePublishWarnsAboutAStaleBase(t *testing.T) {
 	}
 
 	out, stderr, err := runPipelineCLI(t, root, "pipeline", "publish", "--json")
-	if err != nil {
-		t.Fatalf("publish: %v\n%s", err, stderr)
+	if err == nil {
+		t.Fatalf("publish succeeded over a version nobody saw:\n%s", stderr)
 	}
 	if !strings.Contains(stderr, "table-version-2") {
 		t.Errorf("the intervening version was not named:\n%s", stderr)
 	}
+	if !strings.Contains(stderr, "--overwrite-remote") {
+		t.Errorf("the refusal did not say what to do next:\n%s", stderr)
+	}
 	file := decodeJSON(t, out)["files"].([]any)[0].(map[string]any)
+	// `conflict`, not `refused`: an agent has to tell "somebody committed first,
+	// re-apply and try again" from "you may not do this at all".
+	if file["outcome"] != outcomeConflict {
+		t.Errorf("outcome = %v", file["outcome"])
+	}
 	warnings, _ := file["warnings"].([]any)
-	if len(warnings) == 0 || !strings.Contains(warnings[0].(string), "compare-and-swap") {
+	if len(warnings) == 0 || !strings.Contains(warnings[0].(string), "--overwrite-remote") {
 		t.Errorf("warnings = %+v", warnings)
 	}
-	// A warning, not a refusal: the commit still happens.
-	if len(f.committed) != 1 {
+	// NOTHING was committed, and the draft is intact: the CAS runs inside the
+	// commit's own transaction, so a refusal leaves the work where it was.
+	if len(f.committed) != 0 {
 		t.Errorf("committed = %+v", f.committed)
+	}
+	if f.draftOf["table-orders"] != "table-draft-5" {
+		t.Errorf("the draft is gone: %+v", f.draftOf)
+	}
+}
+
+// TestPipelinePublishOverwriteRemoteConfirmsTheCurrentHead: the override
+// resolves the head and confirms it EXPLICITLY, rather than sending a bare
+// "force" the server would have to interpret. The version it wrote over is
+// recorded in the --json payload, because it is the only trace that somebody
+// else's work was discarded and by which version.
+func TestPipelinePublishOverwriteRemoteConfirmsTheCurrentHead(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedStagedFolder(t, f, "private")
+	f.intervening["table-orders"] = []api.TableInterveningVersion{
+		{VersionID: "table-version-2", Name: "Orders", CommittedAt: time.Now()},
+	}
+
+	out, stderr, err := runPipelineCLI(t, root, "pipeline", "publish", "--overwrite-remote", "--json")
+	if err != nil {
+		t.Fatalf("publish --overwrite-remote: %v\n%s", err, stderr)
+	}
+	file := decodeJSON(t, out)["files"].([]any)[0].(map[string]any)
+	if file["outcome"] != outcomePublished {
+		t.Errorf("outcome = %v", file["outcome"])
+	}
+	if file["overwroteVersionID"] != "table-version-2" {
+		t.Errorf("overwroteVersionID = %v, want the version that was discarded", file["overwroteVersionID"])
+	}
+	if len(f.committed) != 1 || f.committed[0] != "table-draft-5" {
+		t.Errorf("committed = %+v", f.committed)
+	}
+	if !strings.Contains(stderr, "discarding what it changed") {
+		t.Errorf("the override did not say what it was doing:\n%s", stderr)
+	}
+}
+
+// TestPipelinePublishOverwriteRemoteIsInertWithoutAConflict: the flag authorizes
+// a refusal that has actually happened. With nothing to overwrite it must not
+// send a confirm at all — a caller who types it out of habit must not be
+// silently pre-authorizing whatever lands next.
+func TestPipelinePublishOverwriteRemoteIsInertWithoutAConflict(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedStagedFolder(t, f, "private")
+
+	out, stderr, err := runPipelineCLI(t, root, "pipeline", "publish", "--overwrite-remote", "--json")
+	if err != nil {
+		t.Fatalf("publish: %v\n%s", err, stderr)
+	}
+	file := decodeJSON(t, out)["files"].([]any)[0].(map[string]any)
+	if file["outcome"] != outcomePublished {
+		t.Errorf("outcome = %v", file["outcome"])
+	}
+	if _, present := file["overwroteVersionID"]; present {
+		t.Errorf("overwroteVersionID was reported on a publish that overwrote nothing: %+v", file)
 	}
 }
 

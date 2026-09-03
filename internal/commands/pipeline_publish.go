@@ -28,6 +28,7 @@ import (
 // is worth saying out loud at the moment it happens.
 func newPipelinePublishCmd() *cobra.Command {
 	var noRequestReview bool
+	var overwriteRemote bool
 	cmd := &cobra.Command{
 		Use:   "publish [paths...]",
 		Short: "Commit your staged drafts, or submit them for review",
@@ -47,6 +48,11 @@ request, which is what CI wants when a merge is expected to land directly.
 
 A draft whose build failed is refused: publishing it would put a table live with
 no data behind it. Fix the SQL and push again.
+
+A draft whose table has been published to since it forked is refused too, and
+nothing is committed — landing it would revert whoever got there first. Push
+again to start from where the table is now, or re-run with --overwrite-remote to
+commit over their version deliberately.
 
 Committing cascades. Every table that reads from one you publish is invalidated
 and rebuilt server-side, so there is nothing else to run afterwards.
@@ -68,7 +74,7 @@ folder has local changes that are not in the drafts.`,
 			if err != nil {
 				return err
 			}
-			result, err := runPipelinePublish(cmd.Context(), f, args, noRequestReview)
+			result, err := runPipelinePublish(cmd.Context(), f, args, noRequestReview, overwriteRemote)
 			// Emitted even on failure, exactly like push: a refusal that carries a
 			// result is one the caller has to be able to READ.
 			if result != nil {
@@ -85,6 +91,8 @@ folder has local changes that are not in the drafts.`,
 	}
 	cmd.Flags().BoolVar(&noRequestReview, "no-request-review", false,
 		"fail instead of submitting a draft for admin review")
+	cmd.Flags().BoolVar(&overwriteRemote, "overwrite-remote", false,
+		"commit even though someone published a new version since your draft was created, discarding their changes")
 	return cmd
 }
 
@@ -103,9 +111,12 @@ type pipelinePublishedFile struct {
 	Path    string `json:"path"`
 	TableID string `json:"tableID"`
 	DraftID string `json:"draftID,omitempty"`
-	// Outcome is outcomePublished, outcomeSubmittedForReview, or
+	// Outcome is outcomePublished, outcomeSubmittedForReview, outcomeConflict or
 	// pushOutcomeRefused — the same vocabulary the other loops use, so a caller
-	// scripting several of them branches on one set of strings.
+	// scripting several of them branches on one set of strings. `conflict` is a
+	// refusal, and is separate from `refused` for the reason `wf publish` splits
+	// them: an agent has to tell "somebody committed first, re-apply and try
+	// again" from "you may not do this at all".
 	Outcome string `json:"outcome"`
 	Detail  string `json:"detail,omitempty"`
 	Error   string `json:"error,omitempty"`
@@ -116,10 +127,16 @@ type pipelinePublishedFile struct {
 	// confident count would paper over.
 	Cascade  int      `json:"cascade"`
 	Warnings []string `json:"warnings,omitempty"`
-	URL      string   `json:"-"`
+	// OverwroteVersionID names the committed version this publish deliberately
+	// wrote over, and is set ONLY on the --overwrite-remote path. Absent on every
+	// ordinary publish, which is what makes its presence meaningful to anything
+	// scripting the CLI: it is the record that somebody else's work was
+	// discarded, and by which version id. Mirrors publishResult's field.
+	OverwroteVersionID string `json:"overwroteVersionID,omitempty"`
+	URL                string `json:"-"`
 }
 
-func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequestReview bool) (*pipelinePublishResult, error) {
+func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequestReview, overwriteRemote bool) (*pipelinePublishResult, error) {
 	client := newClient(f.Resolved.URL, f.Resolved.Token)
 	result := &pipelinePublishResult{
 		FeatureID: f.Binding.FeatureID,
@@ -181,7 +198,7 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 	// message is how a client silently starts doing the wrong thing the day
 	// somebody rewords it. Read ONCE for the whole run; both are properties of
 	// the feature and the caller, not of any one table.
-	routing := publishRouting{NoRequestReview: noRequestReview}
+	routing := publishRouting{NoRequestReview: noRequestReview, OverwriteRemote: overwriteRemote}
 	if f.Binding.FeatureID != "" {
 		shared, err := featureIsShared(ctx, client, f.Binding.FeatureID)
 		if err != nil {
@@ -256,7 +273,7 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 				path, wfdir.StatePath(f.Root), err)
 			return result, errors.New(result.Error)
 		}
-		if file.Outcome == pushOutcomeRefused {
+		if file.Outcome == pushOutcomeRefused || file.Outcome == outcomeConflict {
 			failed++
 		}
 	}
@@ -292,6 +309,18 @@ type publishRouting struct {
 	// NoRequestReview turns every review route into an error, which is what CI
 	// wants when a merge is expected to land directly.
 	NoRequestReview bool
+	// OverwriteRemote authorizes committing over a version of the parent that
+	// landed after the draft was created — a deliberately unpleasant name for a
+	// deliberately unpleasant thing, matching `wf publish`. It resolves the
+	// current head and confirms it explicitly; it never loops, so a version that
+	// lands while this is running produces a fresh refusal rather than a second
+	// attempt.
+	//
+	// It rides on this struct rather than on its own parameter because it is a
+	// property of the RUN, exactly as the other three are — and because the
+	// commit's two refusals (400 needs-review, 409 moved) are decided in one
+	// place, from one value.
+	OverwriteRemote bool
 }
 
 func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec pipelineCodec, inst *wfdir.InstanceState,
@@ -302,6 +331,16 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 		out.Outcome = pushOutcomeRefused
 		out.Error = fmt.Sprintf(format, args...)
 		fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n", path, out.Error)
+		return out
+	}
+	// A CONFLICT is a refusal with its own outcome, for the reason `wf publish`
+	// has one: an agent driving this loop has to tell "somebody committed first,
+	// re-apply and try again" from "you may not do this at all", and both are a
+	// refusal with prose on stderr. Both still count as not-published.
+	conflict := func(format string, args ...any) pipelinePublishedFile {
+		out.Outcome = outcomeConflict
+		out.Error = fmt.Sprintf(format, args...)
+		fmt.Fprintf(os.Stderr, "  Conflict: %s — %s\n", path, out.Error)
 		return out
 	}
 	if out.TableID == "" {
@@ -348,9 +387,10 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 			draft.ID, out.TableID, path)
 	}
 
-	// Two staleness warnings, both before the commit and neither a refusal.
-	// There is no compare-and-swap on a table commit — it is last-writer-wins —
-	// so these are the only warning that exists.
+	// Two staleness warnings, both before the commit and neither a refusal. The
+	// first now says early what the commit's own CAS would say anyway, which is
+	// worth the round trip: it names the intervening versions, where the server's
+	// 409 can only name the head.
 	review, reviewErr := client.GetTableDraftReview(ctx, draft.ID)
 	if reviewErr != nil {
 		fmt.Fprintf(os.Stderr, "  Note: no review payload for %s (%v) — publishing without the staleness check.\n", path, reviewErr)
@@ -359,7 +399,7 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 		for _, v := range review.InterveningVersions {
 			ids = append(ids, v.VersionID)
 		}
-		warning := fmt.Sprintf("%s has been published to since your draft forked (%s) — committing overwrites that, and there is no compare-and-swap to stop it",
+		warning := fmt.Sprintf("%s has been published to since your draft forked (%s) — the commit will be refused unless you pass --overwrite-remote",
 			out.TableID, strings.Join(ids, ", "))
 		out.Warnings = append(out.Warnings, warning)
 		fmt.Fprintf(os.Stderr, "  Warning: %s\n", warning)
@@ -416,7 +456,71 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 	// Set when the commit's outcome was not answered and has to be proved by the
 	// live table instead.
 	unconfirmed := false
-	commitErr := client.CommitTableDraft(ctx, draft.ID)
+	// The version --overwrite-remote confirmed, held locally until the commit is
+	// KNOWN to have landed. On out.OverwroteVersionID it is the record that
+	// somebody else's work was discarded, so it must not be reported by a run
+	// that then refuses because it could not prove the commit landed at all.
+	overwroteVersionID := ""
+	commitErr := client.CommitTableDraft(ctx, draft.ID, "")
+	if commitErr != nil && api.StatusOf(commitErr) == api.StatusConflict {
+		// The one refusal that is about somebody else's work rather than about
+		// permission: the table moved after this draft forked, so committing would
+		// revert a version nobody here has seen. Nothing was written — the CAS runs
+		// inside the commit's own transaction, under the parent's row lock — so the
+		// draft is fully intact, and the only question is whether the author means
+		// to overwrite.
+		if !routing.OverwriteRemote {
+			// The server's own message names the current version, so it is passed
+			// through rather than paraphrased into something less specific.
+			return conflict("%s has been published to since your draft forked — nothing was committed, and your draft is intact:\n      %v\n    Re-apply your change on top of theirs (`ronja pipeline discard %s`, then `ronja pipeline push %s`), or re-run with --overwrite-remote to commit over their version",
+				out.TableID, commitErr, path, path)
+		}
+		// The head is READ, never scraped out of the 409's prose: the HTTP error
+		// body is the flat app-wide {"error": "<message>"} shape, and a regex over
+		// prose starts overwriting the wrong version the day somebody rewords it.
+		// Re-read HERE rather than reused from the payload above, so what is
+		// confirmed is the head at the moment of the decision.
+		head, headErr := client.GetTableDraftReview(ctx, draft.ID)
+		switch {
+		case headErr != nil:
+			return refuse("committing %s was refused (%v), and reading the current version of %s in order to overwrite it failed too: %v",
+				draft.ID, commitErr, out.TableID, headErr)
+		case head.HeadVersionID == "":
+			// Empty is the server's "this table has never been committed to", and
+			// there is then no version to confirm — so the override has nothing to
+			// say and sending an empty confirm would simply be refused again.
+			return refuse("committing %s was refused (%v), but %s reports no committed version to overwrite — --overwrite-remote has nothing to confirm. Look at %s in the web app",
+				draft.ID, commitErr, out.TableID, out.TableID)
+		}
+		fmt.Fprintf(os.Stderr, "  --overwrite-remote: committing %s over version %s of %s, discarding what it changed.\n", path, head.HeadVersionID, out.TableID)
+		if err := client.CommitTableDraft(ctx, draft.ID, head.HeadVersionID); err != nil {
+			// A SECOND 409 means a third commit landed between the read above and
+			// this write. Deliberately not retried: an override authorizes
+			// overwriting the version it was shown, not whatever happens to be there
+			// by the time the request arrives — and a loop would authorize every one
+			// of them.
+			if api.StatusOf(err) == api.StatusConflict {
+				return conflict("%s moved again while this was running — version %s is no longer the current one, so nothing was committed and your draft is intact; re-run to see where it is now: %v",
+					out.TableID, head.HeadVersionID, err)
+			}
+			// A TIMEOUT is handed to the branch below rather than reported as a
+			// failure, on exactly the reasoning that branch owns: the deadline
+			// was ours, the transaction and the cascade it fires were the
+			// server's, so a commit whose request timed out may well have
+			// landed. Returning here left the draft pointer uncleared and the
+			// baseline never refreshed -- on the ONE path that has already
+			// discarded a colleague's version, which is the worst place in this
+			// command to guess.
+			if !api.IsTimeout(err) {
+				return refuse("commit %s over version %s: %v", draft.ID, head.HeadVersionID, err)
+			}
+			overwroteVersionID = head.HeadVersionID
+			commitErr = err
+		} else {
+			overwroteVersionID = head.HeadVersionID
+			commitErr = nil
+		}
+	}
 	if commitErr != nil && api.IsTimeout(commitErr) {
 		// A commit whose request TIMED OUT may well have landed — the deadline
 		// was ours, the transaction and the cascade it fires were the server's.
@@ -448,8 +552,8 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 	if commitErr != nil {
 		// The race the up-front routing cannot close: the feature was shared, or
 		// the caller's role changed, between the reads above and this commit. A
-		// 400 on a SHARED feature is the server's needs-review rejection. There is
-		// no 409 to consider — a table commit has no head-version CAS.
+		// 400 on a SHARED feature is the server's needs-review rejection. A 409 is
+		// the head-version CAS and has already been dealt with above.
 		//
 		// Every condition matters. --no-request-review means the caller wants a
 		// failure rather than a review request, and a fallback that ignored it
@@ -497,8 +601,15 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 				draft.ID, out.TableID, out.TableID, path)
 		}
 	}
+	// Recorded only now: everything above that could still refuse has refused,
+	// so this is the first point at which the overwrite is known to have landed.
+	out.OverwroteVersionID = overwroteVersionID
 	out.Outcome = outcomePublished
 	out.Detail = fmt.Sprintf("committed onto %s", out.TableID)
+	if out.OverwroteVersionID != "" {
+		out.Detail = fmt.Sprintf("committed onto %s, overwriting version %s that was published after your draft was created",
+			out.TableID, out.OverwroteVersionID)
+	}
 	out.Cascade = folderDependents(codec, local, out.TableID)
 	// Both fingerprints now describe the same thing, and it is the LIVE table:
 	// the draft they were taken from does not exist any more. Best-effort — the
@@ -640,6 +751,8 @@ func printPipelinePublishReport(r *pipelinePublishResult) {
 			fmt.Fprintf(out, "\n  %s — submitted for review\n", file.Path)
 		case pushOutcomeRefused:
 			fmt.Fprintf(out, "\n  %s — not published\n", file.Path)
+		case outcomeConflict:
+			fmt.Fprintf(out, "\n  %s — not published (somebody committed first)\n", file.Path)
 		default:
 			fmt.Fprintf(out, "\n  %s — published\n", file.Path)
 		}

@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -211,6 +212,13 @@ type fakeInstance struct {
 	// 404s only for a feature the caller cannot reach, and the CLI reads that as
 	// a broken binding.
 	featureTables map[string][]*api.TableListItem
+	// featureStatus is the status GET /feature/:id answers with, per id. Absent
+	// (0) is 200 — see the route. 400 and 404 are BOTH real refusals for an id
+	// the caller cannot reach (a nonexistent or cross-tenant one is
+	// table.ErrNoRows, hence rjerr.Input and 400; one in this organization the
+	// caller may not read is the no-enumeration 404), and 503 is the instance
+	// not answering at all.
+	featureStatus map[string]int
 	// missStatus is what the three reference reads answer for an id the instance
 	// does not hold. 404 by default, and settable to 400 because BOTH are real:
 	// a row the caller may not see answers the no-enumeration 404, while a
@@ -219,6 +227,16 @@ type fakeInstance struct {
 	// silently blind to half the cases, so the tests stage both.
 	missStatus int
 
+	// failValidate / failCreate are the statuses POST /workflow/validate and
+	// POST /workflow answer with instead of a result, carrying the matching
+	// message as the `error` field; 0 is off. Both exist for one case: the
+	// feature the folder names is not one this credential can reach, which is a
+	// refusal the validate step raises on a default push and the create step
+	// raises under --no-validate.
+	failValidate        int
+	failValidateMessage string
+	failCreate          int
+	failCreateMessage   string
 	// validate is what POST /workflow/validate answers with. Nil means clean,
 	// which is what most tests want: the validate gate is not the subject.
 	validate *api.ValidateResult
@@ -350,6 +368,7 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 		tableDrafts:       map[string]string{},
 		tableCode:         map[string]string{},
 		featureTables:     map[string][]*api.TableListItem{},
+		featureStatus:     map[string]int{},
 		missStatus:        http.StatusNotFound,
 		privilegeLevel:    50,
 
@@ -522,6 +541,39 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"id": tableID, "name": name, "code": f.tableCode[tableID]})
 		return
 	}
+	// GET /feature/:id — the existence check `wf init` makes before it writes a
+	// manifest naming the feature. AFTER the two /feature/model branches above,
+	// which this prefix would otherwise swallow.
+	//
+	// 200 for ANY id unless a test says otherwise: on the real instance a
+	// feature the caller can reach is the ordinary case, and a fake that
+	// defaulted to a refusal would turn every init test into a test of this one
+	// refusal.
+	//
+	// One segment only. `/api/v2/feature/` is a PREFIX of routes that are not a
+	// feature read at all — `/feature/query` among them — and a fake that
+	// answered those with a feature would let a test pass on a request the real
+	// instance would route somewhere else entirely. Anything deeper falls
+	// through to the unexpected-path arm, which is the honest answer.
+	if featureID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/"); ok && !strings.Contains(featureID, "/") {
+		if status := f.featureStatus[featureID]; status != 0 {
+			// The body a real instance sends for each: 400 carries the raw
+			// table.ErrNoRows sentinel on an older backend and the mapped text
+			// on a newer one, 404 the no-enumeration refusal, 503 nothing the
+			// CLI can read as a verdict.
+			switch status {
+			case http.StatusBadRequest:
+				http.Error(w, `{"error":"no rows"}`, status)
+			case http.StatusNotFound:
+				http.Error(w, `{"error":"feature not found"}`, status)
+			default:
+				http.Error(w, `{"error":"Internal server error"}`, status)
+			}
+			return
+		}
+		writeJSON(w, map[string]any{"id": featureID, "name": "Feature", "scope": "private"})
+		return
+	}
 	// The two reference reads `ronja sync check` makes. Neither serves a
 	// payload anything branches on — see agentIDs.
 	if agentID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/agent/"); ok {
@@ -670,6 +722,10 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 
 	// POST /workflow — create.
 	if r.Method == "POST" && (path == "workflow" || path == "workflow/") {
+		if f.failCreate != 0 {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, f.failCreateMessage), f.failCreate)
+			return true
+		}
 		var in api.CreateWorkflowInput
 		decodeBody(f.t, r, &in)
 		f.created = append(f.created, in)
@@ -721,6 +777,10 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		return true
 	}
 	if r.Method == "POST" && path == "workflow/validate" {
+		if f.failValidate != 0 {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, f.failValidateMessage), f.failValidate)
+			return true
+		}
 		var in api.ValidateInput
 		decodeBody(f.t, r, &in)
 		f.validated = append(f.validated, in)
@@ -1306,6 +1366,48 @@ func (t *timeoutAfterLandingOnce) RoundTrip(req *http.Request) (*http.Response, 
 	return nil, context.DeadlineExceeded
 }
 
+// failOnceWithAConnectionError makes the NEXT request to one method+path die
+// before it reaches the wire — a refused connection, a DNS failure, a network
+// that is not there — and lets everything after it through.
+//
+// The sibling of failOnceWithATimeout, and a genuinely different failure: no
+// status ever comes back, so api.StatusOf is 0 while api.Unanswered is still
+// true. That pair is a branch of its own in every "the instance did not answer"
+// message — the one that must say "never reached the instance" rather than
+// print "HTTP 0", which names a status code that does not exist.
+func failOnceWithAConnectionError(t *testing.T, method, path string) {
+	t.Helper()
+	transport := &connectionErrorOnce{method: method, path: path}
+	previous := newClient
+	newClient = func(baseURL, token string) *api.Client {
+		client := previous(baseURL, token)
+		transport.base = client.HTTP.Transport
+		client.HTTP.Transport = transport
+		return client
+	}
+	t.Cleanup(func() { newClient = previous })
+}
+
+type connectionErrorOnce struct {
+	base   http.RoundTripper
+	method string
+	path   string
+	fired  bool
+}
+
+func (c *connectionErrorOnce) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !c.fired && req.Method == c.method && req.URL.Path == c.path {
+		c.fired = true
+		// http.Client wraps this in a *url.Error carrying no status, which is
+		// the shape a real dial failure has.
+		return nil, errors.New("dial tcp: connect: connection refused")
+	}
+	if c.base == nil {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+	return c.base.RoundTrip(req)
+}
+
 type timeoutOnce struct {
 	base   http.RoundTripper
 	method string
@@ -1370,26 +1472,45 @@ func signOutFrom(t *testing.T, url string) {
 	t.Setenv("RONJA_PROFILE", "")
 }
 
-// writeProfile seeds one profile into the isolated config dir, for the tests
+// writeProfile seeds ONE profile into the isolated config dir, for the tests
 // that need a stored ORGANIZATION rather than an environment credential — an
 // environment token deliberately carries none. An empty token leaves the
 // profile signed out, which is a legitimate state: the organization is still
 // what a folder's binding is keyed by.
+//
+// The one-profile case of writeProfiles, and delegating rather than repeating
+// it keeps a single definition of what a seeded config file looks like.
 func writeProfile(t *testing.T, name, url, tenantID, token string) {
+	t.Helper()
+	writeProfiles(t, name, testProfile{Name: name, URL: url, TenantID: tenantID, Token: token})
+}
+
+type testProfile struct {
+	Name       string
+	URL        string
+	TenantID   string
+	TenantName string
+	Token      string
+}
+
+// writeProfiles seeds SEVERAL profiles into the isolated config dir, which is
+// what the --profile refusals need: one organization the folder is bound to and
+// another the credential reaches, on one instance.
+func writeProfiles(t *testing.T, current string, profiles ...testProfile) {
 	t.Helper()
 	dir := os.Getenv("RONJA_CONFIG_DIR")
 	if dir == "" {
-		t.Fatal("writeProfile needs an isolated RONJA_CONFIG_DIR — call signIn or signOut first")
+		t.Fatal("writeProfiles needs an isolated RONJA_CONFIG_DIR — call signIn or signOut first")
 	}
-	f := &config.File{
-		Current: name,
-		Profiles: map[string]*config.Profile{
-			name: {URL: url, TenantID: tenantID, Token: token},
-		},
+	file := &config.File{Current: current, Profiles: map[string]*config.Profile{}}
+	for _, p := range profiles {
+		file.Profiles[p.Name] = &config.Profile{
+			URL: p.URL, TenantID: p.TenantID, TenantName: p.TenantName, Token: p.Token,
+		}
 	}
-	body, err := json.MarshalIndent(f, "", "  ")
+	body, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
-		t.Fatalf("encode profile: %v", err)
+		t.Fatalf("encode profiles: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, config.FileName), body, 0o600); err != nil {
 		t.Fatalf("write %s: %v", config.FileName, err)

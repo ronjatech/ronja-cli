@@ -850,7 +850,7 @@ func LoadManifest(root string, kind Kind) (*Manifest, error) {
 	// value can arrive from a hand edit or from a colleague on a newer CLI —
 	// naming the versions this build understands is the whole message.
 	if !ValidRuntime(m.Runtime) {
-		return nil, fmt.Errorf("%s declares \"runtime\": %d, which this CLI does not know — the runtimes it understands are %s. Upgrade the CLI, or set a runtime from that list",
+		return nil, fmt.Errorf("%s declares \"runtime\": %d, which this CLI does not know — the runtimes it understands are %s. Upgrade the CLI — run: ronja update — or set a runtime from that list",
 			path, m.Runtime, joinInts(Runtimes))
 	}
 	if err := m.checkStacks(path); err != nil {
@@ -922,7 +922,7 @@ func checkFormatVersion(path string, raw []byte, understood int) error {
 		// the silent downgrade this whole change exists to stop: read what we
 		// recognise, write the file back, and whatever the newer format carries
 		// that preservation could not is gone from the customer's repo.
-		return fmt.Errorf("%s is format version %s, and this ronja understands %d — upgrade the CLI (`ronja --version` reports what you are running). Reading it with this build would be a guess, and rewriting it could drop what the newer format carries",
+		return fmt.Errorf("%s is format version %s, and this ronja understands %d — upgrade the CLI, run: ronja update (`ronja --version` reports what you are running). Reading it with this build would be a guess, and rewriting it could drop what the newer format carries",
 			path, value.String(), understood)
 	default:
 		return fmt.Errorf("%s declares \"formatVersion\": %s, which is not a number. It is the FILE FORMAT version and has to be a bare number this build can compare against the %d it understands; leaving the key out means version 1. Nothing was read from the file",

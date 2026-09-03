@@ -73,15 +73,16 @@ const (
 // apiRequest is one fully-resolved request, replayable.
 //
 // Replayable is the load-bearing word: --retry and --wait-until both issue it
-// more than once, so the body is bytes rather than a reader. A reader is
+// more than once, so the body is a BodySource rather than a reader. A reader is
 // consumed by the first attempt and the second would send nothing at all — and
-// an empty POST is the kind of thing a server accepts.
+// an empty POST is the kind of thing a server accepts. Each attempt below calls
+// DoRaw again, which Opens the source afresh and closes what it opened.
 type apiRequest struct {
 	client  *api.Client
 	method  string
 	path    string
 	header  http.Header
-	body    []byte
+	body    api.BodySource
 	timeout time.Duration
 	retries int
 }
@@ -100,7 +101,10 @@ func (r apiRequest) send(ctx context.Context) (*api.RawResponse, error) {
 	for attempt := 0; ; attempt++ {
 		resp, err := r.client.DoRaw(ctx, r.method, r.path, r.header, r.body, r.timeout)
 		if err != nil {
-			return nil, err
+			if timeoutErr := explainUploadTimeout(err, r.body, r.timeout); timeoutErr != nil {
+				return nil, timeoutErr
+			}
+			return nil, explainBodySizeChange(err, r.body)
 		}
 		if attempt >= r.retries || !retryableStatus(resp.Status) {
 			return resp, nil
@@ -126,6 +130,178 @@ func (r apiRequest) send(ctx context.Context) (*api.RawResponse, error) {
 			return nil, err
 		}
 	}
+}
+
+// sizedPath is one file a streamed body was built from, with the size that was
+// measured for it at build time — the number that became its share of the
+// request's Content-Length — and the modification time it carried when that
+// measurement was taken.
+//
+// The modTime is what makes the after-the-fact check able to see a rewrite that
+// kept the length. It is optional: a zero value means the build-time modTime
+// was never captured, and checkFilesUnchanged then says nothing about it rather
+// than treating "unknown" as "changed".
+type sizedPath struct {
+	path    string
+	size    int64
+	modTime time.Time
+}
+
+// pathBody is a body whose bytes come from files named on the command line.
+// Only those can hit the mismatch explainBodySizeChange translates, and only
+// those can be re-stat'ed by checkFilesUnchanged afterwards.
+type pathBody interface {
+	paths() []sizedPath
+}
+
+// explainUploadTimeout says which file was being sent when --timeout expired,
+// or nil when the failure was not that.
+//
+// --timeout bounds ONE REQUEST, and a request includes the body going up. That
+// is invisible until the body is large: a multi-gigabyte -F file=@big.bin dies
+// partway through the send, with an error about a deadline and nothing about
+// the upload — and the caller's reasonable reading, that the instance is slow,
+// is wrong. The remedy is also not the obvious one, because the default (120s)
+// is generous for every request that is not an upload and lowering the file
+// size is not an option, so the message names --timeout 0 explicitly.
+//
+// Narrowed by the body's own type, like explainBodySizeChange: a request with
+// no file in it times out for its own reasons and must keep its own message.
+func explainUploadTimeout(err error, body api.BodySource, timeout time.Duration) error {
+	src, ok := body.(pathBody)
+	if !ok || !api.IsTimeout(err) {
+		return nil
+	}
+	paths := src.paths()
+	if len(paths) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(paths))
+	for _, p := range paths {
+		names = append(names, p.path)
+	}
+	// The deadline is worth quoting because it is the thing to change, and a
+	// caller who did not pass --timeout has no idea what the default is.
+	return fmt.Errorf("the request stopped at the CLI's own --timeout (%s) while %s was being sent — the instance may have received part of it; pass --timeout 0 (or a longer one) and send it again: %w",
+		timeout, strings.Join(names, ", "), err)
+}
+
+// explainBodySizeChange names the file when a streamed body ran SHORT of the
+// length that was measured for it.
+//
+// A file body is stat'ed once and sent later, so the file can change in
+// between, and the two directions fail differently. A file that SHRANK ends
+// before the Content-Length already written, and net/http fails the request
+// outright with "http: ContentLength=N with Body length M" — which is the
+// honest outcome, and this is where it is translated. What the raw error does
+// not say is WHICH file, or that there is nothing wrong with the command. A
+// retry does not re-stat, so a file still being written produces this same
+// message on every attempt rather than a different one each time.
+//
+// A file that GREW does NOT fail here — see checkFilesUnchanged, which is the
+// other half of this window.
+func explainBodySizeChange(err error, body api.BodySource) error {
+	src, ok := body.(pathBody)
+	// Matched on the transport error's text because net/http offers no
+	// sentinel for it: the error is built with errors.New at the point of the
+	// write. Narrowed by the body's own type, so nothing else can be caught by
+	// it — a request with no file in it never reaches this line.
+	//
+	// ⚠️ The substring is a dependency on net/http's own wording, verified
+	// against Go 1.26.5 ("http: ContentLength=%d with Body length %d" in
+	// transfer.go). Nothing here fails loudly if that text changes — the
+	// message simply reverts to the transport's — so the guard is
+	// TestAPISaysWhenARealFileShrankWhileItWasSent, which drives a real short
+	// file through a real transport and asserts the translated message. If that
+	// test fails after a Go upgrade, this is the line to look at.
+	if !ok || !strings.Contains(err.Error(), "ContentLength=") {
+		return err
+	}
+	paths := src.paths()
+	if len(paths) == 0 {
+		return err
+	}
+	// The transport error says a body was short; it does not say which part of
+	// a multipart body it came from. With one file the message can be definite,
+	// with several it must not pretend to be.
+	// Wrapped rather than replaced: the transport error is the evidence for
+	// everything this message asserts, and a caller that reaches for errors.Is
+	// or errors.As on it (api.Unanswered and api.IsTimeout both do) must not
+	// find a bare string where the chain used to be.
+	if len(paths) == 1 {
+		return fmt.Errorf("%s changed size while it was being sent — send it again once it is complete: %w",
+			paths[0].path, err)
+	}
+	names := make([]string, 0, len(paths))
+	for _, p := range paths {
+		names = append(names, p.path)
+	}
+	return fmt.Errorf("one of these changed size while it was being sent, and the transport cannot say which: %s — send the request again once they are all complete: %w",
+		strings.Join(names, ", "), err)
+}
+
+// checkFilesUnchanged re-stats every file a streamed body was built from and
+// reports one that is no longer the file that was measured for it — a different
+// size, or the same size with a different modification time.
+//
+// This is the half of the stat-then-send window the transport does NOT catch,
+// and the asymmetry is not obvious. A file that shrank fails in net/http, as
+// explainBodySizeChange describes. A file that GREW does not: net/http writes
+// exactly Content-Length bytes off a LimitReader, so the request on the wire is
+// complete and valid — the server reads a whole upload of the declared size and
+// answers 200 — and the "ContentLength=N with Body length M" error is raised
+// only afterwards, racing the response in persistConn.roundTrip. Measured, it
+// is usually LOST: the command exits zero and the instance has stored a prefix
+// of the file as a finished upload.
+//
+// So growth is caught here instead: one re-stat, after the response has been
+// emitted (see the call site in `ronja api` — the caller sees what the server
+// said, and THEN a non-zero exit explaining what those bytes actually were).
+//
+// The re-stat compares the modification time as well as the size, because a
+// file rewritten IN PLACE to the SAME length is invisible to both halves
+// otherwise: nothing for the transport to fail on, and a size that matches. It
+// is the quietest member of this family — a mixed-content upload that exits
+// zero — so it is worth the second field.
+func checkFilesUnchanged(body api.BodySource) error {
+	src, ok := body.(pathBody)
+	if !ok {
+		return nil
+	}
+	var changed []string
+	for _, p := range src.paths() {
+		fi, err := os.Stat(p.path)
+		if err != nil {
+			// Nothing left to compare against. A file that vanished after its
+			// bytes were read is not evidence of a truncated upload — the send
+			// read through a handle it already held — and manufacturing a
+			// failure out of a missing stat would fail correct commands.
+			continue
+		}
+		if fi.Size() != p.size {
+			changed = append(changed, fmt.Sprintf("%s changed size while it was being sent (%d → %d bytes) — the instance may have accepted the first %d bytes as a complete upload; send it again once the file is complete",
+				p.path, p.size, fi.Size(), p.size))
+			continue
+		}
+		// Same length, different modification time: the file was rewritten IN
+		// PLACE while it was being read. Size alone cannot see this, and it is
+		// the one case that passes both halves of the window — the transport
+		// wrote exactly Content-Length bytes, so there is no mismatch for
+		// net/http to fail on, and the re-stat above finds the number it
+		// expected. What reached the instance is part of the old file and part
+		// of the new one, accepted as a complete upload.
+		//
+		// A zero build-time modTime means nothing was captured to compare
+		// against, so nothing is claimed: "not known" is not "changed".
+		if !p.modTime.IsZero() && !fi.ModTime().Equal(p.modTime) {
+			changed = append(changed, fmt.Sprintf("%s was modified while it was being sent — it is still %d bytes, so the request went out at its full declared length, but what the instance received is part of the old file and part of the new one; send it again now that the file has settled",
+				p.path, p.size))
+		}
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(changed, "; "))
 }
 
 // retryableStatus reports the answers worth asking again.

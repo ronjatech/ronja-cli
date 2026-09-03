@@ -483,7 +483,7 @@ func runVerdict(run *api.RunResponse) error {
 	case api.RunStatusError:
 		return fmt.Errorf("run %s failed", run.ID)
 	default:
-		return fmt.Errorf("run %s ended with status %q, which this version of the CLI does not know — treating it as a failure rather than a pass.\n  The report above is what the instance said; upgrade the CLI if this status is a new one",
+		return fmt.Errorf("run %s ended with status %q, which this version of the CLI does not know — treating it as a failure rather than a pass.\n  The report above is what the instance said; upgrade the CLI (run: ronja update) if this status is a new one",
 			run.ID, run.Status)
 	}
 }

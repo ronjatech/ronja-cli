@@ -75,6 +75,12 @@ upload endpoints require and -d cannot produce:
   ronja api -X POST /api/v2/file/upload/uploads -F file=@quarterly.pdf
   ronja api -X POST /api/v2/file/upload/uploads -F file=@- -F note=draft
 
+A file is streamed from disk, at any size the instance accepts; content piped on
+standard input is held in memory and capped at 16 MiB, because a pipe cannot be
+re-opened to re-send on a retry. Both -d and -F work this way. --timeout bounds
+the whole request, the upload included, so raise it (or pass --timeout 0) for a
+file large enough that sending it takes longer than the default.
+
 Pull one field out of the answer with --jq, so nothing has to be piped through
 another interpreter to read it. -r prints strings unquoted, which is what makes
 the result safe to substitute:
@@ -125,7 +131,7 @@ error the body is still printed, one "HTTP <status> <method> <path>" line goes
 to stderr, and the command exits non-zero.
 
 --timeout bounds ONE request, the response body included; 0 waits as long as the
-endpoint takes. Because the body is streamed as it arrives, a call that runs out
+endpoint takes, which with --retry leaves the command no time limit at all. Because the body is streamed as it arrives, a call that runs out
 of time has already written part of it — so raise --timeout for an endpoint that
 does real work rather than treating a truncated payload as the answer.
 --wait-timeout separately bounds a --wait-until loop as a whole.
@@ -162,6 +168,16 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 			}
 			if retries < 0 {
 				return fmt.Errorf("--retry cannot be negative (got %d)", retries)
+			}
+			// --timeout bounds ONE attempt, and --retry makes more of them, so
+			// the pair has no overall wall-clock budget at all: an instance
+			// that accepts the connection and then stalls mid-body wedges
+			// every attempt forever, with no further output. A terminal has
+			// Ctrl-C; a CI step or an agent-driven call just hangs, which is
+			// worth one line of warning rather than a surprise. Stderr, so it
+			// never lands in --json output on stdout.
+			if timeout == 0 && retries > 0 {
+				fmt.Fprintf(os.Stderr, "  Note: --timeout 0 with --retry %d leaves no time limit of any kind — an attempt that stalls will not time out, so the command can hang indefinitely.\n", retries)
 			}
 			if data != "" && len(form) > 0 {
 				return errors.New("-d and -F build the request body two different ways — use one or the other")
@@ -204,11 +220,11 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 				return err
 			}
 			if len(form) > 0 {
-				formBody, contentType, err := buildForm(form)
+				formSrc, contentType, err := buildForm(form)
 				if err != nil {
 					return err
 				}
-				body = formBody
+				body = formSrc
 				// The boundary is generated with the body, so the header has
 				// to carry THAT one — see formContentType, which reconciles a
 				// -H the caller also gave.
@@ -260,7 +276,37 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 			}
 			defer resp.Body.Close()
 
-			return out.emit(cmd.Context(), resp, method, path)
+			emitErr := out.emit(cmd.Context(), resp, method, path)
+			// The re-stat runs AFTER emit, and the ordering is the whole point:
+			// the request DID succeed on the wire, so the server's answer is
+			// real and the caller must see it. What follows is the second half
+			// of the truth — that the bytes the answer describes may be a prefix
+			// of the file. Printing the response and then failing is the only
+			// shape that reports both. See checkFilesUnchanged.
+			//
+			// It runs on an HTTP FAILURE too, and that case is the one it was
+			// missing: a file that shrank mid-upload is a plausible cause of the
+			// 400 the server just answered with, and "the bytes sent were a
+			// prefix" is the half of that story only the CLI can tell. An emit
+			// that failed on local I/O — an unwritable --out, a closed stdout —
+			// is a different story entirely, and the response status is what
+			// separates the two.
+			if emitErr != nil && resp.Status < 400 {
+				return emitErr
+			}
+			checkErr := checkFilesUnchanged(body)
+			if checkErr == nil {
+				return emitErr
+			}
+			// errAlreadyReported means emit has ALREADY written its "HTTP <status>"
+			// line to stderr and wants nothing else printed — so joining it here
+			// would suppress this message along with it (run() prints nothing for
+			// an error that says it has spoken for itself). The status line is on
+			// stderr either way; what has to survive is the truncation.
+			if emitErr == nil || errors.Is(emitErr, errAlreadyReported) {
+				return checkErr
+			}
+			return errors.Join(emitErr, checkErr)
 		},
 	}
 
@@ -273,7 +319,7 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 	cmd.Flags().StringArrayVarP(&headers, "header", "H", nil,
 		`extra request header as "Name: value" (repeatable; "Host" is honoured)`)
 	cmd.Flags().DurationVar(&timeout, "timeout", api.DefaultRawTimeout,
-		"how long to wait for one request, response body included (0 waits as long as it takes)")
+		"how long to wait for one request, response body included (0 removes the only bound there is and waits indefinitely)")
 	cmd.Flags().StringVarP(&jqExpr, "jq", "q", "",
 		"filter the JSON response through a jq expression")
 	cmd.Flags().BoolVarP(&rawOutput, "raw", "r", false,
@@ -317,22 +363,26 @@ func parseWaitPlan(expr string, interval, timeout time.Duration) (*waitPlan, err
 	return &waitPlan{until: until, interval: interval, timeout: timeout}, nil
 }
 
-// maxRequestBody caps a body read from a file or a pipe.
+// maxStdinBody caps a body read from a PIPE, and only from a pipe.
 //
-// The whole body is held in memory and handed to the request as one buffer, so
-// an unbounded read is an unbounded allocation driven by whatever path (or pipe)
-// was named — `-d @video.mp4` or a mistyped `-d @/dev/urandom` should fail
-// saying so, not swap the machine out. It is deliberately far above the read
-// side's maxDocBody: a docs page is a few KB, while a legitimate API body can
-// carry an embedded file, and refusing one of those would be the worse failure.
-const maxRequestBody = 16 << 20
+// A file on disk is streamed: it can be stat'ed for a size and re-opened for
+// every retry, so there is nothing to hold and nothing to bound — the only
+// ceiling is whatever the instance itself accepts. Standard input has neither
+// property. It cannot be re-opened, so a retry can only re-send what was kept;
+// keeping it means holding it in memory; and a producer that never stops (a
+// `yes`, a tail of a growing log) would fill that memory with nothing to
+// report. This is the ceiling on that one case.
+//
+// 16 MiB is deliberately far above the read side's maxDocBody: a docs page is a
+// few KB, while a legitimate piped API body can carry an embedded file.
+const maxStdinBody = 16 << 20
 
-// requestBody resolves -d into bytes, or nil for no body.
+// requestBody resolves -d into a body source, or nil for no body.
 //
 // The @ prefix is curl's, and so is the reason for it: a JSON body big enough
 // to matter does not belong on a command line, where the shell's quoting rules
 // get a vote on its contents.
-func requestBody(data string) ([]byte, error) {
+func requestBody(data string) (api.BodySource, error) {
 	if data == "" {
 		return nil, nil
 	}
@@ -340,39 +390,149 @@ func requestBody(data string) ([]byte, error) {
 	if !isRef {
 		// A literal body already fits in a command line, which is a far tighter
 		// bound than anything applied here would be.
-		return []byte(data), nil
+		return api.BytesBody(data), nil
 	}
 	if rest == "-" {
-		// Capped like the file case, and for a stronger reason: a pipe has no
-		// size to check in advance, so a producer that never stops (a `yes`, a
-		// tail of a growing log) would otherwise read forever with nothing to
-		// report.
-		return readStdinLimit("-d @-", maxRequestBody)
+		body, err := readStdinLimit("-d @-", "-d", maxStdinBody)
+		if err != nil {
+			return nil, err
+		}
+		return api.BytesBody(body), nil
 	}
-	return readBodyFile(rest)
+	return fileSource("-d @"+rest, "-d", rest)
 }
 
-// readBodyFile reads -d @file, refusing anything past maxRequestBody.
+// fileBody is a request body streamed off disk.
 //
-// Read through a LimitReader rather than stat-then-read: a size checked before
-// the read is a different moment from the read itself, and the things most
-// likely to be oversized here — a growing log, a character device — either
-// change between the two or report no size at all.
-func readBodyFile(path string) ([]byte, error) {
+// The size is taken once, at build time, and becomes the request's
+// Content-Length; Open re-opens the file for every attempt. Stat-then-send is
+// therefore a window in which the file can change, and the two directions are
+// caught in two different places: a file that SHRANK ends short of the
+// Content-Length already written and fails at the transport (translated by
+// explainBodySizeChange), while a file that GREW produces a complete, valid
+// request carrying a PREFIX of it — the instance may store those bytes as a
+// finished upload — and is caught by the re-stat in checkFilesUnchanged after
+// the response has been emitted.
+type fileBody struct {
+	path string
+	size int64
+	// modTime is the file's modification time as it was when size was
+	// measured. It is the only thing that can tell a same-length in-place
+	// rewrite from an untouched file — see checkFilesUnchanged.
+	modTime time.Time
+}
+
+func (f fileBody) Len() int64 { return f.size }
+
+func (f fileBody) Open() (io.ReadCloser, error) { return os.Open(f.path) }
+
+func (f fileBody) paths() []sizedPath {
+	return []sizedPath{{path: f.path, size: f.size, modTime: f.modTime}}
+}
+
+// fileSource builds a body from a path: streamed when it can be, buffered when
+// it cannot.
+//
+// what names the flag and path as the caller wrote them ("-d @report.pdf"), and
+// flag is the bare flag ("-d", "-F"), named only in the over-the-cap message.
+func fileSource(what, flag, path string) (api.BodySource, error) {
+	kind, fi, err := classifyBodyPath(what, path)
+	if err != nil {
+		return nil, err
+	}
+	if kind == pathRegular {
+		return fileBody{path: path, size: fi.Size(), modTime: fi.ModTime()}, nil
+	}
+	body, err := readUnseekablePath(what, flag, path)
+	if err != nil {
+		return nil, err
+	}
+	return api.BytesBody(body), nil
+}
+
+// pathKind is how a named path's bytes have to be carried.
+type pathKind int
+
+const (
+	// pathRegular is a file on disk: stat'ed for a size, opened lazily, and
+	// re-opened for every retry.
+	pathRegular pathKind = iota
+	// pathUnseekable is everything else that can still be read: a FIFO, a
+	// process substitution (`-d @<(gzip -c x)`, which the shell hands over as
+	// /dev/fd/63), /dev/stdin, a character device.
+	pathUnseekable
+)
+
+// classifyBodyPath decides which of the three things a named path is, and
+// refuses only the one that has no bytes at all.
+//
+// The three-way split is the whole of it:
+//
+//   - A REGULAR file with a NON-ZERO stat size becomes a lazy path segment. It
+//     is the only kind whose stat'ed size can be relied on in advance, which is
+//     what lets the bytes go out with a real Content-Length, straight off disk,
+//     at any size the instance accepts — and the only kind that can be re-opened
+//     to the same bytes when --retry or --wait-until sends the request again.
+//   - A REGULAR file whose stat size is ZERO is treated as unseekable and read,
+//     because on this one value the stat cannot be told apart from a file that
+//     reports no size and yields bytes anyway: procfs, sysfs and cgroup files
+//     all do, and so do some FUSE mounts. Trusting the 0 sent an EMPTY body
+//     with a zero exit — no Content-Length mismatch to fail on, and a re-stat
+//     that compares 0 against 0 and sees nothing wrong — which is the silent
+//     truncation this command is built to refuse. Reading it costs nothing a
+//     pipe does not already cost, and a file that really is empty reads as
+//     empty, so the outcome is unchanged for it.
+//   - A NON-REGULAR but readable path is read into memory, bounded, exactly as
+//     a pipe is. Its stat size is not the size of what reading it yields
+//     (usually 0, for a stream with no end), so it cannot be streamed against a
+//     Content-Length; and it is unseekable and un-replayable, so the only way a
+//     retry can re-send it is if the bytes were kept. Memory is that keeping,
+//     and the cap is what stops a device that never ends from filling it.
+//   - A DIRECTORY is refused. It does have a size (96 bytes on APFS, 4096 on
+//     ext4), but that is the size of the directory ENTRY; there are no bytes to
+//     send, so there is nothing to buffer and nothing to stream.
+func classifyBodyPath(what, path string) (pathKind, os.FileInfo, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, nil, fmt.Errorf("%s: %w", what, err)
+	}
+	if fi.IsDir() {
+		return 0, nil, fmt.Errorf("%s is a directory, not a file — point at a file inside it", what)
+	}
+	if !fi.Mode().IsRegular() {
+		return pathUnseekable, fi, nil
+	}
+	if fi.Size() == 0 {
+		// Not a shortcut for "empty". A stat size of 0 on a regular file is
+		// the one size that may be a LIE about what reading it yields, so the
+		// bytes decide instead of the number.
+		return pathUnseekable, fi, nil
+	}
+	return pathRegular, fi, nil
+}
+
+// readUnseekablePath reads a non-regular path whole, under the same ceiling a
+// pipe gets.
+//
+// The message when it is exceeded says the same three things readStdinLimit's
+// does — what was read, that the content is held in memory because a retry has
+// to be able to re-send it, and that a regular file has neither limitation —
+// and additionally names the path, because unlike standard input the caller
+// wrote one and may not realise it is not an ordinary file.
+func readUnseekablePath(what, flag, path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("read request body: %w", err)
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	defer f.Close()
-	// One byte past the cap, so "exactly at the limit" and "over it" are
-	// distinguishable rather than both looking full.
-	body, err := io.ReadAll(io.LimitReader(f, maxRequestBody+1))
+
+	body, over, err := readLimit(f, maxStdinBody)
 	if err != nil {
-		return nil, fmt.Errorf("read request body: %w", err)
+		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	if len(body) > maxRequestBody {
-		return nil, fmt.Errorf("request body %s is larger than the %d MiB limit — is that the file you meant?",
-			path, maxRequestBody>>20)
+	if over {
+		return nil, fmt.Errorf("%s read more than %d MiB from %s and stopped: %s is not a regular file, so its bytes cannot be re-read for a retry and are held in memory instead, which the CLI caps at %d MiB. Write it to a file and point %s at the path — a file streams from disk at any size the instance accepts.",
+			what, maxStdinBody>>20, path, path, maxStdinBody>>20, flag)
 	}
 	return body, nil
 }

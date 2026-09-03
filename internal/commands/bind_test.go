@@ -16,11 +16,13 @@ import (
 )
 
 // `ronja bind` gets its own fake rather than fakeInstance's, and the reason is
-// the assertion in serve(): this command must talk to exactly two routes — the
-// organization lookup every folder command pays for, and the search. An
-// unexpected path fails the test, which is what pins "bind is not a way to
+// the assertion in serve(): this command must talk to exactly three routes —
+// the organization lookup every folder command pays for, the search, and the
+// single GET /feature/:id that `--feature` checks the id it was handed against.
+// An unexpected path fails the test, which is what pins "bind is not a way to
 // browse resources" as a property of the code rather than a promise in a
-// comment.
+// comment. None of the three is a listing: two answer a term or an id the
+// caller typed, and the third answers "who am I".
 type fakeSearchInstance struct {
 	t *testing.T
 	// hits is what the search answers, keyed by the term asked for. A term with
@@ -31,13 +33,17 @@ type fakeSearchInstance struct {
 	// that an already-bound alias costs no request.
 	terms []string
 	// fail is the status the search answers with instead of a result; 0 is off.
-	fail   int
-	server *httptest.Server
+	fail int
+	// featureStatus is the status GET /feature/:id answers with, per id — the
+	// existence check `bind --feature` makes before it declares a stack. Absent
+	// (0) is 200, since a feature the caller can reach is the ordinary case.
+	featureStatus map[string]int
+	server        *httptest.Server
 }
 
 func newFakeSearchInstance(t *testing.T) *fakeSearchInstance {
 	t.Helper()
-	f := &fakeSearchInstance{t: t, hits: map[string][]api.SearchHit{}}
+	f := &fakeSearchInstance{t: t, hits: map[string][]api.SearchHit{}, featureStatus: map[string]int{}}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
@@ -46,6 +52,28 @@ func newFakeSearchInstance(t *testing.T) *fakeSearchInstance {
 func (f *fakeSearchInstance) URL() string { return f.server.URL }
 
 func (f *fakeSearchInstance) serve(w http.ResponseWriter, r *http.Request) {
+	// GET /feature/:id — the one read `bind --feature` makes, and the only
+	// route here that is not the organization lookup or the search. It is not a
+	// way to browse: the id is one the caller typed, and the answer is whether
+	// they can reach it.
+	//
+	// One segment only, or the unexpected-request assertion below stops being
+	// one: `/api/v2/feature/` prefixes routes that are not a feature read
+	// (`/feature/model/...`, `/feature/query`), and answering those here would
+	// let bind grow a browse call without a single test noticing.
+	if featureID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/"); ok && !strings.Contains(featureID, "/") {
+		switch status := f.featureStatus[featureID]; status {
+		case 0:
+			writeJSON(w, map[string]any{"id": featureID, "name": "Feature", "scope": "private"})
+		case http.StatusBadRequest:
+			http.Error(w, `{"error":"no rows"}`, status)
+		case http.StatusNotFound:
+			http.Error(w, `{"error":"feature not found"}`, status)
+		default:
+			http.Error(w, `{"error":"Internal server error"}`, status)
+		}
+		return
+	}
 	switch r.URL.Path {
 	case "/api/v2/authentication/me":
 		writeJSON(w, map[string]any{

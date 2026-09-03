@@ -232,6 +232,57 @@ func StatusOf(err error) int {
 	return 0
 }
 
+// Unanswered reports that the instance never delivered a verdict — as opposed
+// to delivering one the caller does not like.
+//
+// The distinction is who a message may blame. A 400 is the server having
+// considered the request and refused it, so the refusal is about the request; a
+// connection that never landed, a 429, or any 5xx is the instance not
+// answering, and a CLI that renders those as "your files are wrong" attributes
+// an outage to the author.
+//
+// A decode failure and a build-request failure are deliberately NOT included:
+// both mean an answer arrived (or that we never got as far as asking), and
+// neither is an outage.
+//
+// Neither is a CANCELLED context, and that one is not a technicality. root.go
+// installs signal.NotifyContext, so Ctrl-C during a request surfaces here as a
+// *url.Error wrapping context.Canceled — which the url.Error arm below would
+// otherwise read as an outage, and a caller that warns-and-continues on an
+// outage would then treat "the reader stopped this" as permission to carry on
+// and write files.
+//
+// A DEADLINE is excluded for the same reason in reverse: the request stopped at
+// OUR end, not the instance's, and IsTimeout is the separate question a caller
+// asks about a write that may have landed. BOTH deadline shapes are excluded,
+// which is why the test is IsTimeout rather than a bare
+// errors.Is(context.DeadlineExceeded): the http.Client's own Timeout does not
+// produce that sentinel at all, only a *url.Error that reports Timeout() — so
+// checking the sentinel alone excluded the per-request deadline and let the
+// client ceiling through the url.Error arm below as an outage, which is the
+// opposite verdict on the same event.
+//
+// Separate from retryableStatus and the device flow's isTransient, which answer
+// "should I try again" — a different question with a deliberately different
+// membership.
+func Unanswered(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || IsTimeout(err) {
+		return false
+	}
+	if status := StatusOf(err); status != 0 {
+		return status == http.StatusTooManyRequests || status >= 500
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 // IsTimeout reports a request that died on a DEADLINE rather than on an answer.
 //
 // The distinction is what makes a write recoverable: a 4xx means the server

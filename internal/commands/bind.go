@@ -103,6 +103,16 @@ different feature: that is an edit to ronja.json, not a flag.`,
 			if err != nil {
 				return err
 			}
+			// BEFORE openFolder, and that ordering is the whole point of the
+			// check. openFolder runs adoptStack, which WRITES ronja.json when a
+			// folder still in the legacy `instances[]` shape is named with
+			// --stack — so a `bind --stack <existing> --feature <unreachable>`
+			// that confirmed the feature later would rewrite the committed file
+			// and only then refuse. The two things it needs are both known here:
+			// the id came off the command line, and the credential is resolved.
+			if err := confirmBindFeature(cmd.Context(), featureID, resolved); err != nil {
+				return err
+			}
 			f, err := openFolder(cmd.Context(), resolved, kind)
 			if err != nil {
 				return err
@@ -391,6 +401,47 @@ func bindCount(n int, singular string) string {
 //
 // Nothing is written until every alias has been resolved, so a search that fails
 // half way through leaves the folder exactly as it was rather than half bound.
+// requireStackForFeature is the one refusal --feature earns without looking at
+// anything: a feature says where a STACK's resources are created, so naming no
+// stack names nothing.
+//
+// Its own function because it is now asked twice — once before the folder is
+// opened, so the check that follows costs no request on a command that was never
+// going to run, and once in bindTargetOf, which is the acceptance point and must
+// not depend on a caller having asked first.
+func requireStackForFeature(featureID string) error {
+	if featureID != "" && flagStack == "" {
+		return fmt.Errorf("--feature says which feature a stack's resources are created in, and no stack was named — pass --stack <name> with it")
+	}
+	return nil
+}
+
+// confirmBindFeature is the pre-open half of `bind --feature`: refuse an
+// unreachable feature while the folder on disk is still untouched.
+//
+// Declaring a stack with --feature is the documented way to promote a folder to
+// a SECOND organization, which makes it the other door onto the silent bind
+// `init` just closed — the same id written into the same committed file for an
+// organization nobody has checked it against.
+//
+// The organization is resolved first because the refusal NAMES it, and a
+// $RONJA_TOKEN credential does not know its own by construction. It is not an
+// extra round trip: resolveBinding pays for it moments later on every folder
+// that names anything on this instance, and runBind paid for it on the ones that
+// do not.
+func confirmBindFeature(ctx context.Context, featureID string, resolved *config.Resolved) error {
+	if featureID == "" {
+		return nil
+	}
+	if err := requireStackForFeature(featureID); err != nil {
+		return err
+	}
+	if err := ensureTenant(ctx, resolved); err != nil {
+		return err
+	}
+	return confirmFeatureIn(ctx, featureID, resolved)
+}
+
 func runBind(ctx context.Context, f *folder, yes bool, featureID string) (*bindResult, error) {
 	// A stack is one organization on one instance, and wfdir.checkStacks refuses
 	// one that names none — so DECLARING a stack needs an organization resolved,
@@ -534,7 +585,7 @@ func proposeBind(ctx context.Context, client *api.Client, alias, dependencyKind 
 			"search does not cover codexes — set this one by hand in "+wfdir.ManifestName, nil)
 	case !searchable:
 		return refuse(bindReasonUnknownKind,
-			fmt.Sprintf("this ronja has no search kind for a %q dependency — set it by hand in %s, and upgrade the CLI if the kind is newer than this build", dependencyKind, wfdir.ManifestName), nil)
+			fmt.Sprintf("this ronja has no search kind for a %q dependency — set it by hand in %s, and upgrade the CLI (run: ronja update) if the kind is newer than this build", dependencyKind, wfdir.ManifestName), nil)
 	case len(alias) < api.MinSearchTermLen:
 		// The endpoint answers a too-short term with an empty result and no error,
 		// which is indistinguishable on the wire from "nothing is called that".
@@ -661,8 +712,8 @@ func bindTargetOf(f *folder, featureID string) (bindTarget, error) {
 	// with no --stack reach into whichever environment this credential happened
 	// to match. Declaring or completing an environment is something a person
 	// names; it is not something a credential selects.
-	if featureID != "" && flagStack == "" {
-		return bindTarget{}, fmt.Errorf("--feature says which feature a stack's resources are created in, and no stack was named — pass --stack <name> with it")
+	if err := requireStackForFeature(featureID); err != nil {
+		return bindTarget{}, err
 	}
 	if f.Stack != "" {
 		stack, declared := m.Stacks[f.Stack]

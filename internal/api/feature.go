@@ -25,7 +25,25 @@ type Feature struct {
 	Scope string `json:"scope"`
 }
 
-// GetFeature reads a feature's metadata. 404s for an id the caller cannot reach.
+// GetFeature reads a feature's metadata. A feature the caller cannot reach is
+// refused with the sentence "feature not found" — whether it does not exist, is
+// in another organization, or is someone else's private one, which the server
+// deliberately does not tell apart.
+//
+// ⚠️ Do NOT depend on the STATUS to tell those cases apart. Today a lookup miss
+// happens to reach the wire as 400 and an unreadable-but-present feature as
+// 404, but that split is an artefact of which helper each arm was built from
+// rather than a contract: it is recorded as a known-open item in the backend's
+// access model and is expected to be unified in a later pass. Older instances
+// also answer "no rows" or a bare "not found" here. So the CLI's own matcher
+// (commands.explainFeatureUnreachable) accepts EITHER status for this sentence
+// and branches on the message, which is what makes it survive that pass without
+// a client change. Anything new reading this error should do the same.
+//
+// Two callers, and the second is a READ FOR EXISTENCE rather than for a field:
+// commands.confirmFeatureIn calls it so `init` can refuse a --feature it cannot
+// reach before writing a manifest that names it. That is still not a general
+// feature client — nothing here enumerates, and discovery stays on plain HTTP.
 func (c *Client) GetFeature(ctx context.Context, id string) (*Feature, error) {
 	var out Feature
 	if err := c.Do(ctx, "GET", "feature/"+url.PathEscape(id), nil, &out); err != nil {

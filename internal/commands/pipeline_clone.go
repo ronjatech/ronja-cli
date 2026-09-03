@@ -159,7 +159,10 @@ directory must be empty or absent.`,
 					recordLiveAgreement(liveHash, s.Path, s.TableID, s.LiveCode)
 				}
 				if s.DraftID != "" {
-					recordDraftWrite(baseline, s.Path, s.TableID, s.DraftID, s.Code)
+					// No WIRE fingerprint: this clone read that draft, it did not
+					// write it, so there are no sent bytes to vouch for. See
+					// recordDraftWrite — the first push writes unconditionally.
+					recordDraftWrite(baseline, s.Path, s.TableID, s.DraftID, s.Code, "")
 				} else {
 					recordDraftPointer(baseline, s.Path, s.TableID, "")
 				}

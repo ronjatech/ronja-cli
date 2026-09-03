@@ -127,6 +127,11 @@ type Resolved struct {
 	// workflow id under the other's token. Callers that need the tenant under
 	// an environment token must ask the server (see commands.resolveInstance).
 	TenantID string
+	// TenantName is what the SERVER calls that organization, filled in by the
+	// one /me call ensureTenant already makes. Empty otherwise, including for
+	// every stored profile — those carry the name on Entry.TenantName, and this
+	// field exists precisely for the credential that has no entry to carry one.
+	TenantName string
 }
 
 // NormalizeURL canonicalises a base URL so the same instance always maps to the

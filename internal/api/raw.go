@@ -51,6 +51,35 @@ type RawResponse struct {
 	Body   io.ReadCloser
 }
 
+// BodySource is a request body that can be produced more than once.
+//
+// Two callers need that. --retry and --wait-until re-issue the request, each
+// attempt calling DoRaw again and therefore Open again; and net/http itself
+// replays a body across a 307/308 redirect through GetBody. A plain io.Reader
+// satisfies neither — it is drained by the first attempt, and the second would
+// send a zero-byte body, which a server accepts.
+//
+// Len is what makes a body streamable rather than buffered: it becomes
+// Content-Length, so the bytes can come off disk as they are written to the
+// socket instead of being held whole. A source that cannot state its size in
+// advance (a pipe, a character device) has no business implementing this — the
+// commands buffer those and hand back a BytesBody.
+type BodySource interface {
+	// Len is the exact number of bytes Open will yield.
+	Len() int64
+	// Open returns a fresh reader over the whole body. The caller closes it.
+	Open() (io.ReadCloser, error)
+}
+
+// BytesBody is a body already held in memory.
+type BytesBody []byte
+
+func (b BytesBody) Len() int64 { return int64(len(b)) }
+
+func (b BytesBody) Open() (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(b)), nil
+}
+
 // DoRaw issues an arbitrary request against a path relative to the instance
 // root and returns the response without reading it.
 //
@@ -61,7 +90,7 @@ type RawResponse struct {
 // timeout bounds the whole call, the response body INCLUDED — the deadline
 // rides on Body.Close, not on this function's return. Zero or less means no
 // client-side deadline at all, which the command surfaces as `--timeout 0`.
-func (c *Client) DoRaw(ctx context.Context, method, path string, header http.Header, body []byte, timeout time.Duration) (*RawResponse, error) {
+func (c *Client) DoRaw(ctx context.Context, method, path string, header http.Header, body BodySource, timeout time.Duration) (*RawResponse, error) {
 	// NOT deferred: the deadline has to outlive this function, because the
 	// caller is about to stream a body that is still in flight. Cancelling on
 	// return would truncate every response larger than one buffer. The
@@ -78,15 +107,37 @@ func (c *Client) DoRaw(ctx context.Context, method, path string, header http.Hea
 		ctx, cancel = context.WithCancel(ctx)
 	}
 
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
 	url := c.BaseURL + "/" + strings.TrimPrefix(path, "/")
-	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("build request: %w", err)
+	}
+	if body != nil {
+		// Set on the request rather than passed to NewRequestWithContext,
+		// which only knows how to size the three in-memory reader types and
+		// would otherwise send a streamed body chunked — i.e. unbounded, with
+		// no Content-Length for the server to check or refuse against.
+		req.ContentLength = body.Len()
+		if req.ContentLength == 0 {
+			// Non-nil Body with ContentLength 0 reads as "length unknown" to
+			// net/http, so an empty body would go out chunked. NoBody is how
+			// the stdlib itself spells an explicitly empty one.
+			req.Body = http.NoBody
+			req.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
+		} else {
+			rc, err := body.Open()
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("open request body: %w", err)
+			}
+			req.Body = rc
+			// GetBody is consulted by net/http for ONE thing here: replaying
+			// the body across a 307/308 redirect. It is not what makes
+			// --retry work — send re-calls DoRaw per attempt, so every retry
+			// gets a fresh Open of its own.
+			req.GetBody = body.Open
+		}
 	}
 	if header != nil {
 		req.Header = header.Clone()

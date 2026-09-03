@@ -91,6 +91,13 @@ type fakePipelineInstance struct {
 	// stops the CLI listening, never the build.
 	syncBusy map[string]int
 
+	// stateAfterRead runs ONCE, immediately after GET :id/draft has been served,
+	// and is how a test opens the window layer 1 exists to close: the CLI has
+	// read the draft and compared it, and somebody else's edit lands before its
+	// PUT arrives. Nothing the client-side guard does can see that — only the
+	// precondition on the write can.
+	stateAfterRead func()
+
 	privilegeLevel   int
 	noFrontendOrigin bool
 	// failMe answers the organization lookup with a status instead of an
@@ -147,6 +154,20 @@ type recordedTableUpdate struct {
 	ID          string
 	Code        string
 	InputModels []string
+	// BaseCodeSha256 is the precondition the PUT carried, as a POINTER so the
+	// fake can tell ABSENT from PRESENT-AND-EMPTY. The server reads three states
+	// and answers 400 to the empty one, so collapsing them here would let a
+	// client that dropped `omitempty` — and therefore 400s every unconditional
+	// write in production — pass every test.
+	BaseCodeSha256 *string
+}
+
+// tableUpdateBody is the PUT body as the SERVER sees it, which is not quite
+// api.UpdateTableInput: the precondition is a pointer here for the reason above.
+type tableUpdateBody struct {
+	Code           string   `json:"code"`
+	InputModels    []string `json:"inputModels"`
+	BaseCodeSha256 *string  `json:"baseCodeSha256"`
 }
 
 func newFakePipelineInstance(t *testing.T) *fakePipelineInstance {
@@ -390,7 +411,12 @@ func (f *fakePipelineInstance) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		feature, known := f.features[featureID]
 		if !known {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			// The REAL route's wording. A feature this caller cannot reach and
+			// one that does not exist are deliberately one answer on the server
+			// (RLS), and the CLI recognises it by code — so a fake that invented
+			// its own "not found" would let `pipeline init` pass a test while
+			// falling through to the raw wrapper against a live instance.
+			http.Error(w, `{"error":"feature not found"}`, http.StatusNotFound)
 			return
 		}
 		writeJSON(w, feature)
@@ -429,6 +455,12 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 			return
 		}
 		f.writeDraftRow(w, f.tables[draftID])
+		// AFTER the answer is written, so the CLI really does hold the row as it
+		// was before the hook moved it. Once only.
+		if hook := f.stateAfterRead; hook != nil {
+			f.stateAfterRead = nil
+			hook()
+		}
 
 	case action == "checkout" && r.Method == http.MethodPost:
 		f.serveCheckout(w, id)
@@ -437,7 +469,9 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 		f.serveSync(w, id)
 
 	case action == "commit" && r.Method == http.MethodPost:
-		f.serveCommit(w, id)
+		var in api.TableCommitDraftInput
+		decodeOptionalBody(f.t, r, &in)
+		f.serveCommit(w, id, in.ConfirmHeadVersionID)
 
 	case action == "discard" && r.Method == http.MethodPost:
 		draft := f.tables[id]
@@ -459,9 +493,28 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 			return
 		}
-		var in api.UpdateTableInput
+		var in tableUpdateBody
 		decodeBody(f.t, r, &in)
-		f.updates = append(f.updates, recordedTableUpdate{ID: id, Code: in.Code, InputModels: in.InputModels})
+		f.updates = append(f.updates, recordedTableUpdate{ID: id, Code: in.Code, InputModels: in.InputModels, BaseCodeSha256: in.BaseCodeSha256})
+		// The layer-1 precondition, modelled the way rmodelv2.checkCodePrecondition
+		// decides it and NOT the way the CLI intends it: the digest is compared
+		// against what THIS ROW STORES, whatever the client believed it was
+		// fingerprinting. That is the whole point of the fake refusing here — a
+		// client that sent the disk-form hash of an aliased file would be caught
+		// by production and must be caught here too.
+		//
+		// Three states: absent is no check, "" is a 400 rather than a silent
+		// no-check, and a digest is compare-and-swap.
+		if in.BaseCodeSha256 != nil {
+			if *in.BaseCodeSha256 == "" {
+				http.Error(w, `{"error":"baseCodeSha256 must be a 64-character lowercase hex sha256"}`, http.StatusBadRequest)
+				return
+			}
+			if wfdir.HashString(row.Code) != *in.BaseCodeSha256 {
+				http.Error(w, `{"error":"this table's code changed since you last read it"}`, http.StatusConflict)
+				return
+			}
+		}
 		// Stored VERBATIM on the row that was addressed, which is the property
 		// worth modelling: a PUT to the live row is accepted and is silently lost
 		// work, so nothing here redirects it to a draft.
@@ -698,7 +751,7 @@ func (f *fakePipelineInstance) applyBuildOutcome(id string) {
 	}
 }
 
-func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID string) {
+func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confirmHeadVersionID string) {
 	if status := f.failCommit[draftID]; status != 0 {
 		http.Error(w, `{"error":"admin required to commit into a shared feature"}`, status)
 		return
@@ -706,6 +759,15 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID string
 	draft := f.tables[draftID]
 	if draft == nil || draft.ParentModelID == "" {
 		http.Error(w, `{"error":"not a draft"}`, http.StatusBadRequest)
+		return
+	}
+	// The base-version CAS, read off the SAME state that makes the review
+	// payload's baseStale true — one source of truth in the fake, because it is
+	// one in the server: the gate and the payload both resolve the head through
+	// rmodelv2.lastCommittedShadow. A stale draft is REFUSED, and nothing is
+	// written; the confirm must equal the CURRENT head, not merely be non-empty.
+	if head := f.headVersionOf(draft.ParentModelID); head != "" && confirmHeadVersionID != head {
+		http.Error(w, `{"error":"this table changed since your draft was created — it is now at version `+head+`"}`, http.StatusConflict)
 		return
 	}
 	// A backstop the CLI should never reach: it refuses a failed draft itself,
@@ -721,6 +783,10 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID string
 		return
 	}
 	f.committed = append(f.committed, draftID)
+	// The commit landed, so the parent is now at the version this draft made:
+	// nothing is intervening any more. Modelled, or a second publish of the same
+	// folder would be refused against a version it had just overwritten.
+	delete(f.intervening, draft.ParentModelID)
 	parent := f.tables[draft.ParentModelID]
 	if parent != nil {
 		parent.Code = draft.Code
@@ -838,7 +904,26 @@ func (f *fakePipelineInstance) reviewPayload(draft *api.Table) api.TableDraftRev
 		out.BaseStale = true
 		out.InterveningVersions = versions
 	}
+	// Returned ALWAYS, not only when baseStale — that is the server's contract,
+	// and it is what lets a caller carry the head into a commit without a second
+	// round trip. Empty when the table has never been committed to.
+	out.HeadVersionID = f.headVersionOf(draft.ParentModelID)
 	return out
+}
+
+// headVersionOf is the fake's head-of-version-history for a LIVE table: the
+// newest intervening version, since `intervening` is what this fake uses to say
+// "this table has moved since the drafts of it forked". Empty means the table
+// has never been committed to, which is a real state and not "unknown" — the
+// server returns empty there too rather than falling back to the table's own id.
+//
+// intervening is newest-first, matching the server's committed_at DESC ordering.
+func (f *fakePipelineInstance) headVersionOf(liveID string) string {
+	versions := f.intervening[liveID]
+	if len(versions) == 0 {
+		return ""
+	}
+	return versions[0].VersionID
 }
 
 func (f *fakePipelineInstance) rowCountOf(id string) int64 {

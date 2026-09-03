@@ -253,30 +253,51 @@ func pipelineErrorText(err error) string {
 // checkout holds. An empty draftID means there is none any more (committed,
 // discarded, or gone from under us).
 //
-// A draft id that is not the recorded one CLEARS the draft fingerprint: the
+// A draft id that is not the recorded one CLEARS BOTH draft fingerprints: the
 // recorded bytes describe a row that is not this one, and keeping them would
-// point leg (b) of the drift guard at a different draft's contents.
+// point leg (b) of the drift guard at a different draft's contents — and, worse
+// for the wire one, would send the next PUT a baseCodeSha256 taken from a row
+// that no longer exists, which the server would refuse as somebody else's edit.
 func recordDraftPointer(inst *wfdir.InstanceState, path, tableID, draftID string) {
 	mutateTable(inst, path, func(s *wfdir.TableState) {
 		if s.DraftID != draftID {
 			s.DraftSHA256 = ""
+			s.DraftWireSHA256 = ""
 		}
 		s.TableID = tableID
 		s.DraftID = draftID
 	})
 }
 
-// recordDraftWrite records the SQL just written into a draft — the bytes that
-// draft now holds, and the only thing leg (b) may compare it against.
+// recordDraftWrite records the SQL just written into a draft, in BOTH forms:
+// `content` as it stands on disk, and `wire` as it went over the PUT.
+//
+// Two fingerprints of one write, because they are compared against different
+// things and wfdir.TableState's invariant forbids folding them. `content` is
+// what leg (b) of the drift guard compares (after de-aliasing the remote row),
+// and `wire` is what the ROW now stores — so it, and only it, is what the next
+// PUT may send as baseCodeSha256.
 //
 // Written after the PUT and NOT after the build, deliberately: what the draft
 // holds is decided by the write, so a failed build must still advance this or
 // the next push reads its own last attempt as somebody else's edit and refuses.
-func recordDraftWrite(inst *wfdir.InstanceState, path, tableID, draftID, content string) {
+func recordDraftWrite(inst *wfdir.InstanceState, path, tableID, draftID, content, wire string) {
 	mutateTable(inst, path, func(s *wfdir.TableState) {
 		s.TableID = tableID
 		s.DraftID = draftID
 		s.DraftSHA256 = wfdir.HashString(content)
+		// An empty `wire` means UNKNOWN, not "the row holds nothing", and it is
+		// the CLONE's answer: a clone READ somebody's draft rather than writing
+		// one, and the disk form it kept cannot be turned back into the exact
+		// bytes that row stores (canonicalDisk is lossy — a positional ref and an
+		// id ref both land on the same stem). Recording a fingerprint we cannot
+		// vouch for would make the first push after a clone 409 against a
+		// difference nobody made, so the field is left empty and that push writes
+		// unconditionally, exactly as it does today.
+		s.DraftWireSHA256 = ""
+		if wire != "" {
+			s.DraftWireSHA256 = wfdir.HashString(wire)
+		}
 	})
 }
 

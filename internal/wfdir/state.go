@@ -110,9 +110,17 @@ type InstanceState struct {
 //	InstanceState.Files[path].SHA256  the last COMPLETE push (written AND built).
 //	                                  What "changed since the last sync" means,
 //	                                  for `status` and for what a bare push sends.
-//	TableState.DraftSHA256            what this checkout last WROTE into DraftID.
-//	                                  Leg (b) of the drift guard compares the
-//	                                  draft against this.
+//	TableState.DraftSHA256            what this checkout last wrote into DraftID,
+//	                                  in the DISK form — the file's own bytes,
+//	                                  aliases and sibling stems unresolved. Leg
+//	                                  (b) of the drift guard compares the draft
+//	                                  against this, after de-aliasing the row.
+//	TableState.DraftWireSHA256        the same write, in the WIRE form — the exact
+//	                                  bytes that went over the PUT, ids
+//	                                  substituted for every alias and stem. This
+//	                                  is what the ROW stores, so it is the only
+//	                                  one of the three that may be sent as the
+//	                                  server's baseCodeSha256 precondition.
 //	TableState.LiveSHA256             the LIVE row's SQL as of the last moment
 //	                                  this folder agreed with it — a clone, the
 //	                                  fork of a draft, a publish. Leg (a)
@@ -135,16 +143,34 @@ type InstanceState struct {
 // or discarded from the web UI between two commands, so a caller re-reads
 // (GET /feature/model/:id/draft) rather than trusting a recorded id blindly.
 //
-// Both hashes are omitempty and three-state-safe. EMPTY means "no baseline for
-// that row", which disarms its leg of the drift guard exactly the way an absent
-// file baseline does — the state of a folder cloned from git, of a draft this
-// checkout never wrote to, and of a baseline written before these fields
-// existed.
+// DraftWireSHA256 is LOCAL-ONLY, for exactly the reason DraftID and
+// DraftSHA256 are and LiveSHA256 is not: it is a fingerprint of a PER-USER
+// draft row. "The live table held these bytes" is a fact about the environment
+// and belongs in the committed lock; "my own open draft holds these bytes" is
+// true for one person on one machine, and a colleague inheriting it from git
+// would be handed a precondition taken from a row they cannot even read.
+//
+// It sits beside DraftSHA256 rather than replacing it because they are
+// fingerprints of two different things and the invariant above forbids folding
+// them: the drift guard compares the DISK form (it has to explain drift in
+// terms of the folder, and it de-aliases the remote row to do so), while the
+// server's precondition compares the WIRE form (that is what the row stores).
+// Sending the disk hash as a precondition would 409 every push from any folder
+// that spells a ref as a sibling's stem or a declared alias — which is the
+// ordinary pipeline folder.
+//
+// All three hashes are omitempty and three-state-safe. EMPTY means "no baseline
+// for that row", which disarms its leg of the drift guard exactly the way an
+// absent file baseline does — the state of a folder cloned from git, of a draft
+// this checkout never wrote to, and of a baseline written before these fields
+// existed. For DraftWireSHA256 empty additionally means "send no precondition",
+// which is the server's back-compatible "write unconditionally".
 type TableState struct {
-	TableID     string `json:"tableID"`
-	DraftID     string `json:"draftID,omitempty"`
-	DraftSHA256 string `json:"draftSHA256,omitempty"`
-	LiveSHA256  string `json:"liveSHA256,omitempty"`
+	TableID         string `json:"tableID"`
+	DraftID         string `json:"draftID,omitempty"`
+	DraftSHA256     string `json:"draftSHA256,omitempty"`
+	DraftWireSHA256 string `json:"draftWireSHA256,omitempty"`
+	LiveSHA256      string `json:"liveSHA256,omitempty"`
 }
 
 // FileState is one file as the server last had it. UpdatedAt is diagnostics

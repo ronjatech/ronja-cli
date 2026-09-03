@@ -213,6 +213,7 @@ const reviewFixture = `{
   "interveningVersions": [
     {"versionID": "table-v2", "name": "monthly_revenue", "committedAt": "2026-07-27T12:00:00Z"}
   ],
+  "headVersionID": "table-v2",
   "submittedForReview": true,
   "drafterUserID": "user-1"
 }`
@@ -267,6 +268,71 @@ func TestGetTableDraftReviewDecodesTheWholePayload(t *testing.T) {
 	}
 	if !rev.SubmittedForReview {
 		t.Error("submittedForReview did not decode")
+	}
+	// The value `pipeline publish --overwrite-remote` sends back as
+	// confirmHeadVersionID. A tag that did not decode would leave it empty, which
+	// the override reads as "nothing to confirm" and reports as a dead end on a
+	// table that has moved — a refusal with no way through.
+	if rev.HeadVersionID != "table-v2" {
+		t.Errorf("headVersionID = %q, want the id the override confirms", rev.HeadVersionID)
+	}
+}
+
+// TestUpdateTableCodeSendsBaseCodeSha256OnlyWhenAsserting pins the three-state
+// wire shape of the layer-1 precondition, which is the one tag on this type
+// where omitempty is load-bearing in the DESTRUCTIVE direction: the server
+// answers 400 to an explicit "" (rmodelv2.checkCodePrecondition refuses it
+// rather than reading it as "no check"), so a tag without omitempty would turn
+// every unconditional write in the loop into a bad request.
+func TestUpdateTableCodeSendsBaseCodeSha256OnlyWhenAsserting(t *testing.T) {
+	const digest = "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"
+	for _, tt := range []struct {
+		name    string
+		basis   string
+		present bool
+	}{
+		{"an unconditional write sends no precondition at all", "", false},
+		{"a digest is sent verbatim", digest, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []capture
+			client := serveCapturing(t, 200, "", &got)
+			if err := client.UpdateTableCode(context.Background(), "table-draft-1", "SELECT 1", []string{}, tt.basis); err != nil {
+				t.Fatalf("update: %v", err)
+			}
+			raw, present := got[0].body["baseCodeSha256"]
+			if present != tt.present {
+				t.Fatalf("baseCodeSha256 present = %v, want %v (body %+v)", present, tt.present, got[0].body)
+			}
+			if tt.present && raw != tt.basis {
+				t.Errorf("baseCodeSha256 = %v, want %q", raw, tt.basis)
+			}
+		})
+	}
+}
+
+// TestCommitTableDraftSendsNoBodyWithoutAnOverride: an ordinary commit must send
+// the shape this route took before the CAS existed. The override is the only
+// thing that puts a body on it, and the field name has to match
+// rmodelv2.CommitDraftInput exactly — a misspelt tag decodes to the zero value
+// server-side, which is "no override", so the commit would be refused again with
+// nothing to show for it.
+func TestCommitTableDraftSendsNoBodyWithoutAnOverride(t *testing.T) {
+	var got []capture
+	client := serveCapturing(t, 200, "", &got)
+	if err := client.CommitTableDraft(context.Background(), "table-draft-1", ""); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if len(got[0].body) != 0 {
+		t.Errorf("body = %+v, want nothing sent", got[0].body)
+	}
+	got = nil
+	client = serveCapturing(t, 200, "", &got)
+	if err := client.CommitTableDraft(context.Background(), "table-draft-1", "table-v2"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got[0].body["confirmHeadVersionID"] != "table-v2" {
+		t.Errorf("body = %+v", got[0].body)
 	}
 }
 
@@ -421,7 +487,7 @@ func TestUpdateTableCodeAlwaysSendsInputModels(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var got []capture
 			client := serveCapturing(t, 200, "", &got)
-			if err := client.UpdateTableCode(context.Background(), "table-draft-1", "SELECT 1", tt.inputs); err != nil {
+			if err := client.UpdateTableCode(context.Background(), "table-draft-1", "SELECT 1", tt.inputs, ""); err != nil {
 				t.Fatalf("update: %v", err)
 			}
 			if len(got) != 1 || got[0].method != "PUT" || got[0].path != "/api/v2/feature/model/table-draft-1" {
@@ -459,7 +525,7 @@ func TestLifecycleVerbsHitTheRightRoutes(t *testing.T) {
 			return c.SyncTable(context.Background(), "table-draft-1")
 		}, "/api/v2/feature/model/table-draft-1/sync"},
 		{"commit", func(c *Client) error {
-			return c.CommitTableDraft(context.Background(), "table-draft-1")
+			return c.CommitTableDraft(context.Background(), "table-draft-1", "")
 		}, "/api/v2/feature/model/table-draft-1/commit"},
 		{"discard", func(c *Client) error {
 			return c.DiscardTableDraft(context.Background(), "table-draft-1")

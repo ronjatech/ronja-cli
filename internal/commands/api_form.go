@@ -3,12 +3,16 @@ package commands
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"mime"
 	"mime/multipart"
 	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
 // Multipart bodies for `ronja api -F`.
@@ -28,6 +32,135 @@ import (
 // that it exists; -F is a way of ENCODING a body, in the same category as -d,
 // and it needs no maintenance when a route is added.
 
+// formBody is a multipart body as an ordered list of segments.
+//
+// A segment is either a slice of bytes the CLI generated — part headers, plain
+// fields, a piped part that had to be buffered, the closing boundary — or a
+// reference to a file on disk. Open concatenates them; Len is the sum of the
+// literal lengths and the stat'ed file sizes, which is exact, so the request
+// carries a real Content-Length and the file bytes never enter memory.
+//
+// The boundary is generated ONCE, when the segments are built, and is baked
+// into the literals. Every Open therefore produces byte-for-byte the same body
+// — which is what a retry, and the Content-Type header the command already
+// sent, both require.
+type formBody struct {
+	segments []formSegment
+	size     int64
+}
+
+// formSegment is one piece of the body: literal bytes, or a file to stream.
+type formSegment struct {
+	literal []byte
+	path    string    // empty for a literal segment
+	size    int64     // the file's size at build time
+	modTime time.Time // the file's modification time when size was measured
+}
+
+func (f formBody) Len() int64 { return f.size }
+
+// Open returns a reader over the whole body, opening each file part LAZILY.
+//
+// Eagerly opening every part held one descriptor per file for the whole
+// request, which is a real ceiling on a form assembled in a loop: a hundred
+// parts is a hundred handles held while the slowest of them is uploaded, and
+// nothing about the failure when they run out names the form. One at a time
+// costs nothing — the parts are read strictly in order anyway — and the handle
+// is closed at EOF, before the next one is opened.
+//
+// The cost of the laziness is WHEN an unopenable part is reported: at read
+// time, mid-request, rather than before the request is shaped. That is why
+// checkFormPaths exists and runs first, so the ordinary case (a path that is
+// wrong, or gone) is still caught up front and costs nothing.
+func (f formBody) Open() (io.ReadCloser, error) {
+	return &formReader{segments: f.segments}, nil
+}
+
+// formReader walks a form body's segments, holding at most ONE open file.
+type formReader struct {
+	segments []formSegment
+	next     int
+	// current is the segment being read; open is the file behind it, or nil
+	// when the segment is literal bytes.
+	current io.Reader
+	open    *os.File
+	closed  bool
+}
+
+func (r *formReader) Read(p []byte) (int, error) {
+	if r.closed {
+		return 0, os.ErrClosed
+	}
+	for {
+		if r.current == nil {
+			if r.next >= len(r.segments) {
+				return 0, io.EOF
+			}
+			seg := r.segments[r.next]
+			r.next++
+			if seg.path == "" {
+				r.current = bytes.NewReader(seg.literal)
+				continue
+			}
+			file, err := os.Open(seg.path)
+			if err != nil {
+				return 0, err
+			}
+			r.open, r.current = file, file
+			continue
+		}
+		n, err := r.current.Read(p)
+		if err == io.EOF {
+			// The segment is done: its descriptor is released here rather than
+			// at Close, which is the whole point of opening lazily. A close
+			// error on a file that has just been read to the end says nothing
+			// about the bytes already handed over, so it is not allowed to fail
+			// an upload that is otherwise complete.
+			r.closeCurrent()
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		if n > 0 || err != nil {
+			return n, err
+		}
+		// A reader may legally return (0, nil); ask it again rather than
+		// reporting an EOF it did not give.
+	}
+}
+
+// Close releases the one descriptor that may still be open — the part being
+// read when the request was abandoned. Everything before it was closed at its
+// own EOF.
+func (r *formReader) Close() error {
+	r.closed = true
+	if r.open == nil {
+		return nil
+	}
+	err := r.open.Close()
+	r.open, r.current = nil, nil
+	return err
+}
+
+func (r *formReader) closeCurrent() {
+	if r.open != nil {
+		_ = r.open.Close()
+		r.open = nil
+	}
+	r.current = nil
+}
+
+func (f formBody) paths() []sizedPath {
+	var paths []sizedPath
+	for _, seg := range f.segments {
+		if seg.path != "" {
+			paths = append(paths, sizedPath{path: seg.path, size: seg.size, modTime: seg.modTime})
+		}
+	}
+	return paths
+}
+
 // buildForm turns repeated -F specs into a multipart body and its content type.
 //
 // Two spec forms, curl's:
@@ -35,15 +168,32 @@ import (
 //	name=value    a literal field
 //	name=@path    a file part, read from disk ("-" reads standard input)
 //
-// The body is assembled in MEMORY rather than streamed from disk, which is a
-// deliberate trade. A streamed body is read once and cannot be replayed, and
-// --retry and --wait-until both re-issue the same request — a request whose
-// body evaporated after the first attempt would retry as a zero-byte upload,
-// which the server would accept. Holding the bytes is what makes those flags
-// safe to combine, and maxRequestBody keeps it bounded.
-func buildForm(specs []string) ([]byte, string, error) {
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
+// File parts are STREAMED: the multipart framing around them is generated here,
+// the bytes are not. That is what lets an upload be as large as the instance
+// accepts rather than as large as this process can hold. Replay still works,
+// because a segmented body can be re-opened as often as --retry and
+// --wait-until need it — see formBody. The exceptions are the parts that cannot
+// be re-opened to the same bytes at all: a piped part (`@-`), and a path that
+// is readable but not a regular file. Both are buffered — see
+// classifyBodyPath.
+func buildForm(specs []string) (api.BodySource, string, error) {
+	var (
+		buf    bytes.Buffer
+		body   formBody
+		writer = multipart.NewWriter(&buf)
+	)
+	// flush turns everything the multipart writer has produced since the last
+	// call into one literal segment. Called immediately after a file part's
+	// headers are written, so the file's bytes can be spliced in behind them.
+	flush := func() {
+		if buf.Len() == 0 {
+			return
+		}
+		literal := bytes.Clone(buf.Bytes())
+		body.segments = append(body.segments, formSegment{literal: literal})
+		body.size += int64(len(literal))
+		buf.Reset()
+	}
 
 	for _, spec := range specs {
 		// FIRST = only: a literal value may perfectly well contain one (a URL,
@@ -60,21 +210,22 @@ func buildForm(specs []string) ([]byte, string, error) {
 			}
 			continue
 		}
-		if err := writeFilePart(writer, name, path); err != nil {
+		seg, err := writeFilePart(writer, name, path)
+		if err != nil {
 			return nil, "", err
 		}
-		// Checked per part rather than once at the end so an oversized upload
-		// fails on the file that caused it, and before the rest are read.
-		if buf.Len() > maxRequestBody {
-			return nil, "", fmt.Errorf("the form body is larger than the %d MiB limit — upload it in pieces, or send the bytes directly with -d @%s",
-				maxRequestBody>>20, path)
+		if seg != nil {
+			flush()
+			body.segments = append(body.segments, *seg)
+			body.size += seg.size
 		}
 	}
 
 	if err := writer.Close(); err != nil {
 		return nil, "", fmt.Errorf("finish form body: %w", err)
 	}
-	return buf.Bytes(), writer.FormDataContentType(), nil
+	flush()
+	return body, writer.FormDataContentType(), nil
 }
 
 // writeFilePart adds one file part, with a real content type on it.
@@ -85,24 +236,47 @@ func buildForm(specs []string) ([]byte, string, error) {
 // then cannot preview or extract text from. The type is guessed from the
 // extension — the same thing every browser does for a file input — and falls
 // back to octet-stream only when there is genuinely nothing to go on.
-func writeFilePart(writer *multipart.Writer, name, path string) error {
+//
+// It returns the segment the caller must splice in after the part's headers, or
+// nil when the content was buffered — a piped part, or a path that is readable
+// but not a regular file — and has already been written through the writer.
+func writeFilePart(writer *multipart.Writer, name, path string) (*formSegment, error) {
 	var (
-		body     []byte
-		err      error
+		buffered []byte // the content, when it had to be read rather than streamed
+		streamed bool
+		size     int64
+		modTime  time.Time
 		filename string
 	)
-	if path == "-" {
+	switch {
+	case path == "-":
 		// Named after the field, because a part with no filename is a plain
 		// field to most servers and would be silently dropped by an upload
 		// handler looking for a file.
 		filename = name
-		body, err = readStdinLimit("-F "+name+"=@-", maxRequestBody)
-	} else {
+		content, err := readStdinLimit("-F "+name+"=@-", "-F", maxStdinBody)
+		if err != nil {
+			return nil, err
+		}
+		buffered = content
+	default:
 		filename = filepath.Base(path)
-		body, err = readBodyFile(path)
-	}
-	if err != nil {
-		return err
+		what := "-F " + name + "=@" + path
+		kind, fi, err := classifyBodyPath(what, path)
+		if err != nil {
+			return nil, err
+		}
+		if kind == pathRegular {
+			streamed, size, modTime = true, fi.Size(), fi.ModTime()
+			break
+		}
+		// Not a regular file, but readable: buffered like a pipe, for the
+		// reasons classifyBodyPath sets out.
+		content, err := readUnseekablePath(what, "-F", path)
+		if err != nil {
+			return nil, err
+		}
+		buffered = content
 	}
 
 	contentType := mime.TypeByExtension(filepath.Ext(filename))
@@ -117,12 +291,15 @@ func writeFilePart(writer *multipart.Writer, name, path string) error {
 
 	part, err := writer.CreatePart(header)
 	if err != nil {
-		return fmt.Errorf("build form file %s: %w", name, err)
+		return nil, fmt.Errorf("build form file %s: %w", name, err)
 	}
-	if _, err := part.Write(body); err != nil {
-		return fmt.Errorf("build form file %s: %w", name, err)
+	if streamed {
+		return &formSegment{path: path, size: size, modTime: modTime}, nil
 	}
-	return nil
+	if _, err := part.Write(buffered); err != nil {
+		return nil, fmt.Errorf("build form file %s: %w", name, err)
+	}
+	return nil, nil
 }
 
 // escapeFormValue quotes a name or filename for a Content-Disposition header.
@@ -202,12 +379,18 @@ func formContentType(supplied, generated string) (string, error) {
 	return mime.FormatMediaType(mediaType, params), nil
 }
 
-// checkFormPaths reports a -F file that does not exist BEFORE anything is sent.
+// checkFormPaths reports a -F file that does not exist, or is a directory,
+// BEFORE anything is sent.
 //
 // Not merely a nicer message: without it the first file is read, the body is
 // assembled, and the failure arrives after the request has already been shaped
 // — and with --retry set, after the retry budget has been spent on a request
-// that could never have succeeded.
+// that could never have succeeded. Since formBody opens its parts lazily, it is
+// also the only thing that catches a bad path before the request is in flight.
+//
+// It stats and nothing more: a non-regular path is legitimate here (it is
+// buffered when the body is built), and reading it to find that out would drain
+// the very thing the build is about to read.
 func checkFormPaths(specs []string) error {
 	for _, spec := range specs {
 		_, value, ok := strings.Cut(spec, "=")
@@ -218,8 +401,8 @@ func checkFormPaths(specs []string) error {
 		if !isFile || path == "-" {
 			continue
 		}
-		if _, err := os.Stat(path); err != nil {
-			return fmt.Errorf("-F %s: %w", spec, err)
+		if _, _, err := classifyBodyPath("-F "+spec, path); err != nil {
+			return err
 		}
 	}
 	return nil

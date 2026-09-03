@@ -370,7 +370,7 @@ func (c *Client) PreviewDataApp(ctx context.Context, appID string, in PreviewReq
 	header.Set("Content-Type", "application/json")
 
 	path := "/api/v2/dataapp/" + url.PathEscape(appID) + "/preview"
-	resp, err := c.DoRaw(ctx, "POST", path, header, body, previewCallTimeout(in))
+	resp, err := c.DoRaw(ctx, "POST", path, header, BytesBody(body), previewCallTimeout(in))
 	if err != nil {
 		return nil, err
 	}

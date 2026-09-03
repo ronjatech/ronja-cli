@@ -178,6 +178,7 @@ func run(args []string) int {
 	}
 	ctx, stop := signalContext()
 	defer stop()
+	code := 0
 	if err := root.ExecuteContext(ctx); err != nil {
 		// Cobra has already printed the error for usage problems; this covers
 		// the RunE path. Keep it on stderr so --json output stays parseable.
@@ -187,13 +188,17 @@ func run(args []string) int {
 		// A command that named its own exit code gets it. Checked AFTER the
 		// reporting above rather than instead of it, so a coded failure is still
 		// explained on stderr like every other one.
+		code = 1
 		var coded *exitCodeError
 		if errors.As(err, &coded) {
-			return coded.code
+			code = coded.code
 		}
-		return 1
 	}
-	return 0
+	// The daily update notice goes out LAST: after the command's own output and
+	// after any error line, so it is never interleaved with a report. It cannot
+	// change code, and by construction it cannot fail.
+	finishUpdateCheck(pendingUpdateCheck)
+	return code
 }
 
 func newRootCmd() *cobra.Command {
@@ -226,6 +231,11 @@ through another interpreter to read it. api also has -F for file uploads and
   ronja api /api/v2/feature/query --jq '.result[].id' -r
   ronja api -X POST /api/v2/file/upload/uploads -F file=@report.pdf
   ronja api /api/v2/workflow/run/$id --wait-until '.status != "running"'
+
+And one command that talks to nothing on the server at all:
+
+  ronja update         bring this binary forward to the newest release
+                       (never runs on its own)
 
 The other exceptions are the folder dev loops, which are stateful in a way HTTP
 alone handles badly. If you are editing a workflow, a data app or a feature's
@@ -269,6 +279,21 @@ credentials entirely and never touch disk.`,
 		SilenceErrors: true,
 	}
 
+	// Every tree starts with no check in flight and no update performed, so a
+	// second tree built in the same process — which is what every test does —
+	// cannot inherit either from the first.
+	pendingUpdateCheck, updateRanThisProcess = nil, false
+
+	// The daily update check starts HERE rather than from a scan of os.Args,
+	// because by PersistentPreRunE cobra has resolved which command is running
+	// and parsed --json, so both are plain reads. It returns nil
+	// unconditionally: a check that cannot run must never fail a command
+	// somebody asked for. See update_check.go.
+	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		pendingUpdateCheck = startUpdateCheck(cmd.Context(), cmd)
+		return nil
+	}
+
 	root.PersistentFlags().StringVar(&flagURL, "url", "",
 		"Ronja instance to talk to (default: $RONJA_URL, else the current profile)")
 	root.PersistentFlags().StringVar(&flagProfile, "profile", "",
@@ -289,7 +314,7 @@ credentials entirely and never touch disk.`,
 	root.AddCommand(newLoginCmd(), newLogoutCmd(), newWhoamiCmd(), newProfileCmd(),
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
 		newPipelineCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(),
-		newAPICmd(), newQueryCmd(), newDatabaseCmd())
+		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newUpdateCmd())
 	return root
 }
 

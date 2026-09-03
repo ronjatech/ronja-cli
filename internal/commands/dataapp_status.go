@@ -339,7 +339,17 @@ func printAppStatus(r *appStatusReport) {
 			if r.Remote.Validated != nil && !*r.Remote.Validated {
 				// The single most useful line in this command: a draft that does not
 				// compile cannot be published, and nothing else here would say so.
-				fmt.Fprintf(out, "    compiles:   NO — `ronja app validate` for the diagnostics\n")
+				//
+				// But it is NOT "NO", because the wire cannot say that. All the row
+				// carries is validated_at, which every file write clears in the same
+				// transaction and only a successful compile re-stamps — so NULL is
+				// "no clean build stands for these files", which is equally true
+				// after a failed compile and after one that never ran (an outage, a
+				// push with --no-validate, a builder edit). No compile status is
+				// persisted anywhere, so "NO" was never a measured fact about the
+				// author's code; this says what is known and names the command that
+				// finds out the rest.
+				fmt.Fprintf(out, "    compiles:   no clean build since the last change — `ronja app validate` to find out\n")
 			} else if r.Remote.Validated != nil {
 				fmt.Fprintf(out, "    compiles:   yes (ready to publish)\n")
 			}

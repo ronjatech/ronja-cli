@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
@@ -119,11 +120,42 @@ type appPushResult struct {
 	DraftUnderReview bool `json:"draftUnderReview"`
 	// AccessChanges is every grant and revocation this push made, in full.
 	AccessChanges []accessChange `json:"accessChanges,omitempty"`
-	// Compiles is the verdict from the closing validate: nil when it was skipped
-	// (--no-validate), otherwise whether the draft is publishable as it stands.
-	Compiles *bool `json:"compiles,omitempty"`
+	// Compiles is the verdict from the closing validate: nil when there is no
+	// verdict — the check was skipped (--no-validate) or the compiler did not
+	// answer (see CompileCheck) — otherwise whether the draft is publishable as
+	// it stands. Emitted as null rather than omitted, because "no verdict" is
+	// an answer a machine reader has to be able to see.
+	Compiles *bool `json:"compiles"`
 	// CompileError is the diagnostics from a failed final compile.
 	CompileError *api.CompileError `json:"compileError,omitempty"`
+	// CompileCheck is set only when the closing validate did not ANSWER — an
+	// outage, a 429, a 5xx. It is what separates the two ways Compiles can be
+	// nil, and without it a machine reader could not tell "nobody asked" from
+	// "we asked and nothing came back".
+	CompileCheck *compileCheck `json:"compileCheck,omitempty"`
+	// UnansweredWrite names the file that was in flight when the push stopped on
+	// a failure that says nothing about whether the write landed — the same
+	// question writeOutcomeUncertain answers for the baseline, carried through to
+	// the report so the closing sentence does not tell the author to fix a file
+	// nobody refused. Empty when the push stopped on a definite rejection, which
+	// IS something they can act on.
+	//
+	// Human report only, like URL below: --json already carries the whole stop
+	// in Error, and the file's name is inside it.
+	UnansweredWrite string `json:"-"`
+	// UnansweredWriteVerdict is what the reconciling read established about
+	// UnansweredWrite — and it is nearly always something definite. The read
+	// runs before this report does, so by the time the closing sentence is
+	// written the file has usually been settled one way or the other:
+	// appWriteLanded (it is in Pushed or Deleted above) or appWriteMissed (it
+	// left no trace, and the baseline was repaired accordingly).
+	// appWriteUnknown is the genuinely-open case, and it is reported through
+	// Uncertain instead. Saying "not known" for all three claimed less than
+	// was known, and for a landed file it also contradicted the list above it.
+	//
+	// Only meaningful when UnansweredWrite is set. Human report only, for the
+	// same reason.
+	UnansweredWriteVerdict appWriteVerdict `json:"-"`
 	// Uncertain names files whose write failed and whose outcome could not be
 	// established — the re-read that would have answered failed too. They are
 	// neither pushed nor not-pushed, and saying so is the only honest report.
@@ -156,13 +188,57 @@ type appPushResult struct {
 	LiveURL string `json:"-"`
 }
 
+// compileCheck records a compile check that was ASKED FOR and not answered.
+//
+// It exists so the CLI can say "not known" out loud. A compiler that returns
+// nothing is an outage, and the two things it must not be rendered as are the
+// two things it would otherwise fall into: a failed compile ("your files are
+// wrong") or a skipped one ("nobody asked"). Both are claims, and neither is
+// true.
+//
+// Answered is always false — a check that answered produces a verdict, not one
+// of these — and it is a field rather than an implied absence because the JSON
+// reader is the audience: `"compileCheck": {"answered": false}` says what
+// happened without the reader having to know that the object's mere presence
+// means "no".
+type compileCheck struct {
+	Answered bool `json:"answered"`
+	// TimedOut separates the two ways a check can end with no verdict, which are
+	// not the same event and do not have the same remedy. An unanswered check is
+	// the INSTANCE failing to deliver — worth reporting. A timed-out one is US
+	// having stopped listening: the compile was still running when we gave up,
+	// and may well have finished a moment later. A machine reader deciding
+	// whether to wait longer or to raise an alarm cannot tell them apart from
+	// Status alone, because both leave it 0 on the transport failure shape.
+	TimedOut bool `json:"timedOut,omitempty"`
+	// Status is the HTTP status that came back, 0 when nothing came back at all
+	// (a transport failure, and always so for a timeout).
+	Status int `json:"status"`
+	// Detail is the error verbatim, for a reader debugging their instance.
+	Detail string `json:"detail,omitempty"`
+	// Waited is how long the check ran before we stopped listening. It is the
+	// only honest way to name "the CLI's deadline" from here: the deadline is a
+	// constant inside the api package that this one cannot see, and quoting a
+	// number we did not measure would be a guess about the very thing the
+	// sentence is apologising for.
+	//
+	// Human report only — the --json reader has TimedOut, which is the fact,
+	// where this is only the size of our patience.
+	Waited time.Duration `json:"-"`
+}
+
 // runAppPush is the whole state machine, kept out of the cobra closure so it is
 // testable as a function and so the reporting path has exactly one shape.
 //
 // Returns (result, err): a non-nil result with a non-nil error is the
 // partial-push case, and both halves matter.
 func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushResult, error) {
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	// newClient rather than api.New, for the reason it is a var at all (see
+	// workflow_push.go): it is the seam a test injects a transport through, and
+	// the two failures the closing validate has to tell apart — a request that
+	// never reached the instance, and one that died on our own deadline —
+	// cannot be staged by a fake HTTP handler at all.
+	client := newClient(f.Resolved.URL, f.Resolved.Token)
 	result := &appPushResult{
 		DataAppID: f.Binding.DataAppID,
 		Target:    describeTarget(f.Resolved),
@@ -355,6 +431,7 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// publish actually gates on, and a stale "it compiled three writes ago" is
 	// exactly the thing this loop must not report as ready.
 	if opts.Validate {
+		askedAt := time.Now()
 		validated, verr := client.ValidateDataApp(ctx, target.ID)
 		switch {
 		case verr == nil:
@@ -368,8 +445,57 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 			no := false
 			result.Compiles = &no
 			result.CompileError = &api.CompileError{Message: compileMessageOf(verr, compileErr)}
+		case api.IsTimeout(verr):
+			// OUR deadline fired. The compile was still running when we stopped
+			// listening, so there is no verdict — and, exactly as in the arm
+			// below, no reason to stop: steps 7-8 finished and every byte landed.
+			// Stopping here used to end the push on "check whether <id>
+			// compiles: context deadline exceeded", which the report then
+			// rendered as "fix the problem and push again" — a claim about files
+			// nothing had looked at, on the one failure where the compiler may
+			// have been perfectly happy a second later.
+			//
+			// Dispatched BEFORE the unanswered arm because it is the narrower
+			// question and the two must not compete: whichever way api.Unanswered
+			// comes to classify a client-side deadline, a timeout must never be
+			// reported as the instance having said nothing.
+			result.CompileCheck = &compileCheck{
+				TimedOut: true,
+				Status:   api.StatusOf(verr),
+				Detail:   verr.Error(),
+				Waited:   time.Since(askedAt),
+			}
+		case api.Unanswered(verr):
+			// The compiler never delivered a verdict. Every byte DID land — steps
+			// 7-8 finished — so this is not a `stop`: stopping sets Error with a
+			// nil Compiles, which is exactly the key printAppPushReport reads as
+			// "fix the problem and push again", i.e. an outage rendered as bad
+			// authorship. Compiles stays nil (no verdict exists to report) and
+			// CompileCheck carries why, so the report can say "not known" instead
+			// of guessing in either direction.
+			//
+			// A validate that TIMED OUT is handled by the arm ABOVE and never
+			// reaches here, in either of the two shapes a deadline arrives in: a
+			// per-request context deadline (context.DeadlineExceeded) and the
+			// http.Client's own Timeout ceiling (a *url.Error that reports
+			// Timeout()). api.Unanswered excludes both, because a request that
+			// stopped at our end says nothing about whether the instance
+			// answered — but the ordering here does not rely on that, and
+			// deliberately so.
+			result.CompileCheck = &compileCheck{
+				Status: api.StatusOf(verr),
+				Detail: verr.Error(),
+			}
 		default:
 			return stop(fmt.Errorf("check whether %s compiles: %w", target.ID, verr))
+		}
+		if result.CompileCheck != nil {
+			// Error carries the no-verdict sentence for the --json reader: the
+			// exit code below is non-zero, and a consumer branching on
+			// `.error != ""` would otherwise read an empty string as success on
+			// the one outcome this whole path exists for. The human report does
+			// NOT print it as a stop — see stoppedPartWay.
+			result.Error = compileNotKnownSentence(result.CompileCheck, target.ID)
 		}
 	}
 
@@ -382,11 +508,24 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	if err := anchorAfterPush(f, head, opts.Force); err != nil {
 		return result, err
 	}
+	// Set BEFORE EVERY return below, not after one of them. A push that wrote
+	// nothing and then got a bad verdict — or no verdict at all — is still a push
+	// that wrote nothing, and returning first left UpToDate false, so the report
+	// printed "1 unchanged" for a folder the draft already holds in place of "Up
+	// to date — …". Neither a failed compile nor an outage says anything about
+	// whether the files match: that was settled in steps 7-8.
+	if nothingChanged {
+		result.UpToDate = true
+	}
 	if result.Compiles != nil && !*result.Compiles {
 		return result, fmt.Errorf("the draft does not compile — it cannot be published until it does")
 	}
-	if nothingChanged {
-		result.UpToDate = true
+	if result.CompileCheck != nil {
+		// Non-zero: the push promised a verdict and did not deliver one, and a
+		// CI job that treats "no verdict" as "publishable" is the failure this
+		// whole branch exists to avoid. The report has already said what
+		// happened, in whichever format the caller asked for.
+		return result, errAlreadyReported
 	}
 	return result, nil
 }
@@ -418,8 +557,19 @@ func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, ex
 	if existing.App == nil {
 		featureID := f.Binding.FeatureID
 		if featureID == "" {
-			return nil, fmt.Errorf("this folder has no feature to create the data app in — add \"featureID\" to its entry in %s, or start again with `ronja app init --feature <id>`",
-				wfdir.ManifestPath(f.Root))
+			// The ORGANIZATION is part of the answer whenever this folder has NO
+			// entry here and names another one instead — the same reason
+			// featureIDFor says so for a workflow, and the case `app push
+			// --profile <other>` lands in. "Add featureID to its entry" sends
+			// the reader to a line that already has one, in an entry belonging
+			// to a different organization.
+			if others := f.otherOrganizationsOn(); !f.Bound && len(others) > 0 {
+				return nil, fmt.Errorf("this folder has no feature to create the data app in for %s — it is bound to %s instead, and a data app's ids belong to the organization that holds them, so nothing recorded in %s can be pushed under this credential.\n  %s",
+					describeTarget(f.Resolved), f.describeOrganizationIDs(others),
+					wfdir.ManifestPath(f.Root), f.featureAdviceForAnotherOrganization())
+			}
+			return nil, fmt.Errorf("this folder has no feature to create the data app in — %s, or start again with `ronja app init --feature <id>`",
+				f.featureAdvice())
 		}
 		// A first push is the one path here that WRITES a binding, so this is
 		// where the organization has to be authoritative rather than adopted from
@@ -444,7 +594,7 @@ func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, ex
 			DataAppAccess: f.declaredAccess(),
 		})
 		if err != nil {
-			return nil, explainCreateFailure(err, featureID, f.Resolved.URL)
+			return nil, explainCreateFailure(err, featureID, f)
 		}
 		// Recorded IMMEDIATELY, before any file is written: the app now exists —
 		// live and visible — and a push that died before saving the manifest would
@@ -492,15 +642,18 @@ func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, ex
 // as the last thing a CLI says, because the author is looking straight at the
 // feature they named: passing it through reads as "your id is wrong" when the
 // truth is "that feature is someone else's".
-func explainCreateFailure(err error, featureID, instanceURL string) error {
+func explainCreateFailure(err error, featureID string, f *folder) error {
 	message := api.CodeOf(err)
-	switch {
-	case strings.Contains(message, "admin required"):
+	if strings.Contains(message, "admin required") {
 		return fmt.Errorf("feature %s is shared with the organization, and creating a data app in a shared feature needs an admin.\n  Ask an admin to create the app (then `ronja app clone` it), or point this folder at a feature you own",
 			featureID)
-	case strings.Contains(message, "feature not found"):
-		return fmt.Errorf("feature %s cannot be used on %s: either it does not exist, or it is another user's private feature.\n  Check the id with `GET /api/v2/feature/query`",
-			featureID, instanceURL)
+	}
+	// The unreachable-feature answer, in the SAME words `wf push` and the two
+	// validate paths use. It used to be spelled here alone, on "feature not
+	// found" alone — so the older backend's raw "no rows" fell through to the
+	// bare wrapper, and the reader got a sentence about a query.
+	if explained, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
+		return fmt.Errorf("%s\n  %s", explained, f.featureFixAdvice())
 	}
 	return fmt.Errorf("create the data app in feature %s: %w", featureID, err)
 }
@@ -648,8 +801,17 @@ func putAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targ
 			// See writeOutcomeUncertain: a client rejection never does, and
 			// asking after one is worse than not asking.
 			if writeOutcomeUncertain(err) {
+				// The same predicate, read by the REPORT rather than by the
+				// baseline: a failure that cannot say whether the write landed is
+				// also a failure the author cannot fix, so the closing sentence
+				// must stop telling them to. Recorded before the reconcile,
+				// because what it establishes repairs the baseline — it does not
+				// turn a 5xx into something the author did.
+				result.UnansweredWrite = path
 				want := local[path]
-				switch reconcileUncertainAppWrite(ctx, client, codec, targetID, path, &want, landed) {
+				verdict := reconcileUncertainAppWrite(ctx, client, codec, targetID, path, &want, landed)
+				result.UnansweredWriteVerdict = verdict
+				switch verdict {
 				case appWriteLanded:
 					// It did land after all, so the report has to say so — a
 					// report that disagrees with the baseline beside it is worse
@@ -788,7 +950,12 @@ func deleteAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, t
 			// deleted the file — while a rejection certainly did not. See
 			// writeOutcomeUncertain and reconcileUncertainAppWrite.
 			if writeOutcomeUncertain(err) {
-				switch reconcileUncertainAppWrite(ctx, client, codec, targetID, path, nil, landed) {
+				// See putAppFiles: the report reads this for the same reason the
+				// baseline does.
+				result.UnansweredWrite = path
+				verdict := reconcileUncertainAppWrite(ctx, client, codec, targetID, path, nil, landed)
+				result.UnansweredWriteVerdict = verdict
+				switch verdict {
 				case appWriteLanded:
 					result.Deleted = append(result.Deleted, path)
 				case appWriteUnknown:
@@ -825,10 +992,23 @@ func saveAppBaseline(f *folder, source *api.DataApp, files map[string]string) {
 	}
 }
 
+// stoppedPartWay reports an Error that describes a push that STOPPED, as
+// opposed to one that ran to the end and could not get a verdict.
+//
+// The two share the field because --json has one place to put a reason and a
+// consumer branching on `.error != ""` has to see both. The human report does
+// not: a missing verdict is rendered at length by printCompileVerdict, and
+// printing "Push stopped part-way …" beside it would say the push failed when
+// every byte landed — the same false attribution, one layer up, that
+// CompileCheck exists to prevent.
+func stoppedPartWay(r *appPushResult) bool {
+	return r.Error != "" && r.CompileCheck == nil
+}
+
 func printAppPushReport(r *appPushResult) {
 	out := os.Stdout
 
-	if r.UpToDate && r.Error == "" && len(r.Pushed) == 0 && len(r.Deleted) == 0 {
+	if r.UpToDate && !stoppedPartWay(r) && len(r.Pushed) == 0 && len(r.Deleted) == 0 {
 		fmt.Fprintf(out, "  Up to date — the draft %s already holds this folder.\n", r.DraftID)
 		printAppPushURLs(out, r)
 		printCompileVerdict(out, r)
@@ -862,7 +1042,7 @@ func printAppPushReport(r *appPushResult) {
 		fmt.Fprintf(out, "    %d unchanged\n", r.Unchanged)
 	}
 
-	if r.Error != "" && r.Compiles == nil {
+	if stoppedPartWay(r) && r.Compiles == nil {
 		fmt.Fprintf(out, "\n  Push stopped part-way: %s\n", r.Error)
 		if len(r.Uncertain) > 0 {
 			// The confident sentence would be a lie here: the write failed AND the
@@ -870,6 +1050,35 @@ func printAppPushReport(r *appPushResult) {
 			// not hold those files.
 			fmt.Fprintf(out, "  The draft %s holds what is listed above, except the file(s) marked unknown —\n", r.DraftID)
 			fmt.Fprintf(out, "  asking what became of those failed too. `ronja app status` compares again.\n")
+			return
+		}
+		if r.UnansweredWrite != "" {
+			// "Fix the problem" is a claim about the author's files, and nothing
+			// here refused them: the instance answered a 5xx, or did not answer
+			// at all, part-way through sending one. The remedy is to look and
+			// push again, not to edit anything.
+			//
+			// What became of that file is NOT open at this point. The branch
+			// above already claimed every genuinely-unknown outcome, so the
+			// reconciling read got a definite answer, and the report says which
+			// one — for a landed file, "not known" also contradicted the list
+			// printed just above, which names it as pushed.
+			fmt.Fprintf(out, "  The instance did not answer while %s was being sent.\n", r.UnansweredWrite)
+			switch r.UnansweredWriteVerdict {
+			case appWriteLanded:
+				fmt.Fprintf(out, "  Asking again showed it had landed anyway, so the draft %s holds everything\n", r.DraftID)
+				fmt.Fprintf(out, "  listed above, that file included. Push again to carry on from there.\n")
+			case appWriteMissed:
+				fmt.Fprintf(out, "  Asking again showed it did not land, so the draft %s holds what is listed\n", r.DraftID)
+				fmt.Fprintf(out, "  above, without that file. Push again to send it.\n")
+			default:
+				// Defensive: reaching here would mean the read came back
+				// unknown without Uncertain being written, which the two call
+				// sites do not do. Claim nothing rather than guess.
+				fmt.Fprintf(out, "  The draft %s holds what is listed above, and that file's state is not known;\n", r.DraftID)
+				fmt.Fprintf(out, "  run `ronja app status` and push again.\n")
+			}
+			fmt.Fprintf(out, "  This is not a verdict on your files.\n")
 			return
 		}
 		fmt.Fprintf(out, "  The draft %s holds what is listed above; fix the problem and push again.\n", r.DraftID)
@@ -895,10 +1104,76 @@ func printAppPushURLs(out io.Writer, r *appPushResult) {
 	}
 }
 
+// describeCompileNonAnswer renders WHY no verdict came back — the parenthetical
+// both `ronja app push` and `ronja app validate` put after "the compiler did not
+// answer". Shared so the two surfaces cannot describe one outage two ways.
+//
+// The route is named because it is the actionable half: a reader looking at
+// their own instance's logs needs to know which call fell over, and "the
+// compiler" alone does not say.
+func describeCompileNonAnswer(check *compileCheck, draftID string) string {
+	route := "POST /api/v2/dataapp/" + draftID + "/validate"
+	if check.Status != 0 {
+		return fmt.Sprintf("HTTP %d from %s", check.Status, route)
+	}
+	return fmt.Sprintf("%s never reached the instance: %s", route, check.Detail)
+}
+
+// describeCompileDeadline renders a compile check that outran our patience,
+// naming how long it ran — see compileCheck.Waited for why the measured wait is
+// used rather than the deadline constant it ran into.
+//
+// The wait is omitted rather than rounded to "(0s)" when it is too short to
+// name, which says we did not wait at all. That is only reachable when a
+// deadline was injected instead of reached, but a report that can print a false
+// number under a test can print one in the field.
+func describeCompileDeadline(check *compileCheck) string {
+	const phrase = "the compile check ran past the CLI's deadline"
+	switch {
+	case check.Waited >= time.Second:
+		return fmt.Sprintf("%s (%s)", phrase, check.Waited.Round(time.Second))
+	case check.Waited >= time.Millisecond:
+		return fmt.Sprintf("%s (%s)", phrase, check.Waited.Round(time.Millisecond))
+	}
+	return phrase
+}
+
+// compileNotKnownSentence is "there is no verdict" in one line, for
+// appPushResult.Error. See where it is assigned for why the field is set at all
+// on a push that did not fail.
+func compileNotKnownSentence(check *compileCheck, draftID string) string {
+	if check.TimedOut {
+		return fmt.Sprintf("%s — the files are saved on draft %s, but whether the draft compiles is not known",
+			describeCompileDeadline(check), draftID)
+	}
+	return fmt.Sprintf("the compiler did not answer (%s) — the files are saved on draft %s, but whether the draft compiles is not known",
+		describeCompileNonAnswer(check, draftID), draftID)
+}
+
 // printCompileVerdict renders the closing validate, which is the only thing that
 // says whether the draft can be published.
+//
+// Reached from BOTH endings of printAppPushReport — the up-to-date early return
+// and the ordinary one — because a push that wrote nothing still asks for the
+// verdict, and an outage on that ask is as real there as anywhere else.
 func printCompileVerdict(out *os.File, r *appPushResult) {
 	switch {
+	// The two no-verdict cases are dispatched FIRST, and the ordering is the
+	// whole point: a validate that produced no verdict leaves Compiles nil, which
+	// the "not checked" case below would render as "--no-validate" — a confident
+	// statement about a check that was made and came back empty.
+	case r.CompileCheck != nil && r.CompileCheck.TimedOut:
+		// Its own wording, because it is its own event: nothing failed. The
+		// compile was still running when we stopped listening, so the remedy is
+		// to ask again rather than to look at an instance's logs.
+		fmt.Fprintf(out, "  Compiles: not known — %s.\n", describeCompileDeadline(r.CompileCheck))
+		fmt.Fprintf(out, "            Your files are saved on draft %s, and the compile may still be running.\n", r.DraftID)
+		fmt.Fprintf(out, "            Run `ronja app validate` to ask for the verdict again.\n")
+	case r.CompileCheck != nil:
+		fmt.Fprintf(out, "  Compiles: not known — the compiler did not answer (%s).\n",
+			describeCompileNonAnswer(r.CompileCheck, r.DraftID))
+		fmt.Fprintf(out, "            That is not a verdict on your files; they are saved on draft %s.\n", r.DraftID)
+		fmt.Fprintf(out, "            Run `ronja app validate` again in a moment; if it keeps failing, report it.\n")
 	case r.Compiles == nil:
 		fmt.Fprintf(out, "  Compiles: not checked (--no-validate)\n")
 		fmt.Fprintf(out, "\n  Next: ronja app validate\n")

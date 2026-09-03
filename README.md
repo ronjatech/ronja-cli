@@ -73,6 +73,11 @@ repository has and a folder does not (see
 discovers nothing: it can only report on folders that already carry a committed
 `ronja.json`, which is the same "no browsing" line the loops hold.
 
+One command sits outside the doctrine entirely rather than under it: `ronja
+update` is housekeeping of the binary itself, and touches no Ronja resource and
+no Ronja credential — see [Keeping it current](#keeping-it-current), which also
+covers the once-a-day notice that tells you a newer release exists.
+
 ### Transport is not a wrapper
 
 `ronja api` and `ronja query` (both below) look at first glance like the wrapper
@@ -159,6 +164,166 @@ The binaries are unsigned, so the cask carries a `postflight` hook that strips
 the Gatekeeper quarantine bit. Without it macOS reports a freshly installed
 `ronja` as "damaged" — which is not a message anyone connects to code signing.
 
+### Keeping it current
+
+Nobody knows they are running an old CLI, because nothing tells them. So once a
+day, on a real invocation at a real terminal, `ronja` prints one line to
+**stderr**:
+
+```
+ronja v0.29.0 is available (you have v0.28.4) — run: ronja update
+```
+
+The remedy is chosen by how the binary got onto the machine, because offering
+the wrong one is worse than offering none: a Homebrew install is told
+`brew upgrade ronja` (the file belongs to brew), and on Windows — where there is
+no release asset and `ronja update` refuses — it is told
+`go install github.com/ronjatech/ronja-cli/cmd/ronja@latest`.
+
+**Never stdout, and never for a machine.** The line is suppressed outright when
+any of these hold:
+
+- the running build is not a release — `dev`, Go's `(devel)`, or the
+  pseudo-version of a `go install …@<commit>`. There is nothing to compare
+  against, and the remedy would not apply anyway.
+- stdout or stderr is not a terminal. *Both*, so the line stays out of a piped
+  `eval "$(ronja env)"` **and** out of `2>build.log`.
+- `CI` is set to anything, or `RONJA_NO_UPDATE_CHECK` is set to anything
+  (`RONJA_NO_UPDATE_CHECK=1` is the documented form). The check is one
+  unauthenticated request to `api.github.com`, at most once a day, carrying no
+  Ronja credential; suppressing it here switches that request off as well as the
+  line, rather than making the request and discarding the answer.
+- `--json` was passed.
+- the command is `update`, `env`, `help`, `completion`, or one of cobra's `__`
+  completion drivers — output somebody reads or pipes as a whole.
+- the user was told within the last 24 h already, or the newest known release is
+  not newer than the running version.
+- the update-check file (`update-check.json`, below) cannot be read or written —
+  including the `sudo` case, where the effective uid is 0 and the config
+  directory belongs to somebody else.
+- anything at all failed. Every path here returns quietly; the check cannot
+  change an exit code, and it has nothing to say worth a second line.
+
+**The one honest cost.** The lookup starts after cobra has parsed the flags,
+runs concurrently with the command under a one-second deadline, and is joined
+only once the command has finished writing. For anything that talks to the Ronja
+server it is long finished by then. The worst case is a command that would have
+finished in well under a second being held for the remainder of that second,
+when github.com is slow or black-holed. A lookup that times out or is
+interrupted — Ctrl-C during the command ends it too — rewinds the clock to 23 h
+rather than 24, so a slow link retries hourly instead of going quiet forever,
+and a habit of interrupting slow commands does not silence the notice for a day
+at a time.
+
+That rewind is also what decides how often the stall recurs, and the two
+firewall shapes differ. One that silently DROPs packets to `api.github.com` hits
+the timeout branch, so the clock goes back to 23 h and the second is spent again
+an hour later — hourly, not daily. One that answers with an RST, like a host
+that is simply not there, fails immediately: no stall at all, and the ordinary
+24 h back-off.
+
+Both cadences live in the update-check file, beside the credential file in the
+config directory (`$RONJA_CONFIG_DIR`, else `~/Library/Application
+Support/ronja` or `~/.config/ronja`): when the mirror was last asked, when the
+user was last told, and the newest release known. It holds no secret, and losing
+it costs one extra request. It is claimed *before* the fetch, which is what
+makes an unreadable or root-owned file cost nothing rather than a stalled second
+and a github.com request on every single command.
+
+**`ronja update`** brings the binary forward, and nothing else ever runs it:
+
+```bash
+ronja update           # install the newest release
+ronja update --check   # report what it would do, and change nothing
+```
+
+A binary that rewrites itself as a side effect of a command somebody asked for
+is a binary whose bytes change under a CI job that pinned a version.
+
+On a Homebrew install it swaps nothing and exits **0** with
+`ronja is installed by Homebrew — run: brew upgrade ronja`: nothing is wrong,
+and a non-zero exit would break `ronja update && …` on every Mac. Detection is
+one thing — a `Caskroom` element in the fully resolved path. Deliberately not
+`$HOMEBREW_PREFIX`, which on an Intel Mac is `/usr/local`, exactly where
+somebody who unpacked the tarball puts the binary; they would be told to
+`brew upgrade` a cask they do not have.
+
+**Two ordinary refusals**, and neither is a malfunction. A build that is not a
+release exits non-zero with `ronja is a development build (dev) — there is no
+release to update to; build from source or install a release`: there is nothing
+to compare a development build against, and the swap would replace somebody's
+own build with a published one. When the mirror's newest release is not newer
+than what is running, the command exits **0** with
+`no release newer than ronja v0.28.4` — worded as a comparison rather than "you
+are on the latest release", which would be a lie to someone running
+`v0.29.0-rc.1` while the newest stable is `v0.28.4`.
+
+**The report goes to stderr, and stdout stays empty** — both for the swap and
+for `--check`. That is the tree's rule everywhere (`--json` on everything, and
+only ever on stdout; human narration on stderr), and it is what keeps the one
+parseable object parseable.
+
+`--json` puts that single object on stdout instead. It always carries `current`,
+`method` and `path`; `latest` and `upToDate` appear only when the swap is ours
+to make, because a Homebrew install answers from the binary's own location and
+asks the mirror nothing — there is no latest version to report, so it reports
+`command`. The two paths that have resolved a release file for this platform —
+`--check`, and a swap — also carry `asset`; a swap that completed adds
+`updated: true`, which is the only field that says something was written.
+
+The swap, in the order it happens, because the order **is** the design: sweep
+any `.ronja-update-*` left behind by a SIGKILLed earlier run (only ones over an
+hour old — a fresh one belongs to a run happening right now, and a run in
+progress keeps its own probe fresh so a slow download is not swept out from
+under itself); create the probe
+file in the binary's own directory, which is both the writability test and, being
+on the same filesystem, what makes the final rename atomic; fetch
+`checksums.txt`; stream the archive into `os.TempDir()` through SHA-256, so
+unverified bytes never land beside the binary; extract the entry named exactly
+`ronja` onto the probe with the current binary's permission bits masked to
+`0777` — a `0755` stays `0755`, but a setuid bit somebody once added is **not**
+copied onto freshly downloaded code; then one `os.Rename` over the running
+executable, which macOS and Linux allow because the mapped inode outlives the
+name. Every failure before that rename leaves the installed binary untouched.
+
+If the directory is not writable — `/usr/local/bin` is the usual one — you are
+told before anything is downloaded, and told to re-run with `sudo` or to install
+by the method you used originally. A read-only mount says so in those words
+rather than "permission denied", because it is a different problem.
+
+**The trust boundary.** The checksum defends against a corrupt or truncated
+download, not against a compromised release: the archive and the manifest come
+from the same origin. Both are fetched over https or not at all — an asset URL
+the release listing named over plaintext is refused before the connection, and
+so is a redirect that would drop to it. Beside that, the asset, checksum and
+release-lookup URLs — and every redirect hop — are constrained to `github.com`,
+`api.github.com` and `githubusercontent.com`, so a tampered release listing
+cannot point the download at a host of its own. (The last is matched by domain
+rather than by exact host: GitHub serves release assets from a subdomain of it —
+`objects.` and `release-assets.` have each been the one — and pinning whichever
+it is today would break every download the day it moves.) What none of that buys
+is provenance: the checksum is not a signature — it proves the bytes match
+what the release published, not who published them. See BL-6d3a.
+
+**`releases/latest` is created-at order, not semver.** That is GitHub's own
+rule, and it is the one `go install …@latest` and the Homebrew cask follow too,
+so all three install paths agree — but a re-cut `v0.28.5` published after
+`v0.29.0` would be offered as the newest. Documented rather than engineered
+around.
+
+**`update` is neither a sync verb nor a resource verb.** It is housekeeping of
+the binary itself: the one command in the tree that touches no Ronja resource
+and carries no Ronja credential. `internal/update` cannot even import
+`internal/api` — a test pins that boundary — which is what keeps the bearer
+token structurally unreachable from a request to github.com. So it is admitted
+without widening "sync verbs yes, resource verbs no" rather than in spite of it,
+because it is not a verb over anything on the server at all.
+
+Binaries published before the first release carrying this have neither the check
+nor the command, so those users upgrade once by hand (`brew upgrade ronja`,
+`go install …@latest`, or a fresh tarball). Every version after that is
+reachable by `ronja update`. See BL-4f18.
+
 ### Working on the CLI
 
 From a checkout of the monorepo:
@@ -226,6 +391,12 @@ version (Go modules require a bare `vX.Y.Z` tag at a repository root), then
 runs [GoReleaser](.goreleaser.yaml) — tests, four cross-compiled targets, a
 GitHub Release on the mirror, and the Homebrew cask pushed to
 `ronjatech/homebrew-tap`.
+
+The release also carries `checksums.txt` (`checksum.name_template` in
+`.goreleaser.yaml`), and that manifest is **what `ronja update` verifies** every
+downloaded archive against before it replaces anything — so it is not an
+optional nicety of the pipeline. See
+[Keeping it current](#keeping-it-current).
 
 The publish step passes `GORELEASER_CURRENT_TAG` together with `--skip=validate`
 so that both triggers run **one** code path. On a tag push the environment
@@ -568,8 +739,8 @@ ronja api "/api/v2/workflow/run/$runID/head" \
 | Flag | Does |
 |---|---|
 | `-X`, `--method` | HTTP method. Defaults to GET, or **POST when a body is given** — curl's rule, for curl's reason. Upper-cased for you. |
-| `-d`, `--data` | Request body. `@file` reads a file, `@-` reads stdin, anything else is the literal string. A `@file` or `@-` body is capped at **16 MiB** and refused past it, naming the limit — the body is buffered whole, so an unbounded read is an unbounded allocation chosen by whatever path was typed. |
-| `-F`, `--form` | A `multipart/form-data` part: `name=value` for a literal, `name=@path` for a file (`@-` reads stdin). Repeatable. Mutually exclusive with `-d`, and at most one thing in the whole command may read stdin. |
+| `-d`, `--data` | Request body. `@file` reads a file, `@-` reads stdin, anything else is the literal string. A `@file` is **streamed from disk** at whatever size the instance accepts; a `@-` body comes off a pipe, so it is held in memory and capped at **16 MiB**. A `@path` that is not a plain file — a FIFO, `/dev/fd/N` from process substitution, a character device — is **read into memory** on the same terms as stdin, and capped the same way: it has no size that says what reading it would yield and cannot be re-opened for a retry, so buffering it is what makes it replay-safe and bounded. Only a **directory** is refused, having no bytes to send at all. `--timeout` bounds the whole request, upload included, so raise it — or pass `--timeout 0` — for a large file. |
+| `-F`, `--form` | A `multipart/form-data` part: `name=value` for a literal, `name=@path` for a file (`@-` reads stdin). Repeatable. Mutually exclusive with `-d`, and at most one thing in the whole command may read stdin. Same rule as `-d`: a file streams from disk at any size, a pipe — and any path that is not a plain file — is read into memory and capped at 16 MiB, only a directory is refused, and `--timeout` bounds the upload as well as the answer. Each file part is opened when the encoder reaches it and closed at its end, so an N-file form holds one descriptor, not N. |
 | `-H`, `--header` | `"Name: value"`, repeatable. Repeats of one name are sent as repeats, not collapsed. A `Host:` header is honoured (copied onto `req.Host`) — net/http takes the Host line from there and silently **drops** a `Host` key in the header map, so setting it without that step would do nothing at all. |
 | `--timeout` | How long to wait for **one request**, response body included — the deadline rides on the body's `Close`, not on the request returning. Default 2m; `0` waits as long as it takes; negative is refused. Same semantics and the same `httpFor` plumbing as `ronja query --timeout` (below). |
 | `--retry` | Retry a **429 or 5xx** this many times, honouring `Retry-After` (both the seconds and the HTTP-date form), else exponential backoff capped at 30s. Default 0. A 4xx is never retried — that is the server saying the *request* was wrong. Transport failures are not retried either: a connection that dropped mid-request may well have delivered it. |
@@ -580,10 +751,35 @@ a hole in it exactly where files were concerned. It is not a doctrine breach: a
 content-type is not an endpoint, and nothing here knows what any upload route
 wants.
 
-The multipart body is assembled **in memory**, not streamed from disk. A
-streamed body is read once and cannot be replayed, and `--retry` and
-`--wait-until` both re-issue the request — one whose body had evaporated would
-retry as a zero-byte upload, which the server would accept.
+The multipart body is a list of **segments**: the framing the CLI generates
+(part headers, plain fields, a piped part, the closing boundary) as literal
+bytes, and each file as a reference to its path. `Len` is the sum of the
+literals and the stat'ed file sizes, so the request carries a real
+`Content-Length`; `Open` concatenates them over freshly opened handles, so the
+file bytes never enter memory. The generated boundary is fixed when the
+segments are built, which is what makes every replay byte-identical — `--retry`
+and `--wait-until` both re-issue the request, and one whose body had evaporated
+would retry as a zero-byte upload the server accepts.
+
+Two consequences worth knowing:
+
+- **A file body must be a regular file.** What a FIFO, a character device
+  (`-d @/dev/urandom`) or a socket stats as is not the size of what reading it
+  would yield, so it would send nothing — or, with no size at all, go out
+  chunked and unbounded. A directory has a size, but it is the entry's, and
+  there are no bytes to send at all. Refused before the request; the
+  non-directory cases name `@-` as the way to send one, a directory is told to
+  point at a file inside it.
+- **Stat-then-send is a window**, and the two directions fail differently. A
+  file that **shrank** ends short of the `Content-Length` already written and
+  fails at the transport, which the CLI translates into the file's name. A file
+  that **grew** does not fail there: net/http writes exactly `Content-Length`
+  bytes off a `LimitReader`, so the request is complete and valid on the wire
+  and the instance may store that **prefix** as a finished upload. That one is
+  caught by re-stat'ing every file after the response has been emitted — the
+  server's answer is printed, then the command exits non-zero saying which file
+  grew, from what size to what, and that the first N bytes may have been
+  accepted as the whole thing.
 
 Two refusals, both guarding a failure that is otherwise **silent**:
 
@@ -985,6 +1181,47 @@ why the third one exists:
      "workflowID": "wf-…", "featureID": "col-…"}
   ]
   ```
+
+  **`init` says which organization it is binding to, and confirms `--feature` is
+  reachable there.** Its report ends `Target: <organization> on <url> (not pushed
+  yet)`, and `--json` carries `tenantID` and `organization` beside `url` — the
+  binding is a pair, and reporting half of it left the other half to be
+  discovered by `status` later. Before it writes anything it makes ONE `GET
+  /api/v2/feature/:id` — plus the `GET /api/v2/authentication/me` a `$RONJA_TOKEN`
+  credential already owes, since that credential carries no organization by
+  construction and the report names one. A feature this credential cannot reach is
+  refused with the directory left exactly as it was found, so a refusal never
+  leaves a committed manifest naming a feature that was never going to work. Two
+  things are a warning rather than a refusal: an instance that does not ANSWER (a
+  5xx, a 429, no network) — `init` needs a credential, not a live instance — and a
+  401/403 on the probe itself, which is an answer about the CREDENTIAL rather than
+  about the feature (that route is `structure:read`, while the folder loops are
+  `automation` and `data`, so a narrowly-scoped PAT can push this folder perfectly
+  well and still be refused the question). Same check on `ronja bind --feature`,
+  which is the other way a folder acquires an organization, and there too it runs
+  before the folder is opened — opening one migrates a legacy manifest into the
+  `stacks` shape, and a check made after that would rewrite a committed file and
+  only then refuse.
+
+  **`push` and `validate` name the organization when the feature is not reachable
+  in it.** The server cannot tell "another organization" from "someone else's
+  private feature" from "mistyped" — RLS makes them one query — so neither does
+  the CLI: it says the organization has no such feature *you can reach*, lists
+  the three possibilities, and points at `ronja bind --stack <name> --feature
+  <id>`. It does not suggest `--no-validate`, which would fail identically one
+  step later at create.
+
+  **Nor does it suggest `--no-validate` when the instance did not answer.** A
+  5xx, a 429 or a connection that never landed is not a verdict on the folder,
+  and `wf push` runs validate before any write, so it says exactly that:
+  *validate before pushing: the instance did not answer (…) — nothing was
+  pushed, and this is not a verdict on your files. Try again in a moment.*
+  Offering to skip the check on an instance that did not answer would push
+  files nobody has looked at. ("Did not answer" rather than "is down" is the
+  whole claim the CLI can make: it saw silence, and a 5xx from a healthy
+  instance behind a broken dependency looks the same from here.) `ronja wf
+  validate` says the same thing, minus the words about a push — it saves
+  nothing, so what an outage costs there is the check, not the folder.
 
   The organization is part of the key because workflow ids are scoped to one.
   Keyed by URL alone, a person in two organizations on one instance has a single
@@ -1898,6 +2135,37 @@ to trust the skip. No `journalEntries` means no line, rather than "0 steps
 journaled" — which reads as a fact about the journal when it is equally the
 answer from an instance that does not send the field.
 
+The resume hint is withheld when **nothing in the workflow's code ran**. "Fix
+the code and push first if the failure was a bug" is advice about the author's
+files, and a run that died getting S3 credentials or launching its container
+never reached them. The discriminator is `processingStartedAt`: the Python
+harness stamps it immediately before it `exec`s the workflow — the entrypoint is
+compiled inside that `exec`, and the workflow's own imports run inside it too —
+so an unstamped run never put a line of the author's code in front of the
+interpreter. That ping is best-effort, so steps, a journal, captured logs or a
+Python traceback in the error each outvote a missing stamp; the asymmetry is
+deliberate, since wrongly saying "nothing ran" would hide a real bug from its
+author. When it is withheld the report says so, and says the run is worth
+repeating:
+
+```
+  Nothing in your code ran — the run failed while Ronja was setting it up
+  (get S3 credentials: assume role: …).
+  Run `ronja wf test` again; if it repeats, report it.
+```
+
+It says where the run died and nothing about whose fault that is: not every
+pre-execution failure is Ronja's. A package list `ronja.json` declares is
+checked before the container starts, so an `invalid pip packages: …` failure is
+the author's — and that one gets an extra line naming the file to open.
+
+That notice is printed for **every** failed run whose code never started —
+`wf run` against live as much as `wf test` against a draft, on either runtime —
+because what it reports is a fact about the run and not about what a resume
+could skip. The command it tells you to repeat is the one you ran. The resume
+hint keeps its own narrower conditions: a draft run, durable or with a journal,
+whose code did in fact run.
+
 In a resumed run's step timeline, a step whose result came out of the journal
 reads **`replayed`** rather than `skipped` — the status a continue_on_error step
 that never ran also carries.
@@ -2290,6 +2558,56 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   component you never defined compiles clean and fails in the browser. What the
   check does catch is what stops a bundle existing at all: syntax errors, and
   imports that resolve to nothing (a typo'd path, a file you have not pushed).
+- **A compiler that does not ANSWER is a third outcome**, and `push` and
+  `validate` both name it rather than picking one of the other two. The files
+  are already saved when the closing validate runs, so a 5xx (or a connection
+  that never landed) is not a failed push: it reports `Compiles: not known — the
+  compiler did not answer (…)`, says the files are on the draft, and exits
+  non-zero, because a verdict that was promised and not delivered is not a green
+  CI step.
+
+  There are therefore **three** `compiles` outcomes on the wire, and
+  `compileCheck` is what separates them:
+
+  | `compiles` | `compileCheck` | What happened |
+  |---|---|---|
+  | `true` / `false` | absent | The compiler answered. `false` is its own refusal, and `compileError` carries it. |
+  | `null` | absent | **Nobody asked** — `--no-validate`. |
+  | `null` | present | Asked, no verdict. `answered` is `false`; `timedOut` says whose end stopped. |
+
+  Inside `compileCheck`, `timedOut` is the field that names the two ways a check
+  ends with no verdict, because they are different events with different
+  remedies and `status` cannot tell them apart (it is `0` for both):
+
+  ```json
+  {"compiles": null, "compileCheck": {"answered": false, "status": 500}}
+  ```
+  The **instance** failed to deliver a verdict. Worth reporting.
+
+  ```json
+  {"compiles": null, "compileCheck": {"answered": false, "timedOut": true, "status": 0}}
+  ```
+  The **CLI** stopped listening. The compile was still running when the deadline
+  fired and may well have finished a moment later, so the remedy is to look
+  again or allow more time — not to go hunting for a broken instance. `timedOut`
+  is omitted when false.
+
+  `push --json` **always** emits `compiles`, never omits it, so key presence is
+  not the "was it checked" test — `compileCheck` is.
+
+  ⚠️ `validate --json` emits `compiles: null` too, on the same two non-answers.
+  It was a plain boolean before, so a consumer that decodes it into a
+  non-nullable type now breaks, and one that reads it loosely sees `null` as
+  falsey — i.e. as "does not compile", which is exactly the wrong conclusion.
+  **`null` means NOT KNOWN, never `false`.** Check `compiles === null` before
+  treating it as a verdict.
+- **`app status` says `compiles: no clean build since the last change`, never
+  `NO`.** The row carries one column, `validated_at`: every file write clears it
+  in the same transaction and only a successful compile re-stamps it. So NULL is
+  equally true of a draft that failed to compile, one pushed with
+  `--no-validate`, and one whose compile check never answered — no compile
+  status is persisted anywhere. `ronja app validate` is what finds out which.
+  (`--json` is unchanged: `validated` is the same boolean it always was.)
 - **`app validate` means something different, and `app test` is a report rather
   than a run.** `wf validate` can check a candidate before the workflow exists,
   because `POST /workflow/validate` persists nothing — data apps have no such
@@ -2543,16 +2861,23 @@ it passes the same test `wf` does.
   by a merge is *detected* rather than silently inheriting the old table's
   fingerprints: `push` refuses it, naming both rows, and `--force` accepts the
   new binding by discarding the baseline rather than comparing against it.
-- **The baseline holds three fingerprints per file, not one**, because a
-  pipeline file is synced with three different things. `files[path].sha256` is
+- **The baseline holds four fingerprints per file, not one**, because a
+  pipeline file is synced with several different things. `files[path].sha256` is
   the last **complete** push (written *and* built) — what "changed since your
   last sync" means. `tables[path].draftSHA256` is what this checkout last **wrote
-  into your draft**. `tables[path].liveSHA256` is the **live** table's SQL as of
+  into your draft**, in the **disk** form — the file's own bytes, aliases and
+  sibling stems unresolved. `tables[path].draftWireSHA256` is that same write in
+  the **wire** form, the exact bytes that went over the `PUT` with ids
+  substituted for every name; that is what the row actually stores, so it is the
+  only one of the four that may be sent to the server as a `baseCodeSha256`
+  precondition. `tables[path].liveSHA256` is the **live** table's SQL as of
   the last moment this folder agreed with it (a clone, the fork of a draft, a
   publish). The rule they exist for: **a hash is only ever compared against the
   row it was taken from.** Folded into one value, the guard below compared the
   live table against bytes that only ever existed in a draft, and refused an
-  ordinary `push` → edit → `push`.
+  ordinary `push` → edit → `push`; folded the other way, the *disk* hash sent as
+  a precondition would have 409'd every push from any folder that names a
+  sibling by its stem.
 
   A baseline entry whose file has left both the folder *and* the `tables` map is
   pruned on the next `push` (and disappears from `status` immediately), so
@@ -2636,7 +2961,7 @@ ids in its SQL belong to that organization, and only re-pointing them fixes it.
 | `clone` | writes one `.sql` per **derived** table in the feature, plus manifest and baseline. Prefers your own open draft over live. Creates nothing server-side; the directory must be empty or absent | — |
 | `status` | local changes, per-table build health, open drafts and their verdicts, and drift since the last sync. Read-only — not even a checkout. **Exits non-zero on drift *and* on "not checked"** (see below) | `--json` |
 | `push [paths...]` | per changed file: create → resume/check out your draft → write SQL + derived inputs → sync → build → verdict and confidence report | `--force` |
-| `publish [paths...]` | per staged draft: commit onto the table, or submit it for review | `--no-request-review` |
+| `publish [paths...]` | per staged draft: commit onto the table, or submit it for review | `--no-request-review`, `--overwrite-remote` |
 | `discard [paths...]` | deletes your drafts; the live tables and your local files are untouched | `--yes` |
 
 `push`, `publish` and `discard` all take file paths and act on the whole folder
@@ -2697,11 +3022,16 @@ That is the safety story, and it is the reason this loop reports more than
    nobody has edited is byte-identical to the parent it forked from, so a
    difference is still somebody's unsynced work.
 
-   ⚠️ **There are no per-write preconditions on this API.** A `PUT` to a draft
-   overwrites it unconditionally and a commit overwrites its parent
-   unconditionally — there is no `baseSha256` and no commit CAS the way there is
-   for workflows. This guard is the whole protection and it is a check at one
-   instant: the moment those two rows were read. An empty fingerprint disarms its
+   ⚠️ **This guard is no longer the whole protection, and it stays anyway.** The
+   table surface now carries both server-side compare-and-swap layers workflows
+   have: `baseCodeSha256` on the `PUT` and a base-version CAS on the commit. This
+   guard is still a check at **one instant** — the moment those two rows were
+   read — which is exactly what the `PUT` precondition closes. What it keeps
+   earning is the other three things a precondition cannot do: it runs *before* a
+   write, a sync and a build the server would only refuse at the end of; it
+   covers the **live** row, which no precondition on a draft write speaks about
+   at all; and it explains the difference in terms of the **folder** — this file,
+   that table — where the server can only name two digests. An empty fingerprint disarms its
    own leg deliberately (a colleague who cloned the repo from git has no
    `.ronja/`, and refusing that is refusing the normal way people join); a missing
    *live* one is adopted from the row the guard just read, so a folder can leave
@@ -2712,7 +3042,16 @@ That is the safety story, and it is the reason this loop reports more than
    that had not recorded them would read your own last attempt as somebody else's
    edit and demand `--force` to fix your SQL. The *content* baseline advances only
    on a complete push, so the fixed file is still something a bare `push` sends.
-5. **Then `PUT` → `/sync` → poll to a verdict.** Every command polls through one
+5. **The `PUT` carries `baseCodeSha256`**, the server's layer-1 precondition:
+   the wire-form fingerprint of what this checkout last wrote into *this* draft,
+   so a chat or web-builder edit landing between the guard's read and this write
+   is refused rather than silently overwritten. It is sent only when there is one
+   to send — a draft this checkout has never written to, and every `--force`
+   push, write unconditionally, since `--force` is the author saying they mean to
+   overwrite and a precondition would refuse the one thing the flag exists to
+   permit. It must be the **wire** fingerprint: the row stores the ids, not the
+   stems, which is why the baseline records both.
+6. **Then `/sync` → poll to a verdict.** Every command polls through one
    helper, so the `ready`-with-an-error truth table exists exactly once. It reads
    `buildVerdict`, the computed field on the single-row GET added for this loop
    and for HTTP callers alike: `ok`, `ok_partial`, `failed_stale` (the run failed
@@ -2725,6 +3064,14 @@ live table is untouched, the remaining files are still attempted, and the comman
 exits non-zero. The per-file `--json` `outcome` vocabulary is `pushed`,
 `build_failed`, `refused`, and a caller that read `build_failed` as "nothing
 happened" would discard a draft holding their work.
+
+**A conflict is machine-readable here too.** A file whose write was refused by
+the server's code precondition — somebody edited that draft between this push's
+read and its write — carries `conflict: true` beside its `refused` outcome, for
+the reason `wf push` carries the same field: an agent driving the loop has to
+tell "somebody got there first, re-read and try again" from "you may not do this
+at all", and both are a `refused` with prose in `error`. Do not branch on the
+`error` text; it is the server's, and it is reworded whenever that reads better.
 
 **One failure message gets a diagnosis rather than a repeat.** The server's bare
 `no data found` is the chain-bootstrap failure: a draft builds against its
@@ -2759,8 +3106,8 @@ change, from `GET /api/v2/table/draft/:id/review` plus one sample read:
   `n/a`; printing it as a number would report a table that was never built as one
   that came back with minus one rows.
 - **`baseStale`** — the live table has been published to since your draft forked,
-  naming the intervening versions. Committing would revert them, and nothing
-  server-side will stop you.
+  naming the intervening versions. Committing would revert them, so the commit is
+  **refused** with a 409; `publish --overwrite-remote` is the way through.
 - **Up to five sample rows**, via `POST /api/v2/duckdb/query` on the *draft's*
   id. Read only after a successful sync (a checked-out-never-synced draft of a
   partitioned parent has no partitions of its own and answers "no data") — and
@@ -2808,9 +3155,30 @@ Drafts are published in **dependency order**, as they are pushed: a commit
 cascades, so landing a downstream before its upstream commits a table computed
 from data that is about to be replaced and rebuilt again seconds later.
 
+The per-file `--json` `outcome` vocabulary is `published`,
+`submitted_for_review`, `conflict` and `refused`. `conflict` is a refusal and is
+split out for the reason `wf publish` splits it: an agent driving the loop has to
+tell "somebody committed first, re-apply and try again" from "you may not do this
+at all".
+
+A commit onto a table that has been published to since your draft forked is
+**refused** by the server's base-version CAS, and nothing is written — the check
+runs inside the commit's own transaction, under the parent's row lock, so your
+draft is intact. `--overwrite-remote` is the deliberate override, and it works
+exactly as `wf publish`'s does: it re-reads the current head *at the moment you
+answer* and **confirms that version id explicitly** rather than sending a bare
+force. A version that lands between the read and the write earns a fresh refusal
+instead of a retry — an override authorizes overwriting the version it was
+shown, not whatever happens to be there by the time the request arrives. The
+version it wrote over is reported as `overwroteVersionID` in `--json`, on that
+path only: it is the record that somebody else's work was discarded, and by
+which version.
+
 Before each commit it warns, never refuses, on two kinds of staleness:
-`baseStale` as above, and **stale inputs** — an input table whose row was updated
-after your draft's was. That second one is not paranoia (`GetDependents` excludes
+`baseStale` as above — which now says out loud that the commit will be refused,
+and still earns its round trip because it names the *intervening versions* where
+the server's 409 can only name the head — and **stale inputs**, an input table
+whose row was updated after your draft's was. That second one is not paranoia (`GetDependents` excludes
 shadow rows, so a staged draft is never invalidated by an upstream publish, and
 the confidence report silently decays between push and publish with nothing else
 to say so) but it *is* a **heuristic**, and it is worded as one: neither

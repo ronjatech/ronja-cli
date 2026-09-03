@@ -81,9 +81,24 @@ type CreateTableInput struct {
 // No omitempty on either: an empty `inputModels` is a real declaration ("this
 // table reads from nothing"), and omitempty would collapse it into "derive it
 // for me", which is a different instruction.
+//
+// BaseCodeSha256 is the opposite case, and it MUST carry omitempty — the one
+// place on this type where the tag is load-bearing in the other direction. The
+// server reads three states (rmodelv2.checkCodePrecondition): ABSENT is "write
+// unconditionally", a digest is compare-and-swap, and "" is a 400 rather than
+// "no check", deliberately, so that a caller who thought they were asserting
+// something is told they were not. An `omitempty`-less tag would send `""` on
+// every unconditional write and turn the ordinary push into a 400.
 type UpdateTableInput struct {
 	Code        string   `json:"code"`
 	InputModels []string `json:"inputModels"`
+	// BaseCodeSha256 is the sha256 of the `code` the caller believes the row
+	// currently holds, lowercase hex over the raw bytes — wfdir.HashString,
+	// which rmodelv2.CodeSHA256 is held byte-identical to.
+	//
+	// ⚠️ It is a fingerprint of the WIRE form, because that is what the row
+	// stores: the id-ref SQL this client SENT, not the aliased SQL on disk.
+	BaseCodeSha256 string `json:"baseCodeSha256,omitempty"`
 }
 
 // CreateTable creates a derived table inside a feature.
@@ -119,14 +134,20 @@ func (c *Client) CreateTable(ctx context.Context, in CreateTableInput) (*Table, 
 //
 // The endpoint answers with nothing, so a caller that needs the row's current
 // state re-reads it.
-func (c *Client) UpdateTableCode(ctx context.Context, id, code string, inputModels []string) error {
+//
+// baseCodeSha256 is empty for an unconditional write, which sends no such field
+// at all — the shape this route took before the precondition existed. Supply it
+// only as the fingerprint of the CODE THIS CLIENT LAST SENT to this same row;
+// anything else (the disk form of an aliased file, a hash taken from a
+// different row) is refused with a 409 that describes a conflict nobody caused.
+func (c *Client) UpdateTableCode(ctx context.Context, id, code string, inputModels []string, baseCodeSha256 string) error {
 	if inputModels == nil {
 		// A null would read as "no declaration" and re-arm server-side
 		// derivation; an empty list is the declaration this means.
 		inputModels = []string{}
 	}
 	return c.doSlow(ctx, "PUT", "feature/model/"+url.PathEscape(id),
-		UpdateTableInput{Code: code, InputModels: inputModels}, nil)
+		UpdateTableInput{Code: code, InputModels: inputModels, BaseCodeSha256: baseCodeSha256}, nil)
 }
 
 // CheckoutTable gets-or-creates the CALLER'S OWN draft of a table and returns
@@ -179,10 +200,11 @@ func (c *Client) SyncTable(ctx context.Context, id string) error {
 //
 // Two consequences worth holding on to:
 //
-//   - It OVERWRITES the parent's fields from the draft, and there is no
-//     compare-and-swap. A stale draft silently reverts whatever landed in
-//     between; the review payload's baseStale + interveningVersions is the only
-//     warning that exists, and nothing on this call will stop it.
+//   - It OVERWRITES the parent's fields from the draft, and a base-version CAS
+//     decides whether it may: the draft records the committed version it forked
+//     from, and a commit onto a table that has moved since is refused with a
+//     409. Nothing is written when it is — the CAS runs inside the commit's own
+//     transaction, under the parent's row lock — so the draft is intact.
 //   - It CASCADES. The server emits a materialized event and dependent tables
 //     are invalidated and rebuilt asynchronously — which is why the loop needs
 //     no `run` verb, and why a publish is worth saying out loud.
@@ -191,8 +213,32 @@ func (c *Client) SyncTable(ctx context.Context, id string) error {
 // committing their own draft under a self-approval policy. Decide which branch
 // to take from the feature's scope and the caller's role BEFORE calling, rather
 // than from the rejection prose.
-func (c *Client) CommitTableDraft(ctx context.Context, draftID string) error {
-	return c.doSlow(ctx, "POST", "feature/model/"+url.PathEscape(draftID)+"/commit", nil, nil)
+// confirmHeadVersionID is empty for an ordinary commit, which sends no body at
+// all — the shape this route took before the CAS existed. Supply it only after a
+// 409 has named the version being overwritten, and only on a deliberate
+// override (`pipeline publish --overwrite-remote`). It must equal the head AT
+// COMMIT TIME, not merely be non-empty, so a caller who learns the head and then
+// deliberates while a third version lands gets another 409 — which is why
+// nothing here retries.
+func (c *Client) CommitTableDraft(ctx context.Context, draftID, confirmHeadVersionID string) error {
+	var body any
+	if confirmHeadVersionID != "" {
+		body = TableCommitDraftInput{ConfirmHeadVersionID: confirmHeadVersionID}
+	}
+	return c.doSlow(ctx, "POST", "feature/model/"+url.PathEscape(draftID)+"/commit", body, nil)
+}
+
+// TableCommitDraftInput is the (optional) body of POST
+// /feature/model/:id/commit, mirroring rmodelv2.CommitDraftInput
+// (backend/resource/rmodelv2/model.go). Named apart from the workflow package's
+// CommitDraftInput because both live in this one package; the wire shape is the
+// same because the server's two types are.
+//
+// An empty body is the normal case and means "no override": the commit then
+// requires the live table to still be at the version this draft forked from, and
+// is refused with a 409 when it is not.
+type TableCommitDraftInput struct {
+	ConfirmHeadVersionID string `json:"confirmHeadVersionID,omitempty"`
 }
 
 // DiscardTableDraft deletes a draft, throwing its uncommitted changes away. The

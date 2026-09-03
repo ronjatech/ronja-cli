@@ -271,6 +271,48 @@ func TestRunFailedRunExitsNonZeroAndOffersNoResume(t *testing.T) {
 	}
 }
 
+// A LIVE run that died before the interpreter ever saw the author's code says
+// so, exactly as a draft run does.
+//
+// The notice used to sit under the resume hint's conditions — durable, draft,
+// journal — so `wf run` never printed it: the one command that runs published
+// code, in front of the person most likely to read a bare "AccessDenied" as
+// something they broke. What happened is a fact about the RUN, and nothing
+// about it depends on which row started it or on there being a draft to
+// continue. The resume hint is still withheld, because there is still no draft.
+func TestRunSaysNothingRanWhenTheLiveFailureWasSetup(t *testing.T) {
+	f := newFakeInstance(t)
+	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
+	// No stamp, no steps, no journal, no captured output: the container never
+	// got as far as producing any of them.
+	failed.Logs = ""
+	failed.Error = ptr("get S3 credentials: assume role: AccessDenied")
+	f.runScript = []api.RunResponse{failed}
+	signIn(t, f)
+	withFastPolling(t)
+	root := liveFolder(t, f, nil)
+
+	out, err := runCLI(t, root, "wf", "run")
+	if err == nil {
+		t.Fatal("a failed run exited zero")
+	}
+	if !strings.Contains(out, "Nothing in your code ran") {
+		t.Errorf("a live setup failure did not say the code never ran:\n%s", out)
+	}
+	// Where the run died, not whose fault it was: see printNothingRanNotice.
+	if strings.Contains(out, "not a bug in your files") {
+		t.Errorf("the notice claimed the author's files are innocent, which it cannot know:\n%s", out)
+	}
+	// The command worth repeating is the one that produced this run.
+	if !strings.Contains(out, "Run `ronja wf run` again") {
+		t.Errorf("the notice named a command that did not produce this run:\n%s", out)
+	}
+	// `wf run` offers no resume, notice or not: there is no draft to continue.
+	if strings.Contains(out, "--resume") {
+		t.Errorf("a live failure offered a draft resume:\n%s", out)
+	}
+}
+
 // --- output shape -------------------------------------------------------------
 
 // --json is the same single object `wf test` emits: the run row flattened at the

@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
@@ -52,7 +53,12 @@ the verdict and "compiles" is the draft alone.`,
 			if err != nil {
 				return err
 			}
-			client := api.New(resolved.URL, resolved.Token)
+			// newClient rather than api.New, for the reason it is a var at all
+			// (see workflow_push.go): it is the seam a test injects a transport
+			// through, and the two failures this command has to tell apart — an
+			// instance that never answered, and a check that ran past our own
+			// deadline — cannot be staged by a fake HTTP handler at all.
+			client := newClient(resolved.URL, resolved.Token)
 
 			_, draft, err := resolveAppDraft(cmd.Context(), client, f, "nothing to validate")
 			if err != nil {
@@ -87,18 +93,42 @@ the verdict and "compiles" is the draft alone.`,
 				DraftID:       draft.ID,
 				AliasRefusals: aliases.Refusals,
 			}
+			askedAt := time.Now()
 			validated, verr := client.ValidateDataApp(cmd.Context(), draft.ID)
 			switch {
 			case verr == nil:
-				result.Compiles = validated.IsValidated()
+				compiles := validated.IsValidated()
+				result.Compiles = &compiles
 			case api.StatusOf(verr) == 400:
-				result.Compiles = false
+				no := false
+				result.Compiles = &no
 				result.CompileError = &api.CompileError{Message: compileMessageOf(verr, nil)}
+			case api.IsTimeout(verr):
+				// Our own deadline, not the instance's silence, and reported as
+				// its own thing for the reason `app push` does — see the matching
+				// arm in runAppPush. Dispatched before the unanswered one because
+				// it is the narrower question.
+				result.CompileCheck = &compileCheck{
+					TimedOut: true,
+					Status:   api.StatusOf(verr),
+					Detail:   verr.Error(),
+					Waited:   time.Since(askedAt),
+				}
+			case api.Unanswered(verr):
+				// The compiler did not answer. Falling through to the default arm
+				// below would print "check whether <id> compiles: Internal server
+				// error (HTTP 500)" — cobra's bare error, which reads as a fact
+				// about the draft rather than about the instance. Compiles stays
+				// nil: there is no verdict, and the report says exactly that.
+				result.CompileCheck = &compileCheck{
+					Status: api.StatusOf(verr),
+					Detail: verr.Error(),
+				}
 			default:
 				return fmt.Errorf("check whether %s compiles: %w", draft.ID, verr)
 			}
 
-			result.OK = result.Compiles && len(result.AliasRefusals) == 0
+			result.OK = result.Compiles != nil && *result.Compiles && len(result.AliasRefusals) == 0
 			if flagJSON {
 				if err := emitJSON(result); err != nil {
 					return err
@@ -126,9 +156,14 @@ type appValidateResult struct {
 	// about the draft on the server, and an alias refusal is about the folder in
 	// front of you — and collapsing them would make "compiles: false" a claim
 	// about a compiler that was perfectly happy.
-	OK           bool              `json:"ok"`
-	Compiles     bool              `json:"compiles"`
+	OK bool `json:"ok"`
+	// Compiles is nil when there is no verdict — the compiler did not answer,
+	// and CompileCheck says so. A false here is the compiler's own refusal.
+	Compiles     *bool             `json:"compiles"`
 	CompileError *api.CompileError `json:"compileError,omitempty"`
+	// CompileCheck carries an unanswered check — see appPushResult.CompileCheck,
+	// the same field with the same contract on the same failure.
+	CompileCheck *compileCheck `json:"compileCheck,omitempty"`
 	// AliasRefusals are the local findings — see validateReport.AliasRefusals,
 	// which carries the same contract for the workflow loop.
 	AliasRefusals []string `json:"aliasRefusals,omitempty"`
@@ -149,18 +184,49 @@ func warnIfAppDirty(f *folder) error {
 	return nil
 }
 
+// printAliasRefusalSummary says that the compile verdict — whatever it turned
+// out to be, including none at all — is not this command's verdict, because the
+// folder itself is one `ronja app push` would refuse.
+//
+// The refusals themselves are already on stderr. What has to be said HERE is
+// that the line above is not the answer, and it has to be said on EVERY ending:
+// it used to live inside the "Compiles: yes" branch alone, below an early
+// return, so a folder with a broken alias against an instance whose compiler was
+// down printed "not known" and nothing else — and the one finding this command
+// makes locally, which needs no instance at all, went unmentioned.
+func printAliasRefusalSummary(out *os.File, r *appValidateResult) {
+	if n := len(r.AliasRefusals); n > 0 {
+		fmt.Fprintf(out, "\n  %d alias %s above — `ronja app push` would refuse this folder\n",
+			n, plural(n, "problem"))
+	}
+}
+
 func printAppValidateReport(r *appValidateResult) {
 	out := os.Stdout
-	if r.Compiles {
+	if r.CompileCheck != nil {
+		// Answered first, and never as "Compiles: NO": no compiler said no.
+		fmt.Fprintf(out, "  Compiles: not known\n")
+		if r.CompileCheck.TimedOut {
+			// A deadline of ours, which is not the instance failing to answer —
+			// the compile may still be running. See runAppPush's matching arm.
+			fmt.Fprintf(out, "\n  No verdict: %s — it may still be running, and this is\n", describeCompileDeadline(r.CompileCheck))
+			fmt.Fprintf(out, "  not a verdict on your files. Ask again in a moment.\n")
+		} else {
+			fmt.Fprintf(out, "\n  The compiler did not answer (%s) — not a verdict on your files.\n",
+				describeCompileNonAnswer(r.CompileCheck, r.DraftID))
+			fmt.Fprintf(out, "  Try again in a moment; if it persists, report it.\n")
+		}
+		fmt.Fprintf(out, "\n  Draft:    %s\n", r.DraftID)
+		printAliasRefusalSummary(out, r)
+		return
+	}
+	if r.Compiles != nil && *r.Compiles {
 		fmt.Fprintf(out, "  Compiles: yes\n")
 		fmt.Fprintf(out, "\n  Draft:    %s\n", r.DraftID)
-		if n := len(r.AliasRefusals); n > 0 {
-			// The refusals themselves are already on stderr. What has to be said
-			// HERE is that "Compiles: yes" is not the verdict, because the next
-			// line would otherwise be an instruction to run a command that
-			// refuses.
-			fmt.Fprintf(out, "\n  %d alias %s above — `ronja app push` would refuse this folder\n",
-				n, plural(n, "problem"))
+		if len(r.AliasRefusals) > 0 {
+			// No "Next:" line here — it would be an instruction to run a command
+			// that refuses this folder.
+			printAliasRefusalSummary(out, r)
 			return
 		}
 		fmt.Fprintf(out, "\n  Next: ronja app publish\n")
@@ -171,5 +237,6 @@ func printAppValidateReport(r *appValidateResult) {
 		fmt.Fprintf(out, "\n  %s\n", stripBundleNamespace(r.CompileError.Message))
 	}
 	fmt.Fprintf(out, "\n  Draft:    %s\n", r.DraftID)
+	printAliasRefusalSummary(out, r)
 	fmt.Fprintf(out, "\n  The app stays on its last published version until this compiles.\n")
 }

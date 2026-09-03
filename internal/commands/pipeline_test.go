@@ -56,6 +56,7 @@ func countRequest(f *fakePipelineInstance, want string) int {
 // inviting somebody to fill one in.
 func TestPipelineInitWritesAManifestWithNoEntrypoint(t *testing.T) {
 	f := newFakePipelineInstance(t)
+	f.AddFeature("collection-1", "Sales", "private")
 	signInPipeline(t, f)
 	dir := t.TempDir()
 
@@ -92,6 +93,7 @@ func TestPipelineInitWritesAManifestWithNoEntrypoint(t *testing.T) {
 // already synced would overwrite a manifest holding real bindings.
 func TestPipelineInitRefusesASecondTime(t *testing.T) {
 	f := newFakePipelineInstance(t)
+	f.AddFeature("collection-1", "Sales", "private")
 	signInPipeline(t, f)
 	dir := t.TempDir()
 
@@ -113,10 +115,12 @@ func TestPipelineInitRefusesASecondTime(t *testing.T) {
 // reports there is a create that failed, not a manifest that was wrong from the
 // moment it was written.
 //
-// By shape only. Whether the feature exists is a question for the server, and
-// asking it here would put a round trip in the one command that makes none.
+// By shape, BEFORE the round trip confirmFeatureIn makes: an id that is not a
+// feature id at all is answerable without asking, and the shape refusal names
+// the real prefix, which "has no feature ... you can reach" would not.
 func TestPipelineInitChecksTheFeatureIDShape(t *testing.T) {
 	f := newFakePipelineInstance(t)
+	f.AddFeature("col-legacy", "Legacy", "private")
 	signInPipeline(t, f)
 
 	for _, bad := range []string{"table-orders", "Sales pipeline", "feat-1"} {

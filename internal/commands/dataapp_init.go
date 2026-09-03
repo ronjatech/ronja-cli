@@ -106,6 +106,13 @@ silently and the app would fail in the browser.`,
 				return fmt.Errorf("read %s: %w", wfdir.ManifestPath(root), err)
 			}
 
+			// Before a single byte is written — not the copied entrypoint, not
+			// the scaffold, not the manifest. A refusal here leaves the
+			// directory as it found it. See confirmFeatureIn.
+			if err := confirmFeatureIn(cmd.Context(), featureID, resolved); err != nil {
+				return err
+			}
+
 			// Fixed, not chosen: rdataapp stamps App.tsx at create and carries no
 			// field to change it, so offering an --entrypoint flag would be offering
 			// something the server will not honour.
@@ -184,13 +191,19 @@ silently and the app would fail in the browser.`,
 
 			if flagJSON {
 				payload := map[string]any{
-					"root":       root,
-					"manifest":   wfdir.ManifestPath(root),
-					"url":        resolved.URL,
-					"kind":       wfdir.KindDataApp,
-					"title":      title,
-					"entrypoint": entrypoint,
-					"featureID":  featureID,
+					"root":     root,
+					"manifest": wfdir.ManifestPath(root),
+					"url":      resolved.URL,
+					// The organization the binding names, alongside the instance.
+					// `url` alone was never the whole target — a folder is bound to
+					// (instance, organization), and a script reading back what init
+					// just wrote had to go and ask for the half init already knew.
+					"tenantID":     resolved.TenantID,
+					"organization": describeOrganization(resolved),
+					"kind":         wfdir.KindDataApp,
+					"title":        title,
+					"entrypoint":   entrypoint,
+					"featureID":    featureID,
 					// bound carries `app status`'s meaning, not a second one: the
 					// folder HAS an entry for this instance, which init just wrote.
 					// What is genuinely absent is the app itself, and `created` says
@@ -205,7 +218,7 @@ silently and the app would fail in the browser.`,
 				}
 				return emitJSON(payload)
 			}
-			printAppInitReport(root, resolved.URL, title, entrypoint, featureID, fromPath, copied, scaffolded)
+			printAppInitReport(root, resolved.URL, describeTarget(resolved), title, entrypoint, featureID, fromPath, copied, scaffolded)
 			for _, w := range warnings {
 				fmt.Fprintf(os.Stderr, "  Note: %s\n", w)
 			}
@@ -223,13 +236,13 @@ silently and the app would fail in the browser.`,
 	return cmd
 }
 
-func printAppInitReport(root, url, title, entrypoint, featureID, fromPath string, copied, scaffolded bool) {
+func printAppInitReport(root, url, target, title, entrypoint, featureID, fromPath string, copied, scaffolded bool) {
 	out := os.Stdout
 	fmt.Fprintf(out, "  Data-app folder ready in %s\n\n", root)
 	fmt.Fprintf(out, "  Title:      %s\n", title)
 	fmt.Fprintf(out, "  Entrypoint: %s (fixed — a data app's entrypoint cannot be changed)\n", entrypoint)
 	fmt.Fprintf(out, "  Feature:    %s\n", featureID)
-	fmt.Fprintf(out, "  Instance:   %s (not pushed yet)\n", url)
+	fmt.Fprintf(out, "  Target:     %s (not pushed yet)\n", target)
 	if copied {
 		fmt.Fprintf(out, "\n  Copied %s -> %s\n", fromPath, entrypoint)
 	} else if scaffolded {

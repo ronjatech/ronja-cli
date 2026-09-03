@@ -119,6 +119,19 @@ func printTestReport(o *testOutcome, logsMode string) {
 	case run.Status == api.RunStatusResuming:
 		fmt.Fprintf(out, "\n  Continued: the wait ended and the work continued in a NEWER run, so this one is\n")
 		fmt.Fprintf(out, "             finished with. Nothing failed; follow the newer run in Ronja.\n")
+	// EVERY failed run whose code never started, on any runtime, live or draft.
+	// The fact being reported is about the RUN — it died getting S3 credentials,
+	// or launching the container, before anything the author wrote was evaluated
+	// — and that is exactly as true of `wf run` against live and of a v1 draft as
+	// it is of a durable one. Gating it on the resume hint's conditions, as it
+	// was, meant a live run and a v1 run kept printing a bare error the author
+	// had no way to read as anything but their own bug.
+	//
+	// FIRST, so it wins over the resume hint below: "fix the code and push first
+	// if the failure was a bug" is advice about the author's files, and it is
+	// only honest once the author's files have been run.
+	case run.Status == api.RunStatusError && !userCodeRan(run):
+		printNothingRanNotice(out, run.Error, retryInvocation(o.Live))
 	// The hint is offered for a durable workflow OR for any failed run whose
 	// lineage actually has a journal — resume is not durable-only, and a
 	// standard-runtime workflow with explicitly-keyed steps has real work to
@@ -129,6 +142,112 @@ func printTestReport(o *testOutcome, logsMode string) {
 	case run.Status == api.RunStatusError && !o.Live && (o.Durable || run.JournalEntries > 0):
 		printResumeHint(out, run.JournalEntries)
 	}
+}
+
+// userCodeRan reports whether the author's code reached the interpreter at all.
+//
+// processing_started_at is the primary signal, and it is a strong one: the
+// Python harness calls tools._report_run_started() immediately before
+// exec(code, ...) (infra, cmd/py-invoke/shared/execution.py), the entrypoint is
+// COMPILED inside that exec — its SyntaxError is caught after it — and the
+// workflow's own module imports run inside it too. So a NULL stamp means
+// nothing the author wrote was ever evaluated, syntax errors included.
+//
+// The other three are fallbacks, and they exist because that ping is
+// best-effort: it goes out on a background worker and is skipped outright on a
+// network failure, so a run that DID execute can arrive here unstamped. Steps,
+// captured logs and a Python traceback each prove execution on their own, so
+// any of them outvotes a missing stamp. The asymmetry is deliberate: wrongly
+// saying "nothing ran" hides a real bug from its author, which is worse than
+// the message this replaces.
+//
+// ⚠️ JournalEntries is deliberately NOT one of them, though it reads like the
+// obvious fourth. Every signal here has to be a fact about THIS run, and that
+// one is not: it counts what the resume LINEAGE has journaled, derived on read
+// (see api.RunResponse), so a `wf test --resume` inherits a non-zero count from
+// the runs before it. A resumed run that dies before its container starts —
+// exactly the S3-credential and container-launch failures this notice was
+// written for — then arrives with no stamp, no steps and no logs, and a journal
+// count from work that ran yesterday would vote yes and suppress the notice on
+// the very run that needs it.
+func userCodeRan(run *api.RunResponse) bool {
+	return run.ProcessingStartedAt != nil ||
+		len(run.Steps) > 0 ||
+		run.Logs != "" ||
+		looksLikeTraceback(run.Error)
+}
+
+// looksLikeTraceback reports an error that is a Python traceback. Only the
+// interpreter writes one, so it is evidence of execution that survives the ping
+// having been skipped.
+func looksLikeTraceback(err *string) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(*err, "Traceback (most recent call last)") ||
+		strings.Contains(*err, `File "`)
+}
+
+// printNothingRanNotice says that the failure happened before the author's code
+// was reached — the one thing that turns an infrastructure failure from a
+// puzzle about the folder into a re-run.
+//
+// It reports WHERE the run died, and nothing about WHOSE FAULT that is. The
+// notice used to add "That is not a bug in your files", and it was not entitled
+// to: userCodeRan answers whether the interpreter evaluated anything, which is a
+// fact about the run, not about blame — and the pre-exec path has at least one
+// author-caused member. A workflow whose ronja.json declares a package that does
+// not exist is refused before ExecV2 ever starts (manalysis fails the run with
+// "invalid pip packages: …"), and a declared package whose install fails lands
+// on the same never-executed path. Telling that author their files are innocent
+// sends them looking anywhere but at the one line they wrote wrong.
+//
+// The error's FIRST LINE only: the full message is already on the Error: line
+// above, and repeating it in full here would bury the sentence that matters.
+//
+// retry is the invocation to repeat, because this notice is now printed for a
+// LIVE run too and `ronja wf test` is not the command that produced one. A
+// re-run advice naming the wrong verb is the same class of untruth the notice
+// exists to remove.
+func printNothingRanNotice(out *os.File, runErr *string, retry string) {
+	// The sentence has to END either way. An instance that sent no error at all
+	// leaves nothing for the parenthetical, and the version without it used to
+	// stop mid-line — which reads as output the terminal cut off rather than as
+	// a message with nothing more to say.
+	reason := firstLine(runErr)
+	if reason != "" {
+		fmt.Fprintf(out, "\n  Nothing in your code ran — the run failed while Ronja was setting it up\n")
+		fmt.Fprintf(out, "  (%s).\n", reason)
+	} else {
+		fmt.Fprintf(out, "\n  Nothing in your code ran — the run failed while Ronja was setting it up.\n")
+	}
+	fmt.Fprintf(out, "  Run `%s` again; if it repeats, report it.\n", retry)
+	// The one pre-exec failure the author can act on, named exactly. The prefix
+	// is the backend's own wording for a package list it refused before starting
+	// the container, so matching on it points at the file that holds the list
+	// rather than leaving a re-run as the only advice on offer — a re-run of an
+	// unchanged package list fails identically every time.
+	if strings.HasPrefix(reason, "invalid pip packages") {
+		fmt.Fprintf(out, "  This one is about the folder's pipPackages — check them in ronja.json.\n")
+	}
+}
+
+// retryInvocation names the command that produced this run, which is the one
+// worth repeating.
+func retryInvocation(live bool) string {
+	if live {
+		return "ronja wf run"
+	}
+	return "ronja wf test"
+}
+
+// firstLine is the leading line of a possibly-nil, possibly-multi-line message.
+func firstLine(s *string) string {
+	if s == nil {
+		return ""
+	}
+	line, _, _ := strings.Cut(*s, "\n")
+	return strings.TrimSpace(line)
 }
 
 // printResumeHint offers the one thing a failed durable run makes possible:

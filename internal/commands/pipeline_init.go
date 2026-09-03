@@ -85,6 +85,14 @@ Every .sql file in the folder is one derived table. Anything else is ignored.`,
 			} else if !os.IsNotExist(err) {
 				return fmt.Errorf("read %s: %w", wfdir.ManifestPath(root), err)
 			}
+			// Ahead of the directory being created, for the same reason the
+			// manifest check is: a refused init leaves the filesystem exactly as
+			// it found it. --feature is optional here, and confirmFeatureIn is a
+			// no-op without one — a folder that names no feature refuses at its
+			// first push, which is the behaviour that already existed.
+			if err := confirmFeatureIn(cmd.Context(), featureID, resolved); err != nil {
+				return err
+			}
 			if len(args) == 1 {
 				if err := os.MkdirAll(root, 0o755); err != nil {
 					return fmt.Errorf("create %s: %w", root, err)
@@ -127,8 +135,14 @@ Every .sql file in the folder is one derived table. Anything else is ignored.`,
 					"root":     root,
 					"manifest": wfdir.ManifestPath(root),
 					"url":      resolved.URL,
-					"kind":     wfdir.KindPipeline,
-					"title":    title,
+					// The organization the binding names, alongside the instance.
+					// `url` alone was never the whole target — a folder is bound to
+					// (instance, organization), and a script reading back what init
+					// just wrote had to go and ask for the half init already knew.
+					"tenantID":     resolved.TenantID,
+					"organization": describeOrganization(resolved),
+					"kind":         wfdir.KindPipeline,
+					"title":        title,
 					// Empty when --feature was not given, which is a folder that
 					// cannot push yet and says so on the first attempt.
 					"featureID": featureID,
@@ -139,7 +153,7 @@ Every .sql file in the folder is one derived table. Anything else is ignored.`,
 					"tables": 0,
 				})
 			}
-			printPipelineInitReport(root, resolved.URL, title, featureID)
+			printPipelineInitReport(root, describeTarget(resolved), title, featureID)
 			return nil
 		},
 	}
@@ -163,11 +177,12 @@ const (
 
 // checkFeatureIDShape refuses a --feature value that is not a feature id.
 //
-// By SHAPE only, and it says so: the id is written into a committed manifest and
-// nothing reads it until the first push, so a wrong PREFIX — a table id, a
-// workspace id, a feature's NAME — is worth catching for free. Whether the
-// feature exists is a question for the server, and asking it here would put a
-// round trip in the one command that deliberately makes none.
+// By SHAPE, and BEFORE confirmFeatureIn asks the server whether the id names a
+// feature this credential can reach. The two answer different questions and the
+// shape one answers better: a table id, a workspace id or a feature's NAME is
+// not a feature id at all, and saying so names the real prefix — where the
+// server's answer would only be "no feature you can reach", which reads as a
+// permissions problem.
 //
 // An empty value is accepted: --feature is optional, and a folder without one
 // refuses at its first push with a message that names the fix.
@@ -181,7 +196,7 @@ func checkFeatureIDShape(featureID string) error {
 		featureID, featureIDPrefix, legacyFeatureIDPrefix)
 }
 
-func printPipelineInitReport(root, url, title, featureID string) {
+func printPipelineInitReport(root, target, title, featureID string) {
 	out := os.Stdout
 	fmt.Fprintf(out, "  Pipeline folder ready in %s\n\n", root)
 	fmt.Fprintf(out, "  Title:    %s\n", title)
@@ -191,7 +206,7 @@ func printPipelineInitReport(root, url, title, featureID string) {
 		fmt.Fprintf(out, "  Feature:  none yet — add \"featureID\" to the instance entry in %s before pushing\n",
 			wfdir.ManifestName)
 	}
-	fmt.Fprintf(out, "  Instance: %s (nothing pushed yet)\n", url)
+	fmt.Fprintf(out, "  Target:   %s (nothing pushed yet)\n", target)
 	fmt.Fprintf(out, "\n  Write one .sql file per derived table; anything else in the folder is ignored.\n")
 	fmt.Fprintf(out, "  Commit %s with your SQL; .ronja/ is local-only and ignores itself.\n",
 		wfdir.ManifestName)

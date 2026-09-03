@@ -299,6 +299,30 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 			RuntimeVersion: f.Manifest.RuntimeForValidate(existing.Workflow),
 		})
 		if err != nil {
+			// The feature this folder names is not one this credential can use.
+			// Reported HERE and not only at create, because validate runs FIRST
+			// on the default push — so this is the message a foreign feature id
+			// actually produces — and without the special case it arrives as
+			// "no rows (HTTP 400) (use --no-validate to skip this check)", which
+			// advises skipping a check that would fail identically one step
+			// later at create.
+			if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
+				return nil, fmt.Errorf("%s\n  %s", message, f.featureFixAdvice())
+			}
+			// The instance never delivered a verdict. Nothing has been written —
+			// validate runs before every write on this path — so the honest report
+			// is that the push did not start, not that the folder is wrong. The
+			// --no-validate advice is deliberately absent: skipping the check on
+			// an instance that did not answer would push files nobody has
+			// checked, which is the opposite of what this calls for. "Did not
+			// answer" and not "is down", here and in the message: all the CLI
+			// saw was silence, and a 5xx from a healthy instance behind a broken
+			// dependency looks exactly the same from this side.
+			if api.Unanswered(err) {
+				return nil, fmt.Errorf(
+					"validate before pushing: the instance did not answer (%w) — nothing was pushed, "+
+						"and this is not a verdict on your files. Try again in a moment.", err)
+			}
 			return nil, fmt.Errorf("validate before pushing: %w (use --no-validate to skip this check)", err)
 		}
 		result.Findings = validated.Findings
@@ -803,6 +827,12 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 			ReportingTimezone: declaredZoneForCreate(f.Manifest),
 		})
 		if err != nil {
+			// Reachable on `--no-validate`, where nothing asked the server about
+			// the feature until this write. With validation on the same failure
+			// is caught above.
+			if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
+				return nil, fmt.Errorf("%s\n  %s", message, f.featureFixAdvice())
+			}
 			return nil, fmt.Errorf("create workflow in feature %s: %w", featureID, err)
 		}
 		// Recorded IMMEDIATELY, before any file is written: the workflow now

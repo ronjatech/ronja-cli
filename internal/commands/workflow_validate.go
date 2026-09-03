@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
@@ -212,6 +211,19 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 		RuntimeVersion: f.Manifest.RuntimeForValidate(existing.Workflow),
 	})
 	if err != nil {
+		if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
+			return out, fmt.Errorf("%s\n  %s", message, f.featureFixAdvice())
+		}
+		// The instance never delivered a verdict. This command saves nothing, so
+		// nothing is at stake in the folder — but the bare error ("Internal
+		// server error (HTTP 500)") reads as an answer ABOUT the folder, which is
+		// the one thing it is not. Same sentence as `wf push`'s, minus the words
+		// about a push: see the arm in workflow_push.go.
+		if api.Unanswered(err) {
+			return out, fmt.Errorf(
+				"validate: the instance did not answer (%w) — nothing was checked, "+
+					"and this is not a verdict on your files. Try again in a moment.", err)
+		}
 		return out, err
 	}
 	out.Result = result
@@ -290,9 +302,9 @@ func featureIDFor(ctx context.Context, client *api.Client, f *folder, known *api
 	// entries there name other organizations instead" would be the same species
 	// of wrong advice one case over.
 	if others := f.otherOrganizationsOn(); !f.Bound && len(others) > 0 {
-		return "", fmt.Errorf("%w for organization %s on %s in %s — the entries there name %s instead, and a workflow's ids belong to the organization that holds them.\n  %s, or recreate the folder with `ronja wf init --feature <id>`",
-			errNoFeature, f.Key.TenantID, f.Resolved.URL, wfdir.ManifestPath(f.Root),
-			strings.Join(others, ", "), f.featureAdviceForAnotherOrganization())
+		return "", fmt.Errorf("%w for %s in %s — this folder is bound to %s instead, and a workflow's ids belong to the organization that holds them, so nothing recorded there can be pushed under this credential.\n  %s",
+			errNoFeature, describeTarget(f.Resolved), wfdir.ManifestPath(f.Root),
+			f.describeOrganizationIDs(others), f.featureAdviceForAnotherOrganization())
 	}
 	return "", fmt.Errorf("%w for %s — %s, or recreate the folder with `ronja wf init --feature <id>`",
 		errNoFeature, describeTarget(f.Resolved), f.featureAdvice())

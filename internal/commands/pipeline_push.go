@@ -142,8 +142,19 @@ type pipelineFileResult struct {
 	//
 	// Never a substitute for Error: it is advice about what to do next, and a
 	// caller that only reads one field must read the one the server wrote.
-	Hint   string          `json:"hint,omitempty"`
-	Review *pipelineReview `json:"review,omitempty"`
+	Hint string `json:"hint,omitempty"`
+	// Conflict reports that what refused this file was a compare-and-swap
+	// losing a race -- somebody edited the draft between this push's read and
+	// its write -- rather than a rule the caller cannot satisfy at all.
+	//
+	// It exists because Outcome and Error are both PROSE to a script: a
+	// `refused` covers "re-read and try again" and "you may not do this"
+	// identically, and telling them apart otherwise means substring-matching a
+	// message the server rewords whenever that reads better. Same field, same
+	// reason, as pushResult's and appPushResult's -- and the 409 here is the
+	// RETRYABLE one, which is the half worth splitting out.
+	Conflict bool            `json:"conflict"`
+	Review   *pipelineReview `json:"review,omitempty"`
 	// Sample and URL are rendered by the human report only — see pushResult.URL
 	// for why a link stays out of a shape scripts parse, and samples are garnish
 	// nothing should be scripted against.
@@ -302,8 +313,9 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 			// plain wording: it has a line to add the field to, and the
 			// cross-organization sentence would be wrong advice one case over.
 			if others := f.otherOrganizationsOn(); !f.Bound && len(others) > 0 {
-				return nil, fmt.Errorf("%s has no table yet, and this folder names no feature for organization %s on %s in %s — the entries there name %s instead, and a table's ids belong to the organization that holds them.\n  %s, or start from `ronja pipeline clone <feature-id>` against this organization",
-					path, f.Key.TenantID, f.Resolved.URL, wfdir.ManifestPath(f.Root), strings.Join(others, ", "), f.featureAdviceForAnotherOrganization())
+				return nil, fmt.Errorf("%s has no table yet, and this folder names no feature for %s in %s — it is bound to %s instead, and a table's ids belong to the organization that holds them, so nothing recorded there can be pushed under this credential.\n  %s",
+					path, describeTarget(f.Resolved), wfdir.ManifestPath(f.Root),
+					f.describeOrganizationIDs(others), f.featureAdviceForAnotherOrganization())
 			}
 			return nil, fmt.Errorf("%s has no table yet and this folder names no feature, so there is nowhere to create one.\n  %s, or start from `ronja pipeline init --feature <id>` or `ronja pipeline clone <feature-id>`",
 				path, f.featureAdvice())
@@ -455,6 +467,13 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 		fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n", path, out.Error)
 		return out
 	}
+	// refuseConflict is refuse for the one refusal a caller can DO something
+	// about: it stamps Conflict so a script never has to read the prose to tell
+	// "somebody got there first" from "you may not do this at all".
+	refuseConflict := func(format string, args ...any) pipelineFileResult {
+		out.Conflict = true
+		return refuse(format, args...)
+	}
 
 	// `content` is DISK form — the names the author committed. Everything SENT
 	// from here on is `wire`, and everything COMPARED or RECORDED stays disk form.
@@ -563,10 +582,15 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	}
 
 	// --- 3. The drift guard, in two legs -----------------------------------
-	// There are NO per-write compare-and-swap preconditions on this API: a PUT to
-	// a draft overwrites it unconditionally, and a commit overwrites its parent
-	// unconditionally. This guard is therefore the WHOLE protection, and it is a
-	// check at one instant — the moment these two rows were read.
+	// The server now carries both compare-and-swap layers — baseCodeSha256 on the
+	// PUT below and a base-version CAS on the commit — so this is no longer the
+	// whole protection, and the belt-and-braces is deliberate rather than
+	// leftover. This guard runs BEFORE a write, a sync and a build that the
+	// server's precondition would only refuse at the end of; it covers the LIVE
+	// row, which no precondition on a draft write can speak about at all; and it
+	// can explain the difference in terms of the FOLDER — this file, that table —
+	// where the server can only name two digests. It remains a check at one
+	// instant, which is what layer 1 exists to close.
 	//
 	// Each leg compares a row against the fingerprint TAKEN FROM THAT ROW, which
 	// is the whole of wfdir.TableState's invariant: leg (a) the live table against
@@ -675,7 +699,38 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	recordDraftPointer(inst, path, out.TableID, draft.ID)
 
 	// --- 4. Write, sync, wait ----------------------------------------------
-	if err := client.UpdateTableCode(ctx, draft.ID, wire, inputs); err != nil {
+	// The server's layer-1 precondition, and the ONE fingerprint that may be sent
+	// as it: the WIRE form of what this checkout last wrote into THIS draft. What
+	// goes over the PUT is `wire` — the file with its aliases and sibling stems
+	// substituted for ids — so that is what the row stores, and the disk-form
+	// DraftSHA256 beside it would 409 every push from any folder that spells a
+	// ref by name. See wfdir.TableState: a hash is only ever compared against the
+	// row it was taken from.
+	//
+	// EMPTY sends no precondition, which is the server's "write
+	// unconditionally", and it is the honest answer in the two cases that reach
+	// it: a draft this checkout has never written to (recordDraftPointer above
+	// has just cleared a fingerprint that described a different row), and a
+	// --force push. --force is the author saying they have seen what is on the
+	// server and mean to write over it; sending the precondition anyway would
+	// make the flag refuse the very thing it exists to permit.
+	basis := inst.TableStateFor(path).DraftWireSHA256
+	if opts.Force {
+		basis = ""
+	}
+	if err := client.UpdateTableCode(ctx, draft.ID, wire, inputs, basis); err != nil {
+		// The precondition was refused: somebody edited this draft — the chat
+		// agent, the web builder — between our read a moment ago and this write.
+		// Nothing was written, so their edit is intact and so is the file.
+		//
+		// Reachable even though leg (b) above just compared the same row, because
+		// the two look at different instants: that comparison is a read, this is
+		// the write, and the whole reason the precondition exists is the gap
+		// between them.
+		if api.StatusOf(err) == api.StatusConflict {
+			return refuseConflict("draft %s changed between reading it and writing to it — somebody edited it in the web app or by chat, and nothing was written:\n      %v\n    Run `ronja pipeline status` to see what it holds now, or push --force to overwrite it",
+				draft.ID, err)
+		}
 		// Same refusal as the create's, reached by the other door: a folder whose
 		// binding already names a table here still writes SQL whose refs may not
 		// be readable. Diagnosed here too, or the second push of a promotion
@@ -693,7 +748,7 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	// is advanced HERE and not after the build: a failed build that left this
 	// alone would read its own last attempt as somebody else's edit and refuse the
 	// fix.
-	recordDraftWrite(inst, path, out.TableID, draft.ID, content)
+	recordDraftWrite(inst, path, out.TableID, draft.ID, content, wire)
 	// A 404 while watching is terminal and specific: a draft stops existing the
 	// moment it is committed or discarded, so somebody landed or dropped this one
 	// from the web UI mid-build. The recorded pointer goes with it, or every later

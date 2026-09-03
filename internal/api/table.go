@@ -374,13 +374,25 @@ type TableDraftReview struct {
 	LiveRowCount  int64 `json:"liveRowCount"`
 
 	// BaseStale is true when the live table advanced after this draft forked.
-	// Commit is LAST-WRITER-WINS: landing a stale draft silently reverts those
-	// changes and nothing on the commit call will stop you, so this plus
-	// InterveningVersions is the only warning there is.
+	// Landing a stale draft would revert those changes, so the commit call
+	// REFUSES it with a 409 rather than letting it through — this plus
+	// InterveningVersions is the warning that comes first, and it says what the
+	// commit is about to say anyway.
 	BaseStale bool `json:"baseStale"`
 	// InterveningVersions are the versions that landed in between, newest
 	// first. Present only when BaseStale.
 	InterveningVersions []TableInterveningVersion `json:"interveningVersions"`
+	// HeadVersionID is the live table's CURRENT head committed version, and the
+	// value to send as confirmHeadVersionID to overwrite it on purpose.
+	//
+	// EMPTY is a real state, not "unknown": a table that has never been
+	// committed to has no version to name, and the server returns empty rather
+	// than falling back to the table's own id the way the workflow surface does.
+	// Returned ALWAYS, not only when BaseStale — but it is a point-in-time read,
+	// so a commit that carries it can still be refused if somebody lands a
+	// version in between. That re-refusal is the point of an override that
+	// names a version rather than a bare --force.
+	HeadVersionID string `json:"headVersionID"`
 
 	// SubmittedForReview is whether request-review has already been called.
 	// `pipeline publish` reads it on the review route it takes and reports
