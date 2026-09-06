@@ -819,9 +819,14 @@ func followRun(ctx context.Context, client *api.Client, runID string, timeout ti
 			everHead = true
 			return resp, nil
 		}
-		// ONLY a 404, and only the STATUS: an instance that has the route
-		// answers a run id matching nothing with a 400, and one that does not
-		// answers the router's plain-text breadcrumb, which is not JSON to read.
+		// ONLY a 404, and only the STATUS. An instance that does not have the
+		// route answers the router's plain-text breadcrumb, which is not JSON
+		// to read. A run id matching nothing is the other answer on this
+		// status — on an older backend it arrives as `400 {"error":"no rows"}`
+		// and stops here, on a current one as `404 {"error":"not found"}` and
+		// falls through, which costs one extra request and nothing else: the
+		// probe below fails on the same missing run, so the head route's error
+		// is what the caller gets either way.
 		if api.StatusOf(err) != 404 {
 			return resp, err
 		}

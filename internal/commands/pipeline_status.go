@@ -10,6 +10,7 @@ import (
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
+	"github.com/ronjatech/ronja-cli/internal/tabledocs"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
 )
@@ -189,7 +190,38 @@ type pipelineRemoteReport struct {
 	// Problem is a folder-level failure — the list read itself did not work.
 	Problem string                `json:"problem,omitempty"`
 	Tables  []pipelineTableReport `json:"tables,omitempty"`
-	Notes   []string              `json:"notes,omitempty"`
+	// Docs is one entry per DOCS SIDECAR — the tables this folder documents but
+	// does not build. Absent for the folders that keep none.
+	Docs  []pipelineDocsStatus `json:"docs,omitempty"`
+	Notes []string             `json:"notes,omitempty"`
+}
+
+// pipelineDocsStatus is one docs sidecar's remote state.
+//
+// Two questions, and they are different ones: Drift asks whether the ROW's
+// documentation moved since this folder agreed with it (which a push refuses on),
+// and Pending asks whether the FILE says something the row does not (which a push
+// would send). A sidecar can legitimately be both, neither, or either.
+type pipelineDocsStatus struct {
+	Path    string `json:"path"`
+	Alias   string `json:"alias,omitempty"`
+	TableID string `json:"tableID,omitempty"`
+	Name    string `json:"name,omitempty"`
+	// Problem is why this file cannot be used as it stands — it does not parse,
+	// its alias is not declared and bound here, or the table could not be read.
+	Problem string `json:"problem,omitempty"`
+	// Warning is something worth saying about a file that is nonetheless fine —
+	// see tableDocsSidecar.Warning. Deliberately NOT part of the exit code:
+	// pipelineStatusVerdict scores Problem and Drift, and a placeholder sidecar
+	// must not fail a CI gate that is asking whether the server moved.
+	Warning string `json:"warning,omitempty"`
+	// Drift is one of the drift* constants, measured on the live row's prose.
+	Drift string `json:"drift,omitempty"`
+	// Pending reports that a push would write something: the file declares a
+	// description or a column note the row does not hold. One-directional, by the
+	// three-state rule — prose on a column this file does not name is not a
+	// difference.
+	Pending bool `json:"pending,omitempty"`
 }
 
 func (r *pipelineRemoteReport) note(format string, args ...any) {
@@ -242,7 +274,14 @@ type pipelineTableReport struct {
 	// question the caller had not asked, and the live leg (a colleague committed
 	// while your draft sat open) was invisible on the one surface built to show
 	// it.
-	LiveDrift string               `json:"liveDrift,omitempty"`
+	LiveDrift string `json:"liveDrift,omitempty"`
+	// DocsDrift is the THIRD leg — the live table's DOCUMENTATION against the
+	// fingerprint taken from it — and it is present only for a file that carries
+	// a `-- @table` header. A folder that documents nothing makes no claim about
+	// anybody's prose, so there is nothing to report and this stays empty, which
+	// is what keeps a status on a folder written before this feature unchanged
+	// down to the line.
+	DocsDrift string               `json:"docsDrift,omitempty"`
 	Draft     *pipelineDraftReport `json:"draft,omitempty"`
 	// URL is the table's frontend page as the SERVER stamped it, rendered by the
 	// human report only — see pushResult.URL for why links stay out of --json.
@@ -265,6 +304,41 @@ type pipelineDraftReport struct {
 // Bounded rather than unbounded because the other failure mode is a folder of
 // two hundred tables opening two hundred connections at once.
 const pipelineStatusConcurrency = 8
+
+// fillConcurrently runs fill over each index in `indices`, on at most
+// pipelineStatusConcurrency goroutines, and returns when every one has finished.
+//
+// ONE COPY, because there were two byte-identical ones — this pool and the docs
+// sidecars' — differing only in the call inside the loop. The invariant that
+// makes the pool safe is the same in both and is stated once here rather than
+// twice: EACH CALL WRITES ONLY ITS OWN SLOT of a pre-sized results slice, so
+// there is nothing to lock and the results keep the order of the input.
+//
+// `fill` must not itself close over a shared mutable value. That is the whole of
+// the contract, and it is what a second copy of this loop would be free to
+// forget.
+func fillConcurrently(indices []int, fill func(i int)) {
+	workers := pipelineStatusConcurrency
+	if len(indices) < workers {
+		workers = len(indices)
+	}
+	work := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range work {
+				fill(i)
+			}
+		}()
+	}
+	for _, i := range indices {
+		work <- i
+	}
+	close(work)
+	wg.Wait()
+}
 
 // pipelineRemoteStatus gathers everything server-side in TWO TIERS, degrading
 // rather than aborting.
@@ -384,32 +458,16 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 		reports[i] = report
 	}
 
-	// Tier two, concurrently. Each worker writes only its own slot, so no lock is
-	// needed for the results themselves.
-	work := make(chan int)
+	// Tier two, concurrently. See fillConcurrently: each call writes only its own
+	// slot, so no lock is needed for the results themselves.
 	live := f.live(baseline)
-	var wg sync.WaitGroup
-	workers := pipelineStatusConcurrency
-	if len(needCode) < workers {
-		workers = len(needCode)
-	}
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range work {
-				fillTableDrift(ctx, client, codec, local[reports[i].Path], &reports[i],
-					baseline.TableStateFor(reports[i].Path), live.get(reports[i].Path))
-			}
-		}()
-	}
-	for _, i := range needCode {
-		work <- i
-	}
-	close(work)
-	wg.Wait()
+	fillConcurrently(needCode, func(i int) {
+		fillTableDrift(ctx, client, codec, local[reports[i].Path], &reports[i],
+			baseline.TableStateFor(reports[i].Path), live.get(reports[i].Path), live.getMeta(reports[i].Path))
+	})
 
 	out.Tables = reports
+	out.Docs = pipelineDocsStatuses(ctx, client, f, live)
 	if baseline == nil {
 		// ⚠️ Say WHICH half is unknown. On a stack folder the committed lock still
 		// carries the live fingerprints, so the live-drift line above is a real
@@ -455,7 +513,7 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 //
 // An empty fingerprint is reported as its own answer (driftNoBaseline) rather
 // than as drift.
-func fillTableDrift(ctx context.Context, client *api.Client, codec pipelineCodec, local string, report *pipelineTableReport, state wfdir.TableState, liveSHA string) {
+func fillTableDrift(ctx context.Context, client *api.Client, codec pipelineCodec, local string, report *pipelineTableReport, state wfdir.TableState, liveSHA, metaSHA string) {
 	draft, err := client.GetTableDraft(ctx, report.TableID)
 	if err != nil {
 		report.Drift = driftUnreadable
@@ -476,6 +534,19 @@ func fillTableDrift(ctx context.Context, client *api.Client, codec pipelineCodec
 	// hashes of the bytes on disk, which are in name form.
 	liveCode, liveUnresolved := codec.canonicalDisk(local, live)
 	liveDrift, liveProblem := compareDrift(liveCode, liveUnresolved, liveSHA)
+	// The third leg, and ONLY for a file that opts in. The header is what makes
+	// this folder claim anything about the table's prose; without one there is
+	// nothing to compare and nothing a push would overwrite.
+	if docs, _ := tabledocs.ParseHeader(local); !docs.Empty() {
+		switch {
+		case metaSHA == "":
+			report.DocsDrift = driftNoBaseline
+		case metaOf(live) == metaSHA:
+			report.DocsDrift = driftNone
+		default:
+			report.DocsDrift = driftChanged
+		}
+	}
 
 	if draft == nil {
 		report.URL = live.URL
@@ -586,6 +657,9 @@ func printPipelineStatus(r *pipelineStatusReport) {
 		for _, t := range r.Remote.Tables {
 			printPipelineTableStatus(out, t)
 		}
+		for _, d := range r.Remote.Docs {
+			printPipelineDocsStatus(out, d)
+		}
 	}
 	for _, note := range r.Remote.Notes {
 		fmt.Fprintf(out, "    note: %s\n", note)
@@ -626,7 +700,49 @@ func printPipelineTableStatus(out *os.File, t pipelineTableReport) {
 	case driftUnreadable:
 		fmt.Fprintf(out, "      live:   not checked\n")
 	}
+	// The documentation leg, printed only for a file that carries a header —
+	// an empty DocsDrift is "this folder claims nothing about this table's
+	// prose", which is not an answer worth a line.
+	switch t.DocsDrift {
+	case driftChanged:
+		fmt.Fprintf(out, "      docs:   the documentation of %s changed since your last sync — a push carrying this file's header would overwrite it\n", t.TableID)
+	case driftNoBaseline:
+		fmt.Fprintf(out, "      docs:   nothing to compare against yet — the next push records a baseline\n")
+	}
 	printResourceURL(out, statusKeyWidth, t.URL)
+}
+
+// printPipelineDocsStatus renders one docs sidecar.
+func printPipelineDocsStatus(out *os.File, d pipelineDocsStatus) {
+	fmt.Fprintf(out, "    %s\n", d.Path)
+	if d.Problem != "" {
+		fmt.Fprintf(out, "      %s\n", d.Problem)
+		return
+	}
+	name := d.TableID
+	if d.Name != "" {
+		name = fmt.Sprintf("%s (%s)", d.TableID, d.Name)
+	}
+	fmt.Fprintf(out, "      table:  %s\n", name)
+	switch {
+	case d.Warning != "":
+		// A file that declares nothing gets the note INSTEAD of a docs line, not
+		// as well as one: "the table already says what this file says" is true
+		// of a file that says nothing, and useless.
+		fmt.Fprintf(out, "      note:   %s\n", d.Warning)
+	case d.Pending:
+		fmt.Fprintf(out, "      docs:   this file says something the table does not — a push would write it\n")
+	default:
+		fmt.Fprintf(out, "      docs:   the table already says what this file says\n")
+	}
+	switch d.Drift {
+	case driftChanged:
+		fmt.Fprintf(out, "      drift:  the documentation of %s changed since your last sync — a push would overwrite it\n", d.TableID)
+	case driftNoBaseline:
+		fmt.Fprintf(out, "      drift:  nothing to compare against yet — the next push records a baseline\n")
+	case driftUnreadable:
+		fmt.Fprintf(out, "      drift:  not checked\n")
+	}
 }
 
 // pipelineStatusVerdict turns the report into an exit code, answering ONE
@@ -665,7 +781,7 @@ func pipelineStatusVerdict(r *pipelineStatusReport) error {
 	var drifted, unchecked []string
 	for _, t := range r.Remote.Tables {
 		switch {
-		case t.Drift == driftChanged || t.LiveDrift == driftChanged:
+		case t.Drift == driftChanged || t.LiveDrift == driftChanged || t.DocsDrift == driftChanged:
 			drifted = append(drifted, t.Path)
 		// driftNoBaseline is deliberately absent: it is "not compared yet", not
 		// "could not be compared", and the two rows above are what tell them
@@ -675,6 +791,23 @@ func pipelineStatusVerdict(r *pipelineStatusReport) error {
 			unchecked = append(unchecked, t.Path)
 		}
 	}
+	// The docs sidecars, on the same discipline: a row whose prose moved is
+	// drift, and a file that could not be resolved or read at all is UNCHECKED —
+	// never clean, because "I could not look" is not "nothing is there".
+	//
+	// A PENDING sidecar is deliberately NOT here. Drift asks whether the server
+	// moved under this folder; a file that says something the table does not is
+	// the ordinary state of a folder with work to push, exactly like a modified
+	// .sql file, and that is what a push is for.
+	for _, d := range r.Remote.Docs {
+		switch {
+		case d.Drift == driftChanged:
+			drifted = append(drifted, d.Path)
+		case d.Problem != "", d.Drift == "", d.Drift == driftUnreadable:
+			unchecked = append(unchecked, d.Path)
+		}
+	}
+
 	switch {
 	case len(drifted) > 0 && len(unchecked) > 0:
 		return fmt.Errorf("%d %s drifted on the server (%s), and %d %s could not be checked (%s) — see above",

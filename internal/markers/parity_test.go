@@ -21,6 +21,11 @@ import (
 var serverFiles = []string{
 	"backend/engine/esql/esql.go",
 	"backend/engine/pymarkers/markers.go",
+	// The malformed-argument rule keeps pymarkers' OWN copy of the `{{ ref }}`
+	// regex, because that package is a leaf and cannot import esql for it. Its
+	// own comment says the two must stay identical, and listing the file here is
+	// what makes something enforce that — see TestServerRefPatternCopiesAgree.
+	"backend/engine/pymarkers/malformed.go",
 }
 
 // serverPatterns is every package-level `<name> = regexp.MustCompile("…")` in
@@ -162,6 +167,7 @@ var excludedServerPatterns = map[string]string{
 	// package already knows about, and mirroring either would double-report.
 	"genericMarkerPattern": "the verb-agnostic scanner behind RejectMarkersInsideStrings, not a family",
 	"refPattern":           "the POSITIONAL narrowing of tableIDRefPattern — Occurrence.Positional is this",
+	"refMarkerPattern":     "pymarkers' own leaf-safe copy of tableIDRefPattern, which `ref` above already mirrors; TestServerRefPatternCopiesAgree pins the two server copies to each other",
 }
 
 // TestEveryServerMarkerFamilyIsMirroredOrExcluded is the direction
@@ -221,6 +227,37 @@ func TestEveryServerMarkerFamilyIsMirroredOrExcluded(t *testing.T) {
 		if mirrored[name] {
 			t.Errorf("%s is both mirrored and excluded — one of the two is wrong", name)
 		}
+	}
+}
+
+// TestServerRefPatternCopiesAgree pins the server's two copies of the
+// `{{ ref }}` regex to each other.
+//
+// engine/pymarkers is a leaf (stdlib + lib/rrn + lib/rjerr), so the
+// malformed-argument rule cannot import engine/esql for tableIDRefPattern and
+// keeps refMarkerPattern instead. Its own comment says "the two must stay
+// identical" and nothing enforced it — and both drift directions are silent: a
+// looser copy in pymarkers refuses a marker the extractor never binds, a
+// stricter one lets a handle through the rule and on to a reach query that
+// reports it as unreachable, which is the answer the malformed_marker code
+// exists to stop giving.
+//
+// It lives in this module for the same reason TestPatternParity does: this is
+// already the one place that reads the server's source to compare two copies of
+// a pattern across a boundary the type system cannot cross. It skips with the
+// rest when the backend tree is absent.
+func TestServerRefPatternCopiesAgree(t *testing.T) {
+	root := repoRoot(t)
+	if root == "" {
+		t.Skip("backend tree not present — nothing to compare")
+	}
+	esql := serverPatterns(t, filepath.Join(root, "backend/engine/esql/esql.go"))["tableIDRefPattern"]
+	leaf := serverPatterns(t, filepath.Join(root, "backend/engine/pymarkers/malformed.go"))["refMarkerPattern"]
+	if esql == "" || leaf == "" {
+		t.Fatalf("one of the two copies is gone: esql.tableIDRefPattern=%q pymarkers.refMarkerPattern=%q", esql, leaf)
+	}
+	if esql != leaf {
+		t.Errorf("the server's two {{ ref }} patterns have drifted\n  esql.tableIDRefPattern:      %s\n  pymarkers.refMarkerPattern: %s", esql, leaf)
 	}
 }
 

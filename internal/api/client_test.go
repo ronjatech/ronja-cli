@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -142,5 +144,59 @@ func TestIsTimeoutIgnoresACancelledContext(t *testing.T) {
 	}
 	if IsTimeout(err) {
 		t.Errorf("IsTimeout(%v) = true for a cancelled context", err)
+	}
+}
+
+// AsNameTaken has to be gated on the CODE and not on the 409, because three
+// unrelated refusals wear that status on this client: an optimistic-concurrency
+// conflict on a draft commit, a file precondition, and this. Reading a name
+// collision as one of the first two sends the author to `pipeline discard` or
+// `--overwrite-remote` — neither of which frees a name, and one of which throws
+// away a colleague's version to no purpose.
+func TestAsNameTakenReadsTheCodeAndReturnsTheServersSentence(t *testing.T) {
+	const sentence = `a table named "orders" already exists in this feature (table-d1abc)`
+	err := errorFrom(409, []byte(`{"error":`+strconv.Quote(sentence)+`,"code":"name_taken"}`))
+
+	why, taken := AsNameTaken(err)
+	if !taken {
+		t.Fatalf("AsNameTaken(%v) = false for the refusal it exists to recognise", err)
+	}
+	// The message NAMES the row in the way. Paraphrasing it would leave the
+	// author with a rule and nothing to act on.
+	if why != sentence {
+		t.Errorf("message = %q, want the server's own sentence %q", why, sentence)
+	}
+}
+
+func TestAsNameTakenIgnoresEveryOther409AndNonHTTPError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"a bare 409", errorFrom(409, []byte(`{"error":"the table moved since your draft forked"}`))},
+		{"a 409 carrying a different code", errorFrom(409, []byte(`{"error":"busy","code":"run_in_flight"}`))},
+		{"a body that is not JSON", errorFrom(409, []byte("conflict"))},
+		{"not an HTTP error at all", errors.New("name_taken")},
+		{"no error", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if why, taken := AsNameTaken(tc.err); taken {
+				t.Errorf("AsNameTaken = true (%q) — the code is the only discriminator", why)
+			}
+		})
+	}
+}
+
+// A refusal it has CLAIMED must never come back with an empty sentence: the
+// caller prints it, and a blank line under "that name is taken" is worse than
+// the raw error.
+func TestAsNameTakenNeverReturnsAnEmptySentence(t *testing.T) {
+	why, taken := AsNameTaken(errorFrom(409, []byte(`{"code":"name_taken"}`)))
+	if !taken {
+		t.Fatal("AsNameTaken = false for a body carrying the code")
+	}
+	if strings.TrimSpace(why) == "" {
+		t.Error("message is empty — it must fall back to the error's own rendering")
 	}
 }

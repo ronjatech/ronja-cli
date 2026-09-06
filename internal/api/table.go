@@ -126,6 +126,34 @@ type Table struct {
 	Code        string   `json:"code"`
 	InputModels []string `json:"inputModels"`
 
+	// Description is the table's prose, and DescriptionSource is who wrote it —
+	// "user" (protected from the agent's regeneration) or "ai". Mirrored from
+	// feature.TableView.
+	Description       string `json:"description,omitempty"`
+	DescriptionSource string `json:"descriptionSource,omitempty"`
+
+	// Fields is the table's COLUMN CATALOG: one entry per column the table has,
+	// with whatever prose documents it.
+	//
+	// ⚠️ THE JOIN RULE decides what is in here. The server reports only the
+	// columns it has MEASURED — a name somebody documented that the data does
+	// not contain keeps its prose on the row and is not a column, so it never
+	// appears. A caller must therefore never read this list as "the names the
+	// folder documented"; it is "the columns that exist", which is the left side
+	// of the join and the reason a documentation write reports back what
+	// attached rather than being asked to predict it.
+	//
+	// Populated ONLY by the single-row GET /feature/model/:id — not by the list
+	// endpoint, not by create, checkout or the draft read, which share this DTO.
+	// ABSENT means "not populated on this response", NOT "no columns", which is
+	// why every fingerprint taken from it is taken from a GetTable answer.
+	Fields []TableField `json:"fields,omitempty"`
+
+	// ColumnDocReport is what a write that carried `fields` answers — embedded,
+	// because the server embeds it in the create response rather than nesting it.
+	// Empty on every response that documented nothing.
+	ColumnDocReport
+
 	// ParentModelID is empty on a live table and set on a draft (and on a
 	// committed version snapshot). ShadowStatus says which.
 	ParentModelID string `json:"parentModelID"`
@@ -158,6 +186,35 @@ type Table struct {
 	// on Workflow for why. Absent on the list routes and on rows the server
 	// refuses to link (a committed version snapshot).
 	URL string `json:"url,omitempty"`
+}
+
+// TableField is one entry of Table.Fields: a column and its documentation,
+// mirroring feature.ModelFieldView.
+//
+// Name only, no type. The column catalog this endpoint publishes is about
+// DOCUMENTATION, and the CLI reads it for exactly two things: the third drift
+// leg's fingerprint, and telling an author what a table currently says about its
+// columns.
+type TableField struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// DescriptionSource is "user" or "ai", absent on prose written before the
+	// column carried provenance — which the server reads as person-owned.
+	DescriptionSource string `json:"descriptionSource,omitempty"`
+}
+
+// ColumnDescriptions projects Fields onto name → prose, which is the shape both
+// the drift fingerprint (tabledocs.MetaSHA256) and the "would a push change
+// anything" comparison take.
+func (t *Table) ColumnDescriptions() map[string]string {
+	if t == nil {
+		return nil
+	}
+	out := make(map[string]string, len(t.Fields))
+	for _, f := range t.Fields {
+		out[f.Name] = f.Description
+	}
+	return out
 }
 
 // TableBuildError mirrors feature.TableBuildError: the last failure recorded
@@ -255,8 +312,10 @@ type tableListResponse struct {
 	Result []*TableListItem `json:"result"`
 }
 
-// GetTable reads one table row. 404s for an id the caller cannot reach — the
-// read gate does not distinguish absent from invisible.
+// GetTable reads one table row. Refuses an id the caller cannot reach — the
+// read gate does not distinguish absent from invisible — with `400 {"error":"no
+// rows"}` on an older backend and `404 {"error":"not found"}` on a current one.
+// Callers accept both; see commands.explainUnreadableRefs.
 //
 // This is the only endpoint that serves BuildVerdict, LastBuildError and the
 // full `code`, which is why the pipeline loop's status command pays for it per

@@ -68,10 +68,17 @@ func (i InstanceBaseline) Key() InstanceKey {
 // distinction every pre-existing folder would read as having lost an allowlist
 // it never knew about, and the first push would report drift it cannot explain.
 type InstanceState struct {
-	SourceID          string                   `json:"sourceID"`
-	SourceLifecycle   string                   `json:"sourceLifecycle,omitempty"`
-	BaselineUpdatedAt string                   `json:"baselineUpdatedAt,omitempty"`
-	Title             string                   `json:"title,omitempty"`
+	SourceID          string `json:"sourceID"`
+	SourceLifecycle   string `json:"sourceLifecycle,omitempty"`
+	BaselineUpdatedAt string `json:"baselineUpdatedAt,omitempty"`
+	Title             string `json:"title,omitempty"`
+	// Name is a MODULE's Python package name as the server last had it, and it
+	// is the same guard Title is: a colleague renaming the package in the web
+	// UI must not be silently reverted by the next push. omitempty because
+	// every other kind's baseline has no such field and must not grow an empty
+	// one — and because an absent value means NO GUARD, which is what a state
+	// file written before modules existed deserves.
+	Name              string                   `json:"name,omitempty"`
 	Entrypoint        string                   `json:"entrypoint,omitempty"`
 	Parameters        *[]api.WorkflowParameter `json:"parameters,omitempty"`
 	ReportingTimezone *string                  `json:"reportingTimezone,omitempty"`
@@ -93,6 +100,31 @@ type InstanceState struct {
 	// baseline, and for a pipeline folder written before the key existed. It
 	// never means "no tables", which is what a present-but-empty map says.
 	Tables map[string]TableState `json:"tables,omitempty"`
+	// TableDocs is a PIPELINE folder's per-DOCS-SIDECAR state, and it is the
+	// LEGACY half of the pair Lock.TableDocs owns. A folder on a NAMED STACK
+	// keeps its sidecar recordings in the committed lock, where a fresh CI
+	// checkout can read them; a legacy unnamed instances[] folder has nowhere
+	// committed to put one, so it keeps them here exactly as it kept everything
+	// else before stacks existed. The fork is spelled once, in the commands
+	// package's liveHashes.
+	//
+	// omitempty and three-state-safe, for the reason Tables is: ABSENT means this
+	// folder tracks no sidecar state, never "there are no sidecars".
+	TableDocs map[string]TableDocsState `json:"tableDocs,omitempty"`
+}
+
+// TableDocsState is one docs sidecar's recorded state in a LEGACY folder's local
+// baseline — the mirror of wfdir.LockTableDocs, and it obeys the same invariant:
+// A HASH IS ONLY EVER COMPARED AGAINST THE ROW IT WAS TAKEN FROM. TableID says
+// which row that was, so a sidecar rebound to a different table drops the
+// fingerprint with it.
+type TableDocsState struct {
+	TableID    string `json:"tableID"`
+	MetaSHA256 string `json:"metaSHA256,omitempty"`
+	// DeclaredSHA256 is what the FILE declared at the last push — see
+	// LockTableDocs.DeclaredSHA256 for why it is a second fingerprint rather
+	// than the same one.
+	DeclaredSHA256 string `json:"declaredSHA256,omitempty"`
 }
 
 // TableState is one pipeline file's remote identity as this checkout last saw
@@ -171,6 +203,15 @@ type TableState struct {
 	DraftSHA256     string `json:"draftSHA256,omitempty"`
 	DraftWireSHA256 string `json:"draftWireSHA256,omitempty"`
 	LiveSHA256      string `json:"liveSHA256,omitempty"`
+	// MetaSHA256 is the LIVE row's DOCUMENTATION fingerprint as of the last
+	// moment this folder agreed with it — the LEGACY half of the pair
+	// LockTable.MetaSHA256 owns, kept here for a folder with no named stack for
+	// LiveSHA256's reason exactly.
+	//
+	// It is a fourth fingerprint of a fourth thing, and the invariant above
+	// covers it unchanged: it is taken from the live row's prose and compared
+	// against the live row's prose. Empty disarms its leg.
+	MetaSHA256 string `json:"metaSHA256,omitempty"`
 }
 
 // FileState is one file as the server last had it. UpdatedAt is diagnostics

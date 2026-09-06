@@ -169,7 +169,7 @@ func TestAutomationFieldRefsCountAsAUse(t *testing.T) {
 	codec := newAliasCodec(manifest.Dependencies, sel.Bind)
 
 	withFields := checkAliases(manifest, sel, codec, files,
-		folderStems(wfdir.AutomationKind, files), folderFieldRefs(wfdir.AutomationKind, files))
+		folderStems(wfdir.AutomationKind, files), folderFieldRefs(wfdir.AutomationKind, "", files))
 	for _, warning := range withFields.Warnings {
 		if strings.Contains(warning, "no file in this folder uses it") {
 			t.Errorf("a used dependency was reported as dead config: %q", warning)
@@ -199,7 +199,7 @@ func TestLiteralBindTargetInAnAutomationField(t *testing.T) {
 	codec := newAliasCodec(manifest.Dependencies, sel.Bind)
 
 	report := checkAliases(manifest, sel, codec, files,
-		folderStems(wfdir.AutomationKind, files), folderFieldRefs(wfdir.AutomationKind, files))
+		folderStems(wfdir.AutomationKind, files), folderFieldRefs(wfdir.AutomationKind, "", files))
 	if len(report.Refusals) == 0 {
 		t.Fatalf("writing a bind target's id literally was accepted: %+v", report)
 	}

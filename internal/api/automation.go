@@ -149,8 +149,11 @@ type Automation struct {
 
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	// Prompt is the inline-agent action's instructions. Empty on the workflow
-	// and saved_agent kinds, which carry a sentinel server-side.
+	// Prompt is the inline-agent action's instructions. On the workflow and
+	// saved_agent kinds it is the SENTINEL no-op string the server stamps at
+	// create — not empty, and never masked on read: the row carries the literal
+	// sentinel, which is why a file declaring `prompt` beside either kind is
+	// refused rather than compared.
 	Prompt string `json:"prompt"`
 
 	// TriggerKind is IMMUTABLE. UpdateAutomationInput carries no field for it,

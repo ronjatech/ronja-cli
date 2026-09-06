@@ -388,8 +388,9 @@ func (c *Client) GetWorkflowRun(ctx context.Context, runID string) (*RunResponse
 // head row.
 //
 // Two error shapes, and the difference is the whole reason the CLI can degrade
-// on an old instance: a run id that matches nothing answers 400 (`no rows`),
-// exactly as the sibling run routes do, so a 404 from this path is never a
+// on an old instance: a run id that matches nothing answers 400 (`no rows`) on
+// an older backend and 404 (`not found`) on a current one, exactly as the
+// sibling run routes do, so on an older instance a 404 from this path is never a
 // missing RUN. It means one of two other things — the route is not there (an
 // instance predating it, answering the router's plain-text breadcrumb, which is
 // why callers key the fallback on the STATUS and never on the body: that body

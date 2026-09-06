@@ -930,7 +930,7 @@ func (f *folder) aliasReport() (aliasReport, error) {
 	if err != nil {
 		return aliasReport{}, fmt.Errorf("read this folder's files to check its dependency names: %w", err)
 	}
-	return checkAliases(f.Manifest, f.selection(), f.Codec, files, folderStems(f.Kind, files), folderFieldRefs(f.Kind, files)), nil
+	return checkAliases(f.Manifest, f.selection(), f.Codec, files, folderStems(f.Kind, files), folderFieldRefs(f.Kind, f.Root, files)), nil
 }
 
 // folderStems is the local names a folder's own files claim.
@@ -974,7 +974,18 @@ func folderStems(kind wfdir.Kind, files map[string]string) []string {
 // pre-flight is run by `status` and by `sync check`, which have to keep
 // answering, and the loop's own parse refusal is the better message for that
 // file anyway.
-func folderFieldRefs(kind wfdir.Kind, files map[string]string) []fieldRef {
+//
+// It takes the folder ROOT as well as its syncable files because a PIPELINE
+// folder's second claim is a FILE NAME rather than a field: a docs sidecar's
+// stem is the alias it documents, and those files are not in `files` at all —
+// the kind's SyncExt is ".sql", so Enumerate never sees them. Without this leg
+// a folder that declares a dependency purely in order to document a table it
+// does not build would have that dependency reported as dead config on every
+// command.
+func folderFieldRefs(kind wfdir.Kind, root string, files map[string]string) []fieldRef {
+	if kind.Name == wfdir.KindPipeline {
+		return tableDocsFieldRefs(root)
+	}
 	if kind.Name != wfdir.KindAutomation {
 		return nil
 	}

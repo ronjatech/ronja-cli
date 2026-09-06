@@ -126,6 +126,20 @@ type pushResult struct {
 	// UpToDate reports a push that had nothing to do: the folder, the draft and
 	// the baseline already agree, so not one byte was written.
 	UpToDate bool `json:"upToDate"`
+	// DraftPreexisted reports that DraftID names a row that was ALREADY open
+	// before this push ran, rather than one this push checked out (or created).
+	//
+	// It exists for `sync apply`, which has to tell an up-to-date push over a
+	// FRESH checkout — a copy of live, holding nothing anybody needs published —
+	// from an up-to-date push over a draft an earlier run left behind, whose
+	// publish may never have landed. "Is a draft open" cannot tell them apart:
+	// resolvePushTarget checks one out on the way past, so after ANY push the
+	// answer is yes. See applyFolder.
+	//
+	// Deliberately NOT in the --json payload: it is a fact about the CLI's own
+	// state machine rather than about the row, and the shape is a contract. Same
+	// rule as URL above.
+	DraftPreexisted bool `json:"-"`
 	// DraftUnderReview reports that the draft written to has already been
 	// submitted for admin review — the push changed what someone is reviewing.
 	DraftUnderReview bool `json:"draftUnderReview"`
@@ -203,6 +217,23 @@ type pushResult struct {
 // second. Nothing in the CLI ever reassigns this.
 var newClient = api.New
 
+// refuseMissingEntrypoint is runPush's whole-folder local guard: the manifest
+// names a file the folder does not hold, which is what a rename that left
+// "entrypoint" behind looks like.
+//
+// A function rather than four lines inline because `sync apply`'s dry-run has to
+// make the SAME refusal in the same words — see decideApplyPushPreflight. A
+// folder holding it has a bound WorkflowID, so every decision about it is
+// `update` and a preview that only asked those reported it deployable.
+func refuseMissingEntrypoint(f *folder, local map[string]string) error {
+	entrypoint := f.Manifest.Entrypoint
+	if _, ok := local[entrypoint]; ok {
+		return nil
+	}
+	return fmt.Errorf("the entrypoint %q is not in this folder — create it, or point \"entrypoint\" in %s at one of the files that is",
+		entrypoint, wfdir.ManifestPath(f.Root))
+}
+
 // runPush is the whole state machine, kept out of the cobra closure so it is
 // testable as a function and so the reporting path has exactly one shape.
 //
@@ -231,9 +262,8 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return nil, err
 	}
 	entrypoint := f.Manifest.Entrypoint
-	if _, ok := local[entrypoint]; !ok {
-		return nil, fmt.Errorf("the entrypoint %q is not in this folder — create it, or point \"entrypoint\" in %s at one of the files that is",
-			entrypoint, wfdir.ManifestPath(f.Root))
+	if err := refuseMissingEntrypoint(f, local); err != nil {
+		return nil, err
 	}
 	// The alias pre-flight, still with no network in sight: an unbound
 	// declaration, a bind that answers nothing, or a source writing an id some
@@ -303,9 +333,10 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 			// Reported HERE and not only at create, because validate runs FIRST
 			// on the default push — so this is the message a foreign feature id
 			// actually produces — and without the special case it arrives as
-			// "no rows (HTTP 400) (use --no-validate to skip this check)", which
-			// advises skipping a check that would fail identically one step
-			// later at create.
+			// "no rows (HTTP 400) (use --no-validate to skip this check)" on an
+			// older backend and "not found (HTTP 404) ..." on a current one —
+			// either way advising the reader to skip a check that would fail
+			// identically one step later at create.
 			if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
 				return nil, fmt.Errorf("%s\n  %s", message, f.featureFixAdvice())
 			}
@@ -338,7 +369,17 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	}
 
 	// 4. Resolve the row to write to — the first step that changes anything.
-	target, err := resolvePushTarget(ctx, client, f, featureID, existing, result)
+	// Whether that is a CREATE is a local decision (see sync_decision.go), so it
+	// is taken there rather than re-read off the inspection: the two agree by
+	// construction — inspectTarget answers a nil Workflow exactly when the
+	// binding names none — and a tree-wide apply must decide it without having
+	// inspected anything.
+	//
+	// Recorded BEFORE the resolution, because the resolution is what destroys the
+	// answer: a checkout makes "there is a draft" true whether or not it was true
+	// a moment ago. See pushResult.DraftPreexisted.
+	result.DraftPreexisted = existing.Row() != nil
+	target, err := resolvePushTarget(ctx, client, f, featureID, workflowApplyDecision(f), existing, result)
 	if err != nil {
 		return nil, err
 	}
@@ -781,8 +822,8 @@ func inspectTarget(ctx context.Context, client *api.Client, f *folder) (existing
 // been deleted, archived or turned into a proposal is reported as broken. The
 // alternative — quietly creating a second workflow — leaves the old one's
 // consumers pointing at a row nobody edits any more.
-func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featureID string, existing existingTarget, result *pushResult) (*api.Workflow, error) {
-	if existing.Workflow == nil {
+func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featureID string, decision applyDecision, existing existingTarget, result *pushResult) (*api.Workflow, error) {
+	if decision.Creates() {
 		// A first push is the one path here that WRITES a binding, so this is
 		// where the organization has to be authoritative rather than adopted
 		// from an entry that does not exist yet.

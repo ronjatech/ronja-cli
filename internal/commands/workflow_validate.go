@@ -291,22 +291,31 @@ func featureIDFor(ctx context.Context, client *api.Client, f *folder, known *api
 			return wf.FeatureID, nil
 		}
 	}
-	// The ORGANIZATION is part of the answer whenever this folder has NO entry
-	// here and names another organization instead. "Add featureID to that
-	// instance's binding" then sends the reader to a line that already has one —
-	// which is exactly what they see, and exactly why they do not believe the
-	// message.
-	//
-	// Not bound is half the condition: a folder that IS bound here and merely
-	// left "featureID" out has a line to add the field to, and telling it "the
-	// entries there name other organizations instead" would be the same species
-	// of wrong advice one case over.
+	return "", noFeatureError(f)
+}
+
+// noFeatureError is the two refusals above, in the one place a push loop and a
+// LOCAL decision both read them from (see workflowApplyDecision). Extracted
+// rather than copied because the wrapping is load-bearing: `sync check` tells
+// this apart from every other lookup failure with errors.Is, and a second
+// wording would drift from this one the first time either is edited.
+//
+// The ORGANIZATION is part of the answer whenever this folder has NO entry here
+// and names another organization instead. "Add featureID to that instance's
+// binding" then sends the reader to a line that already has one — which is
+// exactly what they see, and exactly why they do not believe the message.
+//
+// Not bound is half the condition: a folder that IS bound here and merely left
+// "featureID" out has a line to add the field to, and telling it "the entries
+// there name other organizations instead" would be the same species of wrong
+// advice one case over.
+func noFeatureError(f *folder) error {
 	if others := f.otherOrganizationsOn(); !f.Bound && len(others) > 0 {
-		return "", fmt.Errorf("%w for %s in %s — this folder is bound to %s instead, and a workflow's ids belong to the organization that holds them, so nothing recorded there can be pushed under this credential.\n  %s",
+		return fmt.Errorf("%w for %s in %s — this folder is bound to %s instead, and a workflow's ids belong to the organization that holds them, so nothing recorded there can be pushed under this credential.\n  %s",
 			errNoFeature, describeTarget(f.Resolved), wfdir.ManifestPath(f.Root),
 			f.describeOrganizationIDs(others), f.featureAdviceForAnotherOrganization())
 	}
-	return "", fmt.Errorf("%w for %s — %s, or recreate the folder with `ronja wf init --feature <id>`",
+	return fmt.Errorf("%w for %s — %s, or recreate the folder with `ronja wf init --feature <id>`",
 		errNoFeature, describeTarget(f.Resolved), f.featureAdvice())
 }
 

@@ -404,23 +404,36 @@ func timedOutRunUnconfirmed(live *api.Workflow, cause error, detail string) erro
 		live.ID, serverMessage(cause), detail, live.ID)
 }
 
-// refusedRunPost renders the two refusals only the server can make, so neither
+// refusedRunPost renders the three refusals only the server can make, so none
 // arrives as a bare status code.
 //
 // Everything else — the credit kill-stop above all — is passed through in the
 // server's own words, exactly as runTest passes it: the sentence that says what
 // to do about it is the server's, and paraphrasing it loses that.
+//
+// Running a workflow needs only READ access to it — whoever can see a workflow
+// may run it, in a shared Feature or a private one — so neither arm below
+// names a "shared-feature admin gate" or a "Feature owner" any more: those
+// were the rules while the run route borrowed the WRITE gate, and they are
+// gone.
 func refusedRunPost(live *api.Workflow, err error) error {
 	switch api.StatusOf(err) {
 	case 403:
-		// The gate the CLI cannot get past and must not pretend to: a workflow in
-		// a SHARED feature is admin-only to run, and no flag here changes that.
-		// Named as the LIKELY cause rather than the only one — a scope-restricted
-		// token is refused with the same status, and a message that swore it was
-		// the role would send somebody hunting a permission they already have.
-		// The server's own sentence is carried either way, and naming the two ways
-		// forward matters more than naming the rule.
-		return fmt.Errorf("you may not run workflow %s (%s).\n  Usually this means the shared-feature gate: a workflow in a shared feature runs under admin access. A token restricted to narrower scopes is refused the same way.\n  Ask an admin to run it, or let the automation that owns this workflow trigger it",
+		// Two causes share this status and the CLI cannot tell them apart:
+		// the role (a read-only member may open a workflow but not start
+		// runs) and a token restricted to scopes that do not include the
+		// write half of `automation`. The server's own sentence is carried
+		// either way.
+		return fmt.Errorf("you may not run workflow %s (%s).\n  Running needs the User role (a read-only member cannot start runs) and a token whose scopes include automation:write — read access to the workflow itself is enough.\n  Check the role and the token's scopes, or let the automation that owns this workflow trigger it",
+			live.ID, serverMessage(err))
+	case 404:
+		// The command has just read this workflow (and usually just pushed
+		// it), so a 404 on the run is not absence: it is the run gate's
+		// oracle-safe answer for a workflow this credential can no longer SEE
+		// — access to its Feature was withdrawn, or the row was moved, between
+		// the push and the run. Running needs exactly the read access the push
+		// just exercised, so this is a race, not a rule.
+		return fmt.Errorf("workflow %s was here a moment ago, but this credential can no longer see it (%s).\n  Running a workflow needs only read access to it, so access to its Feature has changed since the push — re-run `ronja wf status`, and ask an admin if it is gone",
 			live.ID, serverMessage(err))
 	case api.StatusConflict:
 		return refusedForConcurrency(live, err)

@@ -215,10 +215,16 @@ type fakeInstance struct {
 	// featureStatus is the status GET /feature/:id answers with, per id. Absent
 	// (0) is 200 — see the route. 400 and 404 are BOTH real refusals for an id
 	// the caller cannot reach (a nonexistent or cross-tenant one is
-	// table.ErrNoRows, hence rjerr.Input and 400; one in this organization the
-	// caller may not read is the no-enumeration 404), and 503 is the instance
-	// not answering at all.
+	// table.ErrNoRows, which an older backend still in the field sends as 400
+	// and a current one as 404; one in this organization the caller may not read
+	// is the no-enumeration 404), and 503 is the instance not answering at all.
 	featureStatus map[string]int
+	// featureNotFoundBody is the `error` string the 404 arm above sends. The
+	// no-enumeration refusal names the feature ("feature not found"); the
+	// retyped lookup miss a current backend answers is the bare "not found",
+	// which explainFeatureUnreachable accepts only on a 404. Defaults to the
+	// former, so a test that says nothing stages the refusal it always did.
+	featureNotFoundBody string
 	// missStatus is what the three reference reads answer for an id the instance
 	// does not hold. 404 by default, and settable to 400 because BOTH are real:
 	// a row the caller may not see answers the no-enumeration 404, while a
@@ -303,6 +309,11 @@ type fakeInstance struct {
 	patchServed          bool
 	nextID               int
 
+	// mod is the MODULE arm — rows, files, drafts and versions — kept in its
+	// own struct in module_harness_test.go so the module surface is additive
+	// rather than interleaved with the workflow one it shares nothing with.
+	mod *moduleFake
+
 	server *httptest.Server
 	// Requests records every request served as "METHOD /path", in order — the
 	// cheapest way to assert that a command did NOT make a round trip it
@@ -348,32 +359,34 @@ func (f *fakeInstance) writesFor(path string) []recordedFileWrite {
 func newFakeInstance(t *testing.T) *fakeInstance {
 	t.Helper()
 	f := &fakeInstance{
-		t:                 t,
-		workflows:         map[string]*api.Workflow{},
-		files:             map[string][]api.WorkflowFile{},
-		draftOf:           map[string]string{},
-		failPut:           map[string]int{},
-		failDelete:        map[string]int{},
-		saveWarnings:      map[string][]string{},
-		runHistory:        map[string][]api.WorkflowRun{},
-		titlePatches:      map[string]string{},
-		parameterPatches:  map[string]*[]api.WorkflowParameter{},
-		timezonePatches:   map[string]*string{},
-		entrypointPatches: map[string]string{},
-		runtimePatches:    map[string]int{},
-		tenantZone:        "UTC",
-		tableNames:        map[string]string{},
-		agentIDs:          map[string]bool{},
-		secretIDs:         map[string]bool{},
-		tableDrafts:       map[string]string{},
-		tableCode:         map[string]string{},
-		featureTables:     map[string][]*api.TableListItem{},
-		featureStatus:     map[string]int{},
-		missStatus:        http.StatusNotFound,
-		privilegeLevel:    50,
+		t:                   t,
+		workflows:           map[string]*api.Workflow{},
+		files:               map[string][]api.WorkflowFile{},
+		draftOf:             map[string]string{},
+		failPut:             map[string]int{},
+		failDelete:          map[string]int{},
+		saveWarnings:        map[string][]string{},
+		runHistory:          map[string][]api.WorkflowRun{},
+		titlePatches:        map[string]string{},
+		parameterPatches:    map[string]*[]api.WorkflowParameter{},
+		timezonePatches:     map[string]*string{},
+		entrypointPatches:   map[string]string{},
+		runtimePatches:      map[string]int{},
+		tenantZone:          "UTC",
+		tableNames:          map[string]string{},
+		agentIDs:            map[string]bool{},
+		secretIDs:           map[string]bool{},
+		tableDrafts:         map[string]string{},
+		tableCode:           map[string]string{},
+		featureTables:       map[string][]*api.TableListItem{},
+		featureStatus:       map[string]int{},
+		featureNotFoundBody: "feature not found",
+		missStatus:          http.StatusNotFound,
+		privilegeLevel:      50,
 
 		versions:             map[string][]api.Workflow{},
 		enforcePreconditions: true,
+		mod:                  newModuleFake(),
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
@@ -557,15 +570,18 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 	// through to the unexpected-path arm, which is the honest answer.
 	if featureID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/"); ok && !strings.Contains(featureID, "/") {
 		if status := f.featureStatus[featureID]; status != 0 {
-			// The body a real instance sends for each: 400 carries the raw
-			// table.ErrNoRows sentinel on an older backend and the mapped text
-			// on a newer one, 404 the no-enumeration refusal, 503 nothing the
+			// The body a real instance sends for each. The 400 is what an OLDER
+			// backend answers a lookup miss with — the raw table.ErrNoRows
+			// sentinel — and it stays staged because this binary still meets
+			// those instances; a current one retyped that miss to a 404 carrying
+			// the bare "not found", which is featureNotFoundBody. The 404 arm
+			// otherwise carries the no-enumeration refusal, and 503 nothing the
 			// CLI can read as a verdict.
 			switch status {
 			case http.StatusBadRequest:
 				http.Error(w, `{"error":"no rows"}`, status)
 			case http.StatusNotFound:
-				http.Error(w, `{"error":"feature not found"}`, status)
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, f.featureNotFoundBody), status)
 			default:
 				http.Error(w, `{"error":"Internal server error"}`, status)
 			}
@@ -590,6 +606,12 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"id": secretID, "name": secretID})
+		return
+	}
+	// The module surface, whose paths share no prefix with the workflow one —
+	// matched before serveWrites so a module path can never fall through to the
+	// workflow read switch's default branch and 404 as a missing workflow.
+	if f.serveModule(w, r) {
 		return
 	}
 	if f.serveWrites(w, r) {
@@ -825,7 +847,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// The precondition is checked BEFORE the write and rolls it back by
 			// simply not doing it, which is what the server's in-transaction
 			// check amounts to from the outside.
-			if f.refusePrecondition(w, id, filePath, in.BaseSha256) {
+			if f.refusePrecondition(w, "workflow", f.FileContents(id), filePath, in.BaseSha256) {
 				return true
 			}
 			f.putFile(id, filePath, in.Content)
@@ -863,7 +885,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 				http.Error(w, `{"error":"cannot delete the entrypoint file"}`, http.StatusBadRequest)
 				return true
 			}
-			if f.refusePrecondition(w, id, filePath, in.BaseSha256) {
+			if f.refusePrecondition(w, "workflow", f.FileContents(id), filePath, in.BaseSha256) {
 				return true
 			}
 			f.deleteFile(id, filePath)
@@ -1113,10 +1135,12 @@ func (f *fakeInstance) writeHeadRouteMiss(w http.ResponseWriter, runID string) {
 // Three deliberate differences from serveRunPoll. The 404 branch is the ROUTE
 // being absent (an instance predating --follow) and answers plain text, not
 // JSON, exactly as the router's breadcrumb does — a fake that answered
-// `{"error":...}` would let a CLI decoding the body pass. A missing RUN is a
-// 400 instead, staged through failHeadGets, because that is what the real route
-// does and the two must not be confusable. And the scripted id is left ALONE:
-// the head's id is the payload here, not bookkeeping.
+// `{"error":...}` would let a CLI decoding the body pass. A missing RUN is
+// staged through failHeadGets instead, defaulted to the 400 an older backend
+// answers a lookup miss with — a current one answers 404 there, which is why the
+// follow's fallback is written to survive landing on this status for either
+// reason, and why the two must not be confusable by BODY. And the scripted id is
+// left ALONE: the head's id is the payload here, not bookkeeping.
 func (f *fakeInstance) serveRunHeadPoll(w http.ResponseWriter, runID string) {
 	if f.onPoll != nil {
 		defer f.onPoll()
@@ -1134,6 +1158,9 @@ func (f *fakeInstance) serveRunHeadPoll(w http.ResponseWriter, runID string) {
 		return
 	}
 	if len(f.headScript) == 0 {
+		// A test that scripted nothing gets the older backend's lookup miss. A
+		// current one answers this 404, and either way it is a run that is not
+		// there — see serveRunHeadPoll's note.
 		http.Error(w, `{"error":"no rows in result set"}`, http.StatusBadRequest)
 		return
 	}
@@ -1223,26 +1250,32 @@ func decodeOptionalBody(t *testing.T, r *http.Request, out any) {
 	}
 }
 
-// refusePrecondition mirrors rworkflow.checkFilePrecondition, which is the
-// point: a CLI that sends a hash of the wrong thing has to fail here the way it
-// would in production, not be waved through by a fake that ignores the field.
+// refusePrecondition mirrors rworkflow.checkFilePrecondition — and rmodule's,
+// which is byte-identical to it on purpose — which is the point: a CLI that
+// sends a hash of the wrong thing has to fail here the way it would in
+// production, not be waved through by a fake that ignores the field.
+//
+// It takes the row's CONTENTS rather than an id so both arms of the fake share
+// one implementation: the two servers apply the same rule, and a second copy
+// here would be a second place for it to drift. `noun` is what the refusal calls
+// the row it is talking about.
 //
 // Reports whether it answered (with a 409).
-func (f *fakeInstance) refusePrecondition(w http.ResponseWriter, id, path string, want *string) bool {
+func (f *fakeInstance) refusePrecondition(w http.ResponseWriter, noun string, contents map[string]string, path string, want *string) bool {
 	if want == nil || !f.enforcePreconditions {
 		return false
 	}
-	content, exists := f.FileContents(id)[path]
+	content, exists := contents[path]
 	switch {
 	case *want == "" && !exists:
 		return false
 	case *want == "":
-		http.Error(w, `{"error":"`+path+` already exists on this workflow, but the write asserted it did not"}`,
+		http.Error(w, `{"error":"`+path+` already exists on this `+noun+`, but the write asserted it did not"}`,
 			http.StatusConflict)
 	case exists && wfdir.HashString(content) == *want:
 		return false
 	case !exists:
-		http.Error(w, `{"error":"`+path+` does not exist on this workflow, but the write asserted its content hashed to `+*want+`"}`,
+		http.Error(w, `{"error":"`+path+` does not exist on this `+noun+`, but the write asserted its content hashed to `+*want+`"}`,
 			http.StatusConflict)
 	default:
 		http.Error(w, `{"error":"`+path+` changed since you last read it (it now hashes to `+

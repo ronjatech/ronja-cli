@@ -80,6 +80,14 @@ const (
 	// carries a Tables map and why the single-id helpers refuse this kind rather
 	// than answering with a workflow's field.
 	KindPipeline = "pipeline"
+	// KindModule is a folder of shared Python package sources — the `{{ module }}`
+	// library a workflow imports instead of copying helper files between folders.
+	//
+	// Shaped exactly like a workflow folder (one resource, source files, a
+	// per-user draft/commit lifecycle) minus the two things a workflow has and a
+	// library does not: an entrypoint and anything runnable.
+	KindModule = "module"
+
 	// KindAutomation is a folder of automation .json files, one per automation.
 	// Many-resource like KindPipeline, and refused by the single-id helpers for
 	// the same reason.
@@ -181,6 +189,36 @@ var (
 		Command: "ronja pipeline",
 		SyncExt: ".sql",
 	}
+	// ModuleKind is a folder of shared Python package sources.
+	//
+	// No entrypoint, for the reason PipelineKind has none and a different one: a
+	// pipeline folder has no DISTINGUISHED member, while a module has no
+	// runnable member at all. `import <name>` resolves through `__init__.py`,
+	// which is seeded server-side at create and is a file like any other here —
+	// naming it as an entrypoint would invite `ronja module` to grow a run verb
+	// for something that is not a program.
+	//
+	// SyncExt is `.py` because the SERVER accepts nothing else (V1, plan §3.9):
+	// a module is a Python package, and the runtime's own module-name grammar
+	// mangles a non-.py path (`data.csv` is written as `data/csv.py`). Declaring
+	// it here means a README or a fixture in the folder is skipped locally
+	// rather than PUT and refused mid-push — and, because SyncExt is threaded
+	// through NotSyncable, both Enumerate and CheckLocalPaths answer the same
+	// way, which is what stops a `.md` file the server somehow holds from being
+	// written once and then read as a local deletion.
+	//
+	// No SkipDirs, matching PipelineKind: a folder that syncs `.py` and nothing
+	// else already rules out node_modules/ and dist/ by extension, and a
+	// Python-shaped folder's venv/ is a dot-name or full of non-.py files.
+	// ⚠️ `__pycache__/` is NOT excluded by name, and does not need to be — its
+	// contents are `.pyc`, which SyncExt drops.
+	ModuleKind = Kind{
+		Name:    KindModule,
+		Label:   "module",
+		Command: "ronja module",
+		SyncExt: ".py",
+	}
+
 	// AutomationKind is a folder of automation files — one .json per automation,
 	// each the curated (trigger, action) shape the create/update bodies take.
 	//
@@ -294,6 +332,19 @@ const DefaultEntrypoint = "main.py"
 // inside StateDirName goes through StateDir instead.
 func ManifestPath(root string) string { return filepath.Join(root, ManifestName) }
 func StatePath(root string) string    { return filepath.Join(root, StateDirName, StateFileName) }
+
+// ModuleInitName is the file that makes a MODULE folder an importable Python
+// package, and ModuleInitPath locates it.
+//
+// It lives here rather than beside the module commands because two packages
+// need the same answer: the commands seed it and refuse to push a folder
+// without one, and this package has to know it is a name no exclusion rule may
+// ever drop. It is an ordinary `.py` file, so SyncExt keeps it — the constant
+// exists so nobody has to spell "__init__.py" in two places and get one of them
+// wrong.
+const ModuleInitName = "__init__.py"
+
+func ModuleInitPath(root string) string { return filepath.Join(root, ModuleInitName) }
 
 // StateDir locates the folder's local-only state directory — or a path inside
 // it, when sub is given — and refuses one a symlink puts OUTSIDE root.

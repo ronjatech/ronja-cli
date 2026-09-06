@@ -119,6 +119,25 @@ type Manifest struct {
 	FormatVersion int    `json:"formatVersion,omitempty"`
 	Kind          string `json:"kind"`
 	Title         string `json:"title"`
+	// Name is a MODULE folder's Python package name — the identifier a consumer
+	// workflow writes in import position (`from {{ module('module-X') }} import
+	// tracker` inlines to it). It is the one piece of module metadata that is
+	// not cosmetic: two live modules cannot share it, and a workflow whose own
+	// file tree has a top-level name colliding with it is refused at save.
+	//
+	// A plain string with omitempty rather than the three-state pointer
+	// Parameters and Access carry, and the same rule Title follows: "" means
+	// this folder does not manage the name, so a push leaves the row's alone.
+	// The third state has nothing to describe, because the server refuses an
+	// EMPTY name outright — a module with no package name is not importable, so
+	// "declares the empty name" is not a thing a folder can mean. `module init`
+	// and `module clone` both write the key, so a folder created by either
+	// manages its name from the start.
+	//
+	// omitempty for the reason every other kind-specific key has it: a workflow,
+	// data-app or pipeline manifest must not grow a `"name": ""` key that
+	// belongs to a kind it is not.
+	Name string `json:"name,omitempty"`
 	// Entrypoint is the ONE file the server runs, and it is omitempty because a
 	// pipeline folder has no such file at all: a folder of .sql tables has no
 	// distinguished member, so `"entrypoint": ""` in a committed manifest would be
@@ -613,6 +632,12 @@ type Binding struct {
 	// that same row in place, so the id is stable from first push onwards but
 	// only names a LIVE app once it has been published.
 	DataAppID string `json:"dataAppID,omitempty"`
+	// ModuleID is the WorkflowID of a MODULE folder, a third field for the
+	// reason DataAppID is a second one: the manifest is a file people read, and
+	// a key naming what it points at is worth more than one saved line. Like
+	// both of the others it is the STABLE identity — the live module, or a
+	// parentless draft's own id — never a per-user edit draft's.
+	ModuleID  string `json:"moduleID,omitempty"`
 	FeatureID string `json:"featureID,omitempty"`
 	// Tables is a PIPELINE folder's binding: local relative path → the live
 	// `table-…` id that file builds. One folder, many resources — which is the
@@ -662,6 +687,8 @@ func (b Binding) ResourceID(kind Kind) (string, error) {
 		return b.WorkflowID, nil
 	case KindDataApp:
 		return b.DataAppID, nil
+	case KindModule:
+		return b.ModuleID, nil
 	case KindPipeline, KindAutomation:
 		return "", fmt.Errorf("%s: %w", kind.Label, ErrMultiResourceBinding)
 	default:
@@ -680,6 +707,9 @@ func (b Binding) WithResourceID(kind Kind, id string) (Binding, error) {
 		return b, nil
 	case KindDataApp:
 		b.DataAppID = id
+		return b, nil
+	case KindModule:
+		b.ModuleID = id
 		return b, nil
 	case KindPipeline, KindAutomation:
 		return b, fmt.Errorf("%s: %w", kind.Label, ErrMultiResourceBinding)
@@ -939,6 +969,7 @@ var kindByName = map[string]Kind{
 	KindWorkflow:   WorkflowKind,
 	KindDataApp:    DataAppKind,
 	KindPipeline:   PipelineKind,
+	KindModule:     ModuleKind,
 	KindAutomation: AutomationKind,
 }
 

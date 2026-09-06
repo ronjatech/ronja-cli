@@ -26,32 +26,40 @@ var flagSyncDir string
 // how a broken edge sits in a repository for a month — which is the failure this
 // group exists for.
 //
-// Read-only, and that is a promise with a test behind it (see
-// TestSyncStatusWritesNothing and TestSyncCheckWritesNothing): every path under
-// this command reads three files and makes GETs. Nothing here may reach
+// `status` and `check` are READ-ONLY, and that is a promise with a test behind
+// it (see TestSyncStatusWritesNothing and TestSyncCheckWritesNothing): every
+// path under those two reads three files and makes GETs. Neither may reach
 // wfdir.SaveState, which also writes a .gitignore — a command called `status`
 // creating files in a customer's repository, in a git workflow whose whole point
 // is a clean tree, is the exact wrong failure. ⚠️ It also rules out openFolder,
-// which calls adoptStack and rewrites ronja.json; the tree commands open through
+// which calls adoptStack and rewrites ronja.json; both open through
 // openFolderForStatusAt.
+//
+// `apply` is the one that acts, and it opens through openFolderForStatusAt too —
+// for a different reason, and one worth knowing: adoptStack's rewrite is
+// something apply REFUSES (syncReasonManifestRewrite), so opening through the
+// acting opener would perform the migration and then report declining to.
 func newSyncCmd() *cobra.Command {
 	sync := &cobra.Command{
 		Use:   "sync",
-		Short: "Check every Ronja folder in a tree at once",
-		Long: `Check every Ronja folder in a tree at once.
+		Short: "Check — and deploy — every Ronja folder in a tree at once",
+		Long: `Check, and deploy, every Ronja folder in a tree at once.
 
-Walks down from a directory for every ronja.json — workflow, data app and
-pipeline folders alike — and answers one of two questions about all of them:
+Walks down from a directory for every ronja.json — workflow, data app,
+automation and pipeline folders alike — and answers one question about all of
+them:
 
   ronja sync status                is the committed content what the
                                    organization holds?
   ronja sync check                 does every reference that content makes
                                    still resolve?
+  ronja sync apply                 push and publish all of it
 
-Read-only. Nothing is written, not even a checkout, so it is safe to run on a
-repository you only have read access to.`,
+status and check are read-only: nothing is written, not even a checkout, so they
+are safe to run on a repository you only have read access to. apply writes, and
+refuses by default to create anything that does not already exist.`,
 	}
-	sync.AddCommand(newSyncStatusCmd(), newSyncCheckCmd())
+	sync.AddCommand(newSyncStatusCmd(), newSyncCheckCmd(), newSyncApplyCmd())
 	sync.PersistentFlags().StringVar(&flagSyncDir, "dir", ".",
 		"directory to walk for folders (default: the working directory)")
 	addStackFlag(sync)

@@ -64,6 +64,9 @@ type automationFile struct {
 	// Prompt is the INLINE AGENT action's instructions. A saved-agent action's
 	// per-run seed message is action.config.prompt, which is a different field
 	// on a different object; the server reads them separately and so does this.
+	//
+	// It is REFUSED beside a workflow or saved_agent action, declared or on the
+	// row — see refuseAutomationPromptFor.
 	Prompt *string `json:"prompt,omitempty"`
 
 	// TriggerKind is IMMUTABLE server-side — see refuseUnpatchableAutomation.
@@ -421,6 +424,15 @@ func checkAutomationVocabulary(file *automationFile) error {
 		if err := refuseAutomationReferencesFor(file.Action.Kind, file.References); err != nil {
 			return err
 		}
+		// The DECLARED half of the prompt rule (refuseAutomationPromptFor), same
+		// split as the references rule above: the file's own `kind` answers it
+		// here without a credential, and the half a file cannot answer — a
+		// `prompt` beside NO `action` at all, against a row that already holds
+		// one of these kinds — is asked of the row in
+		// refuseUnpatchableAutomation.
+		if err := refuseAutomationPromptFor(file.Action.Kind, file.Prompt); err != nil {
+			return err
+		}
 	}
 	if file.References != nil {
 		for i, ref := range *file.References {
@@ -474,6 +486,38 @@ func refuseAutomationReferencesFor(kind string, refs *[]api.AutomationReference)
 		return fmt.Errorf("\"references\" cannot be declared beside a saved_agent action: automation access does not apply to one — the agent runs under its OWN references, and the server refuses this with a 400. Declare them on the saved Agent itself in the web app, or drop the action and let this be an inline \"agent\" automation")
 	case api.ActionKindWorkflow:
 		return fmt.Errorf("\"references\" cannot be declared beside a workflow action: the server stores NONE — writing a workflow action deletes the automation's reference rows — so this would push green, read back empty, and report drift no edit could ever close. A workflow runs under the resources its own script markers bind; references belong on an inline \"agent\" action")
+	}
+	return nil
+}
+
+// refuseAutomationPromptFor is THE rule about a top-level `prompt` and action
+// kinds, written once and asked from two places — the parse check, against the
+// kind the FILE declares, and refuseUnpatchableAutomation, against the kind the
+// push would EFFECTIVELY leave behind. Exactly the two-half shape
+// refuseAutomationReferencesFor has, and for the same reason: without the row
+// side, `{"prompt": "…"}` with no `action` block pushed against a row that
+// already holds a workflow or saved_agent action pushes GREEN and then reports
+// the same drift for ever — the very permanent false red this rule exists to
+// remove.
+//
+// A top-level `prompt` beside a workflow or saved_agent action is a value that
+// CANNOT CONVERGE. The server pins those kinds' parent prompt to a sentinel
+// no-op: create stamps it over whatever the body sent, and update drops the
+// prompt patch entirely (actionLocked). So the push reports success, the row
+// reads back the sentinel, `status` reports the same drift for ever and CI
+// exits 1 while describing a change that already landed.
+//
+// An UNKNOWN or empty kind answers nil rather than guessing, like the
+// references rule: on a create with no action the server stores an inline agent
+// action, whose prompt is exactly this field, and refusing there would refuse
+// the ordinary shape.
+func refuseAutomationPromptFor(kind string, prompt *string) error {
+	if prompt == nil {
+		return nil
+	}
+	switch kind {
+	case api.ActionKindWorkflow, api.ActionKindSavedAgent:
+		return fmt.Errorf("\"prompt\" is not a key a %s automation may carry: the server pins that kind's prompt to a sentinel — it stamps the sentinel at create and drops the prompt patch on every update — so the declared value can never converge and `status` would report the same drift for ever. Remove the key; a saved_agent action's per-run seed message is \"action.config.prompt\", a different field on a different object that the server does read", kind)
 	}
 	return nil
 }
@@ -774,6 +818,9 @@ func describeStackFor(stack string) string {
 // refuseAutomationActionKindSwitch.
 func refuseUnpatchableAutomation(file *automationFile, row *api.Automation) error {
 	if err := refuseAutomationReferencesFor(effectiveAutomationActionKind(file, row), file.References); err != nil {
+		return err
+	}
+	if err := refuseAutomationPromptFor(effectiveAutomationActionKind(file, row), file.Prompt); err != nil {
 		return err
 	}
 	if err := refuseAutomationActionKindSwitch(file, row); err != nil {

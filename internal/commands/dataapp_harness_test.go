@@ -348,6 +348,10 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 		switch status := f.featureStatus[featureID]; status {
 		case 0:
 		case http.StatusBadRequest:
+			// The OLDER backend's answer for an id the caller cannot reach: the
+			// raw table.ErrNoRows sentinel. A current one retyped that miss to
+			// the 404 below, and this binary ships against both, so the arm
+			// stays.
 			http.Error(w, `{"error":"no rows"}`, status)
 			return
 		case http.StatusNotFound:
@@ -722,7 +726,17 @@ func (f *fakeAppInstance) serveFile(w http.ResponseWriter, r *http.Request, id, 
 				return
 			}
 		}
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		// 400 {"error":"no rows"}, NOT a 404, and it is the production answer
+		// rather than a simplification: GET :id/files/*path is the one route
+		// the backend deliberately kept on the old shape (api/v2/dataapp:
+		// fileRouteMiss, pinned by TestFileRouteMissStaysA400), precisely
+		// because reconcileUncertainAppWrite reads a 404 there as "this path is
+		// gone" and drops it from the sync baseline. So that branch is DORMANT
+		// against every shipped backend by design, and a fake that 404s here
+		// would exercise a branch no server reaches while leaving the branch
+		// every server DOES reach untested. TestAppReconcile404BranchIsDormant
+		// covers the 404 half against a hypothetical future server.
+		http.Error(w, `{"error":"no rows"}`, http.StatusBadRequest)
 
 	case http.MethodPut:
 		var body struct {

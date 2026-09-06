@@ -24,6 +24,8 @@ package api
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/url"
 )
 
@@ -59,6 +61,66 @@ type CreateTableInput struct {
 	Engine      string   `json:"engine"`
 	Code        string   `json:"code"`
 	InputModels []string `json:"inputModels"`
+
+	// Description is the table's prose, from the file's `-- @table` header, and
+	// DescriptionSource is always DescriptionSourceUser when it is set: a person
+	// committed those words to a repository, so they are protected from the
+	// agent's regeneration exactly as prose typed into the web app is.
+	//
+	// omitempty on BOTH, and it is load-bearing on the second: a create that
+	// declared a source with no description would claim human authorship of
+	// nothing.
+	Description       string `json:"description,omitempty"`
+	DescriptionSource string `json:"descriptionSource,omitempty"`
+
+	// Fields is the column documentation the header declares.
+	//
+	// ⚠️ A create has MEASURED NOTHING, so under the join rule every name here
+	// comes back unmatched — the prose is stored against the name and attaches at
+	// the first build that produces the column. It is sent anyway so a table does
+	// not exist even briefly with prose its own file already carries; the report
+	// the push actually shows a reader is taken from the documentation write that
+	// follows the build. See UpdateTableDocs.
+	Fields []TableFieldInput `json:"fields,omitempty"`
+}
+
+// TableFieldInput is one entry of a `fields` write, mirroring the subset of
+// rdb.ModelFieldV2 the CLI sends.
+//
+// DescriptionSource is always DescriptionSourceUser from this client. Every
+// carrier the CLI has is a file a person committed to a repository, and the
+// distinction the column protects is exactly that: prose Ronja may rewrite
+// versus prose it may not.
+type TableFieldInput struct {
+	Name              string `json:"name"`
+	Description       string `json:"description"`
+	DescriptionSource string `json:"descriptionSource,omitempty"`
+}
+
+// DescriptionSourceUser marks prose a PERSON wrote, which the agent may not
+// overwrite. Mirrored from rdb.DescriptionSourceUser.
+const DescriptionSourceUser = "user"
+
+// ColumnDocReport is what a `fields` write answers: THE JOIN RULE, reported.
+//
+// The measured column set is the truth and prose is joined onto it, so a name
+// the table does not have is neither an error nor a new column — its prose is
+// stored and re-attaches by itself if a later build produces the column, and the
+// caller is told rather than refused. Drift between a committed file and the
+// data is expected: a table is rebuilt on a schedule, a staging column gets
+// renamed, a file is committed ahead of the pipeline that fills it.
+//
+// Both lists are omitempty server-side and both are sorted. An ABSENT report —
+// every field empty — means the write carried no `fields` at all, never that
+// nothing attached.
+type ColumnDocReport struct {
+	AttachedColumns  []string `json:"attachedColumns,omitempty"`
+	UnmatchedColumns []string `json:"unmatchedColumns,omitempty"`
+}
+
+// Documented reports whether this answer describes a documentation write at all.
+func (r ColumnDocReport) Documented() bool {
+	return len(r.AttachedColumns) > 0 || len(r.UnmatchedColumns) > 0
 }
 
 // UpdateTableInput is the body of PUT /feature/model/:id, mirroring the two
@@ -148,6 +210,76 @@ func (c *Client) UpdateTableCode(ctx context.Context, id, code string, inputMode
 	}
 	return c.doSlow(ctx, "PUT", "feature/model/"+url.PathEscape(id),
 		UpdateTableInput{Code: code, InputModels: inputModels, BaseCodeSha256: baseCodeSha256}, nil)
+}
+
+// UpdateTableDocsInput is the body of the DOCUMENTATION half of PUT
+// /feature/model/:id — a second, deliberately separate body from
+// UpdateTableInput, which writes the SQL.
+//
+// SEPARATE BECAUSE THE ORDER MATTERS. Documentation is applied AFTER the build,
+// never with it: the join rule attaches prose to the columns the table has
+// MEASURED, so a `fields` write folded into the same PUT as the SQL would run
+// before anything had been measured and report every column as unmatched — on a
+// first push, correctly but uselessly, and on every later one it would report
+// against the PREVIOUS build's columns. Push → build → attach → report.
+//
+// Every field is three-state, which is what makes a committed file able to
+// document part of a table:
+//
+//   - Description nil        the folder does not manage the table's prose;
+//     the key is absent and the row keeps what it has.
+//   - Description to ""      an explicit claim that there is none. The server
+//     clears the column and, deliberately, does NOT stamp
+//     "user" — empty prose is the caller handing the field
+//     back to Ronja, not a claim of authorship.
+//   - Fields nil             no column is managed; the key is absent.
+//   - Fields with an entry   that column's prose, "" to clear it. A column NOT
+//     named is untouched, which is the whole reason a
+//     folder may document three columns of twelve.
+type UpdateTableDocsInput struct {
+	Description       *string           `json:"description,omitempty"`
+	DescriptionSource string            `json:"descriptionSource,omitempty"`
+	Fields            []TableFieldInput `json:"fields,omitempty"`
+}
+
+// UpdateTableDocs writes a table's DOCUMENTATION and reports what attached.
+//
+// `id` is the row being documented — in the pipeline loop's edit cycle that is
+// always the DRAFT's id, for UpdateTableCode's reason: committing a draft
+// overwrites the parent's fields and its column rows from the draft, so prose
+// written on the live row while a draft is open is lost the moment anyone
+// publishes. The docs-sidecar path is the exception and writes the LIVE row,
+// because a table this folder does not build has no draft in this loop at all.
+//
+// ALLOWED FOR EVERY ROLE on the caller's own draft. Documenting a table is not
+// an admin act: a drafter may write the prose, and the admin who reviews the
+// draft sees the column-description delta before approving it.
+//
+// A nil report is not a failure — it is the answer to a write that carried no
+// `fields`, and it is also what an instance older than the report answers. The
+// write landed either way; only the join rule's read-back is missing, which is
+// why an EOF is folded into "no report" rather than into an error about a
+// documentation write that actually succeeded.
+//
+// ⚠️ NIL THEREFORE MEANS "NOTHING WAS REPORTED", NEVER "NOTHING WAS WRITTEN",
+// and a caller that reads it as the latter says nothing at all about a write
+// that really happened. It is not disambiguated here because this layer cannot:
+// the answer is empty in both cases, and only the caller still holds the file
+// that says how many columns went out. commands.docsResultFrom is where the two
+// are told apart, from `docs` rather than from this return.
+func (c *Client) UpdateTableDocs(ctx context.Context, id string, in UpdateTableDocsInput) (*ColumnDocReport, error) {
+	var out ColumnDocReport
+	err := c.doSlow(ctx, "PUT", "feature/model/"+url.PathEscape(id), in, &out)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !out.Documented() {
+		return nil, nil
+	}
+	return &out, nil
 }
 
 // CheckoutTable gets-or-creates the CALLER'S OWN draft of a table and returns

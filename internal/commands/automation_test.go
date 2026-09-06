@@ -199,6 +199,37 @@ func TestAutomationFileRefusesAnActionWithoutAKind(t *testing.T) {
 	}
 }
 
+// TestAutomationFileRefusesAPromptOnAPinnedActionKind: a workflow or saved_agent
+// automation's parent prompt is pinned to a server-side sentinel — stamped over
+// the body at create, and dropped from the patch on every update — so a declared
+// value can never converge. Left to the push, the file would report success and
+// then drift for ever, with CI exiting 1 over a change that already landed.
+func TestAutomationFileRefusesAPromptOnAPinnedActionKind(t *testing.T) {
+	for _, kind := range []string{"workflow", "saved_agent"} {
+		_, err := parseAutomationFile("a.json",
+			`{"prompt": "summarise yesterday", "action": {"kind": "`+kind+`", "config": {}}}`)
+		if err == nil {
+			t.Fatalf("a prompt beside a %s action must be refused", kind)
+		}
+		if !strings.Contains(err.Error(), "sentinel") ||
+			!strings.Contains(err.Error(), "action.config.prompt") {
+			t.Errorf("the refusal for %s does not say why or where to put it instead: %v", kind, err)
+		}
+	}
+	// The inline agent action is whose instructions the top-level prompt IS, so
+	// it parses — and that is the shape `automation init` scaffolds.
+	if _, err := parseAutomationFile("a.json",
+		`{"prompt": "summarise yesterday", "action": {"kind": "agent", "config": {}}}`); err != nil {
+		t.Errorf("a prompt beside an agent action must parse: %v", err)
+	}
+	// The seed message a saved_agent action DOES read is a different field on a
+	// different object, and it stays declarable.
+	if _, err := parseAutomationFile("a.json",
+		`{"action": {"kind": "saved_agent", "config": {"prompt": "summarise yesterday"}}}`); err != nil {
+		t.Errorf("action.config.prompt on a saved_agent action must parse: %v", err)
+	}
+}
+
 // TestAutomationFileRefusesReferencesOnAnActionThatCannotHoldThem: only an
 // inline agent action carries references, and the WORKFLOW case is why this is a
 // local refusal rather than the server's job.
@@ -342,6 +373,89 @@ func TestAutomationRefusesReferencesAgainstAnActionRowTheFileDoesNotDeclare(t *t
 	}
 	if refs := f.RowOf("job-1").Action.Config.References; len(refs) != 1 || refs[0].ResourceID != "note-1" {
 		t.Errorf("the references did not land on the agent action: %+v", refs)
+	}
+}
+
+// TestAutomationRefusesAPromptAgainstAnActionRowTheFileDoesNotDeclare is the
+// ROW-SIDE half of the prompt rule, the same second door the references rule
+// has (refuseAutomationPromptFor is asked from both places, exactly as
+// refuseAutomationReferencesFor is).
+//
+// A file that declares `prompt` and NO `action` is unmanaged in the action: the
+// push sends no action, the row keeps the workflow or saved_agent one it has,
+// and the server pins that kind's parent prompt to its sentinel. So the push
+// answers 200, the row reads back the sentinel, and status reports the same
+// drift for ever — the exact permanent false red this rule exists to remove.
+// The kind that decides is the ROW's, which is why this leg lives where the row
+// is known.
+func TestAutomationRefusesAPromptAgainstAnActionRowTheFileDoesNotDeclare(t *testing.T) {
+	// No `action` key at all — the half checkAutomationVocabulary cannot answer.
+	const actionless = `{"cronExpr": "0 2 * * *", "prompt": "summarise yesterday"}`
+
+	newFolder := func(t *testing.T, kind string) (*fakeAutomationInstance, string) {
+		t.Helper()
+		f := newFakeAutomationInstance(t)
+		signInAutomation(t, f)
+		f.AddAutomation(&api.Automation{
+			ID: "job-1", Name: "nightly", CronExpr: "0 2 * * *", Enabled: true,
+			Action: &api.AutomationAction{
+				ID: "act-job-1", ScheduledJobID: "job-1", Kind: kind,
+				Config: api.AutomationActionConfig{WorkflowID: "workflow-1"},
+			},
+		})
+		dir := t.TempDir()
+		manifest, lock := automationStack(f, "collection-1",
+			map[string]string{"nightly.json": "job-1"},
+			map[string]string{"nightly.json": anchoredAt(baseTime)})
+		writeAutomationFolder(t, dir, manifest, lock, map[string]string{"nightly.json": actionless})
+		return f, dir
+	}
+
+	f, dir := newFolder(t, api.ActionKindWorkflow)
+	_, stderr, err := runAutomationCLI(t, dir, "automation", "push")
+	if err == nil {
+		t.Fatal("a prompt against a workflow-action row must be refused")
+	}
+	if !strings.Contains(stderr, "sentinel") || !strings.Contains(stderr, "action.config.prompt") {
+		t.Errorf("the refusal does not give the rule or the remedy:\n%s", stderr)
+	}
+	if len(f.updates) != 0 {
+		t.Errorf("the refused push sent %d update(s)", len(f.updates))
+	}
+
+	// STATUS SAYS THE SAME THING, for the same reason it does for references: a
+	// report that called this a pushable change while the push refused it would
+	// be this loop's own worst failure.
+	out, _, err := runAutomationCLI(t, dir, "automation", "status", "--json")
+	if err == nil {
+		t.Error("status scored an unpushable folder as clean")
+	}
+	report := &automationStatusReport{}
+	decodeJSONInto(t, out, report)
+	if len(report.Remote.Automations) != 1 {
+		t.Fatalf("automations = %+v", report.Remote.Automations)
+	}
+	if row := report.Remote.Automations[0]; !strings.Contains(row.Problem, "sentinel") {
+		t.Errorf("status did not report the refusal a push would make: %+v", row)
+	}
+
+	// A saved_agent row is pinned the same way.
+	_, dir = newFolder(t, api.ActionKindSavedAgent)
+	if _, stderr, err := runAutomationCLI(t, dir, "automation", "push"); err == nil {
+		t.Fatal("a prompt against a saved_agent-action row must be refused")
+	} else if !strings.Contains(stderr, "saved_agent") {
+		t.Errorf("the refusal does not name the row's kind:\n%s", stderr)
+	}
+
+	// ⚠️ AND THE ROW IS WHY. Against an inline AGENT action row the top-level
+	// prompt IS that action's instructions, so it must push — refusing it would
+	// refuse the ordinary shape `automation init` scaffolds.
+	f, dir = newFolder(t, api.ActionKindAgent)
+	if _, stderr, err := runAutomationCLI(t, dir, "automation", "push"); err != nil {
+		t.Fatalf("a prompt against an agent-action row must push: %v (%s)", err, stderr)
+	}
+	if got := f.RowOf("job-1").Prompt; got != "summarise yesterday" {
+		t.Errorf("the prompt did not land on the agent action: %q", got)
 	}
 }
 

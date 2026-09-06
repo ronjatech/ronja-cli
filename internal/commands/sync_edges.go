@@ -32,17 +32,21 @@ import (
 // that existence does not leak — the workflow handler's own comment calls it the
 // "no-enumeration 404" — while a row that is deleted, trashed or in another
 // tenant is removed by RLS or by the store's live pin before the predicate ever
-// runs, and surfaces as table.ErrNoRows, which is rjerr.Input and therefore
-// 400. So "deleted" and "not yours" are indistinguishable BY DESIGN, and the
-// two statuses do not even line up with the two meanings.
+// runs, and surfaces as table.ErrNoRows. That sentinel changed status under us:
+// older backends still in the field answer it `400 {"error":"no rows"}`, current
+// ones `404 {"error":"not found"}`, and this binary talks to both. So "deleted"
+// and "not yours" are indistinguishable BY DESIGN, and the two statuses do not
+// even line up with the two meanings — nor with each other across generations.
 //
 // That is why the id's SHAPE is checked locally first (markers.IsResourceID,
 // which takes a kind), and why 400 and 404 on a well-formed id are then treated
-// IDENTICALLY. A verifier keyed on 404 alone would read a deleted table as "my
-// request was malformed" and say nothing; one that read 400 as a client bug
-// would do the same. See Client.GetTable, which already states the half of this
-// the CLI knew about: "404s for an id the caller cannot reach — the read gate
-// does not distinguish absent from invisible."
+// IDENTICALLY — which is also why the 400 arm STAYS rather than being retired
+// with the retype: it is what an older instance still answers. A verifier keyed
+// on 404 alone would read a deleted table on such an instance as "my request was
+// malformed" and say nothing; one that read 400 as a client bug would do the
+// same. See Client.GetTable, which already states the half of this the CLI knew
+// about: "404s for an id the caller cannot reach — the read gate does not
+// distinguish absent from invisible."
 const (
 	edgeOK          = "ok"
 	edgeUnresolved  = "unresolved"
@@ -634,7 +638,15 @@ var validateFindingKinds = map[string]string{
 	"unresolved_codex":    markers.KindCodex,
 	"unresolved_mailbox":  markers.KindMailbox,
 	"unresolved_workflow": markers.KindWorkflow,
-	findingSecretDropped:  markers.KindSecret,
+	// `{{ module }}` is a per-reference marker like the rest, so an unreachable
+	// one is an EDGE. Without this entry it still reached the reader — an
+	// unmapped error code falls through to the folder-level findings list, and
+	// the verdict still goes red — but as a bare sentence rather than as a row
+	// naming the module, the file it is imported in, and the verdict. The edge
+	// shape is the whole output of `sync check`, so a marker family that lands
+	// outside it is the one family you cannot scan for.
+	"unresolved_module":  markers.KindModule,
+	findingSecretDropped: markers.KindSecret,
 }
 
 // edgesFromValidation turns POST /workflow/validate's answer into edges.

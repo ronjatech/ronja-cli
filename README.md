@@ -44,8 +44,9 @@ Two commands make that HTTP half less unpleasant without describing any of it �
 below, and the doctrine that admits them is immediately below this.
 
 The exceptions are the five sync loops — `ronja wf` (workflows), `ronja app`
-(data apps), `ronja pipeline` (derived tables), `ronja automation` (automations)
-and `ronja db` (managed-database migrations), each below. The rule they keep is
+(data apps), `ronja pipeline` (derived tables), `ronja automation` (automations),
+`ronja db` (managed-database migrations) and `ronja module` (shared Python
+packages), each below. The rule they keep is
 **sync verbs yes, resource verbs no**: the CLI may own a filesystem-to-resource
 sync loop, because that is stateful, multi-step and drift-guarded in a way plain
 HTTP handles badly. It still owns no list, browse or delete. If an agent needs something the API already does, the answer is a
@@ -66,12 +67,14 @@ questions come from a file somebody committed, and the answers go back into it �
 and it is deliberately unable to become a browser: it can only ever ask about
 names this folder already declares, never "what tables exist".
 
-And one GROUP sits above them: `ronja sync` (`status`, `check`) asks about a
-whole tree of folders rather than the one you are standing in — a question a
-repository has and a folder does not (see
-[Whole-tree checks](#whole-tree-checks-ronja-sync)). It is read-only and
-discovers nothing: it can only report on folders that already carry a committed
-`ronja.json`, which is the same "no browsing" line the loops hold.
+And one GROUP sits above them: `ronja sync` (`status`, `check`, `apply`) asks
+about a whole tree of folders rather than the one you are standing in — a
+question a repository has and a folder does not (see
+[Whole-tree checks](#whole-tree-checks-ronja-sync)). `status` and `check` are
+read-only; `apply` deploys, by orchestrating the loops rather than writing
+anything itself. All three discover nothing: they can only act on folders that
+already carry a committed `ronja.json`, which is the same "no browsing" line the
+loops hold.
 
 One command sits outside the doctrine entirely rather than under it: `ronja
 update` is housekeeping of the binary itself, and touches no Ronja resource and
@@ -668,6 +671,13 @@ rotating a leaked credential at 3am is exactly when a human-only gate makes
 security worse), and **irreversible at organisation scale** (deleting the org,
 cascade execute, billing).
 
+One refusal carries the same code without being one of those routes: making or
+refreshing a managed database's dev copy **with the production data** in it,
+which terminates every connection to the production database while the copy is
+taken. That is a property of the argument rather than the route — the same two
+routes answer `202` for a **structure-only** copy — so the route is not flagged
+and the handler refuses the narrower thing. See below.
+
 ⚠️ **This makes the CLI strictly less capable than the app, on purpose, and
 someone will file it as a bug.** The defence is the same one the whole PAT model
 rests on: you approved this credential in a browser ninety days ago, for the
@@ -1061,6 +1071,39 @@ A managed database can have a **dev copy**: a separate Postgres database with
 the same schema, its own data, and its own migration ledger. `db sql` and
 `db migrate` reach it with `--env dev`, and `db promote` moves the migrations
 the copy has and production does not onto production.
+
+**Making one is not a CLI verb** (resource verbs never are — see the doctrine
+above), but it is machine-callable, so a pipeline can stand up its own sandbox
+through `ronja api` rather than depending on one made by hand:
+
+```bash
+ronja api -X POST /api/v2/database/<database-id>/twin -d '{"mode":"schema"}'
+```
+
+That answers `202` with the copy at `provisioning`; poll
+`GET /api/v2/database/<database-id>` until its `twin` says `ready`. Do not
+re-POST to poll — a repeat while it is provisioning returns the same row and
+starts nothing, so it tells you no more than the GET does. Refreshing a
+structure-only copy is the same shape at `:id/twin/refresh`, with no body — so
+`-X POST` is required there, since `ronja api` defaults to `GET` when there is
+nothing to send:
+
+```bash
+ronja api -X POST /api/v2/database/<database-id>/twin/refresh
+```
+
+A refresh while the copy is still `provisioning` is refused: the discard that
+starts it would delete the record of a database that is still being built. Wait
+for `ready`.
+
+⚠️ **`{"mode":"data"}` is refused to a machine** with `403 human_required`,
+create and refresh alike: a copy carrying production's rows is taken by
+`CREATE DATABASE ... TEMPLATE`, which terminates every connection to production
+while it runs. A person does that on the database's page in Data Studio, or by
+asking Ronja in a chat. And a refresh may not CHANGE the kind — a stated `mode`
+that differs from the copy's is a `400` for everyone, since downgrading would
+empty a data sandbox and upgrading would disconnect production for a request
+that never said so. Send no `mode` to rebuild the copy as it is.
 
 **You never name the copy.** Every command takes the **production** id and the
 server resolves the copy from it — the copy has no id the CLI ever learns, sends
@@ -1476,6 +1519,7 @@ drift baseline for the first time.
 | `url`, `tenantID`, `featureID` | `ronja.json` | a person chose where this deploys and which feature it lives in — even though the first push is what wrote it down |
 | `workflowID` / `dataAppID` / a pipeline's `tables` | `ronja.lock.json` | a deploy created them |
 | a pipeline's `liveSHA256` | `ronja.lock.json` | "the live table held these bytes when this folder last agreed with it" is true for everybody |
+| a pipeline's `metaSHA256` and its `tableDocs` entries | `ronja.lock.json` | same test, about the row's **documentation**: which table a docs sidecar names, and what its prose looked like when everybody last agreed with it |
 | a workflow's / app's `headVersionID` | `ronja.lock.json` | "this folder forked from that published version" is true for everybody |
 | draft ids, draft fingerprints | `.ronja/state.json` | a draft is **yours**; a colleague inheriting one from git would be pointed at a row they cannot see |
 
@@ -1547,7 +1591,11 @@ organization the folder *means* and `/me` says which one the token *reaches*,
 and a stale declaration or a token exported for the wrong organization is
 exactly where those differ. Asked, the disagreement is refused by name; skipped,
 the push resolves the stack's `featureID` under a token that cannot see it and
-reads the 404 as "create it".
+reads the 404 as "create it". (That reading is right for the CREATE twins: they
+404 a private Feature the caller cannot write into, which for a push is indeed
+"there is nothing here for you". The RUN route answers the same status only for
+a workflow the credential can no longer SEE, and `run` renders it rather than
+passing it through.)
 
 **Migration, and how a folder stays on the old shape.** A folder written before
 stacks keeps its `instances` list, ids and all, and **no push rewrites it** — a
@@ -1800,7 +1848,7 @@ argument exactly as found:
 - **An unresolvable argument, `secret` only.** Deliberately asymmetric: the
   secret legs are the ONLY ones the server answers with a WARNING rather than an
   error (`rworkflow`'s `secretIDs` / `querySecretIDs` are `SeverityWarning`;
-  `ref`, `write`, `agent`, `codex`, `mailbox` and `workflow` are all
+  `ref`, `write`, `agent`, `codex`, `mailbox`, `workflow` and `module` are all
   `SeverityError`). Every other family hard-rejects the save, and that refusal is
   older and better-aimed than anything invented client-side, so those are left
   alone.
@@ -1867,9 +1915,20 @@ that, and offers what it found. Then it writes the accepted answers into
 `ronja.json` and exits **non-zero while any declared name is still unbound**, so
 CI can run it as a check rather than only as an authoring aid.
 
-It is **kind-agnostic** — `dependencies` is a key all three folder kinds carry —
-which is why it sits at the root of the command tree rather than inside `wf`,
-`app` and `pipeline` as three commands that would have to stay identical.
+It is **kind-agnostic** — `dependencies` is a key the workflow, data-app and
+pipeline folder kinds all carry — which is why it sits at the root of the
+command tree rather than inside `wf`, `app` and `pipeline` as three commands
+that would have to stay identical.
+
+⚠️ **A module folder is refused**, before anything is opened or looked up.
+Module files are marker-free, so a declared alias has nothing to resolve *into*:
+the block is not merely unbound, it is unfillable. Left to run, `bind` would
+report "0 names bound" on one — true, and read as "nothing was missing" rather
+than "this command does not apply here". Declare the dependency in the consumer
+workflow, which does carry markers, and pass the resolved value into the
+module's function as an argument. `ronja module status` says the same thing
+about a `dependencies` block already committed to a module folder, which nothing
+else refuses and nothing ever fills.
 
 Five rules, and each one is a wrong deploy that does not fail:
 
@@ -1894,9 +1953,9 @@ Five rules, and each one is a wrong deploy that does not fail:
   called `orders` never arrives. A full page is reported as `ambiguous`, with the
   one candidate it did see named, so the invariant above holds structurally
   instead of resting on the page happening to be complete.
-- **A codex cannot be proposed at all.** The search endpoint does not fan out to
-  codexes, so an empty result there means "nobody looked", not "nothing is called
-  that". Reported as exactly that, and set by hand.
+- **A codex or a module cannot be proposed at all.** The search endpoint fans
+  out to neither, so an empty result there means "nobody looked", not "nothing is
+  called that". Reported as exactly that, and set by hand.
 
 Two smaller edges worth knowing. An alias shorter than two characters is below
 the endpoint's minimum term and is reported as *not looked up* rather than as not
@@ -2000,15 +2059,21 @@ not obvious enough to lose by accident:
   and, like it, naming the conversion to a mid-run approval rather than the
   off-switch.
 
-Two server refusals are rendered rather than passed through as a status code. A
-**403** is the shared-feature admin gate (`requireWorkflowAccess(write=true)`) —
-it names the gate and the two ways forward, ask an admin or let the automation
-trigger it — and a **409** is the `skip` concurrency policy: it leads with the
-fact that *nothing ran*, and names the blocking run from the response's own
-`blockingRunId` detail, never out of the message (see `api.AsRunInFlight`, and
-`gt.NewRunInFlightConflict` on the server for why the prose cannot be trusted to
-carry it). Everything else — the credit kill-stop above all — arrives in the
-server's own words.
+Three server refusals are rendered rather than passed through as a status code.
+Running a workflow needs only **read** access to it — whoever can see a workflow
+may run it, shared Feature or private — so neither refusal is about the Feature's
+scope. A **403** is the role (a read-only member may open a workflow but not
+start runs) or a token whose scopes lack `automation:write`; the CLI cannot tell
+the two apart and names both. A **404** is the run gate's oracle-safe answer for
+a workflow the credential can no longer SEE — access withdrawn or the row moved
+between the push and the run — and since the push just exercised exactly the
+read access a run needs, it is rendered as the race it is rather than as
+absence. A **409** is the `skip` concurrency
+policy: it leads with the fact that *nothing ran*, and names the blocking run
+from the response's own `blockingRunId` detail, never out of the message (see
+`api.AsRunInFlight`, and `gt.NewRunInFlightConflict` on the server for why the
+prose cannot be trusted to carry it). Everything else — the credit kill-stop
+above all — arrives in the server's own words.
 
 A **timed-out run POST is not a refusal.** The server commits the `workflow_runs`
 row and only then dispatches asynchronously, so a deadline of *ours* says nothing
@@ -2807,6 +2872,11 @@ folder of `.sql` files: clone → edit → push → publish. It is the fourth fo
 loop, and the first one that binds *many* resources — one `.sql` file is one
 derived table.
 
+It also carries the **documentation** for those tables, in an opt-in header in
+each `.sql` file, and for tables it does *not* build — integration, foundation,
+dynamic, workflow-written — in a committed `tables/<alias>.json` sidecar. See
+**Documentation** below.
+
 ```bash
 ronja pipeline clone collection-abc    # or: ronja pipeline init --feature collection-abc
 $EDITOR orders-by-region.sql
@@ -2843,7 +2913,9 @@ it passes the same test `wf` does.
   costs a directory listing rather than a hash of every file in it. It filters the *skipped* list too: `.git/`, a `.venv/` and
   a dot-file were never candidates here, and reporting them on every command
   trains the reader past the line that matters — a `.sql` file that was skipped,
-  which is still reported.
+  which is still reported. One kind of non-`.sql` file *is* read, and by a pass
+  of its own rather than by the walk: a `tables/<alias>.json` docs sidecar — see
+  **Documentation** below.
 - **The binding is a map, not an id.** `ronja.json` records `tables`, relative
   path → the live `table-…` id that file builds, per (instance, organization)
   like every other binding:
@@ -2878,6 +2950,12 @@ it passes the same test `wf` does.
   ordinary `push` → edit → `push`; folded the other way, the *disk* hash sent as
   a precondition would have 409'd every push from any folder that names a
   sibling by its stem.
+
+  A **fifth**, `metaSHA256`, arrives with documentation and is described in its
+  own section below. It is a separate value for the same invariant: it is taken
+  from a different part of the row and answers a different question, so folding
+  it into `liveSHA256` would report "the SQL changed" for a description somebody
+  edited in the web app.
 
   A baseline entry whose file has left both the folder *and* the `tables` map is
   pruned on the next `push` (and disappears from `status` immediately), so
@@ -2960,7 +3038,7 @@ ids in its SQL belong to that organization, and only re-pointing them fixes it.
 | `init` | writes `ronja.json` + `.ronja/`. Creates nothing server-side — each table comes into existence on the first push of its file | `--feature` (a push refuses without one), `--title` |
 | `clone` | writes one `.sql` per **derived** table in the feature, plus manifest and baseline. Prefers your own open draft over live. Creates nothing server-side; the directory must be empty or absent | — |
 | `status` | local changes, per-table build health, open drafts and their verdicts, and drift since the last sync. Read-only — not even a checkout. **Exits non-zero on drift *and* on "not checked"** (see below) | `--json` |
-| `push [paths...]` | per changed file: create → resume/check out your draft → write SQL + derived inputs → sync → build → verdict and confidence report | `--force` |
+| `push [paths...]` | per changed file: create → resume/check out your draft → write SQL + derived inputs → sync → build → **documentation** → verdict and confidence report. Then, in a pass of its own, each `tables/*.json` docs sidecar | `--force` |
 | `publish [paths...]` | per staged draft: commit onto the table, or submit it for review | `--no-request-review`, `--overwrite-remote` |
 | `discard [paths...]` | deletes your drafts; the live tables and your local files are untouched | `--yes` |
 
@@ -3099,9 +3177,13 @@ change, from `GET /api/v2/table/draft/:id/review` plus one sample read:
   positional `{{ ref('0') }}` resolves by index into that list, so repointing it
   moves what the same text reads. Signed on one line rather than split across two
   labels, since the commonest lineage change is a swap. The payload's `nameDelta`
-  and `descriptionDelta` are deliberately **not** mirrored — this loop never
-  pushes either (a name is stamped once at create), so a field it cannot cause is
-  a field nobody would keep in step.
+  is deliberately **not** mirrored — a name is stamped once at create and this
+  loop never writes it again, so a field it cannot cause is a field nobody would
+  keep in step.
+- **Documentation** (`Docs: description written; 2 column(s) documented: …`) —
+  what the file's `-- @table` header wrote, and which of its column names the
+  table's data actually has. Read back from the write rather than predicted; see
+  below.
 - **Row counts**, draft against live. `-1` means "not available" and prints as
   `n/a`; printing it as a number would report a table that was never built as one
   that came back with minus one rows.
@@ -3125,6 +3207,187 @@ loop is `data` scope but `/table/draft/*` lives in the `admin` scope group, so a
 token scoped to `data` alone runs the whole loop except this read and
 `request-review`, which sits in the same group. A full-access PAT — what
 `ronja login` stores — is unaffected.
+
+### Documentation — two carriers, one contract
+
+A folder of SQL can say what its tables and columns hold, and a push writes it.
+There are two places to write it and they are deliberately disjoint.
+
+**1. An opt-in header in a `.sql` file**, for the tables this folder *builds*:
+
+```sql
+-- @table One row per invoice line, from Fortnox, refreshed nightly.
+-- Amounts are in SEK; a credit note carries a negative quantity.
+-- @column invoice_no: the supplier's own number, not Ronja's id
+-- @column amount: line total, excluding VAT
+SELECT ...
+```
+
+**Opt-in is the whole design.** The block is read only when the *first* comment
+line of the file opens with `-- @table`; a leading comment that does not is
+ordinary commentary and nothing is read, judged or reported. Without that rule
+every pipeline folder in existence would start pushing its first comment as a
+table description on the next release, silently, over prose an admin may have
+written by hand.
+
+The grammar in full: leading blank lines are skipped; a plain `-- text` line
+**continues** whatever was last opened, joined with a single space, so a
+description or a column note may run over several lines; `-- @column <name>:
+<text>` opens a column, and everything after the *first* colon is the text; a
+**bare `--`** ends the documentation, so anything below it in the same comment
+block is ordinary commentary and is neither read nor reported. A malformed line
+— no colon, no name, no text, an unknown `@directive`, a second `@table` — is
+**warned about and dropped**, never a refusal: nothing about a comment should be
+able to stop a push of SQL that is perfectly good.
+
+The header **stays in `code`**. It is sent as part of the SQL and hashes as
+ordinary bytes, which is what makes an edit to a description show up as a
+changed file in `status` and get picked up by a bare `push` with no new
+machinery. The drift guard canonicalises `{{ ref }}` markers and nothing else.
+
+**2. A committed docs sidecar**, `tables/<alias>.json`, for the tables this
+folder does **not** build — integration, foundation, dynamic, workflow-written.
+Those are where column prose matters most and they have no folder anywhere:
+
+```json
+{
+  "description": "One row per Fortnox invoice line, synced hourly.",
+  "columns": {
+    "invoice_no": "the supplier's own number, not Ronja's id",
+    "amount": "line total, excluding VAT, in SEK"
+  }
+}
+```
+
+The stem is an **alias**: a name `ronja.json` declares under `dependencies` with
+kind `table`, which each stack's `bind` map points at the id *that* organization
+uses — so one committed folder documents the right rows in every environment it
+deploys to, and `ronja bind` reconciles the names. A literal `table-…` id is
+accepted too, exactly as everywhere else in the alias layer, and means the
+folder only ever works against the organization that minted it. Two keys and no
+more: unknown keys are an **error**, because a dropped key is the failure this
+whole loop exists to remove — the file says one thing, the row keeps another,
+and nothing reports a difference.
+
+It lives in the pipeline folder rather than in a `ronja table` loop of its own
+because everything such a loop would need is already here: one manifest, one
+bind map, one lock, one tree walk. The two carriers cannot fight over one table:
+a sidecar naming a table this folder *builds* is refused, and the check is on the
+id it resolves to rather than on its name — a sidecar called after a literal
+`table-…` id, or an alias bound to one, collides with no filename at all.
+
+**Three-state, both carriers.** A column you do not name is **unmanaged**: the
+push sends nothing for it and the row keeps whatever it says, so a file may
+document three columns of twelve. In the sidecar an explicit `""` is the
+opposite claim — "there is no prose here" — and clears the row; the header has
+no way to spell that, and a `-- @column x:` with nothing after the colon is a
+warning rather than a clearance.
+
+**The join rule: the data is the truth, and prose is joined onto it.** A
+documented name the table does not have is **not** created as a column and is
+**not** an error. Its prose is stored against the name, re-attaches by itself if
+a later build produces the column, and the push reports it:
+
+```
+  revenue.sql — pushed (built)
+    Docs:   description written; 1 column(s) documented: id; 1 name(s) the table
+            does not have, kept for when it does: margin
+```
+
+That is what makes a committed docs file safe to keep in git: it may
+legitimately drift from data that is rebuilt nightly, renamed in staging, or not
+loaded yet. In `--json` the same answer is `docs.attachedColumns` /
+`docs.unmatchedColumns` per file, taken from the server's own reply rather than
+guessed locally — the CLI has no schema and must not predict one.
+
+**The order is push → build → attach → report.** Documentation is written
+*after* the build, on the draft, because the join attaches prose to the columns
+the table has **measured** — sent with the SQL it would be judged against no
+columns at all on a new table, and against the previous build's on an old one.
+The header's `fields` do ride the `create` as well, so a table never exists even
+briefly with no prose its own file already holds; on a create every name comes
+back unmatched, which is the same rule against an empty left side. A sidecar has
+no draft and writes the live row directly: a table this folder does not build
+has nowhere for prose to wait, and documentation is the one change to a table
+that cannot break a build.
+
+Every role may do this. Documenting a table is not an admin act — a drafter
+writes the prose and the admin reviewing the draft sees it before approving.
+
+**A third drift leg.** `metaSHA256` fingerprints the live row's *whole*
+documentation — its description plus every column that carries prose — and a
+push carrying documentation is refused when it has moved since this folder
+agreed with it, naming what moved. `--force` overwrites *and* re-records the
+agreement, or the same difference would be reported on every later push and
+`--force` would become a permanent part of the command line. It **arms only for
+a folder that documents something**: a folder with no header and no sidecar
+records nothing and behaves exactly as it did.
+
+It covers the whole row rather than the columns this folder manages, and that is
+deliberate. Hashing only the managed names would move the value whenever the
+*file* changed — adding one `-- @column` line would compare a hash of six
+columns against a recording of five and report drift nobody caused. Hashing the
+row means it only ever moves when the **row** moves, which is the only thing the
+leg asks about. The cost is that prose somebody else wrote on a column this
+folder does not manage also pauses the next documenting push, once, with a
+message saying exactly that.
+
+A sidecar records **two** fingerprints, in `ronja.lock.json` under `tableDocs`:
+that one, and `declaredSHA256` — what the *file* declared at the last push. The
+second is not redundant. A sidecar is not in the folder's enumeration at all (a
+pipeline folder syncs `.sql`), so nothing else can answer "has this file changed
+since we pushed it" — and comparing the file against the row cannot answer it
+either, because a documented name the table does not have is stored server-side
+and never reported back, so such a file would read as pending for ever and be
+re-sent on every push.
+
+**`status` and `sync status` understand both.** A `.sql` file's header shows as
+a `docs:` line beside its `drift:` and `live:` legs. Each sidecar gets its own
+entry saying which table it names, whether a push would write anything
+(`pending`), and whether the row's prose moved. In the tree gate a pending
+sidecar is a **local** change — the same shape as an edited `.sql` file, because
+the organization does not yet hold what the folder committed — while a row whose
+prose moved is drift, and one that could not be resolved or read is *unknown*,
+never clean. `sync check` verifies the table a literal-id sidecar names and
+reports one whose alias nothing binds; a sidecar's alias also counts as a **use**
+of its dependency, or the alias pre-flight would call every such declaration
+dead config on every command.
+
+**Failure modes.** A documentation write that does not land while the SQL did is
+its own outcome, `docs_failed`: the draft holds the work and is still
+publishable, but the run exits non-zero, because a folder whose committed file
+says one thing and whose row says another is exactly the silent divergence this
+loop exists to remove. Such a file is **not** recorded as synced, so the next
+bare `push` picks it up and tries the prose again — without that, a caller who
+may not write column prose on this instance would fail on every documented file
+of their first push and never be offered a retry. It is counted apart in the
+summary, too: its SQL landed, and calling it a file that "did not land" would
+send an author looking for a table that is there. **`publish` honours the same
+withholding.** It runs in a separate process and remembers nothing, so before
+banking a documented file it asks the live row whether it holds what the file
+declares — judged under the join rule, so names the table does not have are
+exempt. When it does not, the content baseline is left as `push` left it and the
+file stays unsynced; banking it would let the next bare push skip it for ever,
+with the committed header and the row disagreeing in silence. A sidecar that
+cannot be parsed, whose alias nothing binds, or which names a table **this folder
+builds** — one table, one carrier — is refused **before any request** and named;
+the loop may only ever ask about names the folder already declares, never browse
+the organization for a table with a similar name. A sidecar that declares
+**nothing** (an empty `{}`, or a placeholder somebody committed and has not
+filled in) is a **warning**, not a refusal — outcome `nothing_to_document`,
+nothing sent, exit code untouched. As a refusal it broke the whole folder: every
+later push exited non-zero for ever, including pushes naming unrelated files.
+
+**The sidecar's write is guarded, not compare-and-swap, and the difference is
+worth knowing.** The `.sql` half sends `baseCodeSha256` and the server refuses
+the write outright if the row moved. A documentation write has no such
+precondition to send — `PUT /feature/model` has one, and it is on `code` — so
+the sidecar's guard is a read-then-write: it reads the row, compares the
+fingerprint, then writes. A web edit landing inside that one-round-trip window is
+overwritten. Bounded, and stated rather than papered over: it is prose only, the
+losing edit is in the row's audit history, and the next push re-reads and reports
+the divergence. Closing it properly means a `baseMetaSha256` on the server's
+documentation body, and it belongs with that change.
 
 ### Publishing, and why there is no `run`
 
@@ -3368,6 +3631,25 @@ ROW, so it needs the row to have been read: `push` refuses the file and `status`
 reports it as a problem, and neither writes anything. The refusal above still
 fires first whenever the file names the kind itself.
 
+### `prompt` belongs to an inline `agent` action too
+
+A top-level `prompt` beside a `workflow` or a `saved_agent` action is refused for
+the same reason: those kinds' parent prompt is pinned to a server-side sentinel —
+stamped over the body at create, and dropped from the patch on every update — so
+the declared value can never converge and `status` reports the same drift for
+ever. Remove the key; a `saved_agent` action's per-run seed message is
+`action.config.prompt`, a different field on a different object that the server
+does read. This is a **load-time** refusal, so `ronja sync status` and
+`ronja sync check` over a tree containing such a file refuse to load it rather
+than reporting green-with-drift.
+
+**Leaving `action` out does not leave this rule out either.** A file declaring
+`prompt` and no `action`, against an automation that already runs a workflow or a
+saved Agent, reaches the same pinned sentinel by the second door — same shape as
+the `references` rule above. That one is refused against the ROW, so `push`
+refuses the file and `status` reports it as a problem, and neither writes
+anything.
+
 ### `action.kind` is one-way out of `agent`
 
 Switching an automation **to** a `workflow` or a `saved_agent` action works, and
@@ -3531,21 +3813,306 @@ Stacks, `--stack`, `dependencies` + `bind`, the alias collision rules and the
 knowing: because the binding is keyed by **path**, renaming a file is an orphan
 plus a create rather than a rename — the same property `ronja pipeline` has.
 
+## Module folders (`ronja module`)
+
+`ronja module`, aliased `mod`, is the sixth folder loop.
+
+A **module** is a versioned, named Python package that workflows *import* instead
+of copying helper files between folders. It exists because the copying already
+failed in production: three EMAB workflows shared a `tracker.py` kept in sync by
+a push script's `cp`, and cloning them today yields three *different* files —
+29,351 / 28,501 / 37,108 bytes, three distinct sha256s, with a function present
+in one copy and missing from another. Nothing server-side could see that three
+folders claimed the same file.
+
+The loop is `ronja wf` with the workflow-only half removed, and that is
+deliberate rather than convenient: it shares `wfdir`, the three-layer drift
+guard, the committed head anchor, `checkPushable`, `confirm` and the whole
+report vocabulary. `ronja mod` is an alias.
+
+### The folder
+
+```
+emab-tracker/
+  ronja.json          kind: "module", the package name, the title, the bindings
+  ronja.lock.json     what deploys recorded: the module id, the head version
+  .ronja/state.json   this checkout's sync baseline (git-ignored, never committed)
+  __init__.py         what makes it an importable package
+  tracker.py
+  nesting.py
+```
+
+Two keys are module-specific:
+
+- **`name`** is the Python package consumers import — the identifier that appears
+  after `import`. It has to be a valid Python identifier, is unique among the
+  live modules in the organization, and is refused when it shadows something the
+  runtime already provides (`json`, `requests`, `tools`, …), because user modules
+  are *appended* to `sys.path` and a shadowing name would be silently
+  unimportable. A plain string with the same three-state rule `title` follows:
+  `""` means "this folder does not manage the name", never "clear it" — an empty
+  name is refused server-side anyway, since a module without one is not
+  importable.
+- **no `entrypoint`.** A module is a package, not a program, and the manifest
+  carries no key for a concept the primitive does not have.
+
+**`.py` only.** Everything else in the folder is skipped — silently as far as the
+module is concerned, but *reported* on stderr, because a file the author believes
+is part of the module and the CLI quietly ignores is the worst kind of surprise.
+The restriction is the server's (V1): the runtime's module-name grammar mangles a
+non-`.py` path, writing `data.csv` as `data/csv.py`. It is threaded through
+`wfdir.Kind.SyncExt`, so `Enumerate` and `CheckLocalPaths` answer identically —
+the rule that stops a baseline claiming a path no later walk returns.
+
+**`__init__.py` is not optional.** The server seeds one inside the create
+transaction, and `module init` seeds one locally, and the two are not redundant:
+without the local copy the first push would create the module, list back the
+server's seed, find no local file at that path and try to *delete* it — which the
+server refuses, stopping the very first push of every new folder. `push` and
+`validate` both refuse a folder that is missing it, by name, before anything is
+written.
+
+### The verbs
+
+| verb | what it does |
+| --- | --- |
+| `init <name> --feature <id>` | write the folder. Creates nothing server-side |
+| `clone <module-id> [dir]` | copy an existing module down. Read-only — no draft is opened |
+| `status` | local changes, remote state, drift |
+| `validate` | check the folder **locally**; nothing is sent |
+| `push` | sync the folder into the module's draft |
+| `publish` | commit the draft, or — for an admin's shared-feature draft — submit it for review. A pending **proposal** is already with the admins, so it is reported rather than sent again |
+| `discard` | throw the draft away (`--delete-module` for one never published) |
+
+⚠️ **`publish` on a pending proposal calls nothing.** A shared-feature create
+files the proposal at `push` time; `POST draft/:id/request-review` is the
+governance engine's DRAFT transition and answers `row is not a draft` for a
+proposed row, and the commit path answers the same and then falls into
+request-review for a second copy of it. So the routing short-circuits on
+`LifecycleProposed` before either, reports `submitted_for_review` with a detail
+saying the create already filed it, and exits zero. Approval is an admin's own
+decision and deliberately has no CLI verb.
+
+**There is no `run` and no `test`, and the absence is the primitive.** A module
+has no entrypoint, no parameters and no run identity — there is nothing to run.
+Testing a change means running a *consumer*: edit the module draft, then
+`ronja wf test` in a workflow folder that imports it, which resolves the runner's
+own open module draft on purpose. A `module test` would have to invent a workflow
+to run the module in, and the invented one is the thing that would be wrong.
+Discovery is absent for the usual reason: no `module list`, no `module delete`.
+
+### `validate` is local-only
+
+`ronja wf validate` exists to resolve `{{ ref }}` / `{{ secret }}` / `{{ agent }}`
+markers against the author's access, which genuinely requires the server. **A
+module refuses every Ronja marker at save** — it receives its database handles,
+data and configuration as function arguments — so there is nothing to resolve and
+no server-side pass to run. What is checkable is checked here: the path grammar,
+the `.py` rule, the size and NUL limits, the case-collision rule, the package
+name's identifier shape, the presence of `__init__.py`, and **the marker rule
+itself**, which needs no server precisely because it resolves nothing — a lexical
+scan naming the file and the marker family, ported from the server's own gate
+(`pymarkers.FirstRonjaMarkerVerb`) with the same dead-text rule: a marker in a
+docstring or a `#` comment is documentation, one in a live string literal is not.
+
+That last check is the one the migration path walks into. Moving `tracker.py` out
+of a workflow folder and into a module means moving code that may well have
+carried a `{{ ref }}` there. `push` runs the same scan among its **local guards**,
+before the first server write, so the refusal costs a folder edit rather than a
+half-written draft: the server refuses a marker one file at a time, so a push that
+let the folder through would create the module, write files until it reached the
+offending one, and stop. `validate` lists every file that carries one; `push`
+names the first and refuses.
+
+The report says so on every run, clean or not, because "clean" would otherwise be
+read as "the push will work". The two things it cannot see are whether the
+package name is free and whether you may write to the feature; `push` reports
+both the moment it asks.
+
+### One draft, not one per author
+
+This is the one place the module loop's *semantics* differ from the workflow
+loop's rather than merely being smaller. A workflow draft is per-user; a **module
+has exactly one draft**, because a draft is a snapshot of the whole file set and
+two would each silently drop the other's edits at commit.
+
+Three consequences, all of them visible in the output:
+
+- `clone` may clone a **colleague's** open draft, and says so.
+- `status` reports the draft's `drafterUserID`, because whose it is decides
+  whether `discard` is tidying up or destroying somebody's afternoon.
+- `discard` names the drafter in its confirmation prompt. "Discard your draft"
+  would be a false statement half the time, and the half where it is false is the
+  half that costs somebody their work.
+
+A push into that shared draft is not a free-for-all, but **authority is the guard
+here, not the compare-and-swap**. Only the draft's own drafter and an admin may
+write to it at all; everyone else is refused, and refused with a **404** rather
+than a 403, because naming whose draft it is would disclose a row they may not
+see. `module push` translates that 404 rather than passing it on — a 404 on a
+path-addressed route otherwise reads as "no such file" — and names the drafter
+`status` already reported.
+
+So the CAS matters admin-to-admin, and between two checkouts of the same person's
+folder: there it is what refuses a file the other side changed since your last
+sync instead of overwriting it.
+
+### A first push creates *and* checks out
+
+Where a module lands at create depends on the feature's scope, and the two
+answers are not symmetric:
+
+| feature | the create returns | writable? |
+| --- | --- | --- |
+| private | a **live** module | no — live rows are immutable |
+| shared | a **proposal** an admin must approve | yes, to its proposer |
+
+`rmodule.Add` stamps the drafter fields only on the shared branch, so the
+lifecycle trigger classifies a private-feature module as `live` — and
+`requireDraft` refuses a file write on it ("file mutations are only allowed on
+draft or proposed modules"). A first push into a private feature therefore
+creates the module, records the binding and the head anchor, and then **checks a
+draft out of it** before writing a byte. A shared create is skipped: a proposal
+is already writable, and checkout takes a live parent.
+
+The binding is still recorded *before* the checkout, for the reason it is
+recorded before any file write: the module exists from the create onwards, and a
+push that died before saving the manifest would leave an orphan the next push
+could not find and would try to create again — where "again" is a 409 on the
+package name, for ever.
+
+One consequence worth stating: in a private feature the package-name collision
+lands at the **create**, on the first push, because the row is born live and the
+uniqueness index fires at INSERT. Rename it in `ronja.json` and push again.
+
+### The drift guard is the workflow loop's, unchanged
+
+All three layers carry over, sharing `driftVerdict`, `filePreconditions`,
+`headAgreement` and `anchorAfterPush` with `ronja wf`:
+
+1. **Local baseline check** — remote versus `.ronja/state.json`, refusing a push
+   that would overwrite what moved on the server. Metadata counts: the package
+   name and the title are pushed as blindly as the code, so a colleague renaming
+   the package is drift, not a silent revert.
+2. **Per-file `baseSha256` CAS** on every PUT and DELETE, checked *inside* the
+   write transaction under the module's row lock. Armed exactly where the
+   baseline vouched, suppressed exactly where it was bypassed (`--force`, and a
+   module this push created).
+3. **Publish CAS on the committed head**, anchored in `ronja.lock.json` so a
+   fresh CI checkout with no baseline can push under preconditions rather than
+   past them. `--overwrite-remote` reads the head from `GET :id/versions` and
+   confirms it explicitly — never scraped out of the 409's prose — and `--force`
+   past a version this folder never saw **clears** the anchor rather than
+   advancing onto a publish the repository does not contain.
+
+Two small differences, both in the module's favour:
+
+- The anchor after a publish comes **straight off the commit response**
+  (`headVersionID` on `rmodule.CommitOutcome`) rather than from a second read.
+- `cloneAnchor` is shared with the workflow loop verbatim, because `rmodule`
+  stamps `base_version_id` the way `rworkflow` does. The `rdataapp` divergence
+  that forced a second anchor function does not exist here.
+
+### Metadata is patched on TWO rows
+
+`PUT /module/:id` takes the live module and refuses a draft id — a module's name
+is claimed against the live-uniqueness index, and a draft has no claim to make.
+So where `wf push` patches one row (the draft, which the commit then publishes),
+`module push` has to patch two:
+
+- the **identity row** through `PUT /module/:id`, so the change is visible now
+  and the drift guard and the baseline have something to compare against;
+- the **open draft** through `POST /module/:id/checkout`, whose body is an
+  `rmodule.DraftEditInput`, so the commit publishes the intended metadata.
+
+The second one is not tidiness. `rmodule.commitDraftInTx` overwrites the parent's
+name, title and description with the **draft's** copies — the copies taken when
+the draft was checked out — so a title patched onto the live row alone survives
+exactly until somebody publishes, and then reverts to a value nobody typed. The
+two patches are computed independently (each against the row it is sent to), so a
+draft left stale by a rename made in the browser is reconciled on the next push
+whether or not the live row also needs one.
+
+The checkout that *resolves* the row a push writes to still sends an **empty**
+body, and runs before the drift guard: seeding a draft with a manifest title
+nothing has compared against the live row yet would apply an edit the guard is
+about to refuse. Metadata is written in one place, after the guard.
+
+One consequence is stated rather than hidden: while a module is still
+**unpublished** (a parentless draft, or a proposal in a shared feature) there is
+no live row to patch and no draft *of* one, so its metadata cannot be patched at
+all. The create carried the manifest's values; a manifest edited since reaches
+the row at the first publish. `push` reports that as `metadataDeferred` instead
+of sending a request that would be refused.
+
+### Publishing says what it did not change
+
+A shared-feature module's commit is admin-only — a module edit fans out to every
+workflow that imports it, so it gets at least the review a single workflow edit
+gets — and a non-admin's `publish` submits the draft for review and *says so*.
+Reporting "published" there is the kind of lie people discover a week later,
+after republishing three consumers against a version that does not exist.
+
+The report closes with the blast radius and the rule that makes it mean
+something:
+
+```
+  3 workflow(s) pin this module — each picks up the new version when it is next
+  republished. Publishing a module changes nothing for a consumer on its own.
+```
+
+The count is **the server's**, carried on the commit response
+(`dependentWorkflowCount`). It is not computed client-side, and could not honestly
+be: it is the delete gate's own reverse lookup (`governance.FindDependents` over
+`workflows.module_ids`), read through the RLS-scoped pool, so it counts every
+workflow in the organization that imports this module — **the same set the delete
+gate refuses on**, and one the caller may well not be able to enumerate. (That
+gate discloses their names when it refuses, which is what makes counting them
+here the right number rather than a leak.) It is capped at 100, like every other
+reverse lookup. It is printed only on
+a publish that actually landed, and only when positive — `0` means "none, or the
+count could not be taken", and there is nothing to say about either.
+
+### Consumers never hold module files
+
+A workflow that imports a module carries only the marker, in import position:
+
+```python
+from {{ module('module-abc123') }} import tracker   # → from emab_tracker import tracker
+```
+
+`ronja wf clone` of a consumer is exactly as it was; module sources never appear
+in a workflow folder. That is the whole point — one copy, one id, one version
+history, and a graph that can answer "what does editing this affect".
 ## Whole-tree checks (`ronja sync`)
 
-A repository holds many folders. The five loops each answer "is this folder in
+A repository holds many folders. The six loops each answer "is this folder in
 step with the organization?" for themselves, and answering it forty times by
 hand is how a broken edge sits in a repo for a month. `ronja sync` asks two
-questions of a whole tree at once:
+questions of a whole tree at once, and answers a third:
 
 ```bash
 ronja sync status                      # is the committed content what the org holds?
 ronja sync check                       # does every reference that content makes resolve?
+ronja sync apply                       # push AND publish all of it
 ronja sync status --dir apps --stack prod --json
 ```
 
-Both walk **down** from `--dir` for every `ronja.json` — workflow, data-app,
-pipeline and automation folders alike. `status` computes each folder's report
+All three walk **down** from `--dir` for every `ronja.json` — workflow, data-app,
+pipeline and automation folders alike.
+
+⚠️ **Module folders are discovered and not covered**, reported `not_checked`
+with the reason `kind_not_covered`. That is deliberately a different reason from
+`unreadable`: this build understands the kind perfectly well and has a whole
+command for it, so telling the reader otherwise would send them to a CLI upgrade
+they do not need. Run `ronja module status` in one instead. The reason is still
+never green — a folder nobody checked is a folder nobody checked, and the tree
+verdict has to say so. (Covering them means a root-parameterised module status
+report and a verdict fold for `status`, and for `check` a statement that a
+marker-free kind makes no references at all; until that exists, saying so is the
+honest answer.)
+
+`status` computes each folder's report
 with the same function `ronja wf status` / `ronja app status` /
 `ronja pipeline status` / `ronja automation status` run, so
 the two surfaces cannot drift about what a folder's state IS — but the VERDICT it
@@ -3554,8 +4121,8 @@ commands deliberately leave out of theirs (see below). There is no repo-level
 file to declare: a read-only command does not need one, and a committed file
 format is the most expensive thing to get wrong.
 
-Read-only, and enforced: `TestSyncStatusWritesNothing` and
-`TestSyncCheckWritesNothing` snapshot a fixture tree before and after and assert
+`status` and `check` are read-only, and enforced: `TestSyncStatusWritesNothing`
+and `TestSyncCheckWritesNothing` snapshot a fixture tree before and after and assert
 it is byte-for-byte identical. That is not ceremony — `wfdir.SaveState` also
 writes a `.gitignore`, so any refactor that let a status path reach a save would
 create files in a customer's repository as a side effect of a command called
@@ -3647,7 +4214,7 @@ this" and on "I could not look".
 |---|---|---|
 | 0 | `clean` | every folder was checked, and every one is clean |
 | 1 | `drifted` (`status`) / `broken` (`check`) | checked, and something is out of step — changed on the server, or never deployed at all / a reference does not resolve |
-| 2 | `unknown` | could not tell — a skipped folder, an unreadable manifest, a dead credential, or an **empty walk** |
+| 2 | `unknown` | could not tell — a skipped folder, an unreadable manifest, a dead credential, or an **empty walk**; under `apply`, also a write the instance never answered (`api.Unanswered` / a timeout) and the folders an interrupt never reached |
 
 **`unknown` wins over the middle answer.** The strongest true statement about a
 tree where one folder drifted and another could not be read is that not
@@ -3982,6 +4549,162 @@ validate endpoint, which **refuses without a `featureID`** — the normal state
 before a folder's first push, and therefore `not_checked{no_feature}` rather than
 a failure or a silent skip.
 
+### `sync apply` — the deploy
+
+`ronja sync apply` runs each folder's own **push and then its publish**, in path
+order. Push alone stages a draft for three of the four kinds — every push report
+ends `Next: ronja … publish` — so an apply that stopped there would be a
+repository of unpublished drafts reported as a deploy. ⚠️ The fourth kind has no
+draft at all: the automation loop writes production directly, so "apply
+publishes" must not be read as "everything goes through a reviewable draft".
+
+**It adds no writer.** Every byte it sends is sent by a loop that already exists,
+under that loop's own guards. What it adds is refusal — and the local half of
+every refusal comes from `sync_decision.go`, which is also what `--dry-run`
+prints, so the preview and the run cannot disagree about what apply will attempt.
+
+**Update-only, and that is the design rather than a limitation.** Apply refuses:
+
+| refusal | why |
+|---|---|
+| `would_create` | nothing is bound to this unit, so a push would MAKE a row. There is no delete verb to undo one (cascade and purge are `HumanOnly`), and a CI runner that discards its checkout loses the created ids in `ronja.lock.json` and creates again next run |
+| `no_drift_anchor` | an automation the folder is bound to and has never recorded agreeing with. An empty `LockAutomation.UpdatedAt` disarms **both** guards at once, so the write would overwrite whatever moved AND flip `enabled` false→true on a row somebody paused during an incident |
+| `manifest_rewrite` | acting here would rewrite a committed `ronja.json` — `adoptStack` adopting a stranded lock stack, or `Manifest.Record` dropping an `instances[]` entry superseded by the **named** stack. Migration stays a per-folder act somebody watched |
+
+⚠️ **A plain legacy `instances[]` folder is NOT a `manifest_rewrite`, and deploys.**
+`Manifest.Record` takes its `!sel.Named()` branch for an unnamed selection —
+`SetBinding` in place, returning *before* the `instances[]` drop — so a push there
+migrates nothing. Refusing it locked every pre-stacks repository out of the deploy
+verb with no route to green in either direction: `manifest_rewrite` with no
+`--stack`, `unnamed_stack` (exit 2) with one. The refusal is therefore gated on
+the selection being **named** *and* the stack being declared, which is exactly the
+condition under which `Record` really does drop the entry.
+
+⚠️ **The create gate is per CREATION UNIT, never per folder.** `Lock.Binding`
+carries `WorkflowID`/`DataAppID` at folder grain, but `Tables` and `Automations`
+are `map[path]…` at FILE grain and both loops discriminate per file. A
+folder-grain gate would call a pipeline folder with six bound `.sql` files and
+one new one "bound", and `runPipelinePush` would then `CreateTable` the seventh —
+a live empty table in a live organization, out of a command that promised to
+create nothing. `TestSyncApplyRefusesACreateAtFileGrainInABoundFolder` is
+mutation-proved on exactly that: remove the gate and the fake records the create.
+
+**`--allow-create` opts into the first refusal, and only the first.** It counts
+**files, not folders** — `Tables` and `Automations` are per-file maps, so a merge
+adding one file to each of thirty folders is thirty rows — and it **names the
+number, the organization and the destination FEATURES on stderr before the first
+write**, because volume is the failure mode and thirty numbers announced folder
+by folder is not a number anybody adds up. The features are the informed-consent
+half: every create resolves its destination from `f.Binding.FeatureID` out of a
+committed, hand-editable `ronja.json`, and all four decisions gate on nothing but
+`FeatureID != ""` — so in the CI setting this flag is for, a commit editing one
+folder's `featureID` silently redirects rows into any feature the runner's
+credential can reach, and a line naming only a count cannot tell that run from
+the intended one. Grouped and deduped, sorted by id so a CI log is
+deterministic, counted on `Creates()` rather than `WouldCreate()` — a unit
+refused for want of a feature has no destination, and that is the reason it has
+none. That is what the plan/execute split in `syncApplyTree` is for:
+every decision is local, so planning the whole tree first costs no request.
+`--dry-run --allow-create` previews the same count and writes nothing. ⚠️
+`summary.creates` is what the tree HOLDS and `summary.created` is what apply went
+ahead with **and landed** — read off the loops' own per-row `created` flags after
+the fact, never the plan, so a folder that cleared the gate and then failed
+mid-push reports none. ⚠️ ONE EXCEPTION, and it is the report's own: under
+`--dry-run` nothing runs, so `created` carries the PLANNED count instead and the
+report says `dryRun: true` beside it (the human renderer says "would be
+created"). A reader of the `--json` contract who takes a dry-run's `created` for
+history is reading a prediction. The other two refusals stand whatever the flag says: neither is about a row that does not
+exist, and one flag that loosened all three would be one nobody could reason
+about from its name.
+
+**No `--force`, no `--overwrite-remote`, deliberately.** Where apply refuses on
+drift the escape is the folder's own command, run by somebody looking at that one
+folder — and the refusal says so, because the first operator to hit thirty
+refusals with no named escape asks for a flag instead.
+
+**It publishes with `--no-request-review`.** `publishRouting` sends a non-admin
+caller on a shared feature to `request-review`, and `runPipelinePublish` counts
+only `refused`/`conflict` as failed — so `submitted_for_review` returns a nil
+error and reads as success. A naive apply from a CI credential would file one
+review request per folder and exit 0 saying "published". Apply fails instead, and
+independently treats a review request as a **non-deploy** in its own verdict.
+
+**Order is path order and the report names it.** That is for determinism and
+diffable CI logs, nothing more: a derived table's draft always builds against its
+inputs' LIVE data and a commit cascades server-side, so a folder deployed "too
+early" self-heals on the next run — the symptom is a spurious build failure, not
+a wrong table. Do not build dependency ordering for a problem that does not exist.
+
+**An interrupt finishes the report.** Ctrl-C 20 folders into 30 leaves a tree
+that is part live and part not, which is exactly the state that needs a report:
+the folders already answered keep their answers, the rest are
+`unknown{interrupted}`, and `--json` still emits.
+
+**A refusal does not stop the run.** Every folder is attempted and reported, and
+the exit code is the tree's, on the same three-valued contract `status` uses:
+`0` applied, `1` refused or did not land, `2` could not tell. ⚠️ `1` is for an
+answer, and a write the server never gave one to is a `2`: `api.Unanswered`, a
+timeout — a write that may well have committed — and a Ctrl-C are `unknown`, on
+the mapping every sibling tree command already uses for a failed read. Calling an
+interrupted last folder "not deployed" beside one that may be deployed is the
+report claiming certainty it does not have. Best-effort by construction: a loop
+that reports its stop as prose rather than a wrapped error is still
+indistinguishable from a definite refusal. `applied` /
+`refused` are apply's spellings of `clean` / `drifted`, on the precedent
+`sync check` set with `broken`: one rank, one exit code, a word that is true
+about what this command did.
+
+**Publish is skipped only when the folder has NOTHING STAGED, which is not what
+an `UpToDate` push means.** "Nothing to push" has two causes and only one of them
+means the folder is live: the draft is a copy of live and always was, or an
+earlier run pushed and its publish then failed. Reading the push's verdict as an
+answer about the publish reported the second one `applied`, exit 0, for ever —
+sticky, because every later run takes the same short-circuit, and reachable with
+no failure at all by a developer running `ronja wf push` before CI runs apply.
+
+So the question is put to the record that knows, per kind. Pipeline: the files
+the baseline records a draft id for — `pipelineStagedDrafts`, extracted from the
+publish's own no-argument target selection so there is one definition of what a
+publish targets. Workflow / data app: a draft that **pre-existed this push** and
+**holds something the live row does not**. Both halves are load-bearing, and each
+is a separate mutation test:
+
+- "is a draft open" cannot answer it, because `resolvePushTarget` checks one out
+  on the way past — after any push a draft always exists;
+- "did it pre-exist" cannot answer it either, and this one is subtle: the draft an
+  up-to-date apply leaves behind pre-exists the NEXT run and is identical to live,
+  so pre-existence alone publishes on every second run — a version per folder per
+  two runs rather than per run. Halving the regression is not fixing it.
+
+A parentless draft is the third leg: it has no live row to compare against, so it
+awaits publication by definition. Without it a workflow created under
+`--allow-create` whose publish failed stays unpublished for ever.
+
+⚠️ **Files only**, the honest edge of the claim: a draft whose only difference
+from live is METADATA — a title, an entrypoint, a declared calendar — reads as
+nothing staged. Publish that folder from its own directory. The comparison costs
+two listings, and only on a folder that has a draft lying about.
+
+**The local guards inside the loops are part of the preview too.** An orphaned
+automation file, a dependency cycle and a positional ref all refuse before the
+loop's first byte and live outside `applyDecision`, so `decideApplyPushPreflight`
+runs them — by calling the loops' own functions, on the loops' own inputs — and a
+dry-run reports the same refusal the apply makes. ⚠️ What is still outside it:
+per-file *validity* refusals (an unparseable automation declaration, a file over
+the size cap), which a dry-run reports as `applied` and the apply refuses. That
+is the honest edge of the claim.
+
+**`--dry-run`** prints, per creation unit, what apply would attempt, off the same
+`applyDecision` values apply then executes. It counts **creates as well as
+updates** — a folder is only previewed once every gate cleared, so a create it
+lists is one `--allow-create` let through and apply is about to make. ⚠️ It deliberately does **not**
+promise a clean remote: that is a network read whose answer can move between the
+preview and the run, and promising it is what makes a dry-run a liar. ⚠️ And
+there is no `no-op` action, uniformly: it is knowable locally for a pipeline file
+and not for a workflow or a data app, whose files compare against a listing of
+the caller's own draft. A unit apply may find unchanged is reported as `update`,
+which is what apply will attempt.
+
 ## Design rules
 
 These are load-bearing for the agent use case — please keep them true:
@@ -4007,7 +4730,8 @@ These are load-bearing for the agent use case — please keep them true:
   (`Enumerate`) and the local-path validator (`CheckLocalPaths`) both take the
   `wfdir.Kind` as a single threaded value, because the `Kind` decides which
   directories are never synced (`node_modules` / `dist` / `build` for a data
-  app). Let those two disagree and the baseline records a file the walk will
+  app) and which file extension is synced at all (`.sql` for a pipeline, `.py`
+  for a module). Let those two disagree and the baseline records a file the walk will
   never see again — a phantom deletion that the *next* push applies server-side.
   This is why `LoadManifest(root, kind)` refuses the other kind outright: the two
   folder types are indistinguishable by shape, so nothing else would catch it.
@@ -4033,7 +4757,7 @@ internal/config/     the CLI config file (os.UserConfigDir()/ronja/config.json),
 internal/wfdir/      the synced folder: ronja.json, ronja.lock.json,
                      .ronja/state.json, local enumeration and the sha256 drift
                      baseline — one Kind per loop (workflow / data app /
-                     pipeline), and stacks in stack.go / lock.go
+                     pipeline / module), and stacks in stack.go / lock.go
 internal/tablerefs/  the {{ ref('…') }} grammar: canonicalization to id form,
                      and the input list derived from it
 ```
@@ -4046,11 +4770,20 @@ name with the api package's `workflow_run.go`.
 Their endpoint mirrors live in `internal/api/workflow.go`, `workflow_write.go`
 and `workflow_run.go`, hand-mirrored against
 `backend/api/v2/workflow/handler.go`. The data-app and pipeline commands follow
-the same shape (`dataapp_*.go`, `pipeline_*.go`, with the shared folder plumbing
-in `dataapp.go` / `pipeline.go`); the pipeline mirrors are
-`internal/api/table.go` and `table_write.go`, against
+the same shape (`dataapp_*.go`, `pipeline_*.go`, `module_*.go`, with the shared
+folder plumbing in `dataapp.go` / `pipeline.go` / `module.go`); the pipeline
+mirrors are `internal/api/table.go` and `table_write.go`, against
 `backend/api/v2/feature/api_model.go` and the draft-review route in
-`backend/api/v2/governance/`.
+`backend/api/v2/governance/`, and the module mirrors are
+`internal/api/module.go` and `module_write.go`, against
+`backend/api/v2/module/handler.go`.
+
+The module loop shares more than a shape: `head_version.go`'s anchor machinery,
+`workflow_push.go`'s `driftVerdict` / `filePreconditions` / `acknowledgedRemote`,
+`workflow_discard.go`'s `confirm` and `workflow_publish.go`'s outcome vocabulary
+are all used verbatim by `module_*.go`. That reuse is the point — a second copy
+of the drift guard would be a second place for "armed exactly where the baseline
+vouched" to come to mean something else.
 
 `internal/commands/bind.go` is the one command that belongs to no loop: it is
 kind-agnostic, because `dependencies` is a manifest key all three folder kinds
@@ -4059,7 +4792,7 @@ from. Its mirror is `internal/api/search.go`, against
 `backend/api/v2/search/handler.go` and `backend/lib/search/hit.go` — four fields
 of eleven, plus the two server constants whose absence would be misread
 (`minQueryLen`, which answers a short term with an empty result and no error, and
-the fact that the endpoint has no `codex` leg at all).
+the fact that the endpoint has no `codex` or `module` leg at all).
 
 `internal/api/raw.go` is the odd one out: it deliberately mirrors nothing, and
 its response body carries the request's context cancellation on `Close` so a

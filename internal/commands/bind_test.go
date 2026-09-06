@@ -66,6 +66,9 @@ func (f *fakeSearchInstance) serve(w http.ResponseWriter, r *http.Request) {
 		case 0:
 			writeJSON(w, map[string]any{"id": featureID, "name": "Feature", "scope": "private"})
 		case http.StatusBadRequest:
+			// The OLDER backend's answer for an id the caller cannot reach: the
+			// raw table.ErrNoRows sentinel. A current one retyped that miss to
+			// the 404 below, and this binary ships against both.
 			http.Error(w, `{"error":"no rows"}`, status)
 		case http.StatusNotFound:
 			http.Error(w, `{"error":"feature not found"}`, status)
@@ -672,18 +675,22 @@ func TestBindRefusesAManifestWhoseBindIsAlreadyBroken(t *testing.T) {
 	}
 }
 
-// Every dependency kind resolves to a search kind, or is codex.
+// Every dependency kind resolves to a search kind, or is one of the two the
+// search endpoint does not cover.
 //
 // This is the guard on ADDING one. A kind with no entry in searchKindOf and no
 // case here would be reported as "not searchable", which is the codex sentence —
 // and a reader told the search does not cover their kind stops looking for the
 // row that is right there.
 func TestEverySearchableDependencyKindIsMapped(t *testing.T) {
+	// codex and module are the two kinds the endpoint has no leg for; both are
+	// listed here so ADDING a third is a decision somebody makes on purpose.
+	unsearchable := map[string]bool{markers.KindCodex: true, markers.KindModule: true}
 	for _, kind := range markers.Kinds() {
 		_, ok := searchKindOf(kind)
-		if kind == markers.KindCodex {
+		if unsearchable[kind] {
 			if ok {
-				t.Errorf("%s has a search kind, but the endpoint does not fan out to codexes", kind)
+				t.Errorf("%s has a search kind, but the endpoint does not fan out to it", kind)
 			}
 			continue
 		}
@@ -776,5 +783,50 @@ func TestSearchHitDecodesTheServerShape(t *testing.T) {
 	want := api.SearchHit{Kind: "table", ID: "table-1", Title: "orders", Score: 3}
 	if got != want {
 		t.Errorf("hit = %+v, want %+v", got, want)
+	}
+}
+
+// `ronja bind` is kind-agnostic on purpose — it reads `dependencies` and writes
+// `bind`, which three of the four folder kinds carry. A MODULE folder is the
+// one that must not be run to completion: module files are marker-free, so a
+// declared alias has nothing to resolve INTO, and the bind loop's honest report
+// on one is "0 names bound". That reads as "nothing was missing" rather than
+// "this command does not apply here", which is why the refusal is explicit and
+// arrives before the folder is even opened.
+func TestBindRefusesAModuleFolderAndSaysWhy(t *testing.T) {
+	f := newFakeSearchInstance(t)
+	signInTo(t, f.URL())
+	root := t.TempDir()
+	manifest := fmt.Sprintf(`{
+  "formatVersion": 3,
+  "kind": "module",
+  "title": "Tracker",
+  "name": "emab_tracker",
+  "dependencies": {"orders": {"kind": "table"}},
+  "stacks": {"prod": {"url": %q, "tenantID": %q, "featureID": "col-1"}}
+}
+`, f.URL(), testTenantID)
+	if err := os.WriteFile(filepath.Join(root, wfdir.ManifestName), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "__init__.py"), []byte("\n"), 0o644); err != nil {
+		t.Fatalf("write __init__.py: %v", err)
+	}
+
+	_, err := runCLI(t, root, "bind", "--stack", "prod", "--yes")
+	if err == nil {
+		t.Fatal("bind ran on a module folder instead of refusing")
+	}
+	// The refusal has to name the kind AND the reason. Naming only the kind
+	// reads as "wrong verb, try another one", and there is no other verb.
+	if !strings.Contains(err.Error(), "module") {
+		t.Errorf("refusal does not name the folder kind: %v", err)
+	}
+	if !strings.Contains(err.Error(), "marker-free") {
+		t.Errorf("refusal does not say WHY an alias cannot resolve here: %v", err)
+	}
+	// Nothing may be looked up: the folder was ruled out before any request.
+	if len(f.terms) != 0 {
+		t.Errorf("bind searched on a module folder: %v", f.terms)
 	}
 }

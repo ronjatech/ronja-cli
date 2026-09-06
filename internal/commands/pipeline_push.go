@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/tabledocs"
 	"github.com/ronjatech/ronja-cli/internal/tablerefs"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
@@ -26,6 +27,19 @@ const (
 	pushOutcomePushed      = "pushed"
 	pushOutcomeBuildFailed = "build_failed"
 	pushOutcomeRefused     = "refused"
+	// `docs_failed` is the SQL half landing and the DOCUMENTATION half not: the
+	// file was written, the draft built, and the write that would have attached
+	// the header's prose to the built columns did not go through. Split from
+	// `pushed` because it is the one state where a green push would leave a
+	// table whose committed file says one thing and whose row says another —
+	// exactly the silent divergence this loop exists to remove — and split from
+	// `refused` because the work is on the server and publishing it is still the
+	// right next step.
+	//
+	// ⚠️ An UNMATCHED column name is not this. A documented name the table does
+	// not have is the join rule working: the prose is stored, the write
+	// succeeded, and the outcome is `pushed`.
+	pushOutcomeDocsFailed = "docs_failed"
 )
 
 // `ronja pipeline push` syncs each changed .sql file into YOUR draft of its
@@ -54,8 +68,32 @@ sync (or that has no table yet):
 Files are pushed in dependency order, so a table is built after everything in
 this folder that it reads from. Name paths to push only those.
 
+DOCUMENTATION. A .sql file may open with a header saying what its table and
+columns hold, and a push writes it after the build:
+
+  -- @table One row per invoice line, from Fortnox, refreshed nightly.
+  -- Amounts are in SEK.
+  -- @column invoice_no: the supplier's own number, not Ronja's id
+  -- @column amount: line total, excluding VAT
+
+It is OPT-IN: a leading comment that does not open with "-- @table" is ordinary
+commentary and is left alone. For a table this folder does NOT build — an
+integration or foundation table, or one a workflow writes — put the same thing
+in tables/<alias>.json instead, where <alias> is a "table" dependency this
+folder declares and "ronja bind" points at a row:
+
+  {"description": "...", "columns": {"amount": "line total, excluding VAT"}}
+
+Both are three-state: a column you do not name is left exactly as it is, so a
+file may document three columns of twelve. A documented name the table does not
+have is REPORTED, not refused — the prose is kept and attaches by itself if a
+build later produces the column, which is what makes a committed file safe to
+keep in git alongside data that changes.
+
 It refuses a table whose SQL changed on the server since your last sync — chat
-and the web builder edit the same draft — naming what moved. --force overwrites.
+and the web builder edit the same draft — naming what moved, and it refuses on
+the same terms when a documented table's DESCRIPTION or column prose moved.
+--force overwrites.
 
 A failed build is not the end of the push: the remaining files are still
 attempted, each result is reported, and the command exits non-zero.
@@ -113,6 +151,10 @@ type pipelinePushResult struct {
 	// Files is one entry per file this push ATTEMPTED, in the order it attempted
 	// them — which is dependency order, and is worth preserving for that reason.
 	Files []pipelineFileResult `json:"files"`
+	// Docs is one entry per DOCS SIDECAR this push attempted — the tables this
+	// folder documents but does not build. Absent for the folders that keep
+	// none, which is every folder that has not adopted them.
+	Docs []pipelineDocsFileResult `json:"docs,omitempty"`
 	// UpToDate reports a push that found nothing to do.
 	UpToDate bool `json:"upToDate"`
 	// Error summarises a push that did not fully succeed. The per-file entries
@@ -155,12 +197,38 @@ type pipelineFileResult struct {
 	// RETRYABLE one, which is the half worth splitting out.
 	Conflict bool            `json:"conflict"`
 	Review   *pipelineReview `json:"review,omitempty"`
+	// Docs is what this file's `-- @table` header wrote, and what the server
+	// joined it onto. Absent for a file that carries no header, which is every
+	// file in every folder that has not opted in.
+	Docs *tableDocsResult `json:"docs,omitempty"`
 	// Sample and URL are rendered by the human report only — see pushResult.URL
 	// for why a link stays out of a shape scripts parse, and samples are garnish
 	// nothing should be scripted against.
 	Sample string   `json:"-"`
 	URL    string   `json:"-"`
 	Notes  []string `json:"notes,omitempty"`
+}
+
+// printPipelineDocsResult renders one docs sidecar's outcome.
+func printPipelineDocsResult(out *os.File, doc pipelineDocsFileResult) {
+	if doc.Outcome == docsOutcomeRefused {
+		fmt.Fprintf(out, "\n  %s — not documented\n", doc.Path)
+		for _, line := range strings.Split(strings.TrimRight(doc.Error, "\n"), "\n") {
+			fmt.Fprintf(out, "    %s\n", line)
+		}
+		return
+	}
+	fmt.Fprintf(out, "\n  %s — %s\n", doc.Path, doc.Outcome)
+	if doc.Outcome == docsOutcomeNothing {
+		// No table line: nothing was read, because a file that declares nothing
+		// is answered before the network.
+		fmt.Fprintf(out, "    %s\n", doc.Warning)
+		return
+	}
+	fmt.Fprintf(out, "    Table:  %s\n", doc.TableID)
+	if line := describeDocsResult(doc.Result); line != "" {
+		fmt.Fprintf(out, "    Docs:   %s\n", line)
+	}
 }
 
 // pipelineReview is the confidence report: what committing this draft would
@@ -186,6 +254,24 @@ type pipelineReview struct {
 	// committing would silently revert whatever landed in between.
 	BaseStale           bool     `json:"baseStale,omitempty"`
 	InterveningVersions []string `json:"interveningVersions,omitempty"`
+}
+
+// pipelineChangedTargets is the set of files a no-argument push sends: the ones
+// with no table behind them, and the ones whose bytes differ from the baseline
+// this folder last synced.
+//
+// Extracted because `sync apply`'s local pre-flight has to know the same set —
+// the positional-ref refusal is checked on what is being SENT, and a second
+// spelling of "what a push would send" is exactly how a dry-run starts
+// disagreeing with the run it previews.
+func pipelineChangedTargets(f *folder, local, known map[string]string) []string {
+	var targets []string
+	for _, path := range sortedPaths(local) {
+		if f.Binding.Tables[path] == "" || known[path] != wfdir.HashString(local[path]) {
+			targets = append(targets, path)
+		}
+	}
+	return targets
 }
 
 func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelinePushOptions) (*pipelinePushResult, error) {
@@ -216,7 +302,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	// because a pipeline folder is the one kind whose files claim local names, and
 	// a dependency declared under one of them is dead text that reads as if it
 	// were in force.
-	aliases := checkAliases(f.Manifest, f.selection(), f.Codec, local, folderStems(f.Kind, local), folderFieldRefs(f.Kind, local))
+	aliases := checkAliases(f.Manifest, f.selection(), f.Codec, local, folderStems(f.Kind, local), folderFieldRefs(f.Kind, f.Root, local))
 	if err := aliases.err(); err != nil {
 		return nil, err
 	}
@@ -237,17 +323,27 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	// 2. What to push. Named paths win outright — asking for a file explicitly
 	// means pushing it whether or not it looks changed, which is how somebody
 	// recovers from a draft they edited elsewhere.
+	// The docs sidecars, read and resolved with no network in sight: which table
+	// each one names here, and which cannot be used as it stands. Read even when
+	// the folder keeps none, which costs one failed stat.
+	sidecars, err := readTableDocsSidecars(f.Root)
+	if err != nil {
+		return nil, err
+	}
+	sidecars = resolveTableDocsSidecars(f, sidecars)
+
 	var targets []string
 	if len(args) > 0 {
-		if targets, err = resolveArgPaths(f.Root, args, local); err != nil {
+		var sqlArgs []string
+		sqlArgs, sidecars, err = splitDocsArgs(f.Root, args, sidecars)
+		if err != nil {
+			return nil, err
+		}
+		if targets, err = resolveArgPaths(f.Root, sqlArgs, local); err != nil {
 			return nil, err
 		}
 	} else {
-		for _, path := range sortedPaths(local) {
-			if f.Binding.Tables[path] == "" || known[path] != wfdir.HashString(local[path]) {
-				targets = append(targets, path)
-			}
-		}
+		targets = pipelineChangedTargets(f, local, known)
 	}
 	// A file removed from the folder is NOT a table this push deletes. There is
 	// no delete verb here on purpose (doctrine: sync verbs yes, resource verbs
@@ -261,7 +357,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 				wfdir.ManifestName)
 		}
 	}
-	if len(targets) == 0 {
+	if len(targets) == 0 && len(sidecars) == 0 {
 		// The prune above is a real edit to the baseline, and this is the path it
 		// is most likely to be taken on: the ordinary way to reach it is a folder
 		// with nothing left to push. Saved here or the note is printed on every
@@ -294,31 +390,19 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		return nil, err
 	}
 
-	// 4. Creating a table needs a feature, and refusing here costs no request.
+	// 4. The local decision, per file — create or update, and the refusal a
+	// create earns when this folder names no feature. Taken through
+	// applyDecisionsFor so that a tree-wide apply and its dry-run read the same
+	// answer this loop acts on; nothing here needs a request. See
+	// sync_decision.go for where that boundary is and why it is there.
+	decisions := applyDecisionsFor(f, ordered)
+	if err := errFromDecisions(decisions); err != nil {
+		return nil, err
+	}
 	creating := false
-	for _, path := range ordered {
-		if f.Binding.Tables[path] != "" {
-			continue
-		}
-		creating = true
-		if f.Binding.FeatureID == "" {
-			// The ORGANIZATION is part of the answer whenever this folder has NO
-			// entry here and names another organization instead — the same reason
-			// featureIDFor says so for a workflow. "Add featureID to the <url>
-			// entry" sends the reader to a line that already has one, which is
-			// what they see and why they stop believing the message. A folder
-			// cloned from another organization is the ordinary way to arrive here.
-			//
-			// A folder that IS bound here and merely left "featureID" out gets the
-			// plain wording: it has a line to add the field to, and the
-			// cross-organization sentence would be wrong advice one case over.
-			if others := f.otherOrganizationsOn(); !f.Bound && len(others) > 0 {
-				return nil, fmt.Errorf("%s has no table yet, and this folder names no feature for %s in %s — it is bound to %s instead, and a table's ids belong to the organization that holds them, so nothing recorded there can be pushed under this credential.\n  %s",
-					path, describeTarget(f.Resolved), wfdir.ManifestPath(f.Root),
-					f.describeOrganizationIDs(others), f.featureAdviceForAnotherOrganization())
-			}
-			return nil, fmt.Errorf("%s has no table yet and this folder names no feature, so there is nowhere to create one.\n  %s, or start from `ronja pipeline init --feature <id>` or `ronja pipeline clone <feature-id>`",
-				path, f.featureAdvice())
+	for _, d := range decisions {
+		if d.Creates() {
+			creating = true
 		}
 	}
 	// A create WRITES a binding, and a binding must name its organization
@@ -340,7 +424,12 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	// Carried forward per file because the answer depends on what earlier files
 	// in the same push did.
 	created := map[string]bool{}
-	failed := 0
+	// failed and docsFailed are counted APART. A docs_failed file's SQL was
+	// written, built and is publishable — only its prose did not land — so
+	// counting it among the files that "did not land" tells an author their table
+	// is not there when it is, and tells a script the push produced nothing to
+	// publish when it produced everything.
+	failed, docsFailed := 0, 0
 	for _, path := range ordered {
 		// One Ctrl-C, one message. Without this every remaining file makes its
 		// own doomed request and prints its own refusal, turning a single
@@ -362,16 +451,98 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		if err := f.saveBaseline(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
 		}
-		if file.Outcome != pushOutcomePushed {
+		switch file.Outcome {
+		case pushOutcomePushed:
+		case pushOutcomeDocsFailed:
+			docsFailed++
+		default:
 			failed++
 		}
 	}
 
-	if failed > 0 {
-		result.Error = fmt.Sprintf("%d of %d file(s) did not land", failed, len(result.Files))
-		return result, fmt.Errorf("%s", result.Error)
+	// 6. The DOCS SIDECARS — the tables this folder documents but does not build.
+	// After the SQL, so a report reads as "here is what I built, here is what I
+	// documented", and so a sidecar for a table an earlier file in this same push
+	// created is written against a row that now exists.
+	result.Docs = pushTableDocs(ctx, client, f, inst, sidecars, opts)
+	refusedDocs, settledDocs := 0, 0
+	for _, doc := range result.Docs {
+		switch doc.Outcome {
+		case docsOutcomeRefused:
+			refusedDocs++
+		case docsOutcomeUpToDate, docsOutcomeNothing:
+			// Both mean "this file changed nothing and needs nothing" — the row
+			// already agrees, or the file declares nothing to disagree with — and
+			// that is the question UpToDate below is asking. Counting only the
+			// first would make a folder holding one placeholder sidecar report
+			// upToDate: false on every otherwise-clean run.
+			settledDocs++
+		}
 	}
-	return result, nil
+	// UP TO DATE IS AN ANSWER ABOUT THE OUTCOMES, not about the early return that
+	// used to be its only home. That branch is now taken only by a folder with no
+	// sidecars at all, so any folder keeping one reported `upToDate: false` on
+	// every clean run — the one key a script watches to decide whether a push
+	// changed the organization, saying "yes" every time.
+	result.UpToDate = len(result.Files) == 0 && settledDocs == len(result.Docs)
+
+	// The problems, counted apart and said apart. Three different things go wrong
+	// here and they have different fixes: a file that never landed, a file whose
+	// SQL landed and whose prose did not, and a docs sidecar refused before any
+	// request.
+	var problems []string
+	if failed > 0 {
+		problems = append(problems, fmt.Sprintf("%d of %d file(s) did not land", failed, len(result.Files)))
+	}
+	if docsFailed > 0 {
+		problems = append(problems, fmt.Sprintf("%d file(s) built, and are publishable, but their documentation did not land", docsFailed))
+	}
+	if refusedDocs > 0 {
+		problems = append(problems, fmt.Sprintf("%d of %d docs file(s) were refused", refusedDocs, len(result.Docs)))
+	}
+	if len(problems) == 0 {
+		return result, nil
+	}
+	result.Error = strings.Join(problems, ", and ")
+	return result, fmt.Errorf("%s", result.Error)
+}
+
+// splitDocsArgs takes the docs sidecars out of a push's positional arguments.
+//
+// `ronja pipeline push tables/orders.json` is the obvious thing to type after
+// editing one, and resolveArgPaths would refuse it — correctly, for a .sql
+// resolver — with a message about a file that is not SQL. So the sidecars are
+// matched first, by path, and only what is left goes to the SQL resolver.
+//
+// Naming ANY path narrows the docs pass to the sidecars named, exactly as it
+// narrows the SQL half to the files named: `push orders.sql` means that file and
+// nothing else, and quietly re-pushing eleven docs files beside it would be the
+// command doing more than it was asked.
+func splitDocsArgs(root string, args []string, sidecars []tableDocsSidecar) (sqlArgs []string, selected []tableDocsSidecar, err error) {
+	byPath := make(map[string]tableDocsSidecar, len(sidecars))
+	for _, file := range sidecars {
+		byPath[file.Path] = file
+	}
+	for _, arg := range args {
+		abs, absErr := filepath.Abs(arg)
+		if absErr != nil {
+			return nil, nil, fmt.Errorf("resolve %s: %w", arg, absErr)
+		}
+		rel, relErr := filepath.Rel(root, abs)
+		if relErr != nil {
+			return nil, nil, fmt.Errorf("resolve %s against %s: %w", arg, root, relErr)
+		}
+		rel = filepath.ToSlash(rel)
+		if file, ok := byPath[rel]; ok {
+			selected = append(selected, file)
+			continue
+		}
+		if _, isSidecarPath := wfdir.TableDocsAlias(rel); isSidecarPath {
+			return nil, nil, fmt.Errorf("%s is not a docs file in this folder", arg)
+		}
+		sqlArgs = append(sqlArgs, arg)
+	}
+	return sqlArgs, selected, nil
 }
 
 // explainUnreadableRefs names the `{{ ref }}` ids in this file that the caller
@@ -387,17 +558,21 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 // same reach question the refusal asked. An id that reads fine is not the cause,
 // and the caller's admin explanation stands.
 //
-// ⚠️ THE REFUSAL IS A 400, not a 404, and that is the whole cross-organization
-// case. A row the caller cannot see is not "forbidden" and is not "missing" —
-// RLS makes it invisible, so the read finds no row and the handler answers
-// `400 {"error":"no rows"}`. Reachability and existence are indistinguishable
-// here by design (see rjerr.Forbiddenf above: naming the difference would answer
-// "does table-X exist?"), which is exactly why all three statuses count as "not
-// reachable by you" and none of them claims to know which.
+// ⚠️ THE REFUSAL'S STATUS DEPENDS ON THE INSTANCE, and that is the whole
+// cross-organization case. A row the caller cannot see is not "forbidden" and is
+// not "missing" — RLS makes it invisible, so the read finds no row and the
+// handler answers the lookup-miss sentinel: `400 {"error":"no rows"}` on older
+// backends still in the field, `404 {"error":"not found"}` on current ones. This
+// binary ships against both and accepts both, which is why the 400 arm stays.
+// Reachability and existence are indistinguishable here by design (see
+// rjerr.Forbiddenf above: naming the difference would answer "does table-X
+// exist?"), which is exactly why all three statuses count as "not reachable by
+// you" and none of them claims to know which.
 //
-// This was wrong once and shipped green: the fake instance answered 404 for an
-// unknown table where the real one answers 400, so the test passed against a
-// server that does not exist. The fake now mirrors production.
+// This was wrong once and shipped green in the other direction: the fake
+// instance answered 404 for an unknown table when every real one answered 400,
+// so the test passed against a server that did not exist. Both answers are
+// staged now, because both are somebody's production.
 //
 // A round trip PER REF, and NONE of it on the happy path — this runs only after
 // a write has already been refused, where the requests are cheap and a second
@@ -458,6 +633,19 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	path, content string, upstreams []string, created map[string]bool, opts pipelinePushOptions) pipelineFileResult {
 
 	out := pipelineFileResult{Path: path, TableID: f.Binding.Tables[path]}
+	// The file's OPT-IN documentation header, read before anything else because
+	// three later decisions turn on whether there is one: the create body, the
+	// third drift leg (which arms only for a push that carries documentation),
+	// and the write that follows the build.
+	//
+	// Warnings, never refusals — a malformed comment must not be able to stop a
+	// push of SQL that is perfectly good. They are printed AND carried in the
+	// result, so a --json caller sees the same thing a person does.
+	docs, docWarnings := tabledocs.ParseHeader(content)
+	for _, warning := range docWarnings {
+		fmt.Fprintf(os.Stderr, "  Note: %s — %s\n", path, warning)
+		out.Notes = append(out.Notes, warning)
+	}
 	// Where this folder's LIVE fingerprints live — the lock file on a named
 	// stack, the local baseline on a legacy one. See liveHashes.
 	liveHash := f.live(inst)
@@ -512,14 +700,26 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	var adoptedRow *api.Table
 	if out.TableID == "" {
 		name := tableNameFor(path)
-		row, err := client.CreateTable(ctx, api.CreateTableInput{
+		// The header's prose rides the create so the table does not exist even
+		// briefly with none. Its `fields` all come back UNMATCHED — a create has
+		// measured nothing — which is why the report a reader is shown is taken
+		// from the documentation write after the build, not from here.
+		create := api.CreateTableInput{
 			Name:        name,
 			FeatureID:   f.Binding.FeatureID,
 			Kind:        api.TableKindDerived,
 			Engine:      api.TableEngineDuckDB,
 			Code:        wire,
 			InputModels: inputs,
-		})
+			Fields:      docsCreateFields(docs),
+		}
+		if docs.Description != nil {
+			create.Description = *docs.Description
+			if create.Description != "" {
+				create.DescriptionSource = api.DescriptionSourceUser
+			}
+		}
+		row, err := client.CreateTable(ctx, create)
 		switch {
 		case err == nil:
 			out.TableID = row.IdentityID()
@@ -555,6 +755,15 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 			return refuse("creating the table for %s in feature %s was refused (%v).\n    Creating a NEW table needs an admin. Editing tables that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin to create %q in that feature (or to run this one push), then add its id to \"tables\" in %s and push again",
 				path, f.Binding.FeatureID, err, name, wfdir.ManifestName)
 		default:
+			// A name already taken in the target feature, which the generic
+			// arm reported as "HTTP 409" and nothing else. It is the one
+			// create refusal the author fixes in the FOLDER — the file stem is
+			// the name — so say which of the two things to rename, and never
+			// suggest a retry: this create will refuse identically forever.
+			if why, taken := api.AsNameTaken(err); taken {
+				return refuse("creating the table for %s in feature %s was refused — that name is taken:\n      %s\n    Rename the file (its stem is the table's name), or rename the table already holding the name in the web app, then push again",
+					path, f.Binding.FeatureID, why)
+			}
 			return refuse("create the table for %s in feature %s: %v", path, f.Binding.FeatureID, err)
 		}
 		out.Created = true
@@ -624,9 +833,34 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 			liveCode, liveKnown = code, true
 		}
 		var drifted []string
+		// sqlDrifted counts the legs that are about CODE, so the refusal below
+		// can head itself with what actually fired. Legs (a) and (b) are the SQL;
+		// leg (c) is the prose, and a run where only it fired must not be
+		// announced as "the SQL changed" — the SQL is byte-identical, and a
+		// reader sent to look for a code change that is not there stops believing
+		// the message.
+		sqlDrifted := 0
 		// (a) The LIVE table moved: a colleague committed while we were away.
 		if reason := driftReason(codec, content, "the live table", live, liveHash.get(path)); reason != "" {
 			drifted = append(drifted, reason)
+			sqlDrifted++
+		}
+		// (c) The live table's DOCUMENTATION moved — an admin rewrote a
+		// description in the web app, or the agent documented a column — and this
+		// push is about to write prose of its own over it at the next publish.
+		//
+		// A third leg rather than a widening of (a), by the invariant on
+		// wfdir.TableState: it is taken from a different part of the row and
+		// answers a different question, so folding it into the SQL hash would
+		// report "the SQL changed" for a description nobody's SQL touched.
+		//
+		// ARMED ONLY BY A FILE THAT CARRIES A HEADER. A folder that documents
+		// nothing makes no claim about anybody's prose, so there is nothing here
+		// to protect and this leg does not exist for it.
+		if !docs.Empty() {
+			if reason := docsDriftReason("the live table", live, liveHash.getMeta(path)); reason != "" {
+				drifted = append(drifted, reason)
+			}
 		}
 		// (b) Our OWN draft moved. Not paranoia: the chat agent's editDerivedTable
 		// works in exactly this row, so without this leg a web or chat edit to
@@ -653,13 +887,14 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 			}
 			if reason := driftReason(codec, content, "your draft "+draft.ID, draft, against); reason != "" {
 				drifted = append(drifted, reason)
+				sqlDrifted++
 			}
 		}
 		forced := false
 		if len(drifted) > 0 {
 			if !opts.Force {
-				return refuse("the SQL of %s changed on the server since your last sync — pushing would overwrite it:\n      %s\n    Run `ronja pipeline status` to see the detail, or push --force to overwrite",
-					out.TableID, strings.Join(drifted, "\n      "))
+				return refuse("%s of %s changed on the server since your last sync — pushing would overwrite it:\n      %s\n    Run `ronja pipeline status` to see the detail, or push --force to overwrite",
+					driftHeadline(sqlDrifted, len(drifted)), out.TableID, strings.Join(drifted, "\n      "))
 			}
 			fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s: %s\n", path, strings.Join(drifted, "; "))
 			forced = true
@@ -678,6 +913,19 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 		// it means something.
 		if liveKnown && (forced || liveHash.get(path) == "") {
 			recordLiveAgreement(liveHash, path, out.TableID, liveCode)
+		}
+		// The documentation half of the same acknowledgement, on the same rule
+		// and for the same two reasons: an absent recording is a state a folder
+		// should be able to leave, and a --force push is the author saying they
+		// have seen what is on the server. Only for a folder that documents
+		// something — recording a fingerprint for a folder that makes no claim
+		// would arm a guard nothing ever needed and refuse a later push for a
+		// change that was never this folder's business.
+		//
+		// `live` is a GetTable answer, which is the only response that carries
+		// the column catalog — see metaOf.
+		if !docs.Empty() && (forced || liveHash.getMeta(path) == "") {
+			recordMetaAgreement(liveHash, path, out.TableID, metaOf(live))
 		}
 	}
 
@@ -812,13 +1060,62 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 		return out
 	}
 
-	// --- 5. Success: baseline, then the confidence report -------------------
-	// Written AND built, which is what makes this a complete sync — the one thing
-	// "changed since your last push" is measured against. Recorded per file as it
-	// lands, which is what lets a push that stops later leave an accurate baseline
-	// behind.
+	// --- 5. The documentation, AFTER the build ------------------------------
+	// THE ORDER IS THE RULE: push → build → attach → report. The join rule
+	// attaches prose to the columns the table has MEASURED, so a `fields` write
+	// sent with the SQL would be judged against the previous build's columns —
+	// and against no columns at all on a table that has just been created. Sent
+	// here, the report is about the schema this push actually produced.
+	//
+	// It goes to the DRAFT, like the SQL: committing copies the draft's column
+	// rows onto the live table, so prose written on the live row while a draft is
+	// open is lost the moment anybody publishes.
+	//
+	// BEFORE recordSynced, which is the whole reason this step moved above it.
+	// The content baseline is what the bare-push selector compares against, so a
+	// file recorded as synced while its prose did NOT land is a file the next
+	// bare push skips — for ever, silently, with the committed file and the row
+	// saying different things. The one divergence this loop exists to remove.
+	if in, send := docsWriteInput(docs); send {
+		report, err := client.UpdateTableDocs(ctx, draft.ID, in)
+		out.Docs = docsResultFrom(docs, report, err)
+		if err != nil {
+			// A 404 is the draft being GONE — committed or discarded from the web
+			// app between the build and this write — and the recorded pointer has
+			// to go with it, exactly as awaitBuild's 404 arm does above. Without
+			// this the next `publish` commits a row that no longer exists, and
+			// the failure it reports is about a draft id rather than about what
+			// happened.
+			if api.StatusOf(err) == 404 {
+				recordDraftPointer(inst, path, out.TableID, "")
+			}
+			// The SQL landed and built; only the prose did not. Reported as its
+			// own outcome rather than folded into a green push, and returned
+			// WITHOUT advancing the baseline — the same shape as a failed build
+			// above, and for the stronger reason: a build failure is loud on the
+			// next push, and a skipped file is silent for ever.
+			out.Docs.Error = pipelineErrorText(err)
+			out.Outcome = pushOutcomeDocsFailed
+			out.Error = fmt.Sprintf("the SQL of %s was written and built, but its documentation was not: %s", path, out.Docs.Error)
+			if hint := docsRefusalHint(err); hint != "" {
+				out.Error += "\n    " + hint
+			}
+			fmt.Fprintf(os.Stderr, "  Note: %s — %s\n", path, out.Error)
+			return out
+		}
+		if line := describeDocsResult(out.Docs); line != "" {
+			fmt.Fprintf(os.Stderr, "  Note: %s — %s\n", path, line)
+		}
+	}
+
+	// --- 6. Success: baseline, then the confidence report -------------------
+	// Written, built AND documented, which is what makes this a complete sync —
+	// the one thing "changed since your last push" is measured against. Recorded
+	// per file as it lands, which is what lets a push that stops later leave an
+	// accurate baseline behind.
 	recordSynced(inst, path, content)
 	out.Outcome = pushOutcomePushed
+
 	out.Review = fetchReview(ctx, client, draft.ID, path)
 	// Samples are read only AFTER a successful sync: a draft that has been
 	// checked out and never synced has no partitions of its own. And only when
@@ -842,6 +1139,24 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 		}
 	}
 	return out
+}
+
+// driftHeadline names WHAT moved, from the legs that actually fired.
+//
+// Three legs, two subjects: (a) the live table's SQL and (b) our own draft are
+// code, (c) is the row's prose. A refusal that always said "the SQL changed"
+// sent a reader looking for a code difference that does not exist whenever a
+// colleague had merely reworded a description — and a message that is wrong in a
+// case anybody meets is one nobody reads in the cases it is right.
+func driftHeadline(sqlLegs, total int) string {
+	switch {
+	case sqlLegs == 0:
+		return "the documentation"
+	case sqlLegs == total:
+		return "the SQL"
+	default:
+		return "the SQL and the documentation"
+	}
 }
 
 // buildRunning reads a row back to ask whether a build of it is in flight.
@@ -1108,11 +1423,14 @@ func describeLineageDelta(added, removed []string) string {
 func printPipelinePushReport(r *pipelinePushResult) {
 	out := os.Stdout
 	if r.UpToDate {
-		fmt.Fprintf(out, "  Up to date — every .sql file in this folder matches your last sync.\n")
+		fmt.Fprintf(out, "  Up to date — every .sql file and docs sidecar in this folder matches your last sync.\n")
 		return
 	}
 	for _, file := range r.Files {
 		printPipelineFileResult(out, file)
+	}
+	for _, doc := range r.Docs {
+		printPipelineDocsResult(out, doc)
 	}
 	if r.Target != "" {
 		fmt.Fprintf(out, "\n  Target:   %s\n", r.Target)
@@ -1136,6 +1454,16 @@ func printPipelineFileResult(out *os.File, file pipelineFileResult) {
 		fmt.Fprintf(out, "    Table:  %s is untouched — a draft build never changes live data\n", file.TableID)
 		for _, line := range strings.Split(strings.TrimRight(file.Error, "\n"), "\n") {
 			fmt.Fprintf(out, "    %s\n", line)
+		}
+		return
+	}
+
+	if file.Outcome == pushOutcomeDocsFailed {
+		fmt.Fprintf(out, "\n  %s — built, documentation NOT written\n", file.Path)
+		fmt.Fprintf(out, "    Draft:  %s (holds the SQL, and is still publishable)\n", file.DraftID)
+		fmt.Fprintf(out, "    Table:  %s\n", file.TableID)
+		if file.Docs != nil {
+			fmt.Fprintf(out, "    %s\n", file.Docs.Error)
 		}
 		return
 	}
@@ -1169,6 +1497,13 @@ func printPipelineFileResult(out *os.File, file pipelineFileResult) {
 			fmt.Fprintf(out, "    Warning: the live table has been published to since this draft forked (%s) — committing would revert that.\n",
 				strings.Join(r.InterveningVersions, ", "))
 		}
+	}
+	// The documentation line, and there is exactly one of it whatever the header
+	// declared. UNMATCHED NAMES ARE INFORMATION: the push succeeded, the prose is
+	// stored, and it attaches by itself if a build later produces the column — so
+	// it reads as a sentence about the data rather than as a warning.
+	if line := describeDocsResult(file.Docs); line != "" {
+		fmt.Fprintf(out, "    Docs:   %s\n", line)
 	}
 	if file.Sample != "" {
 		fmt.Fprintf(out, "    Sample:\n")

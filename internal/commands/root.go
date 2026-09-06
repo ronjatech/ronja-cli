@@ -313,7 +313,7 @@ credentials entirely and never touch disk.`,
 	// verb would be filing a repository-wide question under one of its answers.
 	root.AddCommand(newLoginCmd(), newLogoutCmd(), newWhoamiCmd(), newProfileCmd(),
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
-		newPipelineCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(),
+		newPipelineCmd(), newModuleCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(),
 		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newUpdateCmd())
 	return root
 }

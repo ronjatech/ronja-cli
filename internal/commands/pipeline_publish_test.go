@@ -761,3 +761,36 @@ func TestPipelinePublishIgnoresNonSQLDirt(t *testing.T) {
 		t.Errorf("a non-SQL file was counted as local dirt:\n%s", stderr)
 	}
 }
+
+// TestPipelinePublishTellsANameCollisionApartFromAFork: three unrelated refusals
+// wear a 409 on this client, and reading a name collision as the fork one is
+// actively harmful — it sends the author to `pipeline discard` (which throws
+// away the work they are trying to publish) or `--overwrite-remote` (which
+// discards a colleague's version), and NEITHER frees the name. So the CLI has to
+// branch on the body's `code`, and say the thing that actually resolves it.
+func TestPipelinePublishTellsANameCollisionApartFromAFork(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedStagedFolder(t, f, "private")
+	const why = `a table named "Orders" already exists in this feature (table-d1abc)`
+	f.nameTakenOnCommit["table-draft-5"] = why
+
+	out, stderr, _ := runPipelineCLI(t, root, "pipeline", "publish", "--json")
+	file := decodeJSON(t, out)["files"].([]any)[0].(map[string]any)
+	if file["outcome"] != pushOutcomeRefused {
+		t.Errorf("outcome = %v, want %q — a taken name is not a race somebody else won", file["outcome"], pushOutcomeRefused)
+	}
+	// The server's sentence names the row in the way; without it the author has
+	// a rule and nothing to act on.
+	if msg, _ := file["error"].(string); !strings.Contains(msg, why) {
+		t.Errorf("the server's own sentence was dropped:\n%s", msg)
+	}
+	for _, wrong := range []string{"pipeline discard", "--overwrite-remote", "forked"} {
+		if strings.Contains(stderr, wrong) {
+			t.Errorf("the fork advice %q was given for a name collision:\n%s", wrong, stderr)
+		}
+	}
+	if len(f.committed) != 0 {
+		t.Errorf("committed = %+v, want nothing", f.committed)
+	}
+}

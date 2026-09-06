@@ -278,12 +278,15 @@ func TestRunChecksParametersAgainstTheLiveDeclaration(t *testing.T) {
 
 // --- the two refusals only the server can make --------------------------------
 
-// A workflow in a shared feature runs under admin access. A bare 403 tells
-// somebody nothing; naming the gate and the two ways forward does.
-func TestRunExplainsTheAdminGateOn403(t *testing.T) {
+// Running a workflow needs only READ access to it, so a 403 is the role (a
+// read-only member) or a token's scopes — never the feature's scope. A bare
+// 403 tells somebody nothing; naming both causes and the way forward does,
+// and the message must NOT send them hunting for admin access or a Feature
+// owner, which were the rules while the run route borrowed the write gate.
+func TestRunExplainsRoleOrScopeOn403(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failRun = http.StatusForbidden
-	f.failRunMessage = "mutating an organization-scoped workflow requires admin role"
+	f.failRunMessage = "forbidden"
 	signIn(t, f)
 	withFastPolling(t)
 	root := liveFolder(t, f, nil)
@@ -292,9 +295,40 @@ func TestRunExplainsTheAdminGateOn403(t *testing.T) {
 	if err == nil {
 		t.Fatal("a refused run exited zero")
 	}
-	for _, want := range []string{"admin access", "Ask an admin", "automation"} {
+	for _, want := range []string{"User role", "automation:write", "read access to the workflow itself is enough", "forbidden"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("403 message missing %q: %v", want, err)
+		}
+	}
+	for _, stale := range []string{"admin access", "shared feature", "Feature's owner"} {
+		if strings.Contains(err.Error(), stale) {
+			t.Errorf("403 message still names the retired write-gate rule %q: %v", stale, err)
+		}
+	}
+	if f.runPolls != 0 {
+		t.Errorf("polled %d times for a run that never started", f.runPolls)
+	}
+}
+
+// A 404 on the run of a workflow the command has just read is the gate's
+// oracle-safe answer for a row the credential can no longer SEE — a race with
+// an access change, not absence and not a rule about who may run. Bare, it
+// reads "not found" straight after a successful push.
+func TestRunExplainsLostVisibilityOn404(t *testing.T) {
+	f := newFakeInstance(t)
+	f.failRun = http.StatusNotFound
+	f.failRunMessage = "not found"
+	signIn(t, f)
+	withFastPolling(t)
+	root := liveFolder(t, f, nil)
+
+	_, err := runCLI(t, root, "wf", "run")
+	if err == nil {
+		t.Fatal("a refused run exited zero")
+	}
+	for _, want := range []string{"can no longer see it", "only read access", "wf status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("404 message missing %q: %v", want, err)
 		}
 	}
 	if f.runPolls != 0 {

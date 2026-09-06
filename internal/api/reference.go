@@ -20,8 +20,9 @@ import (
 // and, when it did not, on the status — so the payload types below are
 // deliberately the two fields a diagnostic might one day want to quote, not a
 // mirror of the row. See Client.GetTable's note: a read gate does not
-// distinguish absent from invisible, so a 404 here means "not available to
-// you", never "deleted".
+// distinguish absent from invisible, so a refusal here means "not available to
+// you" and never says which — least of all now that a current backend answers a
+// lookup miss with the same 404 the no-enumeration refusal uses.
 
 // Agent is the sliver of a saved Agent the edge verifier reads.
 type Agent struct {
@@ -31,10 +32,13 @@ type Agent struct {
 
 // GetAgent reads one saved Agent. Scope: agents:read.
 //
-// ⚠️ Its two failure shapes DISAGREE about which status they use, and the
+// ⚠️ Its two failure shapes need not agree about which status they use, and the
 // handler says so: an Agent that exists but is not yours answers 404, an id
-// matching nothing at all answers 400. Both mean "not available to you", which
-// is exactly why the verifier treats the pair identically.
+// matching nothing at all answers the lookup-miss sentinel — `400 {"error":"no
+// rows"}` on an older backend, `404 {"error":"not found"}` on a current one. The
+// CLI ships against both and accepts both, which is why the 400 arm stays: all
+// of them mean "not available to you", and that is exactly why the verifier
+// treats them identically.
 func (c *Client) GetAgent(ctx context.Context, id string) (*Agent, error) {
 	var out Agent
 	if err := c.Do(ctx, "GET", "agent/"+url.PathEscape(id), nil, &out); err != nil {
@@ -82,8 +86,10 @@ type Note struct {
 // string as it was written rather than normalising it.
 //
 // Failure shapes collapse the way GetAgent's do — a note that exists but is not
-// visible answers 404, an id matching nothing answers 400 — and the verifier
-// treats the pair identically for the reason this file's opening note gives.
+// visible answers 404, an id matching nothing answers `400 {"error":"no rows"}`
+// on an older backend and `404 {"error":"not found"}` on a current one — and the
+// verifier treats all of them identically for the reason this file's opening
+// note gives.
 func (c *Client) GetNote(ctx context.Context, id string) (*Note, error) {
 	var out Note
 	if err := c.Do(ctx, "GET", "note/"+url.PathEscape(id), nil, &out); err != nil {

@@ -223,6 +223,45 @@ func CodeOf(err error) string {
 	return ""
 }
 
+// NameTakenCode is the wire discriminator on the 409 every naming surface
+// answers when a name already identifies another row in the same namespace — a
+// table's feature, a feature's organization — mirrored from gt.NameTakenCode
+// (backend/lib/api/gt/error.go).
+const NameTakenCode = "name_taken"
+
+// AsNameTaken reports whether an error is that refusal, and hands back the
+// server's own sentence, which NAMES the row already holding the name.
+//
+// Gated on the CODE, never the status, for the reason AsRunInFlight is: a 409 on
+// this client already means at least two unrelated things — an optimistic-
+// concurrency conflict on a draft commit, and a file precondition — and the only
+// thing the three have in common is a number. Reading it as "somebody published
+// over your draft" sends the author to `discard` or `--overwrite-remote`, one of
+// which destroys a colleague's work and neither of which frees a name.
+//
+// The message is passed through rather than paraphrased: it is the half that
+// says WHICH row is in the way, and a CLI that dropped it would leave the author
+// with a rule and no way to see what tripped it. It falls back to the error's own
+// rendering when the body carries a code but no prose, so this never returns an
+// empty sentence for a refusal it has claimed.
+func AsNameTaken(err error) (string, bool) {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		return "", false
+	}
+	var body struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if json.Unmarshal([]byte(apiErr.Body), &body) != nil || body.Code != NameTakenCode {
+		return "", false
+	}
+	if body.Error == "" {
+		return apiErr.Error(), true
+	}
+	return body.Error, true
+}
+
 // StatusOf extracts the HTTP status, or 0 if the error was not an HTTP error.
 func StatusOf(err error) int {
 	var apiErr *Error

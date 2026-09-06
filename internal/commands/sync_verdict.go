@@ -28,6 +28,14 @@ const (
 	// printed "drifted" at somebody whose alias lost its bind would send them
 	// looking at a diff that does not exist.
 	verdictBroken = "broken"
+	// verdictApplied and verdictRefused are `sync apply`'s own two words, where
+	// `sync status` has clean/drifted and `sync check` has clean/broken. Here
+	// rather than beside the command for the same reason verdictBroken is: this
+	// block is the tree-command vocabulary, and verdictRank below reads all of
+	// them — a constant defined in the command file made the ranking depend on
+	// another file's const block, which is the drift this one exists to prevent.
+	verdictApplied = "applied"
+	verdictRefused = "refused"
 )
 
 // folderVerdict is one folder's answer plus the sentence that explains it.
@@ -197,8 +205,30 @@ func verdictOfPipelineStatus(r *pipelineStatusReport, localFiles int, undeployed
 		case t.Drift == driftNoBaseline, t.LiveDrift == driftNoBaseline:
 			delta.Unchecked = append(delta.Unchecked, t.Path)
 		}
-		if t.Drift == driftChanged || t.LiveDrift == driftChanged {
+		if t.Drift == driftChanged || t.LiveDrift == driftChanged || t.DocsDrift == driftChanged {
 			delta.Remote = append(delta.Remote, t.Path)
+		}
+	}
+
+	// The DOCS SIDECARS — the tables this folder documents but does not build.
+	// They belong in this gate for the reason the whole command exists: `sync
+	// status` asks whether a push from anywhere beneath a directory would change
+	// the organization, and a sidecar the row does not agree with is exactly such
+	// a change. It is a LOCAL one — the file says something the organization does
+	// not yet hold — which is the same shape as an edited .sql file.
+	//
+	// The same two corrections as above: unknown dominates, and driftNoBaseline
+	// is unknown here even though the single-folder command reads it as green.
+	var docsPending []string
+	for _, d := range r.Remote.Docs {
+		switch {
+		case d.Problem != "", d.Drift == "", d.Drift == driftUnreadable, d.Drift == driftNoBaseline:
+			delta.Unchecked = append(delta.Unchecked, d.Path)
+		case d.Drift == driftChanged:
+			delta.Remote = append(delta.Remote, d.Path)
+		}
+		if d.Pending {
+			docsPending = append(docsPending, d.Path)
 		}
 	}
 
@@ -220,7 +250,7 @@ func verdictOfPipelineStatus(r *pipelineStatusReport, localFiles int, undeployed
 	// the folder committed. Gating it on the absence of a baseline would make the
 	// answer depend on whose machine it ran on, which is the exact property the
 	// lock file exists to remove.
-	delta.Local = dedupe(localChanges(r.Local), r.WillCreate, undeployed)
+	delta.Local = dedupe(localChanges(r.Local), r.WillCreate, undeployed, docsPending)
 	return delta.verdict()
 }
 
@@ -506,16 +536,18 @@ func neverDeployedVerdict(localFiles int, creates string) folderVerdict {
 // verdictRank is the ONE precedence the tree commands fold by, and there is
 // deliberately only one: unknown beats the middle answer beats clean.
 //
-// The middle answer is spelled `drifted` by `sync status` and `broken` by
-// `sync check` — two words for one rank, because the two commands report
-// different things about a folder and neither word is right for the other. They
-// never appear in one report: a tree command runs one computation over every
-// folder, so a list of verdicts is all one vocabulary.
+// The middle answer is spelled `drifted` by `sync status`, `broken` by
+// `sync check` and `refused` by `sync apply` — three words for one rank, because
+// the three commands report different things about a folder and no word is right
+// for the others. They never appear in one report: a tree command runs one
+// computation over every folder, so a list of verdicts is all one vocabulary.
+//
+// `applied` takes the green rank by falling through, exactly as `clean` does.
 func verdictRank(verdict string) int {
 	switch verdict {
 	case verdictUnknown:
 		return 2
-	case verdictDrifted, verdictBroken:
+	case verdictDrifted, verdictBroken, verdictRefused:
 		return 1
 	}
 	return 0

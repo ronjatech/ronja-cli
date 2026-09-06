@@ -342,6 +342,84 @@ func (h liveHashes) get(path string) string {
 	return h.inst.TableStateFor(path).LiveSHA256
 }
 
+// getMeta and setMeta are the same fork for the DOCUMENTATION fingerprint —
+// the third drift leg. They route exactly as the SQL pair does, and for the same
+// reason: on a named stack the answer is a fact about the environment and lives
+// in the committed lock, and a legacy instances[] folder keeps it where it kept
+// everything before stacks existed.
+func (h liveHashes) getMeta(path string) string {
+	if h.stack != "" {
+		return h.lock.TableMeta(h.stack, path)
+	}
+	return h.inst.TableStateFor(path).MetaSHA256
+}
+
+func (h liveHashes) setMeta(path, tableID, meta string) {
+	if h.stack != "" {
+		h.lock.SetTableMeta(h.stack, path, tableID, meta)
+		return
+	}
+	mutateTable(h.inst, path, func(s *wfdir.TableState) {
+		s.TableID = tableID
+		s.MetaSHA256 = meta
+	})
+}
+
+// docsSeen and setDocsSeen are the SIDECAR half — a table this folder documents
+// but does not build, keyed by the sidecar's path rather than by a .sql file.
+//
+// The same lock/baseline fork, and it exists for the sidecar because a legacy
+// folder has nowhere committed to put a recording: wfdir.Lock.SetTableDocsSeen
+// refuses an empty stack name outright rather than writing `"stacks":{"":{…}}`
+// into a committed file.
+//
+// ⚠️ A NIL inst IS THE ORDINARY CASE, not a defensive nicety, and both halves
+// have to answer it. `.ronja/state.json` is gitignored, so `f.State.For(f.Key)`
+// is nil on every fresh clone — and `pipeline status` passes that nil straight
+// in, unlike push and publish which go through pipelineBaseline. Both siblings
+// already guard it (wfdir.InstanceState.TableStateFor answers the zero value,
+// wfdir.Lock.TableDocsSeen answers three empty strings); these two were the pair
+// that did not, and the read runs inside a status worker goroutine, so the miss
+// was a raw process panic rather than an error anybody could act on.
+//
+// Empty strings are the right answer for a folder that has never synced here:
+// "no recording" disarms the drift guard, which is exactly what a fresh clone
+// means. The write is a no-op for the same reason the lock refuses an empty
+// stack — there is no baseline in memory to record into, and inventing one here
+// would write a file that `status` promises never to write.
+func (h liveHashes) docsSeen(path string) (tableID, meta, declared string) {
+	if h.stack != "" {
+		return h.lock.TableDocsSeen(h.stack, path)
+	}
+	if h.inst == nil {
+		return "", "", ""
+	}
+	entry := h.inst.TableDocs[path]
+	return entry.TableID, entry.MetaSHA256, entry.DeclaredSHA256
+}
+
+func (h liveHashes) setDocsSeen(path, tableID, meta, declared string) {
+	if h.stack != "" {
+		h.lock.SetTableDocsSeen(h.stack, path, tableID, meta, declared)
+		return
+	}
+	if h.inst == nil {
+		return
+	}
+	if h.inst.TableDocs == nil {
+		h.inst.TableDocs = map[string]wfdir.TableDocsState{}
+	}
+	// A sidecar rebound to a DIFFERENT table drops the old row's fingerprint
+	// with it, by the invariant on wfdir.LockTableDocs: a hash is only ever
+	// compared against the row it was taken from.
+	entry := h.inst.TableDocs[path]
+	if entry.TableID != tableID {
+		entry = wfdir.TableDocsState{}
+	}
+	entry.TableID, entry.MetaSHA256, entry.DeclaredSHA256 = tableID, meta, declared
+	h.inst.TableDocs[path] = entry
+}
+
 func (h liveHashes) set(path, tableID, liveCode string) {
 	if h.stack != "" {
 		h.lock.SetTableLive(h.stack, path, tableID, wfdir.HashString(liveCode))
@@ -370,10 +448,24 @@ func recordLiveAgreement(live liveHashes, path, tableID, liveCode string) {
 	live.set(path, tableID, liveCode)
 }
 
-// recordSynced records a COMPLETE push of one file: written to the draft AND
-// built. This is the "last sync" every local diff is measured against, so it
-// advances only on success — a bare push after a failed build has to still see
-// the file as changed and try again.
+// recordMetaAgreement records the LIVE row's DOCUMENTATION as the one this
+// folder agrees with — the third leg's counterpart to recordLiveAgreement.
+//
+// Called only where that is true: a live row this command just READ through
+// GetTable (the only response that carries the column catalog), and a publish
+// that just committed onto one. An empty meta CLEARS the recording, which is how
+// a caller says "I can no longer honestly claim to have seen this row's prose"
+// rather than leaving a fingerprint of a state that has since moved.
+func recordMetaAgreement(live liveHashes, path, tableID, meta string) {
+	mutateTable(live.inst, path, func(s *wfdir.TableState) { s.TableID = tableID })
+	live.setMeta(path, tableID, meta)
+}
+
+// recordSynced records a COMPLETE push of one file: written to the draft, built
+// AND documented. This is the "last sync" every local diff is measured against,
+// so it advances only on success — a bare push after a failed build, or after a
+// documentation write that was refused, has to still see the file as changed and
+// try again.
 func recordSynced(inst *wfdir.InstanceState, path, content string) {
 	inst.Files[path] = wfdir.FileState{SHA256: wfdir.HashString(content)}
 }

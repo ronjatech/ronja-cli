@@ -206,6 +206,7 @@ func TestIsResourceID(t *testing.T) {
 		{KindAgent, "agent-1", true},
 		{KindMailbox, "mailbox-1", true},
 		{KindWorkflow, "workflow-1", true},
+		{KindModule, "module-1", true},
 		// A note rides TWO prefixes: the rename preserved the old `skill-` ids,
 		// and a client that knew only `note-` would read a live skill id as an
 		// alias and hunt for a declaration nobody wrote.
@@ -227,7 +228,7 @@ func TestIsResourceID(t *testing.T) {
 // beside them by hand.
 func TestKindsMatchTheFamilyTable(t *testing.T) {
 	got := strings.Join(Kinds(), ",")
-	if want := "agent,codex,mailbox,note,secret,table,workflow"; got != want {
+	if want := "agent,codex,mailbox,module,note,secret,table,workflow"; got != want {
 		t.Errorf("Kinds() = %s, want %s", got, want)
 	}
 	for _, kind := range Kinds() {
@@ -259,7 +260,7 @@ func TestKindsMatchTheFamilyTable(t *testing.T) {
 // If a marker-less kind ever leaked into MarkerKinds, that refusal would come
 // back silently, on files nobody edited.
 func TestMarkerKindsPartitionKinds(t *testing.T) {
-	if got := strings.Join(MarkerKinds(), ","); got != "agent,codex,mailbox,secret,table,workflow" {
+	if got := strings.Join(MarkerKinds(), ","); got != "agent,codex,mailbox,module,secret,table,workflow" {
 		t.Errorf("MarkerKinds() = %s", got)
 	}
 	if got := strings.Join(MarkerlessKinds(), ","); got != "note" {

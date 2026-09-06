@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1752,6 +1753,41 @@ func TestPipelinePushNamesTheRefItCouldNotRead(t *testing.T) {
 	}
 }
 
+// The SAME case against a current backend, which retyped the lookup miss: the
+// unreachable ref read now answers `404 {"error":"not found"}` where the
+// instance above answers `400 {"error":"no rows"}`. The diagnosis must not move
+// with the status — the CLI ships on its own tag and meets both — which is
+// exactly why explainUnreadableRefs counts 400, 403 and 404 alike and why the
+// 400 arm is not dead code.
+func TestPipelinePushNamesTheRefItCouldNotReadOnACurrentBackend(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	f.missTableStatus = http.StatusNotFound
+	signInPipeline(t, f)
+	f.AddFeature("collection-1", "Sales", "private")
+	f.failCreate = 403
+
+	root := t.TempDir()
+	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales"}
+	manifest.SetBinding(f.Key(), wfdir.Binding{FeatureID: "collection-1"})
+	writePipelineFolder(t, root, manifest, map[string]string{
+		"revenue.sql": "SELECT * FROM {{ ref('table-elsewhere') }}",
+	})
+
+	_, stderr, err := runPipelineCLI(t, root, "pipeline", "push")
+	if err == nil {
+		t.Fatal("push accepted a table whose ref it cannot read")
+	}
+	if !strings.Contains(stderr, "table-elsewhere") {
+		t.Errorf("refusal does not name the id:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "{{ ref('table-elsewhere') }}") {
+		t.Errorf("refusal does not quote the marker:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "needs an admin") {
+		t.Errorf("a 404 lookup miss was read as an admin problem:\n%s", stderr)
+	}
+}
+
 // ...and the admin explanation survives for the case where it IS the cause. A
 // 403 whose refs all read fine is a create the caller is not allowed to make,
 // and replacing one wrong guess with another would be no better than the bug.
@@ -1775,5 +1811,43 @@ func TestPipelinePushStillBlamesAdminWhenTheRefsAreFine(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "needs an admin") {
 		t.Errorf("the admin explanation was lost:\n%s", stderr)
+	}
+}
+
+// TestPipelinePushNamesTheTableHoldingTheNameItWanted: a create refused because
+// the name is taken used to fall to the generic arm and read as "HTTP 409" and
+// nothing else. It is the one create refusal the author fixes in the FOLDER —
+// the file's stem IS the table's name — so the refusal has to say so, quote the
+// server's sentence naming the holder, and not invite a retry that will refuse
+// identically forever.
+func TestPipelinePushNamesTheTableHoldingTheNameItWanted(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	f.AddFeature("collection-1", "Sales", "private")
+	const why = `a table named "revenue" already exists in this feature (table-d1abc)`
+	f.nameTakenOnCreate = why
+
+	root := t.TempDir()
+	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales"}
+	manifest.SetBinding(f.Key(), wfdir.Binding{FeatureID: "collection-1"})
+	writePipelineFolder(t, root, manifest, map[string]string{
+		"revenue.sql": "SELECT 1",
+	})
+
+	_, stderr, err := runPipelineCLI(t, root, "pipeline", "push")
+	if err == nil {
+		t.Fatal("push reported a create the server refused as a success")
+	}
+	if !strings.Contains(stderr, why) {
+		t.Errorf("the server's own sentence, which names the holder, was dropped:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "Rename the file") {
+		t.Errorf("refusal does not say where the name comes from:\n%s", stderr)
+	}
+	// The two wrong readings of a 409 on this command.
+	for _, wrong := range []string{"needs an admin", "timed out"} {
+		if strings.Contains(stderr, wrong) {
+			t.Errorf("a taken name was reported as %q:\n%s", wrong, stderr)
+		}
 	}
 }

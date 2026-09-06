@@ -98,6 +98,7 @@ const (
 	KindCodex    = "codex"
 	KindMailbox  = "mailbox"
 	KindWorkflow = "workflow"
+	KindModule   = "module"
 	// KindNote is the first dependency kind with NO marker family behind it,
 	// and the distinction is the point rather than an omission — see
 	// markerlessKinds.
@@ -243,6 +244,13 @@ var families = []struct {
 	// backend/engine/pymarkers/markers.go, workflowMarkerPattern.
 	{Family{Verb: "workflow", Kind: KindWorkflow, Args: 1}, "workflowMarkerPattern",
 		regexp.MustCompile(`\{\{+\s*workflow\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}+`)},
+	// backend/engine/pymarkers/markers.go, moduleMarkerPattern. The one family
+	// whose marker sits in IMPORT position and substitutes to a bare package
+	// name rather than a quoted literal — which changes nothing here, because
+	// this layer only ever reads and rewrites the marker's first ARGUMENT, and
+	// that argument is a `module-` id like every other entry below.
+	{Family{Verb: "module", Kind: KindModule, Args: 1}, "moduleMarkerPattern",
+		regexp.MustCompile(`\{\{+\s*module\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}+`)},
 }
 
 // idPrefixes mirrors the per-kind predicates in backend/lib/rrn/rrn.go — the
@@ -267,6 +275,7 @@ var idPrefixes = map[string][]string{
 	KindCodex:    {"cdx-"},
 	KindMailbox:  {"mailbox-"},
 	KindWorkflow: {"workflow-"},
+	KindModule:   {"module-"},
 	KindNote:     {"note-", "skill-"},
 }
 

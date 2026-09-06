@@ -56,7 +56,16 @@ type fakePipelineInstance struct {
 	synced map[string]bool
 	// fields is a row's column set, which is what the review payload's
 	// fieldsDelta is computed from.
+	//
+	// It is also the MEASURED half of THE JOIN RULE: a documentation write
+	// attaches only to a name in here, and one that is not is stored, reported
+	// as unmatched, and left out of the row's `fields[]` entirely.
 	fields map[string][]string
+	// columnDocs is a row's column PROSE, keyed by row id and then by column
+	// name — including names the row has not measured, which is the retention
+	// half of the join rule: prose is kept against the name and re-attaches by
+	// itself if a build later produces the column.
+	columnDocs map[string]map[string]string
 	// rowCounts is a row's materialized row count; an absent entry is -1, the
 	// server's "not available", which is NOT zero.
 	rowCounts map[string]int64
@@ -113,17 +122,42 @@ type fakePipelineInstance struct {
 	queryError string
 
 	// --- failure injection, per row where it makes sense ---------------------
-	failGet      map[string]int
+	failGet map[string]int
+	// failDocsPut answers a DOCUMENTING PUT — one carrying `description` or
+	// `fields` — with a status, leaving the SQL PUT of the same row alone.
+	//
+	// Its own knob rather than a reuse of failPut, because the case it models is
+	// exactly the one the two-PUT split creates and no single-status fake can
+	// reach: the SQL lands and builds, and only the prose is refused. That is
+	// what a non-admin met on an instance whose allowlist had no `fields` in it,
+	// and it is the state a push must be able to RETRY out of.
+	failDocsPut  map[string]int
 	failDraftGet map[string]int
 	failCheckout map[string]int
 	failPut      map[string]int
 	failSync     map[string]int
 	failCommit   map[string]int
-	failReview   map[string]int
-	failCreate   int
-	failList     int
-	failFeature  int
-	failQuery    int
+	// nameTakenOnCommit scripts the OTHER 409 a commit can answer, keyed by
+	// draft id: the draft would publish a name another live table in the feature
+	// already holds. It is separate from failCommit because the BODY is the
+	// point — the CLI must branch on the `code`, not on the 409 it shares with
+	// the base-version CAS above.
+	nameTakenOnCommit map[string]string
+	failReview        map[string]int
+	failCreate        int
+	// nameTakenOnCreate is the sentence POST /feature/model answers 409
+	// `name_taken` with; "" is off. Its own knob rather than a status on
+	// failCreate because the BODY is what the CLI has to read.
+	nameTakenOnCreate string
+	failList          int
+	failFeature       int
+	failQuery         int
+	// missTableStatus is what GET /feature/model/:id answers for a row this fake
+	// does not hold. BOTH generations are real and this binary talks to both:
+	// an older backend answers the lookup-miss sentinel `400 {"error":"no
+	// rows"}`, a current one `404 {"error":"not found"}`. Defaults to the 400,
+	// so a test that says nothing stages the older instance.
+	missTableStatus int
 
 	// --- what the fake was asked to do, for assertions -----------------------
 	created         []api.CreateTableInput
@@ -154,6 +188,19 @@ type recordedTableUpdate struct {
 	ID          string
 	Code        string
 	InputModels []string
+	// SetsCode and SetsInputModels report whether the PUT NAMED those keys at
+	// all, which is not the same as what they held. The documentation write is a
+	// PUT that names neither: rmodelv2.Patch reads every field as an optional, so
+	// an absent `code` leaves the row's SQL alone — and a fake that read an
+	// absent key as "" would model a server which WIPES the SQL of every table
+	// the CLI documents, and would let that ship.
+	SetsCode        bool
+	SetsInputModels bool
+	// The documentation half of a PUT. Description is a pointer for the
+	// three-state rule: absent is unmanaged, and an explicit "" clears the row.
+	Description       *string
+	DescriptionSource string
+	Fields            []api.TableFieldInput
 	// BaseCodeSha256 is the precondition the PUT carried, as a POINTER so the
 	// fake can tell ABSENT from PRESENT-AND-EMPTY. The server reads three states
 	// and answers 400 to the empty one, so collapsing them here would let a
@@ -165,37 +212,45 @@ type recordedTableUpdate struct {
 // tableUpdateBody is the PUT body as the SERVER sees it, which is not quite
 // api.UpdateTableInput: the precondition is a pointer here for the reason above.
 type tableUpdateBody struct {
-	Code           string   `json:"code"`
-	InputModels    []string `json:"inputModels"`
-	BaseCodeSha256 *string  `json:"baseCodeSha256"`
+	Code           *string   `json:"code"`
+	InputModels    *[]string `json:"inputModels"`
+	BaseCodeSha256 *string   `json:"baseCodeSha256"`
+
+	Description       *string               `json:"description"`
+	DescriptionSource string                `json:"descriptionSource"`
+	Fields            []api.TableFieldInput `json:"fields"`
 }
 
 func newFakePipelineInstance(t *testing.T) *fakePipelineInstance {
 	t.Helper()
 	f := &fakePipelineInstance{
-		t:              t,
-		tables:         map[string]*api.Table{},
-		draftOf:        map[string]string{},
-		buildErr:       map[string]*api.TableBuildError{},
-		synced:         map[string]bool{},
-		fields:         map[string][]string{},
-		rowCounts:      map[string]int64{},
-		submitted:      map[string]bool{},
-		intervening:    map[string][]api.TableInterveningVersion{},
-		features:       map[string]*api.Feature{},
-		syncOutcome:    map[string]string{},
-		syncMessage:    map[string]string{},
-		rejectCommit:   map[string]bool{},
-		syncBusy:       map[string]int{},
-		failGet:        map[string]int{},
-		failDraftGet:   map[string]int{},
-		failCheckout:   map[string]int{},
-		failPut:        map[string]int{},
-		failSync:       map[string]int{},
-		failCommit:     map[string]int{},
-		failReview:     map[string]int{},
-		privilegeLevel: 50,
-		queryCSV:       "id,total\n1,42\n2,17\n",
+		t:                 t,
+		tables:            map[string]*api.Table{},
+		draftOf:           map[string]string{},
+		buildErr:          map[string]*api.TableBuildError{},
+		synced:            map[string]bool{},
+		fields:            map[string][]string{},
+		columnDocs:        map[string]map[string]string{},
+		rowCounts:         map[string]int64{},
+		submitted:         map[string]bool{},
+		intervening:       map[string][]api.TableInterveningVersion{},
+		features:          map[string]*api.Feature{},
+		syncOutcome:       map[string]string{},
+		syncMessage:       map[string]string{},
+		rejectCommit:      map[string]bool{},
+		syncBusy:          map[string]int{},
+		failGet:           map[string]int{},
+		failDocsPut:       map[string]int{},
+		failDraftGet:      map[string]int{},
+		failCheckout:      map[string]int{},
+		failPut:           map[string]int{},
+		failSync:          map[string]int{},
+		failCommit:        map[string]int{},
+		nameTakenOnCommit: map[string]string{},
+		failReview:        map[string]int{},
+		missTableStatus:   http.StatusBadRequest,
+		privilegeLevel:    50,
+		queryCSV:          "id,total\n1,42\n2,17\n",
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
@@ -350,6 +405,99 @@ func (f *fakePipelineInstance) writeRow(w http.ResponseWriter, row *api.Table) {
 	writeJSON(w, out)
 }
 
+// writeRowWithCatalog answers the SINGLE-ROW GET, which is the ONE response that
+// carries `fields[]`. Modelled as its own method because that asymmetry is real
+// and load-bearing: the create, the checkout and the draft read all share the
+// DTO and none of them populates the catalog, so a CLI that took a documentation
+// fingerprint from one of those would be hashing a table with no columns. A fake
+// that filled the field in everywhere would hide exactly that bug.
+func (f *fakePipelineInstance) writeRowWithCatalog(w http.ResponseWriter, row *api.Table) {
+	if row == nil {
+		writeJSON(w, nil)
+		return
+	}
+	out := *row
+	out.Fields = f.columnCatalog(row.ID)
+	f.writeRow(w, &out)
+}
+
+// columnCatalog is THE JOIN RULE on the read side: the columns the row has
+// MEASURED, each carrying whatever prose documents it. A documented name the
+// row has not measured is NOT here, however recently somebody wrote it —
+// documenting a column cannot bring it into existence.
+func (f *fakePipelineInstance) columnCatalog(id string) []api.TableField {
+	measured := f.fields[id]
+	if len(measured) == 0 {
+		return nil
+	}
+	docs := f.columnDocs[id]
+	names := append([]string{}, measured...)
+	sortStrings(names)
+	out := make([]api.TableField, 0, len(names))
+	for _, name := range names {
+		field := api.TableField{Name: name, Description: docs[name]}
+		if field.Description != "" {
+			field.DescriptionSource = api.DescriptionSourceUser
+		}
+		out = append(out, field)
+	}
+	return out
+}
+
+// documentColumns stores a `fields` write and answers THE JOIN RULE: which of
+// the names given attached to a measured column and which did not.
+//
+// The unmatched prose IS STORED, which is the retention half — a transient
+// teardown or a renamed staging column must not destroy what somebody wrote, and
+// the prose re-attaches by itself the moment a build produces the column.
+func (f *fakePipelineInstance) documentColumns(id string, fields []api.TableFieldInput) *api.ColumnDocReport {
+	if fields == nil {
+		return nil
+	}
+	measured := map[string]bool{}
+	for _, name := range f.fields[id] {
+		measured[name] = true
+	}
+	if f.columnDocs[id] == nil {
+		f.columnDocs[id] = map[string]string{}
+	}
+	var report api.ColumnDocReport
+	seen := map[string]bool{}
+	for _, field := range fields {
+		name := strings.TrimSpace(field.Name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		f.columnDocs[id][name] = field.Description
+		if measured[name] {
+			report.AttachedColumns = append(report.AttachedColumns, name)
+		} else {
+			report.UnmatchedColumns = append(report.UnmatchedColumns, name)
+		}
+	}
+	sortStrings(report.AttachedColumns)
+	sortStrings(report.UnmatchedColumns)
+	return &report
+}
+
+// copyColumnDocs is the fake's copyFields: checkout copies live → draft, commit
+// copies draft → live. Without it a draft would be documented and the commit
+// would leave the live row saying nothing, which is the opposite of what the
+// server does and would make the CLI's "write to the draft" rule look wrong.
+func (f *fakePipelineInstance) copyColumnDocs(fromID, toID string) {
+	if src := f.columnDocs[fromID]; len(src) > 0 {
+		dst := map[string]string{}
+		for name, text := range src {
+			dst[name] = text
+		}
+		f.columnDocs[toID] = dst
+	}
+	if src := f.fields[fromID]; len(src) > 0 && len(f.fields[toID]) == 0 {
+		f.fields[toID] = append([]string{}, src...)
+	}
+}
+
 // writeDraftRow answers GET :id/draft, which goes through toTableView and
 // therefore carries NO buildVerdict and NO lastBuildError.
 //
@@ -495,7 +643,24 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 		}
 		var in tableUpdateBody
 		decodeBody(f.t, r, &in)
-		f.updates = append(f.updates, recordedTableUpdate{ID: id, Code: in.Code, InputModels: in.InputModels, BaseCodeSha256: in.BaseCodeSha256})
+		if status := f.failDocsPut[id]; status != 0 && (in.Fields != nil || in.Description != nil) {
+			// The message production sends a non-admin, verbatim: the CLI must
+			// explain it from the STATUS, never by reading this prose.
+			http.Error(w, `{"error":"field not allowed: fields"}`, status)
+			return
+		}
+		recorded := recordedTableUpdate{
+			ID: id, BaseCodeSha256: in.BaseCodeSha256,
+			SetsCode: in.Code != nil, SetsInputModels: in.InputModels != nil,
+			Description: in.Description, DescriptionSource: in.DescriptionSource, Fields: in.Fields,
+		}
+		if in.Code != nil {
+			recorded.Code = *in.Code
+		}
+		if in.InputModels != nil {
+			recorded.InputModels = *in.InputModels
+		}
+		f.updates = append(f.updates, recorded)
 		// The layer-1 precondition, modelled the way rmodelv2.checkCodePrecondition
 		// decides it and NOT the way the CLI intends it: the digest is compared
 		// against what THIS ROW STORES, whatever the client believed it was
@@ -515,13 +680,32 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 				return
 			}
 		}
-		// Stored VERBATIM on the row that was addressed, which is the property
-		// worth modelling: a PUT to the live row is accepted and is silently lost
-		// work, so nothing here redirects it to a draft.
-		row.Code = in.Code
-		row.InputModels = in.InputModels
+		// EVERY FIELD IS AN OPTIONAL, exactly as rmodelv2.Patch is: an absent key
+		// leaves the column alone. Modelled rather than collapsed because the
+		// documentation write is a PUT that names no `code`, and a fake that read
+		// that as "" would model a server which wipes the SQL of every table the
+		// CLI documents — and would let that ship.
+		//
+		// Stored VERBATIM on the row that was addressed, which is the other
+		// property worth modelling: a PUT to the live row is accepted and is
+		// silently lost work, so nothing here redirects it to a draft.
+		if in.Code != nil {
+			row.Code = *in.Code
+		}
+		if in.InputModels != nil {
+			row.InputModels = *in.InputModels
+		}
+		if in.Description != nil {
+			row.Description = *in.Description
+			row.DescriptionSource = in.DescriptionSource
+		}
 		row.UpdatedAt = row.UpdatedAt.Add(time.Minute)
-		writeJSON(w, nil)
+		if in.Fields == nil {
+			// A PUT that documents nothing answers exactly what it always did.
+			writeJSON(w, nil)
+			return
+		}
+		writeJSON(w, f.documentColumns(id, in.Fields))
 
 	case action == "" && r.Method == http.MethodGet:
 		if status := f.failGet[id]; status != 0 {
@@ -530,16 +714,25 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 		}
 		row := f.tables[id]
 		if row == nil {
-			// Production answers 400 {"error":"no rows"} here, NOT 404: a row the
-			// caller cannot see is invisible to RLS, so the read finds nothing and
-			// cannot tell "not yours" from "not there" — which is the point. This
-			// fake said 404 once, and explainUnreadableRefs was written against
-			// that fiction: its test passed while the real cross-organization case
-			// fell through to the wrong diagnosis. Mirror production here.
+			// A row the caller cannot see is invisible to RLS, so the read finds
+			// nothing and cannot tell "not yours" from "not there" — which is the
+			// point. WHICH STATUS that sentinel reaches the wire as depends on the
+			// instance: an older backend answers 400 {"error":"no rows"}, a
+			// current one 404 {"error":"not found"}, and the CLI ships against
+			// both — hence missTableStatus, and hence a twin test per arm.
+			//
+			// This fake said 404 once when every backend answered 400, and
+			// explainUnreadableRefs was written against that fiction: its test
+			// passed while the real cross-organization case fell through to the
+			// wrong diagnosis. Stage what a real instance answers, both of them.
+			if f.missTableStatus == http.StatusNotFound {
+				http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+				return
+			}
 			http.Error(w, `{"error":"no rows"}`, http.StatusBadRequest)
 			return
 		}
-		f.writeRow(w, row)
+		f.writeRowWithCatalog(w, row)
 		// A row left `building` — which only a refused sync does here — lands on
 		// the read that watched it. Reported first and landed after, so the caller
 		// that asked BECAUSE it was refused sees the build it was told about.
@@ -601,6 +794,10 @@ func (f *fakePipelineInstance) serveList(w http.ResponseWriter, r *http.Request)
 }
 
 func (f *fakePipelineInstance) serveCreate(w http.ResponseWriter, r *http.Request) {
+	if f.nameTakenOnCreate != "" {
+		http.Error(w, `{"error":`+strconv.Quote(f.nameTakenOnCreate)+`,"code":"name_taken"}`, http.StatusConflict)
+		return
+	}
 	if f.failCreate != 0 {
 		http.Error(w, `{"error":"admin required to create a table"}`, f.failCreate)
 		return
@@ -613,16 +810,26 @@ func (f *fakePipelineInstance) serveCreate(w http.ResponseWriter, r *http.Reques
 	// create endpoints mint a parentless draft. That is the whole reason push
 	// records the binding before it does anything else.
 	row := f.AddTable(&api.Table{
-		ID:          fmt.Sprintf("table-new-%d", f.nextID),
-		Name:        in.Name,
-		Kind:        in.Kind,
-		FeatureID:   in.FeatureID,
-		Code:        in.Code,
-		InputModels: in.InputModels,
-		Status:      api.TableStatusPending,
+		ID:                fmt.Sprintf("table-new-%d", f.nextID),
+		Name:              in.Name,
+		Kind:              in.Kind,
+		FeatureID:         in.FeatureID,
+		Code:              in.Code,
+		InputModels:       in.InputModels,
+		Status:            api.TableStatusPending,
+		Description:       in.Description,
+		DescriptionSource: in.DescriptionSource,
 	})
 	f.synced[row.ID] = false
-	f.writeRow(w, row)
+	// The report rides the create response, embedded — and on a create it is
+	// ALWAYS every name unmatched, because a table that has never built has
+	// measured nothing. That is the join rule, not a special case.
+	report := f.documentColumns(row.ID, in.Fields)
+	out := *row
+	if report != nil {
+		out.ColumnDocReport = *report
+	}
+	f.writeRow(w, &out)
 }
 
 // serveCheckout models the ONE lifecycle divergence that shapes the whole push
@@ -666,6 +873,9 @@ func (f *fakePipelineInstance) serveCheckout(w http.ResponseWriter, liveID strin
 	})
 	f.synced[draftID] = false
 	f.draftOf[liveID] = draftID
+	draft.Description = live.Description
+	draft.DescriptionSource = live.DescriptionSource
+	f.copyColumnDocs(liveID, draftID)
 	f.writeRow(w, draft)
 }
 
@@ -735,6 +945,13 @@ func (f *fakePipelineInstance) applyBuildOutcome(id string) {
 	if message == "" {
 		message = "The transformation is impossible with the given inputs: `orders` has no column `customer_id`."
 	}
+	// A build MEASURES the columns. A draft that has never been built has none of
+	// its own, so it inherits its parent's — which is what lets a test declare
+	// the measured set once, on the live table, without predicting the id of a
+	// draft the CLI has not checked out yet.
+	if row.ParentModelID != "" && len(f.fields[id]) == 0 {
+		f.fields[id] = append([]string{}, f.fields[row.ParentModelID]...)
+	}
 	switch outcome {
 	case "build_failed":
 		row.Status = api.TableStatusBuildFailed
@@ -756,9 +973,31 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confi
 		http.Error(w, `{"error":"admin required to commit into a shared feature"}`, status)
 		return
 	}
+	// Answered BEFORE the base-version CAS below, so the test exercises the two
+	// 409s as the distinct refusals they are rather than whichever the fake
+	// happens to reach first.
+	if why := f.nameTakenOnCommit[draftID]; why != "" {
+		http.Error(w, `{"error":`+strconv.Quote(why)+`,"code":"name_taken"}`, http.StatusConflict)
+		return
+	}
 	draft := f.tables[draftID]
 	if draft == nil || draft.ParentModelID == "" {
 		http.Error(w, `{"error":"not a draft"}`, http.StatusBadRequest)
+		return
+	}
+	// THE GOVERNANCE GATE, modelled because it is a property of the SERVER and
+	// not of the CLI: committing into a SHARED feature is admin-only, and the
+	// refusal is a 400 — which is exactly the status the publish loop reads as
+	// "the needs-review case" and, without --no-request-review, converts into a
+	// review request it then reports as a SUCCESS.
+	//
+	// A fake that let every commit through modelled the CLI's intent instead: a
+	// non-admin run against a shared feature came back "published" here and filed
+	// thirty review requests in production. Privilege levels count DOWN, so 10 is
+	// USR_ADMIN.
+	if feature := f.features[draft.FeatureID]; feature != nil &&
+		feature.Scope == scopeOrganization && f.privilegeLevel > 10 {
+		http.Error(w, `{"error":"admin required to commit into a shared feature"}`, http.StatusBadRequest)
 		return
 	}
 	// The base-version CAS, read off the SAME state that makes the review
@@ -793,6 +1032,12 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confi
 		parent.InputModels = append([]string{}, draft.InputModels...)
 		parent.Status = draft.Status
 		parent.UpdatedAt = draft.UpdatedAt.Add(time.Minute)
+		// The commit overwrites the parent's fields FROM THE DRAFT, and copyFields
+		// carries the column rows with them — which is what makes writing prose
+		// into a draft the right thing to do rather than a way of losing it.
+		parent.Description = draft.Description
+		parent.DescriptionSource = draft.DescriptionSource
+		f.copyColumnDocs(draftID, parent.ID)
 		f.synced[parent.ID] = true
 	}
 	f.dropDraft(draftID)

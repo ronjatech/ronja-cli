@@ -457,6 +457,15 @@ func TestSyncCheckMapsValidateFindings(t *testing.T) {
 			Severity: "warning", Code: "secret_dropped", Message: "secret not reachable", Path: "main.py",
 			Marker: "{{ secret('secret-gone', 'token') }}",
 		}, syncExitDrifted, edgeUnreachable},
+		// `{{ module }}` is a per-reference marker like the rest, and an
+		// unmapped code is not a silent drop — it lands in the folder's
+		// `findings` and still reddens the verdict — so the thing this case
+		// actually pins is that it arrives as an EDGE, which is the only shape
+		// a reader can scan for the module by name.
+		{"unresolved module", api.ValidateFinding{
+			Severity: "error", Code: "unresolved_module", Message: "no such module", Path: "main.py",
+			Marker: "{{ module('module-gone') }}",
+		}, syncExitDrifted, edgeUnreachable},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

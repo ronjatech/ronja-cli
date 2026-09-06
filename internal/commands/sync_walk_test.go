@@ -235,3 +235,39 @@ func TestSyncUnknownKindClaimsNoKind(t *testing.T) {
 		}
 	}
 }
+
+// A module folder is understood and not covered, and the difference has to
+// reach the reader. Before `ronja module` existed the probe answered "unknown
+// kind" for one, which sent an author to upgrade a CLI that was already new
+// enough; and the moment the probe learned the kind, the dispatch below became
+// the real hazard — both sync verbs end in a `default:` arm, so an uncaught
+// module folder would have been reported on as a WORKFLOW, against workflow
+// endpoints, using a module's id.
+func TestSyncModuleFolderIsNotCoveredRatherThanUnknown(t *testing.T) {
+	base := t.TempDir()
+	seedManifest(t, filepath.Join(base, "tracker"), wfdir.ModuleKind, nil)
+
+	found, err := discoverFolders(base)
+	if err != nil {
+		t.Fatalf("discoverFolders: %v", err)
+	}
+	if len(found) != 1 {
+		t.Fatalf("found %d folders, want 1", len(found))
+	}
+	f := found[0]
+	if !f.notChecked() {
+		t.Fatalf("module folder was checked; it has no leg in either verb")
+	}
+	if f.Reason != syncReasonKindNotCovered {
+		t.Errorf("reason = %q, want %q — `unreadable` sends the reader to a CLI upgrade they do not need",
+			f.Reason, syncReasonKindNotCovered)
+	}
+	// The kind IS established here, unlike the unknown-kind case, so the report
+	// line must carry it rather than an empty string.
+	if f.Kind.Name != wfdir.KindModule {
+		t.Errorf("kind = %q, want %q", f.Kind.Name, wfdir.KindModule)
+	}
+	if !strings.Contains(f.Detail, "ronja module status") {
+		t.Errorf("detail does not name the command that DOES answer for this folder: %q", f.Detail)
+	}
+}

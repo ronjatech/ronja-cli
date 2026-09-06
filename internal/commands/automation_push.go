@@ -153,6 +153,31 @@ func automationWriteIsInfrastructural(err error) bool {
 	return status == 0 || status == 429 || status >= 500
 }
 
+// automationOrphanError is the refusal a file that left the folder earns, in the
+// one place the push and `sync apply`'s local pre-flight both read it from.
+func automationOrphanError(orphans []string) error {
+	return fmt.Errorf("%d %s bound to an automation and %s gone from this folder:\n    %s\n  Those automations are LIVE and this push leaves them alone. A file lost to a bad rebase must not silently stop one, so deleting is an explicit choice: `ronja automation push --prune`. Restore the files instead if that is what you meant.\n  ⚠️ --prune is a 30-day SOFT delete that also pauses the row, and this CLI cannot empty that trash (purging is a human-only route in the web app).",
+		len(orphans), plural(len(orphans), "file"), agree(len(orphans), "is", "are"),
+		strings.Join(orphans, "\n    "))
+}
+
+// refuseBoundAutomationsWithNoFeature is runAutomationPush's step-5 refusal, in
+// the one place it and `sync apply`'s local pre-flight both read it from.
+//
+// ⚠️ It is NOT step 4's create refusal in another guise, and that is why the two
+// are separate. A folder that creates nothing reaches step 5 with an empty
+// featureID quite legally — the lock deliberately stores none — and
+// ListAutomations("") filters every row away rather than failing, which the loop
+// then reads as "every automation is gone".
+func refuseBoundAutomationsWithNoFeature(f *folder) error {
+	if len(f.Binding.Automations) == 0 || f.Binding.FeatureID != "" {
+		return nil
+	}
+	return fmt.Errorf("this folder is bound to %d %s here, and nothing can be compared against without knowing which feature holds them, so nothing was pushed.\n  %s",
+		len(f.Binding.Automations), plural(len(f.Binding.Automations), "automation"),
+		automationFeatureAdvice(f))
+}
+
 func runAutomationPush(ctx context.Context, f *folder, opts automationPushOptions) (*automationPushResult, error) {
 	client := newClient(f.Resolved.URL, f.Resolved.Token)
 	result := &automationPushResult{
@@ -185,7 +210,7 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 			strings.Join(lines, "\n    "))
 	}
 	aliases := checkAliases(f.Manifest, f.selection(), f.Codec, local,
-		folderStems(f.Kind, local), folderFieldRefs(f.Kind, local))
+		folderStems(f.Kind, local), folderFieldRefs(f.Kind, f.Root, local))
 	if err := aliases.err(); err != nil {
 		return nil, err
 	}
@@ -213,9 +238,7 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 	// --- 2. A file that left the folder is not an automation this deletes ----
 	orphans := automationOrphans(f.Binding, local)
 	if len(orphans) > 0 && !opts.Prune {
-		return nil, fmt.Errorf("%d %s bound to an automation and %s gone from this folder:\n    %s\n  Those automations are LIVE and this push leaves them alone. A file lost to a bad rebase must not silently stop one, so deleting is an explicit choice: `ronja automation push --prune`. Restore the files instead if that is what you meant.\n  ⚠️ --prune is a 30-day SOFT delete that also pauses the row, and this CLI cannot empty that trash (purging is a human-only route in the web app).",
-			len(orphans), plural(len(orphans), "file"), agree(len(orphans), "is", "are"),
-			strings.Join(orphans, "\n    "))
+		return nil, automationOrphanError(orphans)
 	}
 
 	// --- 3. The authority a mailbox needs, said before it is needed ---------
@@ -223,21 +246,27 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 		return nil, err
 	}
 
-	// --- 4. Creating an automation needs a feature --------------------------
+	// --- 4. The local decision, per file ------------------------------------
+	//
+	// Create or update, and the refusal a create earns when this folder names no
+	// feature. Taken through applyDecisionsFor so a tree-wide apply and its
+	// dry-run read the same answer this loop acts on; nothing here needs a
+	// request. See sync_decision.go.
+	//
+	// ⚠️ Its third answer — applyActionUnanchored, a bound row this folder has no
+	// anchor for — is deliberately NOT acted on here. This loop has always
+	// pushed such a file with both guards disarmed, and its write is what RECORDS
+	// the anchor; refusing it here would leave the folder with no way to earn
+	// one. Whether a tree-wide apply may write it is `sync apply`'s decision, not
+	// a side effect of moving where the create fork is spelled.
+	decisions := applyDecisionsFor(f, sortedPaths(local))
+	if err := errFromDecisions(decisions); err != nil {
+		return nil, err
+	}
 	creating := false
-	for _, path := range sortedPaths(local) {
-		if f.Binding.Automations[path] != "" {
-			continue
-		}
-		creating = true
-		if f.Binding.FeatureID == "" {
-			if others := f.otherOrganizationsOn(); !f.Bound && len(others) > 0 {
-				return nil, fmt.Errorf("%s has no automation yet, and this folder names no feature for organization %s on %s in %s — the entries there name %s instead, and an automation's ids belong to the organization that holds them.\n  %s",
-					path, f.Key.TenantID, f.Resolved.URL, wfdir.ManifestPath(f.Root),
-					strings.Join(others, ", "), f.featureAdviceForAnotherOrganization())
-			}
-			return nil, fmt.Errorf("%s has no automation yet and this folder names no feature, so there is nowhere to create one.\n  %s, or start from `ronja automation init --feature <id>`",
-				path, f.featureAdvice())
+	for _, d := range decisions {
+		if d.Creates() {
+			creating = true
 		}
 	}
 	// A create WRITES a binding, and a binding must name its organization
@@ -259,10 +288,8 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 	// any orphan and deletes each one unguarded. `status` already refuses this
 	// case with automationFeatureAdvice, so the same advice is given here rather
 	// than a second wording of the same missing key.
-	if len(f.Binding.Automations) > 0 && f.Binding.FeatureID == "" {
-		return nil, fmt.Errorf("this folder is bound to %d %s here, and nothing can be compared against without knowing which feature holds them, so nothing was pushed.\n  %s",
-			len(f.Binding.Automations), plural(len(f.Binding.Automations), "automation"),
-			automationFeatureAdvice(f))
+	if err := refuseBoundAutomationsWithNoFeature(f); err != nil {
+		return nil, err
 	}
 	rows := map[string]*api.Automation{}
 	if len(f.Binding.Automations) > 0 {

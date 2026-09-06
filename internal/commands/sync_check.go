@@ -604,7 +604,15 @@ func pipelineReferences(ctx context.Context, f *folder, checker *edgeChecker) (
 	pipe := newPipelineCodec(f, files)
 	edges = append(edges, dependencyEdges(f.Manifest, aliases)...)
 	edges = append(edges, markerEdges(f, files, &pipe)...)
-	return checker.apply(ctx, edges), nil, aliases.Warnings, "", ""
+	// The DOCS SIDECARS are references too, and they are the one kind written as
+	// a FILE NAME rather than as a marker: `tables/orders.json` says this folder
+	// documents whatever `orders` binds to here. Nothing above would look at
+	// them — markers.Scan reads .sql and finds nothing, and the alias edges only
+	// cover names ronja.json declares, which a sidecar written against a literal
+	// id deliberately is not.
+	docsEdges, docsFindings := tableDocsEdges(f)
+	edges = append(edges, docsEdges...)
+	return checker.apply(ctx, edges), docsFindings, aliases.Warnings, "", ""
 }
 
 // dataAppReferences checks what a data app DECLARES, and compares it against
@@ -657,7 +665,7 @@ func folderSourceAndAliases(f *folder) (map[string]string, aliasReport, error) {
 	if err != nil {
 		return nil, aliasReport{}, err
 	}
-	return files, checkAliases(f.Manifest, f.selection(), f.Codec, files, folderStems(f.Kind, files), folderFieldRefs(f.Kind, files)), nil
+	return files, checkAliases(f.Manifest, f.selection(), f.Codec, files, folderStems(f.Kind, files), folderFieldRefs(f.Kind, f.Root, files)), nil
 }
 
 // checkVerdictOf folds one folder's edges into its verdict.

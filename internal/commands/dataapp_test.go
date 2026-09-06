@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1199,11 +1201,21 @@ func TestAppPushSaysSoWhenItCannotFindOutWhatLanded(t *testing.T) {
 }
 
 // TestAppPushReconcilesAnUncertainDelete covers the DELETE half of the
-// reconcile, where the SAME 404 answer means the opposite of what it means for a
-// write: a file that is not on the server is a deletion that LANDED, where for a
-// PUT it is one that missed. A branch that read the answer the other way round
-// would still look right against whichever quadrant it was checked against, so
-// both are staged here.
+// reconcile against the backend as it actually answers.
+//
+// The two quadrants are not symmetric, and that asymmetry is the finding: the
+// reconciling read is a GET on :id/files/*path, which answers 400 "no rows" for
+// a path that is not there (fileRouteMiss — the one route the by-id 404 pass
+// deliberately left alone). So a deletion that LANDED is unreadable: the CLI
+// asks, gets a 400, learns nothing, and reports the path as uncertain with the
+// baseline still claiming it. A deletion that MISSED is readable, because the
+// file is still there to be returned.
+//
+// The consequence for the author is real and is asserted below: after an
+// uncertain delete the retry is a DRIFT REFUSAL ("removed there"), not an
+// ordinary push. That is the honest cost of the 400, and it is the reason
+// reconcileUncertainAppWrite's 404 branch is dormant against every shipped
+// backend — see TestAppReconcile404BranchIsDormant for that branch's own cover.
 //
 // rdataapp.DeleteFile removes the row and recompiles the bundle afterwards, out
 // of transaction, which is what makes the outcome uncertain in the first place —
@@ -1214,19 +1226,25 @@ func TestAppPushReconcilesAnUncertainDelete(t *testing.T) {
 		// stage makes the DELETE of lib/old.tsx fail. The difference between the
 		// two is whether the row was removed before it did.
 		stage func(*fakeAppInstance)
-		// landed is what the reconcile must establish, and what the report, the
-		// baseline and the server then all have to agree on.
+		// landed says whether the server actually removed the row — what the
+		// fake staged, not what the CLI can see.
 		landed bool
+		// readable says whether the reconciling read can ESTABLISH that. Only
+		// the missed half is readable: a present file comes back as a row, an
+		// absent one comes back as the 400 the CLI cannot interpret.
+		readable bool
 	}{
 		{
-			name:   "the deletion landed",
-			stage:  func(f *fakeAppInstance) { f.failDeleteAfterWrite = map[string]int{"lib/old.tsx": 500} },
-			landed: true,
+			name:     "the deletion landed, and the 400 hides it",
+			stage:    func(f *fakeAppInstance) { f.failDeleteAfterWrite = map[string]int{"lib/old.tsx": 500} },
+			landed:   true,
+			readable: false,
 		},
 		{
-			name:   "the deletion missed",
-			stage:  func(f *fakeAppInstance) { f.failDelete = map[string]int{"lib/old.tsx": 500} },
-			landed: false,
+			name:     "the deletion missed, and the read proves it",
+			stage:    func(f *fakeAppInstance) { f.failDelete = map[string]int{"lib/old.tsx": 500} },
+			landed:   false,
+			readable: true,
 		},
 	}
 	for _, tc := range cases {
@@ -1264,36 +1282,91 @@ func TestAppPushReconcilesAnUncertainDelete(t *testing.T) {
 			}
 			var result appPushResult
 			decodeJSONInto(t, out, &result)
-			if len(result.Uncertain) != 0 {
-				t.Errorf("the reconciling read succeeded, so nothing is unknown: %+v", result.Uncertain)
+			if uncertain := slices.Contains(result.Uncertain, "lib/old.tsx"); uncertain == tc.readable {
+				t.Errorf("report lists it as uncertain = %v, want %v — an unreadable outcome must be declared, and a readable one must not be", uncertain, !tc.readable)
 			}
 
 			_, stillThere := f.FileContents(draft.ID)["lib/old.tsx"]
 			if stillThere == tc.landed {
 				t.Fatalf("the fake staged the wrong half: file present = %v, deletion landed = %v", stillThere, tc.landed)
 			}
-			if got := slices.Contains(result.Deleted, "lib/old.tsx"); got != tc.landed {
-				t.Errorf("report lists it as deleted = %v, want %v — the report has to describe what the server holds", got, tc.landed)
+			// The report claims a deletion only when the read PROVED one, which
+			// on this route it never can — the proof would be a 404.
+			if got := slices.Contains(result.Deleted, "lib/old.tsx"); got {
+				t.Errorf("report lists it as deleted, but the reconciling read could not establish that (it answers 400, not 404)")
 			}
 			base := appStateOf(t, root).For(f.Key())
 			if base == nil {
 				t.Fatal("expected a baseline to be recorded after a partial push")
 			}
-			if _, recorded := base.Files["lib/old.tsx"]; recorded == tc.landed {
-				t.Errorf("baseline records it = %v, want %v: %v", recorded, !tc.landed, base.Files)
+			// The baseline only ever DROPS a path on a 404. It therefore still
+			// claims lib/old.tsx in both halves — conservative, and the safe
+			// direction: a baseline that under-claims a deletion costs one drift
+			// refusal, one that over-claims silently overwrites somebody's work.
+			if _, recorded := base.Files["lib/old.tsx"]; !recorded {
+				t.Errorf("baseline dropped the path, but only a 404 may do that: %v", base.Files)
 			}
 
-			// The consequence either way: the baseline describes the server, so the
-			// retry is an ordinary push rather than a drift refusal about the CLI's
-			// own half-finished work.
 			f.failDeleteAfterWrite, f.failDelete = nil, map[string]int{}
-			if _, err := runCLI(t, root, "app", "push", "--json"); err != nil {
-				t.Fatalf("the retry must not be refused: %v", err)
+			_, retryErr := runCLI(t, root, "app", "push", "--json")
+			if tc.landed {
+				// The honest cost of the 400: the server no longer holds a file
+				// the baseline still claims, so the retry reports DRIFT rather
+				// than quietly re-deleting. The author sees it and forces past.
+				if retryErr == nil {
+					t.Fatal("want a drift refusal on the retry — the baseline still claims a file the server deleted, and pushing over that silently is the failure mode the guard exists for")
+				}
+				if _, forceErr := runCLI(t, root, "app", "push", "--force", "--json"); forceErr != nil {
+					t.Fatalf("--force must clear it: %v", forceErr)
+				}
+			} else if retryErr != nil {
+				t.Fatalf("nothing moved on the server, so the retry is an ordinary push: %v", retryErr)
 			}
 			if _, ok := f.FileContents(draft.ID)["lib/old.tsx"]; ok {
 				t.Error("the retry left the deleted file on the server")
 			}
 		})
+	}
+}
+
+// TestAppReconcile404BranchIsDormant is the only cover for
+// reconcileUncertainAppWrite's 404 branch, and it is labelled as such: NO
+// SHIPPED BACKEND REACHES IT. GET /dataapp/:id/files/*path answers 400 "no
+// rows" for a path that is not there and always has (api/v2/dataapp's
+// fileRouteMiss, pinned server-side by TestFileRouteMissStaysA400) — the one
+// route the by-id 404 pass deliberately left alone, precisely because THIS
+// branch drops the path from the sync baseline and a shipped binary must not
+// start doing that against an app it merely cannot reach.
+//
+// So the fake in every other app test answers 400, and this one stands up a
+// hypothetical FUTURE server that 404s, to pin what the branch would then do.
+// The day the backend flips, this stops being hypothetical and the fake changes
+// to match; until then, delete neither.
+func TestAppReconcile404BranchIsDormant(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+	}))
+	defer srv.Close()
+	client := api.New(srv.URL, "test-token")
+
+	// A PUT: nothing there means the write MISSED, and the baseline must stop
+	// claiming the path.
+	want := "mine\n"
+	landed := map[string]string{"App.tsx": "acknowledged\n"}
+	if got := reconcileUncertainAppWrite(context.Background(), client, aliasCodec{}, "data_app-1", "App.tsx", &want, landed); got != appWriteMissed {
+		t.Errorf("verdict = %v, want appWriteMissed — an absent file after a PUT is a write that did not land", got)
+	}
+	if _, still := landed["App.tsx"]; still {
+		t.Errorf("baseline still claims a path the server says is not there: %v", landed)
+	}
+
+	// A DELETE inverts it: the SAME answer is a deletion that LANDED.
+	landed = map[string]string{"lib/old.tsx": "acknowledged\n"}
+	if got := reconcileUncertainAppWrite(context.Background(), client, aliasCodec{}, "data_app-1", "lib/old.tsx", nil, landed); got != appWriteLanded {
+		t.Errorf("verdict = %v, want appWriteLanded — an absent file after a DELETE is a deletion that took effect", got)
+	}
+	if _, still := landed["lib/old.tsx"]; still {
+		t.Errorf("baseline still claims a deleted path: %v", landed)
 	}
 }
 
@@ -1581,6 +1654,35 @@ func TestAppPushExplainsCreateRefusals(t *testing.T) {
 				t.Errorf("expected the message to explain %q, got %v", tc.want, err)
 			}
 		})
+	}
+}
+
+// The unreachable-feature create against a CURRENT backend, which retyped the
+// lookup miss: the three cases above all arrive as 400, this one as `404
+// {"error":"not found"}`. The bare code is status-gated to 404 in
+// explainFeatureUnreachable, so this is the arm that proves the current
+// backend's answer still reaches the reader as a sentence about the feature —
+// and the 400 cases stay because older instances still answer that way.
+func TestAppPushExplainsACurrentBackendCreateRefusal(t *testing.T) {
+	f := newFakeAppInstance(t)
+	f.failCreate = http.StatusNotFound
+	f.failCreateMessage = "not found"
+	signInApp(t, f)
+
+	root := writeAppFolder(t, t.TempDir(), &wfdir.Manifest{Title: "App"},
+		map[string]string{"App.tsx": "x"})
+	m := appManifestOf(t, root)
+	m.SetBinding(f.Key(), wfdir.Binding{FeatureID: "feat-1"})
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runCLI(t, root, "app", "push")
+	if err == nil {
+		t.Fatal("expected the create refusal to fail the push")
+	}
+	if !strings.Contains(err.Error(), "has no feature feat-1 you can reach") {
+		t.Errorf("a 404 lookup miss reached the reader as a bare sentinel: %v", err)
 	}
 }
 

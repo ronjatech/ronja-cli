@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/tabledocs"
 	"github.com/ronjatech/ronja-cli/internal/tablerefs"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
@@ -136,6 +137,25 @@ type pipelinePublishedFile struct {
 	URL                string `json:"-"`
 }
 
+// pipelineStagedDrafts names the files this folder has recorded a draft for, in
+// path order — exactly the set a publish with no arguments acts on.
+//
+// A function rather than a loop inside the publish because `sync apply` has to
+// ask the same question BEFORE deciding to call the publish at all: "is there
+// anything staged here", asked of the one record that answers it. A second loop
+// over inst.Tables would be a second definition of what a publish targets, and
+// the two would drift the day the selection grows a condition.
+func pipelineStagedDrafts(inst *wfdir.InstanceState) []string {
+	var out []string
+	for path, state := range inst.Tables {
+		if state.DraftID != "" {
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequestReview, overwriteRemote bool) (*pipelinePublishResult, error) {
 	client := newClient(f.Resolved.URL, f.Resolved.Token)
 	result := &pipelinePublishResult{
@@ -164,7 +184,7 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 	codec := newPipelineCodec(f, local)
 	// Reported, never refused: publish acts on drafts that are already staged and
 	// built, and a bind that has gone missing since the push cannot un-build them.
-	noteAliasReport(checkAliases(f.Manifest, f.selection(), f.Codec, local, folderStems(f.Kind, local), folderFieldRefs(f.Kind, local)))
+	noteAliasReport(checkAliases(f.Manifest, f.selection(), f.Codec, local, folderStems(f.Kind, local), folderFieldRefs(f.Kind, f.Root, local)))
 	inst := pipelineBaseline(f)
 
 	var targets []string
@@ -173,12 +193,7 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 			return nil, err
 		}
 	} else {
-		for path, state := range inst.Tables {
-			if state.DraftID != "" {
-				targets = append(targets, path)
-			}
-		}
-		sort.Strings(targets)
+		targets = pipelineStagedDrafts(inst)
 	}
 	if len(targets) == 0 {
 		result.Nothing = true
@@ -462,6 +477,18 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 	// that then refuses because it could not prove the commit landed at all.
 	overwroteVersionID := ""
 	commitErr := client.CommitTableDraft(ctx, draft.ID, "")
+	// A commit lands the draft's NAME on the live row, so a second 409 now wears
+	// this status: the name is taken in the feature. It is answered first and on
+	// the CODE, because the branch below is about somebody else's work and sends
+	// the author to `discard` or `--overwrite-remote` — neither of which frees a
+	// name, and one of which throws away a colleague's version to no purpose.
+	if why, taken := api.AsNameTaken(commitErr); taken {
+		// The fix is in the web app, not in this folder: `push` sends a name on
+		// CREATE only, so renaming the .sql file does not rename the table — it
+		// unbinds the file and the next push creates a second one beside it.
+		return refuse("committing %s was refused — the name your draft would publish is taken:\n      %s\n    Nothing was committed and your draft is intact. Rename one of the two tables in the web app, then publish again",
+			out.TableID, why)
+	}
 	if commitErr != nil && api.StatusOf(commitErr) == api.StatusConflict {
 		// The one refusal that is about somebody else's work rather than about
 		// permission: the table moved after this draft forked, so committing would
@@ -611,6 +638,34 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 			out.TableID, out.OverwroteVersionID)
 	}
 	out.Cascade = folderDependents(codec, local, out.TableID)
+	// ARMED ONLY BY A FILE THAT CARRIES A HEADER, which is the rule
+	// wfdir.LockTable.MetaSHA256 states and which this command was quietly
+	// breaking: it recorded the fingerprint for every table it published,
+	// documenting file or not. The cost is not a wasted hash — it is a diff in a
+	// COMMITTED file (`metaSHA256` per table in ronja.lock.json) appearing in
+	// every existing pipeline folder on its next publish, for a feature nobody in
+	// that folder has adopted, arming a drift leg that then pauses a later push
+	// for prose that was never this folder's business.
+	docs, _ := tabledocs.ParseHeader(local[path])
+	documented := !docs.Empty()
+	// AND DOCUMENTED IS NOT THE SAME QUESTION AS DOCUMENTED SUCCESSFULLY. The
+	// line above reads the FILE; this one reads the ROW, and they disagree in
+	// exactly one case, which is the one that matters: a push whose SQL landed
+	// and whose prose was refused (pushOutcomeDocsFailed). That push withheld
+	// recordSynced on purpose so the file stays re-pushable — and publish, which
+	// runs in a different process and remembers nothing, used to bank BOTH the
+	// content baseline and the documentation agreement anyway, from a header it
+	// had only parsed. The file then hashes clean, the bare push skips it, the
+	// meta leg reads driftNone, and the committed header and the row disagree for
+	// ever. See docsLanded for how the row is asked under the join rule.
+	//
+	// Only meaningful where the row could be read; the liveErr branch below never
+	// consults it.
+	landed := docsLanded(docs, live)
+	if documented && liveErr == nil && !landed {
+		fmt.Fprintf(os.Stderr, "  Note: %s was published, but %s does not hold the documentation this file declares — its prose never landed (a push can report that as `documentation NOT written`). The file is left as unsynced so the next `ronja pipeline push` sends it again.\n",
+			path, out.TableID)
+	}
 	// Both fingerprints now describe the same thing, and it is the LIVE table:
 	// the draft they were taken from does not exist any more. Best-effort — the
 	// server-side change has already happened, and failing the command afterwards
@@ -618,11 +673,47 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 	switch {
 	case liveErr != nil:
 		fmt.Fprintf(os.Stderr, "  Note: %s was published, but its baseline could not be refreshed (%v) — `ronja pipeline status` will show it as drifted until the next push.\n", path, liveErr)
+		// The DOCUMENTATION fingerprint is CLEARED rather than left, and this is
+		// the one branch where the two halves behave differently. The commit just
+		// copied the draft's column rows onto the live table, so whatever was
+		// recorded describes a state that has certainly moved — keeping it would
+		// refuse the next documenting push and name a change this folder made
+		// itself. Empty is "no answer", which the next push adopts from the row it
+		// reads. (The SQL leg above is left alone deliberately: its note tells the
+		// author status will show drift, and the code half is what --force exists
+		// for. Prose has no such recovery worth spending, because it is re-derived
+		// from the file on the next push anyway.)
+		if documented {
+			recordMetaAgreement(f.live(inst), path, out.TableID, "")
+		}
 	case unresolved:
 		fmt.Fprintf(os.Stderr, "  Note: %s was published, but its stored SQL canonicalizes to something this client cannot read, so the baseline was left alone.\n", path)
+		if documented && landed {
+			recordMetaAgreement(f.live(inst), path, out.TableID, metaOf(live))
+		}
 	default:
 		recordLiveAgreement(f.live(inst), path, out.TableID, liveCode)
-		recordSynced(inst, path, liveCode)
+		// The third leg's agreement, at the third moment it is true: the commit
+		// copied the draft's prose onto the live row, and this read is of that
+		// row. Without it the next documenting push would report the folder's own
+		// publish as somebody else's edit. `live` is a GetTable answer, the only
+		// response carrying the column catalog — see metaOf.
+		//
+		// AND ONLY WHEN IT REALLY IS TRUE. An agreement recorded here for prose
+		// the row does not hold is the drift guard being disarmed by the very
+		// command it is meant to protect against.
+		if documented && landed {
+			recordMetaAgreement(f.live(inst), path, out.TableID, metaOf(live))
+		}
+		// The SQL leg above is recorded either way — it DID land, and leg (a) has
+		// to keep describing the row this folder just published. What is withheld
+		// when the prose did not land is the CONTENT baseline, because that is
+		// what the bare-push selector reads: leaving it as push left it is the
+		// whole of "the file is still unsynced, send it again". The URL is
+		// reported regardless; the table exists and the reader wants the link.
+		if !documented || landed {
+			recordSynced(inst, path, liveCode)
+		}
 		out.URL = live.URL
 	}
 	return out

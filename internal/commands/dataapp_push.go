@@ -115,6 +115,12 @@ type appPushResult struct {
 	Unchanged int      `json:"unchanged"`
 	// UpToDate reports a push that had nothing to do.
 	UpToDate bool `json:"upToDate"`
+	// DraftPreexisted reports that DraftID names a row that was ALREADY open
+	// before this push ran, rather than one this push checked out (or created).
+	// It is `sync apply`'s half of the up-to-date question — see the identical
+	// field on pushResult, and applyFolder — and is deliberately out of the
+	// --json payload for the same reason.
+	DraftPreexisted bool `json:"-"`
 	// DraftUnderReview reports that the draft written to has already been
 	// submitted for admin review — the push changed what someone is reviewing.
 	DraftUnderReview bool `json:"draftUnderReview"`
@@ -227,6 +233,19 @@ type compileCheck struct {
 	Waited time.Duration `json:"-"`
 }
 
+// refuseMissingAppEntrypoint is runAppPush's whole-folder local guard — the
+// data-app half of refuseMissingEntrypoint, worded for the kind because an app's
+// entrypoint is what the bundle compiles from, and shared with
+// decideApplyPushPreflight for the same reason.
+func refuseMissingAppEntrypoint(f *folder, local map[string]string) error {
+	entrypoint := f.Manifest.Entrypoint
+	if _, ok := local[entrypoint]; ok {
+		return nil
+	}
+	return fmt.Errorf("the entrypoint %q is not in this folder — a data app compiles from it, so it has to exist.\n  Create it, or check \"entrypoint\" in %s",
+		entrypoint, wfdir.ManifestPath(f.Root))
+}
+
 // runAppPush is the whole state machine, kept out of the cobra closure so it is
 // testable as a function and so the reporting path has exactly one shape.
 //
@@ -259,9 +278,8 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 		return nil, err
 	}
 	entrypoint := f.Manifest.Entrypoint
-	if _, ok := local[entrypoint]; !ok {
-		return nil, fmt.Errorf("the entrypoint %q is not in this folder — a data app compiles from it, so it has to exist.\n  Create it, or check \"entrypoint\" in %s",
-			entrypoint, wfdir.ManifestPath(f.Root))
+	if err := refuseMissingAppEntrypoint(f, local); err != nil {
+		return nil, err
 	}
 	// The capability vocabulary is closed and the SERVER does not police it —
 	// an unknown name is dropped at token-mint time, so a typo publishes green
@@ -296,7 +314,15 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	}
 
 	// 3. Resolve the row to write to — the first step that changes anything.
-	target, err := resolveAppPushTarget(ctx, client, f, existing, result)
+	// Whether this is a CREATE is a local decision (see sync_decision.go), taken
+	// there rather than re-read off the inspection: the two agree by construction
+	// — inspectAppTarget answers a nil App exactly when the binding names none —
+	// and a tree-wide apply must decide it without having inspected anything.
+	//
+	// Recorded BEFORE the resolution, because the resolution is what destroys the
+	// answer — see the same line in runPush.
+	result.DraftPreexisted = existing.Row() != nil
+	target, err := resolveAppPushTarget(ctx, client, f, appApplyDecision(f), existing, result)
 	if err != nil {
 		return nil, err
 	}
@@ -553,24 +579,15 @@ func compileMessageOf(verr error, fromWrite *api.CompileError) string {
 // deleted, archived or turned into a proposal is reported as broken by
 // inspectAppTarget. Quietly creating a second app would leave the old one's
 // viewers pointing at a row nobody edits any more.
-func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, existing appTarget, result *appPushResult) (*api.DataApp, error) {
-	if existing.App == nil {
+func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, decision applyDecision, existing appTarget, result *appPushResult) (*api.DataApp, error) {
+	// The no-feature refusal, which sync_decision.go owns so that a dry-run reads
+	// the same sentence rather than a second wording of it. Only ever set on a
+	// create, so it stays inside this function's own create branch in effect.
+	if err := decision.Err(); err != nil {
+		return nil, err
+	}
+	if decision.Creates() {
 		featureID := f.Binding.FeatureID
-		if featureID == "" {
-			// The ORGANIZATION is part of the answer whenever this folder has NO
-			// entry here and names another one instead — the same reason
-			// featureIDFor says so for a workflow, and the case `app push
-			// --profile <other>` lands in. "Add featureID to its entry" sends
-			// the reader to a line that already has one, in an entry belonging
-			// to a different organization.
-			if others := f.otherOrganizationsOn(); !f.Bound && len(others) > 0 {
-				return nil, fmt.Errorf("this folder has no feature to create the data app in for %s — it is bound to %s instead, and a data app's ids belong to the organization that holds them, so nothing recorded in %s can be pushed under this credential.\n  %s",
-					describeTarget(f.Resolved), f.describeOrganizationIDs(others),
-					wfdir.ManifestPath(f.Root), f.featureAdviceForAnotherOrganization())
-			}
-			return nil, fmt.Errorf("this folder has no feature to create the data app in — %s, or start again with `ronja app init --feature <id>`",
-				f.featureAdvice())
-		}
 		// A first push is the one path here that WRITES a binding, so this is
 		// where the organization has to be authoritative rather than adopted from
 		// an entry that does not exist yet.
@@ -897,6 +914,18 @@ func reconcileUncertainAppWrite(ctx context.Context, client *api.Client, codec a
 	saved, err := client.GetDataAppFile(ctx, targetID, path)
 	if err != nil {
 		if api.StatusOf(err) == 404 {
+			// ⚠️ DORMANT AGAINST EVERY SHIPPED BACKEND, BY DESIGN. GET
+			// :id/files/*path answers 400 "no rows" for a path that is not
+			// there — the one route the server's by-id 404 pass deliberately
+			// left alone (api/v2/dataapp's fileRouteMiss, pinned there by
+			// TestFileRouteMissStaysA400), precisely because THIS branch drops
+			// the path from the sync baseline: were the route to 404 for an app
+			// the caller merely cannot READ, every path would report itself
+			// deleted. So a 400 lands on appWriteUnknown below and the author
+			// gets a drift refusal on the retry — the conservative half.
+			// Kept, and tested (TestAppReconcile404BranchIsDormant), because the
+			// binary ships against servers it was not built with.
+			//
 			// Nothing there: a PUT that did not land, or a DELETE that did.
 			// Either way the baseline must stop claiming the path — left standing,
 			// it would make the next push read a deletion this one performed as a

@@ -103,6 +103,16 @@ different feature: that is an edit to ronja.json, not a flag.`,
 			if err != nil {
 				return err
 			}
+			// Refused HERE, before the folder is opened, because everything
+			// below this line is about reconciling declared names and a module
+			// has none to reconcile. Without it `bind` runs to completion on a
+			// module folder and reports "0 names bound" — which is true, and
+			// which a reader takes as "nothing was missing" rather than "this
+			// command does not apply here".
+			if kind.Name == wfdir.KindModule {
+				return fmt.Errorf("this is a %s folder, and `ronja bind` has nothing to do in one: %s.\n  For what you CAN do here, see `ronja module --help`",
+					kind.Label, moduleDependenciesInert)
+			}
 			// BEFORE openFolder, and that ordering is the whole point of the
 			// check. openFolder runs adoptStack, which WRITES ronja.json when a
 			// folder still in the legacy `instances[]` shape is named with
@@ -165,6 +175,9 @@ func folderKindHere() (wfdir.Kind, error) {
 			// same set as the kinds this build can READ and is deliberately not
 			// derived from wfdir's registry: a kind whose command group does not
 			// exist yet has no business in advice about how to make one.
+			//
+			// `ronja module` is absent for a second reason again: it creates a
+			// folder, but not one `bind` acts on — see moduleDependenciesInert.
 			return wfdir.WorkflowKind, fmt.Errorf("no %s here or in any parent directory — run `ronja bind` inside a folder created by `ronja wf`, `ronja app`, `ronja pipeline` or `ronja automation`",
 				wfdir.ManifestName)
 		}
@@ -195,6 +208,15 @@ func folderKindHere() (wfdir.Kind, error) {
 // `known=false`, which is how `ronja sync status` came to exit 2 for a whole
 // tree over a folder it understands perfectly. A registry lookup cannot be left
 // behind that way — see wfdir.KindByName.
+//
+// ⚠️ `known` means THE BUILD UNDERSTANDS THIS KIND, never "this command can act
+// on it". A module folder is known and neither caller acts on one: `bind`
+// refuses it because a module declares no dependencies (see
+// moduleDependenciesInert), and `ronja sync` reports it not_checked for
+// kind_not_covered. Answering `false` for module would have been the cheap way
+// to get both refusals, and it would have made both of them lie — sync would
+// tell the reader this build does not understand a kind it has a whole command
+// for.
 func folderKindAt(root string) (kind wfdir.Kind, known bool, err error) {
 	raw, err := os.ReadFile(wfdir.ManifestPath(root))
 	if err != nil {
@@ -233,6 +255,18 @@ func folderKindLabels() string {
 	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
 }
 
+// moduleDependenciesInert is the ONE wording of why the alias layer does nothing
+// in a module folder, shared by `bind` (which refuses one) and `module status`
+// (which flags a block already committed to one).
+//
+// The alias layer resolves a declared name INTO A MARKER, and module files carry
+// no markers at all — that is the load-bearing rule of the whole primitive, the
+// one `module validate` and `module push` enforce (see moduleMarkerProblem). So
+// a module folder's `dependencies` block has nothing to fill: it is not merely
+// unbound, it is unfillable, and every message about it has to say which of the
+// two it means or the reader goes looking for the binding they are missing.
+const moduleDependenciesInert = "modules are marker-free, so a module folder's `dependencies` block resolves nothing — there is no marker in a module file for an alias to fill. Declare the dependency in the CONSUMER workflow, which does carry markers, and pass the resolved value into this module's function as an argument"
+
 // Why an alias could not be proposed. These strings are the `reason` field of
 // the --json output, so they are a contract with whatever reads it: each one
 // says something a reader would act on differently.
@@ -267,9 +301,9 @@ const (
 // relies on that. They are separate contracts with separate owners: a dependency
 // kind is part of the ronja.json FILE FORMAT (renaming one breaks every folder
 // in the field), and a hit kind is the search endpoint's wire vocabulary. An
-// explicit table also makes the one that has NO counterpart legible — `codex` is
-// absent because the endpoint does not fan out to codexes, so no query can ever
-// return one.
+// explicit table also makes the ones that have NO counterpart legible — `codex`
+// and `module` are absent because the endpoint fans out to neither, so no query
+// can ever return one.
 //
 // ok is false for a kind with no search coverage; the caller has to say which of
 // the two absences it is.

@@ -65,6 +65,40 @@ func TestInitRefusesAFeatureItCannotReach(t *testing.T) {
 	}
 }
 
+// The same refusal against a CURRENT backend, which retyped the lookup miss:
+// where the instance above answers `400 {"error":"no rows"}`, this one answers
+// `404 {"error":"not found"}` — the bare sentinel, not the no-enumeration
+// "feature not found" the 404 arm otherwise carries. explainFeatureUnreachable
+// gates that bare code to a 404 on purpose, so this is the arm that proves the
+// gate lets the real answer through rather than only the two named codes.
+func TestInitRefusesAFeatureItCannotReachOnACurrentBackend(t *testing.T) {
+	f := newFakeInstance(t)
+	f.featureNotFoundBody = "not found"
+	f.featureStatus["feat-foreign"] = http.StatusNotFound
+	signIn(t, f)
+	dir := t.TempDir()
+
+	_, err := runCLI(t, dir, "wf", "init", "--feature", "feat-foreign")
+	if err == nil {
+		t.Fatal("init accepted a feature this credential cannot reach")
+	}
+	// The discriminating assertion: an unmatched code still fails init, but as
+	// the generic "check feature … : not found (HTTP 404)" wrapper. Only the
+	// matcher produces this sentence.
+	if !strings.Contains(err.Error(), "has no feature") || !strings.Contains(err.Error(), "you can reach") {
+		t.Errorf("the current backend's bare sentinel reached the reader unexplained: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Test Org") {
+		t.Errorf("the refusal does not name the organization it would have bound: %v", err)
+	}
+	if !strings.Contains(err.Error(), "feat-foreign") {
+		t.Errorf("the refusal does not name the feature: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, wfdir.ManifestName)); statErr == nil {
+		t.Error("a refused init wrote a manifest naming a feature it had just refused")
+	}
+}
+
 // The refusal names the CREDENTIAL as well as the organization, because "wrong
 // feature" and "right feature, wrong organization" take different fixes and the
 // reader cannot tell them apart from the id alone.

@@ -83,6 +83,10 @@ type LockStack struct {
 	// the moment its author publishes.
 	WorkflowID string `json:"workflowID,omitempty"`
 	DataAppID  string `json:"dataAppID,omitempty"`
+	// ModuleID is a MODULE folder's created row, with the meaning the two above
+	// carry. A module syncs its files into a per-user draft exactly as a
+	// workflow does, so HeadVersionID below is its anchor too.
+	ModuleID string `json:"moduleID,omitempty"`
 	// HeadVersionID is the committed VERSION of the LIVE row that this folder's
 	// content was forked from — the workflow/data-app answer to the question
 	// LockTable.LiveSHA256 answers for a pipeline, and for exactly the same
@@ -136,6 +140,26 @@ type LockStack struct {
 	// below states what it is instead, and it is the one thing to read before
 	// touching any writer of this map.
 	Automations map[string]LockAutomation `json:"automations,omitempty"`
+	// TableDocs is a PIPELINE folder's per-DOCS-SIDECAR state: the table each
+	// committed docs file describes, and that row's documentation fingerprint as
+	// of the last moment this folder agreed with it.
+	//
+	// Keyed by the sidecar's slash-separated relative path (`tables/orders.json`),
+	// exactly as Tables and Automations are keyed by theirs.
+	//
+	// SEPARATE FROM Tables, and the separation is the design rather than an
+	// accident of typing. Tables is keyed by a .sql file — a table this folder
+	// BUILDS — and a sidecar exists precisely for the tables it does not: an
+	// integration table, a foundation table, one a workflow writes. Those have no
+	// .sql file to key on and never will, so folding the two maps together would
+	// mean inventing a fake path for a file that does not exist.
+	//
+	// Committed for Tables' reason: which row a path documents, and what that
+	// row's prose looked like when everybody last agreed with it, are facts about
+	// the ENVIRONMENT rather than about a person. A sidecar writes straight to
+	// the live row — there is no draft in this path — so unlike a pipeline file
+	// there is no per-user half at all.
+	TableDocs map[string]LockTableDocs `json:"tableDocs,omitempty"`
 
 	// ⚠️ There is deliberately NO per-file fingerprint for a workflow or a data
 	// app here, and the asymmetry with Tables above is not an oversight. Those
@@ -163,6 +187,26 @@ type LockStack struct {
 type LockTable struct {
 	TableID    string `json:"tableID"`
 	LiveSHA256 string `json:"liveSHA256,omitempty"`
+	// MetaSHA256 is the LIVE row's DOCUMENTATION as of the last moment this
+	// folder agreed with it — its description plus every column that carries
+	// prose, hashed by tabledocs.MetaSHA256.
+	//
+	// A third leg beside LiveSHA256, and a separate value for the invariant this
+	// type states rather than for tidiness: it is taken from a different part of
+	// the row and answers a different question, so folding it into the SQL hash
+	// would report "the SQL changed" for a description somebody edited in the web
+	// app — and, worse, would make every existing folder's recorded LiveSHA256
+	// wrong on the first push after this field shipped.
+	//
+	// It ARMS ONLY for a push that carries documentation. A folder whose .sql
+	// files open with no `-- @table` header declares nothing about a table's
+	// prose, so there is nothing for the guard to protect and nothing is
+	// recorded — which is what keeps every folder written before this feature
+	// behaving exactly as it did.
+	//
+	// Empty means the guard is DISARMED — "no answer", never "agreed" — exactly
+	// as an absent LiveSHA256 disarms leg (a).
+	MetaSHA256 string `json:"metaSHA256,omitempty"`
 
 	// unknown is this table entry's forward-compatibility sidecar, and it is
 	// here for the same reason Lock and LockStack have one: it is an object in a
@@ -177,6 +221,46 @@ type LockTable struct {
 	// api request types (WorkflowParameter, DataAppAccess) — those are the wire
 	// format too, so preserving them is a decision about what the CLI SENDS.
 	// This type is written to disk and nowhere else.
+	unknown unknownKeys
+}
+
+// LockTableDocs is one docs sidecar's recorded state on one stack.
+//
+// ⚠️ MetaSHA256 obeys the invariant on LockTable, and it is the same invariant
+// for the same reason: A HASH IS ONLY EVER COMPARED AGAINST THE ROW IT WAS TAKEN
+// FROM. TableID is which row that was, so a sidecar rebound to a different table
+// — the alias repointed by `ronja bind`, a stack switched, a merge — drops the
+// fingerprint with it rather than comparing one table's prose against a hash
+// taken from another's.
+type LockTableDocs struct {
+	// TableID is the row this sidecar's alias resolved to when the fingerprint
+	// was taken. It duplicates what the manifest's bind map says today on
+	// purpose: the recording has to name the row it describes, not merely that
+	// it describes one.
+	TableID string `json:"tableID"`
+	// MetaSHA256 is that row's documentation fingerprint (tabledocs.MetaSHA256).
+	// Empty DISARMS the guard — "no answer", never "agreed" — which is the state
+	// of a folder cloned from git and of one written before this field existed.
+	MetaSHA256 string `json:"metaSHA256,omitempty"`
+	// DeclaredSHA256 is the fingerprint of what the FILE declared when it was
+	// last pushed (tabledocs.Docs.Fingerprint) — this sidecar's answer to "has
+	// the local file changed since the last sync", which for a .sql file is
+	// answered by the folder's own content baseline.
+	//
+	// It needs its own field because a sidecar is not in that baseline at all: a
+	// pipeline folder syncs `.sql`, so the enumeration never sees these files.
+	//
+	// ⚠️ TWO FINGERPRINTS OF TWO DIFFERENT THINGS, and the invariant this type
+	// states is why they are not one value: MetaSHA256 is taken from the ROW and
+	// compared against the row, this one is taken from the FILE and compared
+	// against the file. Comparing the file against the row cannot work — a
+	// documented name the table does not have is stored server-side and never
+	// reported back, so such a sidecar would read as pending for ever and be
+	// re-sent on every push.
+	DeclaredSHA256 string `json:"declaredSHA256,omitempty"`
+
+	// unknown is this entry's forward-compatibility sidecar, for the reason
+	// LockTable's has one: it is an object in a COMMITTED file.
 	unknown unknownKeys
 }
 
@@ -238,6 +322,7 @@ var (
 	lockKeys           = jsonFieldNames(reflect.TypeOf(Lock{}))
 	lockStackKeys      = jsonFieldNames(reflect.TypeOf(LockStack{}))
 	lockTableKeys      = jsonFieldNames(reflect.TypeOf(LockTable{}))
+	lockTableDocsKeys  = jsonFieldNames(reflect.TypeOf(LockTableDocs{}))
 	lockAutomationKeys = jsonFieldNames(reflect.TypeOf(LockAutomation{}))
 	stackKeys          = jsonFieldNames(reflect.TypeOf(Stack{}))
 )
@@ -313,6 +398,24 @@ func (t LockTable) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return t.unknown.merge(body)
+}
+
+func (d *LockTableDocs) UnmarshalJSON(data []byte) error {
+	var decoded plainLockTableDocs
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*d = LockTableDocs(decoded)
+	d.unknown.capture(data, lockTableDocsKeys)
+	return nil
+}
+
+func (d LockTableDocs) MarshalJSON() ([]byte, error) {
+	body, err := json.Marshal(plainLockTableDocs(d))
+	if err != nil {
+		return nil, err
+	}
+	return d.unknown.merge(body)
 }
 
 func (a *LockAutomation) UnmarshalJSON(data []byte) error {
@@ -445,7 +548,7 @@ func (l *Lock) Binding(stack string) Binding {
 	if !ok {
 		return Binding{}
 	}
-	b := Binding{WorkflowID: entry.WorkflowID, DataAppID: entry.DataAppID}
+	b := Binding{WorkflowID: entry.WorkflowID, DataAppID: entry.DataAppID, ModuleID: entry.ModuleID}
 	if len(entry.Tables) > 0 {
 		b.Tables = make(map[string]string, len(entry.Tables))
 		for path, table := range entry.Tables {
@@ -475,7 +578,7 @@ func (l *Lock) Binding(stack string) Binding {
 // LockAutomation.UpdatedAt names.
 func (l *Lock) SetBinding(stack string, b Binding) {
 	_, existed := l.entry(stack)
-	if !existed && b.WorkflowID == "" && b.DataAppID == "" && len(b.Tables) == 0 && len(b.Automations) == 0 {
+	if !existed && b.WorkflowID == "" && b.DataAppID == "" && b.ModuleID == "" && len(b.Tables) == 0 && len(b.Automations) == 0 {
 		// Nothing to record and nothing recorded before. `wf init --stack dev`
 		// declares the stack and creates nothing, and writing `{"stacks":{"dev":
 		// {}}}` for it puts a committed file into the customer's repo that says
@@ -493,11 +596,12 @@ func (l *Lock) SetBinding(stack string, b Binding) {
 	// rebound path. Kept, it would be a version id read from one workflow and
 	// compared against another's history, where it can only ever fail to match:
 	// a guard that refuses every push and names a version nobody recognises.
-	if entry.WorkflowID != b.WorkflowID || entry.DataAppID != b.DataAppID {
+	if entry.WorkflowID != b.WorkflowID || entry.DataAppID != b.DataAppID || entry.ModuleID != b.ModuleID {
 		entry.HeadVersionID = ""
 	}
 	entry.WorkflowID = b.WorkflowID
 	entry.DataAppID = b.DataAppID
+	entry.ModuleID = b.ModuleID
 	if b.Tables == nil {
 		entry.Tables = nil
 	} else {
@@ -624,6 +728,81 @@ func (l *Lock) SetTableLive(stack, path, tableID, sha string) {
 	}
 	table.TableID, table.LiveSHA256 = tableID, sha
 	entry.Tables[path] = table
+	l.Stacks[stack] = entry
+}
+
+// TableMeta reads the DOCUMENTATION fingerprint this folder last agreed with for
+// one pipeline file's live table. Empty for a path with no recording, which is
+// what disarms the third drift leg — "no answer", never "agreed".
+func (l *Lock) TableMeta(stack, path string) string {
+	if l == nil {
+		return ""
+	}
+	return l.Stacks[stack].Tables[path].MetaSHA256
+}
+
+// SetTableMeta records the LIVE row's documentation fingerprint as the one this
+// folder agrees with.
+//
+// Called only where that is TRUE — a live row this command just READ, or one it
+// just committed onto — and never with a fingerprint taken from a draft. A
+// draft's prose is not the live row's, and recording it here would report
+// agreement with a state nobody else can see, then refuse every later push as
+// drift on a table that never moved.
+//
+// An empty sha CLEARS the recording, which is how a caller says "I can no longer
+// honestly claim to have seen this row's documentation" — a publish that could
+// not re-read the row it just wrote — without having to know whether one was
+// there before.
+func (l *Lock) SetTableMeta(stack, path, tableID, sha string) {
+	entry := l.stack(stack)
+	if entry.Tables == nil {
+		entry.Tables = map[string]LockTable{}
+	}
+	// Read-edit-store, so the forward-compatibility sidecar survives; and only
+	// for the SAME table, by the invariant on LockTable.
+	table := entry.Tables[path]
+	if table.TableID != tableID {
+		table = LockTable{}
+	}
+	table.TableID, table.MetaSHA256 = tableID, sha
+	entry.Tables[path] = table
+	l.Stacks[stack] = entry
+}
+
+// TableDocsSeen reads one docs sidecar's recorded table id and the documentation
+// fingerprint this folder last agreed with. An unrecorded path answers two empty
+// strings, which disarms the guard.
+func (l *Lock) TableDocsSeen(stack, path string) (tableID, meta, declared string) {
+	if l == nil {
+		return "", "", ""
+	}
+	entry := l.Stacks[stack].TableDocs[path]
+	return entry.TableID, entry.MetaSHA256, entry.DeclaredSHA256
+}
+
+// SetTableDocsSeen records the row a docs sidecar describes and that row's
+// documentation fingerprint at the moment this folder agreed with it.
+//
+// ⚠️ A LEGACY instances[] folder has no stack name, and there is nowhere in a
+// lock keyed by stack name to put its recording — writing one anyway puts
+// `"stacks":{"":{…}}` into a committed file, which is the bug SetAutomationSeen
+// names. Its recording lives in .ronja/state.json instead; see the liveHashes
+// fork in the commands package.
+func (l *Lock) SetTableDocsSeen(stack, path, tableID, meta, declared string) {
+	if stack == "" {
+		return
+	}
+	entry := l.stack(stack)
+	if entry.TableDocs == nil {
+		entry.TableDocs = map[string]LockTableDocs{}
+	}
+	docs := entry.TableDocs[path]
+	if docs.TableID != tableID {
+		docs = LockTableDocs{}
+	}
+	docs.TableID, docs.MetaSHA256, docs.DeclaredSHA256 = tableID, meta, declared
+	entry.TableDocs[path] = docs
 	l.Stacks[stack] = entry
 }
 

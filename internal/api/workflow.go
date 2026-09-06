@@ -235,7 +235,9 @@ func (w *Workflow) IdentityID() string {
 }
 
 // GetWorkflow reads a workflow's metadata. 404s for an id the caller cannot
-// reach — the read gate does not distinguish absent from invisible.
+// reach — the read gate does not distinguish absent from invisible. An id
+// matching nothing at all lands there too on a current backend; an older one
+// answers it `400 {"error":"no rows"}`, and callers accept both.
 func (c *Client) GetWorkflow(ctx context.Context, id string) (*Workflow, error) {
 	var out Workflow
 	if err := c.Do(ctx, "GET", "workflow/"+url.PathEscape(id), nil, &out); err != nil {

@@ -30,15 +30,14 @@ type Feature struct {
 // in another organization, or is someone else's private one, which the server
 // deliberately does not tell apart.
 //
-// ⚠️ Do NOT depend on the STATUS to tell those cases apart. Today a lookup miss
-// happens to reach the wire as 400 and an unreadable-but-present feature as
-// 404, but that split is an artefact of which helper each arm was built from
-// rather than a contract: it is recorded as a known-open item in the backend's
-// access model and is expected to be unified in a later pass. Older instances
-// also answer "no rows" or a bare "not found" here. So the CLI's own matcher
+// ⚠️ Do NOT depend on the STATUS to tell those cases apart, and note that it has
+// already moved once: an older backend reaches the wire with a lookup miss as
+// 400 and an unreadable-but-present feature as 404, while a current one answers
+// 404 for both. That split was never a contract, and the older instances still
+// in the field also answer "no rows" or a bare "not found" here. So the matcher
 // (commands.explainFeatureUnreachable) accepts EITHER status for this sentence
-// and branches on the message, which is what makes it survive that pass without
-// a client change. Anything new reading this error should do the same.
+// and branches on the message, which is what carried it through the retype
+// without a client change. Anything new reading this error should do the same.
 //
 // Two callers, and the second is a READ FOR EXISTENCE rather than for a field:
 // commands.confirmFeatureIn calls it so `init` can refuse a --feature it cannot

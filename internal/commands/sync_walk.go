@@ -29,6 +29,16 @@ const (
 	// Reported rather than skipped, because a folder this command cannot open
 	// is precisely a folder it cannot vouch for.
 	syncReasonUnreadable = "unreadable"
+	// syncReasonKindNotCovered — a kind this build fully understands, that
+	// `ronja sync` has no leg for. Today that is `module` and nothing else.
+	//
+	// Distinct from syncReasonUnreadable on purpose. "This build does not
+	// understand your folder" and "this command does not cover your folder"
+	// send a reader to opposite places — the first to a CLI upgrade, the second
+	// to `ronja module status`, which answers for that folder perfectly well.
+	// Both are still NEVER GREEN: a module folder nobody checked is a module
+	// folder nobody checked, and the tree verdict has to say so.
+	syncReasonKindNotCovered = "kind_not_covered"
 	// syncReasonStackElsewhere — the folder declares the requested stack, and it
 	// points at a different instance or organization than this credential
 	// reaches. A repository legitimately holds folders belonging to several
@@ -202,6 +212,29 @@ func discoverFolders(dir string) ([]discoveredFolder, error) {
 			continue
 		}
 		folder.Kind = kind
+		// A module folder is understood and not covered, and it must not reach
+		// the dispatch below: both status and check end in a `default:` arm
+		// (workflow and pipeline respectively), so an uncaught module folder
+		// would not be skipped — it would be silently REPORTED ON as a workflow,
+		// against workflow endpoints, using a module's id.
+		//
+		// Answering for one is real work rather than a missing case: `status`
+		// would need a root-parameterised module status report and a verdict
+		// fold, and `check` would need to state that a marker-free kind makes no
+		// references at all. Until that exists, saying so is the honest answer.
+		//
+		// The Kind is KEPT rather than zeroed the way the unknown-kind branch
+		// above zeroes it: there the fallback is WorkflowKind and printing it
+		// would be a lie, whereas here the probe established the real kind and
+		// both report lines stamp Kind.Name, so the reader gets `"kind":
+		// "module"` beside the reason instead of an empty string.
+		if kind.Name == wfdir.KindModule {
+			folder.Reason = syncReasonKindNotCovered
+			folder.Detail = fmt.Sprintf("%s is a module folder, and `ronja sync` covers workflow, data-app and pipeline folders — run `ronja module status` in it instead",
+				wfdir.ManifestPath(root))
+			out = append(out, folder)
+			continue
+		}
 		// The kind probe reads one key and forgives everything else, so a
 		// manifest that will not decode, declares a format version this build
 		// cannot read, or carries the old-style "instances" object is still
