@@ -285,3 +285,52 @@ func (c *Client) Promote(ctx context.Context, databaseID string, in PromoteInput
 	}
 	return &out, nil
 }
+
+// DatabaseConnection is the GET :id/roles response — the shared cluster
+// endpoint, the physical database name, and the roles minted on it.
+//
+// Only the fields the CLI actually uses are mirrored. The roles list is
+// deliberately absent: `db env` and `db connect` need the PROXY block and
+// nothing else, and mirroring a role projection here would be a second,
+// permanently-stale copy of a shape `ronja api` already prints in full.
+type DatabaseConnection struct {
+	Host     string `json:"host"`
+	Port     string `json:"port"`
+	SSLMode  string `json:"sslMode"`
+	Database string `json:"database"`
+	// Proxy is how to reach this database with psql or pg_dump. ABSENT — a nil
+	// pointer, not a zero struct — when the instance has no Postgres-wire proxy
+	// deployed OR the caller is not an admin. The server does not say which, and
+	// a client must not guess: both are answered by the same refusal.
+	Proxy *DatabaseProxy `json:"proxy"`
+}
+
+// DatabaseProxy is the psql/pg_dump coordinates for one managed database.
+//
+// ⚠️ ConnectionString carries the literal placeholder <YOUR_PAT> where the
+// password goes — the server never sends a credential here, and neither `db
+// env` nor `db connect` prints this string with a real one substituted in. The
+// PAT the commands use is the one the profile already holds, and it moves into
+// an environment variable or a child process, never onto a terminal.
+type DatabaseProxy struct {
+	Host string `json:"host"`
+	Port string `json:"port"`
+	// Username is "<database-id>.read" — the tier is part of the login, because
+	// the proxy resolves the Postgres role server-side.
+	Username         string `json:"username"`
+	Database         string `json:"database"`
+	ConnectionString string `json:"connectionString"`
+	// ReadRoleMinted is false when the database has no `read` role yet, which is
+	// the state a freshly provisioned one is in. The proxy refuses such a login
+	// AFTER authenticating, so the commands refuse it here instead.
+	ReadRoleMinted bool `json:"readRoleMinted"`
+}
+
+// DatabaseConnectionInfo reads a managed database's connection details.
+func (c *Client) DatabaseConnectionInfo(ctx context.Context, databaseID string) (*DatabaseConnection, error) {
+	var out DatabaseConnection
+	if err := c.Do(ctx, "GET", "database/"+databaseID+"/roles", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

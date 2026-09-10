@@ -77,7 +77,7 @@ go through ` + "`ronja db migrate`" + `, which records them in the database's le
 If the database has no write role yet, the first statement fails saying so.
 Mint one with:
 
-  ronja api -X POST /api/v2/database/<id>/user -d '{"access":"write","featureID":"<id>"}'`,
+  ronja api -X POST /api/v2/database/<id>/user -d '{"access":"write","featureID":"<feature-id>"}'`,
 		// Two positionals: the database id and (optionally) the SQL. Three would
 		// be somebody who forgot to quote their SQL, and cobra's own error says
 		// so better than a merged string that half-runs.

@@ -24,6 +24,10 @@ import (
 //     which of these files has already been applied. That last question has to
 //     be answered against the database's own ledger, and answering it by hand is
 //     a sequence of calls with a comparison in the middle.
+//   - `db env` and `db connect` are the `ronja env` kind of command, not a
+//     wrapped endpoint: they move the credential the CLI already holds into
+//     the place psql and pg_dump read it from, without it ever being displayed.
+//     See database_proxy.go for why both exist and why there is no `db dump`.
 //   - `db promote` is the other end of that same loop. It moves a ledger TAIL
 //     between two ledgers: the shared prefix is compared position by position,
 //     the divergence case has to be reported as an instruction rather than a
@@ -50,8 +54,15 @@ state, rather than the analytical tables ` + "`ronja query`" + ` reads.
   ronja db migrate status        what is applied, pending or drifted
   ronja db migrate push          apply the migrations/ folder
   ronja db promote <database-id> move the dev copy's migrations onto production
+  ronja db env <database-id>     PG* variables for psql and pg_dump (eval it)
+  ronja db connect <database-id> open psql, read-only
 
-All three are admin-only, as the underlying API is.
+All of them are admin-only, as the underlying API is.
+
+` + "`db env`" + ` and ` + "`db connect`" + ` reach the database from OUTSIDE Ronja, with
+your own Postgres tools, over a read-only session:
+
+  eval "$(ronja db env mdb-abc)" && pg_dump -Fc > dump.pgc
 
 A database can have a DEV COPY — same schema, its own data, its own ledger.
 ` + "`db sql`" + ` and ` + "`db migrate`" + ` reach it with --env dev, always naming the
@@ -62,12 +73,13 @@ Creating, listing and deleting databases stay on plain HTTP:
 
   ronja api -X POST /api/v2/database -d '{"name":"crm"}'
   ronja api /api/v2/database/query
-  ronja api -X POST /api/v2/database/<id>/user -d '{"access":"write","featureID":"<id>"}'
+  ronja api -X POST /api/v2/database/<id>/user -d '{"access":"write","featureID":"<feature-id>"}'
 
 That last one is not optional: a new database has no connection roles, and
 ` + "`db sql`" + ` runs as the write role, so mint one before your first statement.`,
 	}
-	db.AddCommand(newDatabaseSQLCmd(), newDatabaseMigrateCmd(), newDatabasePromoteCmd())
+	db.AddCommand(newDatabaseSQLCmd(), newDatabaseMigrateCmd(), newDatabasePromoteCmd(),
+		newDatabaseEnvCmd(), newDatabaseConnectCmd())
 	return db
 }
 

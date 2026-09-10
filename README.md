@@ -26,6 +26,10 @@ ronja env           # export lines for RONJA_URL / RONJA_TOKEN — meant for eva
 ronja profile list  # which logins this machine holds
 ```
 
+`ronja db env` is the same idea for Postgres tools — `eval` it and `psql` /
+`pg_dump` reach a managed database with no arguments; `ronja db connect` opens
+`psql` without printing anything at all. Both under "Managed databases" below.
+
 After `ronja context` an agent works over plain HTTP. `context` **fetches
 `/llms.txt` from the instance and inlines it** rather than restating what the
 API can do, so it cannot drift from the API it describes. Everything it points
@@ -1029,6 +1033,10 @@ ronja db sql <database-id> "SELECT count(*) FROM leads" --env dev
 ronja db promote <database-id> --dry-run
 ronja db promote <database-id>            # asks first
 ronja db promote <database-id> --yes      # for CI, agents, anything headless
+
+# reach it from outside Ronja, with your own Postgres tools
+eval "$(ronja db env <database-id>)" && pg_dump -Fc > dump.pgc
+ronja db connect <database-id>
 ```
 
 **Why these three and no others.** `db sql` clears the same bar `ronja query`
@@ -1041,6 +1049,9 @@ the same test `migrate` passes, and it is not a list, a browse or a delete.
 Creating, listing and deleting a database are single calls that `ronja api` runs
 perfectly well, so there is deliberately no `db list` / `db create` /
 `db delete`.
+
+`db env` and `db connect` are a different kind of thing again — see
+"psql and pg_dump" below.
 
 **`db sql` is DML only.** It runs as the database's *write* role, which has no
 CREATE privilege, so DDL is refused by Postgres itself rather than filtered
@@ -1186,6 +1197,100 @@ refuses a non-`workflow` kind, so a committed
 beneath it, and a workflow manifest above a `migrations/` folder would break
 `db migrate`. A shareable binding needs the manifest layer split properly; it is
 not worth coupling to this.
+
+### psql and pg_dump (`db env`, `db connect`)
+
+These two point **ordinary Postgres tools** at a managed database, through
+Ronja's Postgres-wire proxy. Neither wraps an endpoint. They are the same kind
+of command `ronja env` is: they move the credential the CLI already holds into
+the place a different program reads it from, without it ever being displayed.
+
+```bash
+eval "$(ronja db env <database-id>)"   # sets PGHOST/PGPORT/PGUSER/PGDATABASE/
+psql                                   #      PGSSLMODE/PGSSLROOTCERT/PGPASSWORD
+pg_dump -Fc > dump.pgc
+
+ronja db connect <database-id>                              # interactive psql
+ronja db connect <database-id> -- -c "select count(*) from orders"
+```
+
+**`db env` is meant to be evaluated, not read** — the same rule as `ronja env`,
+for the same reason. `eval` consumes the command's stdout, so your access token
+moves from the credential file into `PGPASSWORD` and nothing prints it. Running
+it bare prints a live credential to your terminal, and it warns on stderr when
+it notices it is about to. Shell state does not persist between separate agent
+tool calls, so keep the load and the work in one command:
+
+```bash
+eval "$(ronja db env <database-id>)" && pg_dump -Fc > dump.pgc
+```
+
+**`db connect` prints nothing at all.** It execs `psql` with the token on the
+child process's own environment, so the credential never reaches your terminal,
+your shell history or `ps`. `psql` must be on your PATH; everything after `--`
+is passed to it unchanged, and its exit status is this command's.
+
+**Why both.** `libpq` has no environment variable for `keepalives_idle`. The
+proxy sits behind a load balancer that idles a TCP flow out after a few minutes,
+and only the *client's* keepalives reset that timer — so a long interactive
+session needs `keepalives_idle=60` in the conninfo, which only a command that
+builds the conninfo itself can supply. `db env` is the form that lets `pg_dump`
+(never idle) work with no arguments; `db connect` is the one that survives a
+coffee break.
+
+**The session is read-only.** The proxy resolves the database's `read` role
+server-side, so `SELECT` works and nothing else does — no DDL, no DML, no
+`nextval` — whatever your own role is. Your token is the *password*, and it is
+still your token: it carries your live role, dies when you leave, and can be
+revoked like any other.
+
+**`sslmode=verify-full` and `sslrootcert=system`, never `require`.** The token
+travels as the password, and `require` accepts any certificate — so a downgrade
+hands the credential to whoever answers the socket. Both commands set the strict
+pair and no Ronja surface ever prints a weaker one. `sslrootcert=system` needs
+libpq 16 or newer.
+
+**Objects outside `public` need `-n public`.** The read role holds no `USAGE` on
+other schemas, so a whole-database `pg_dump` of such a database fails on the
+first object in one; restrict it to `public`.
+
+**Two refusals, deliberately distinct.** *"This organization has no psql proxy
+configured, or your role is not admin"* means there is no proxy block to work
+from — the server does not distinguish the two causes, so neither does the
+message. *"No read role Ronja can use"* means the proxy is there and the login
+would authenticate before being refused; mint one with
+
+```
+ronja api -X POST /api/v2/database/<database-id>/user \
+  -d '{"access":"read","featureID":"<feature-id>"}'
+```
+
+`featureID` is required and has no default — the feature owns the stored
+credential, which makes it an access decision. Name an **organization** feature
+when something inside Ronja will use the credential (a workflow, a data app, an
+agent), since only that leg reaches a non-admin member; a **private** feature is
+narrower and enough for a role you only ever use from `psql`, which the proxy
+resolves either way. Private is not "yours alone", though — another admin can
+still bind it. List features with their scope:
+
+```
+ronja api /api/v2/feature/query --jq '.result[] | [.id, .scope, .name] | @tsv' -r
+```
+
+And if the database already has a read credential, minting **replaces** it:
+anything still holding the old one stops working.
+
+**`--env dev` is not supported here** and says so rather than failing as an
+unknown flag. A dev copy is a database in its own right at the proxy — its own
+id, its own physical name, its own read role — and it is addressed by that id.
+The prod→dev overlay exists for requests that *name* a production database, and
+a proxy login never does: the username **is** the id.
+
+**There is deliberately no `db dump`.** `pg_dump` after `db env` is the whole
+feature, and a wrapper would have to re-expose every `pg_dump` flag — format,
+compression, parallelism, table selection, `--no-owner` — forever, to be worth
+using at all. What the CLI can add is the credential and the connection
+parameters, which is exactly what these two do.
 
 ## Workflow folders (`ronja wf`)
 
@@ -4855,14 +4960,18 @@ running, deleting the file is safe.
 one.** The credential is *loaded*, not displayed:
 
 ```bash
-eval "$(ronja env)"    # sets RONJA_URL + RONJA_TOKEN; eval consumes the output
+eval "$(ronja env)"        # sets RONJA_URL + RONJA_TOKEN; eval consumes the output
+eval "$(ronja db env ID)"  # sets PG* incl. PGPASSWORD, for psql and pg_dump
 ```
 
 Being able to READ a credential and having it ECHOED are different things, and
 only the second puts it in a terminal scrollback, a CI log, or an agent
-transcript. `ronja env` does print the token if you run it bare — that is
-unavoidable for a command meant to be eval'd — so it warns on stderr when
-stdout is a TTY, and every doc shows it only through `eval`.
+transcript. **Two commands emit the token, and only as something to eval**:
+`ronja env` and `ronja db env`. Both print it if you run them bare — that is
+unavoidable for a command meant to be eval'd — so both warn on stderr when
+stdout is a TTY, and every doc shows them only through `eval`. `ronja db
+connect` does not print it at all: the token goes to psql through the child
+process's own environment.
 
 **Shell state does not persist between separate agent tool calls.** Each call is
 usually a fresh shell, so `eval "$(ronja env)"` in one and `$RONJA_TOKEN` in the
