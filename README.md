@@ -1625,6 +1625,7 @@ drift baseline for the first time.
 | `workflowID` / `dataAppID` / a pipeline's `tables` | `ronja.lock.json` | a deploy created them |
 | a pipeline's `liveSHA256` | `ronja.lock.json` | "the live table held these bytes when this folder last agreed with it" is true for everybody |
 | a pipeline's `metaSHA256` and its `tableDocs` entries | `ronja.lock.json` | same test, about the row's **documentation**: which table a docs sidecar names, and what its prose looked like when everybody last agreed with it |
+| a pipeline's `metrics` entries | `ronja.lock.json` | same test, about a metric's **definition**: which row a `metrics/<name>.json` file is, what that row's recipe hashed to when everybody last agreed with it, and what the file itself last declared. ⚠️ A metric's id lives here and **never** in `ronja.json` — that map is keyed by `.sql` path, and the SQL half of the loop walks it |
 | a workflow's / app's `headVersionID` | `ronja.lock.json` | "this folder forked from that published version" is true for everybody |
 | draft ids, draft fingerprints | `.ronja/state.json` | a draft is **yours**; a colleague inheriting one from git would be pointed at a row they cannot see |
 
@@ -1924,6 +1925,12 @@ called that" for a row sitting right there. What the two share is the alias
 namespace and not the grant: the server still checks each list against the row
 it names, so listing a plain table as a metric is refused there exactly as it is
 when written as an id. `commands.accessDependencies` carries the full reasoning.
+
+The same rule binds the `ronja pipeline` loop's own metric carrier, and for the
+identical reason: a `metrics/<alias>.json` file's stem and its `recipe.source`
+are both spelled `{"kind": "table"}`. See "Metrics — a definition, not SQL",
+which states the consequence out loud — `ronja bind` cannot tell a metric from a
+plain table of the same name, and the mistake surfaces at push, by name.
 
 **`formatVersion` 3 is refused BY ITS ABSENCE, at push time.** A manifest that
 declares `dependencies` while stating a lower version is one this build cannot
@@ -3141,11 +3148,11 @@ ids in its SQL belong to that organization, and only re-pointing them fixes it.
 | Verb | Does | Flags worth knowing |
 |---|---|---|
 | `init` | writes `ronja.json` + `.ronja/`. Creates nothing server-side — each table comes into existence on the first push of its file | `--feature` (a push refuses without one), `--title` |
-| `clone` | writes one `.sql` per **derived** table in the feature, plus manifest and baseline. Prefers your own open draft over live. Creates nothing server-side; the directory must be empty or absent | — |
+| `clone` | writes one `.sql` per **derived** table and one `metrics/<name>.json` per **metric**, plus manifest, lock and baseline. Prefers your own open draft over live. Creates nothing server-side; the directory must be empty or absent | — |
 | `status` | local changes, per-table build health, open drafts and their verdicts, and drift since the last sync. Read-only — not even a checkout. **Exits non-zero on drift *and* on "not checked"** (see below) | `--json` |
-| `push [paths...]` | per changed file: create → resume/check out your draft → write SQL + derived inputs → sync → build → **documentation** → verdict and confidence report. Then, in a pass of its own, each `tables/*.json` docs sidecar | `--force` |
-| `publish [paths...]` | per staged draft: commit onto the table, or submit it for review | `--no-request-review`, `--overwrite-remote` |
-| `discard [paths...]` | deletes your drafts; the live tables and your local files are untouched | `--yes` |
+| `push [paths...]` | per changed file: create → resume/check out your draft → write SQL + derived inputs → sync → build → **documentation** → verdict and confidence report. Then, in passes of their own, each `tables/*.json` docs sidecar and each `metrics/*.json` definition | `--force`, `--force-verified-metric` |
+| `publish [paths...]` | per staged draft: commit onto the table or the metric, or submit it for review. A committed metric definition change re-fingerprints, so the report says the metric now reads *verified · review pending* | `--no-request-review`, `--overwrite-remote` |
+| `discard [paths...]` | deletes your drafts, metric drafts included; the live rows and your local files are untouched | `--yes` |
 
 `push`, `publish` and `discard` all take file paths and act on the whole folder
 when given none. Narrowing does not narrow the *graph*: dependency order is still
@@ -3166,11 +3173,21 @@ There is deliberately no `pipeline list`, no `pipeline delete` and **no `run`**:
 committing cascades server-side, so publishing already rebuilds everything
 downstream (see below).
 
-`clone` says on stderr what it left behind, in two deliberately different
-wordings: non-derived kinds are "not cloned (kinds: dynamic, integration)" —
-they have no SQL a file could hold — while metrics are "not cloned (out of scope
-for this loop)", because a metric runs the *identical* draft flow and claiming
-otherwise would send someone looking for a capability the product already has.
+`clone` writes one `.sql` per derived table **and one `metrics/<name>.json` per
+metric**, and says on stderr only what it genuinely left behind: non-derived
+kinds, as "not cloned (kinds: dynamic, integration)", which have no SQL and no
+recipe a file could hold.
+
+⚠️ **The metric line is deleted rather than reworded, and that is the point.** It
+used to read "not cloned (out of scope for this loop)" — phrased with some care
+so as not to claim metrics *could* not be cloned, because a metric runs the
+identical draft flow and saying otherwise would send someone looking for a
+capability the product already had. That sentence is now simply false, and a
+message this loop no longer needs is one to remove. The single remaining skip is
+a metric an older instance answers no `metricRecipe` for; it is named
+individually and counted apart (`skipped.metricsWithoutRecipe`) rather than
+refusing the whole clone, because a collective refusal would make `clone`
+unusable against every instance that does not serve the field yet.
 
 ### A push builds a draft, never the live table
 
@@ -3493,6 +3510,122 @@ overwritten. Bounded, and stated rather than papered over: it is prose only, the
 losing edit is in the row's audit history, and the next push re-reads and reports
 the divergence. Closing it properly means a `baseMetaSha256` on the server's
 documentation body, and it belongs with that change.
+
+### Metrics — a definition, not SQL
+
+A metric is a **recipe**, so no `.sql` file can hold one. It gets a carrier of
+its own inside the same folder — `metrics/<alias>.json` — and the loop's three
+verbs mean for it exactly what they mean for a derived table, because a metric
+runs the IDENTICAL draft flow: `push` stages it in your own draft and builds it,
+`publish` commits it or asks an admin to, `discard` drops the draft.
+
+That is what makes this a file type rather than a `ronja metric` loop. Everything
+such a loop would need is already here — one manifest, one bind map, one lock,
+one tree walk — and a second top-level command would be second copies of all
+four. It is the docs sidecar's argument, and it applies with more force here,
+because unlike documentation a metric really does have a draft, a build and a
+publish, and those are the verbs this folder already has.
+
+```json
+{
+  "recipe": {
+    "source": "orders",
+    "time": {"column": "created_at", "native_grain": "day"},
+    "dimensions": [{"name": "country"}],
+    "base_measures": [
+      {"name": "revenue", "agg": "sum",   "column": "amount"},
+      {"name": "orders",  "agg": "count", "column": "*"}
+    ],
+    "value": "revenue / orders"
+  },
+  "description": "Average order value, per day.",
+  "reportingTimezone": "Europe/Stockholm"
+}
+```
+
+**Three keys, and the asymmetry inside them is deliberate.** Unknown keys at the
+TOP level are refused where they were written, on the sidecar's rule — a dropped
+key is the failure this whole loop exists to remove, and a `verified` or an
+`owner` somebody adds expecting it to be honoured must not be ignored on every
+push for ever. Unknown keys INSIDE the `recipe` are preserved verbatim, because
+the recipe grammar belongs to the server (`rdb.ValidateMetricRecipe`) and a Go
+shape for it here would be a second thing to keep in step, whose drifted version
+would accept a recipe the compiler then refused. There is deliberately no field
+for anything DERIVED from the recipe — additivity, the time and value columns,
+the dimension list, the compiled SQL, the source closure — and none for
+verification state: a file that could set either could contradict its own
+recipe, or mint a metric asserting somebody else had vetted it.
+
+**Names.** The file's stem is the metric's name, or an alias a stack binds to a
+metric that already exists. `recipe.source` resolves exactly as a `{{ ref }}`
+does — a sibling `.sql` stem first, then a declared alias, then a literal
+`table-…` id — which is what lets one committed folder define the same number in
+several organizations.
+
+**The pass runs AFTER the `.sql` pass, and that is where the ordering comes
+from.** A metric contributes no `{{ ref }}` edge (no marker resolves a metric),
+so it cannot join the folder's topological order; running the pass last buys the
+same guarantee by construction. A metric MAY source a table this folder builds —
+that is the main case, and there is no disjointness rule against it. The docs
+sidecar's `builtBy` refusal does not transfer: that one is about a table having
+ONE carrier, and a `recipe.source` is a reference to another row rather than a
+second carrier of it.
+
+**One namespace.** `requireNameFreeTx` has no `kind` predicate, so a metric and a
+table collide server-side. A folder holding both `revenue.sql` and
+`metrics/Revenue.json` is refused before the first byte is sent — the store stays
+the truth, and the local guard exists only so the refusal names both files
+instead of arriving half way through a push.
+
+**Drift, two legs with two owners.** The LIVE metric's canonicalized recipe
+against the lock's `liveSHA256`, checked client-side before anything is written —
+no draft precondition can speak about the live row. And the DRAFT, owned
+server-side by `baseRecipeSha256`, which is strictly better than a local baseline
+because it also catches the author's own chat agent editing the same draft.
+
+⚠️ **`liveSHA256` is taken over the ROW's recipe, never the file's.** The file
+carries aliases and may omit a defaultable key; the row carries real ids with
+every default filled in. Hashing the file would report drift on every stack, on
+the first push, for ever. The bytes hashed are the ones the server SENT, hashed
+verbatim — decoding a recipe into a map and re-marshalling it changes the key
+order and breaks the compare-and-swap against a difference nobody made.
+
+⚠️ **`--force` is not enough on a verified metric, and this is the one
+destructive gate in the loop.** Leg (a) firing means a colleague committed a
+definition change to the company's official KPI. So `--force` prints the remote's
+canonical recipe diff before overwriting it — you see what you are replacing —
+and REFUSES outright when the live metric's `metric_status` is `verified` unless
+`--force-verified-metric` is passed as well. Overwriting a verified definition
+somebody else wrote should cost a sentence you had to type.
+
+**`publish` says what committing costs.** A recipe change re-fingerprints on the
+next build, so a previously-verified metric lands *drifted*; the report says so
+(`"reverified": true` in `--json`) because that is a governance consequence the
+author caused and would otherwise meet in the UI.
+
+⚠️ **A LEGACY unnamed `instances[]` folder keeps a metric's id in the git-ignored
+local baseline**, exactly as it keeps everything else from before stacks existed.
+So a colleague's fresh clone of such a folder has no id, tries to create by name,
+and is recovered by adopt-by-name below. A `--stack` folder commits the id and
+never meets this.
+
+**Recovery when the binding is not recorded.** The likelier failure is not a
+crash but a 200 the CLI failed to persist: the metric exists, the lock does not,
+and the next push tries to create the same name — which the store refuses with a
+`name_taken` the author cannot act on from the folder. So on a `name_taken` at
+create the loop looks the name up in the target feature, and if it resolves to a
+`kind=metric` row THERE it adopts it into the lock and carries on; anything else
+is reported as the collision it is, with `ronja bind` as the manual route. Same
+shape as `reconcileTimedOutCreate`, and adopting only on a positive
+identification is the whole of its safety.
+
+⚠️ **Known limitation, documented rather than fixed.** `GET /api/v2/search`
+reports a metric as kind `table` (`search.Hit.IsMetric` is `json:"-"`), so
+`ronja bind` cannot tell a metric from a plain table of the same name and will
+bind an exact-name match of either. There is deliberately no `metric` dependency
+kind and there will not be one — a metric alias is spelled `{"kind": "table"}`,
+for the reason `allowedMetricIDs` is above. The mistake surfaces at push, by
+name, which is where it can be acted on.
 
 ### Publishing, and why there is no `run`
 

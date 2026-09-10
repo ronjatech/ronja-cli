@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -186,9 +187,13 @@ func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	seedFeature(f, "private")
-	// Two rows that must NOT become files, for two different reasons.
+	// One row that must NOT become a file — an integration table has no SQL a
+	// file could hold — and one that becomes a file of a DIFFERENT kind: a
+	// metric is a recipe, so it clones into metrics/<name>.json rather than into
+	// .sql.
 	f.AddTable(&api.Table{ID: "table-raw", Name: "Raw orders", FeatureID: "collection-1", Kind: "integration"})
-	f.AddTable(&api.Table{ID: "table-mrr", Name: "MRR", FeatureID: "collection-1", Kind: api.TableKindMetric})
+	f.AddTable(&api.Table{ID: "table-mrr", Name: "MRR", FeatureID: "collection-1", Kind: api.TableKindMetric,
+		MetricRecipe: json.RawMessage(`{"source":"table-orders","value":"revenue","version":1}`)})
 
 	dir := t.TempDir()
 	out, stderr, err := runPipelineCLI(t, dir, "pipeline", "clone", "collection-1", "out", "--json")
@@ -218,7 +223,13 @@ func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 		t.Error("an integration table must not become a file")
 	}
 	if _, err := os.Stat(filepath.Join(root, "mrr.sql")); err == nil {
-		t.Error("a metric must not become a file")
+		t.Error("a metric must not become a .sql file")
+	}
+	// The metric IS cloned, into its own carrier, with the recipe verbatim in id
+	// form — the same form the .sql files' refs are written in, because a cloned
+	// folder declares no dependencies for an alias to resolve through.
+	if got := readFile(t, root, "metrics/MRR.json"); !strings.Contains(got, `"source": "table-orders"`) {
+		t.Errorf("metrics/MRR.json = %q", got)
 	}
 
 	binding := pipelineBindingOf(t, root, f.Key())
@@ -230,15 +241,22 @@ func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 	}
 	assertPipelineBaselineMatchesDisk(t, root, f.Key())
 
-	// The two skip reasons are reported SEPARATELY and in different words: a
-	// non-derived kind has no SQL a file could hold, while a metric runs the
-	// identical draft flow and is out of scope for this loop. Claiming otherwise
-	// would send somebody looking for a capability the product already has.
+	// The metric's identity is in the LOCK, never in the manifest's `tables` map:
+	// that map is keyed by .sql path and is walked by the whole SQL half of the
+	// loop, so a metric in it would be pushed as SQL.
+	if _, inTables := binding.Tables["metrics/MRR.json"]; inTables {
+		t.Errorf("a metric must not land in the manifest's tables map: %+v", binding.Tables)
+	}
+
+	// The non-derived skip is still reported by kind. The metric one is GONE
+	// rather than reworded: a note saying metrics were "not cloned (out of scope
+	// for this loop)" is exactly the caveat that outlives its own deploy, and
+	// this clone just made it false.
 	if !strings.Contains(stderr, "kinds: integration") {
 		t.Errorf("the non-derived skip was not reported by kind:\n%s", stderr)
 	}
-	if !strings.Contains(stderr, "1 metric(s) not cloned (out of scope for this loop)") {
-		t.Errorf("the metric skip was not reported as out-of-scope:\n%s", stderr)
+	if strings.Contains(stderr, "not cloned (out of scope") {
+		t.Errorf("metrics are cloned now, so nothing may say otherwise:\n%s", stderr)
 	}
 	if strings.Contains(stderr, "kinds: metric") {
 		t.Errorf("a metric must not be reported as an unsupported kind:\n%s", stderr)
@@ -412,7 +430,8 @@ func TestPipelineCloneRoundTripsFilenames(t *testing.T) {
 }
 
 // TestPipelineCloneRefusesAFeatureWithNoDerivedTables: a folder with no files is
-// not a useful thing to have created, and the reason is worth saying.
+// not a useful thing to have created, and the reason is worth saying. A feature
+// holding only integration tables has neither SQL nor a recipe for a file.
 func TestPipelineCloneRefusesAFeatureWithNoDerivedTables(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -928,6 +947,40 @@ func TestPipelineDiscardReportsNothingStaged(t *testing.T) {
 	}
 	if len(f.discarded) != 0 {
 		t.Errorf("nothing was staged, but %v was discarded", f.discarded)
+	}
+}
+
+// TestPipelineDiscardNamesADocsSidecarForWhatItIs: the guard in front of a docs
+// sidecar has to be able to SEE the folder's sidecars.
+//
+// It was handed a nil set, so no argument could ever match it and every sidecar
+// path fell through to the shape check — which told the person that a file
+// sitting in their own folder "is not a docs file in this folder", and sent them
+// hunting a typo that was not there.
+func TestPipelineDiscardNamesADocsSidecarForWhatItIs(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedBoundFolder(t, f)
+	f.AddTable(&api.Table{ID: "table-raw", Name: "Raw", FeatureID: "collection-1", Kind: "integration"})
+	declareTableDependency(t, root, f.Key(), "raw", "table-raw")
+	writeSidecar(t, root, "raw", `{"columns":{"amount":"ours"}}`)
+
+	_, _, err := runPipelineCLI(t, root, "pipeline", "discard", wfdir.TableDocsPath("raw"), "--yes", "--json")
+	if err == nil {
+		t.Fatal("naming a docs sidecar must be refused — there is no draft in that path to discard")
+	}
+	if !strings.Contains(err.Error(), "no draft to discard") {
+		t.Errorf("a sidecar that IS in this folder was refused for the wrong reason: %v", err)
+	}
+
+	// The other case keeps its own answer, which is the one that is true of it: a
+	// path that looks like a sidecar and is not there.
+	_, _, err = runPipelineCLI(t, root, "pipeline", "discard", wfdir.TableDocsPath("nope"), "--yes", "--json")
+	if err == nil {
+		t.Fatal("a docs path that is not in the folder must be refused by name")
+	}
+	if !strings.Contains(err.Error(), "is not a docs file in this folder") {
+		t.Errorf("verdict = %v", err)
 	}
 }
 

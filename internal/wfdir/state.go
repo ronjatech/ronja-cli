@@ -111,6 +111,33 @@ type InstanceState struct {
 	// omitempty and three-state-safe, for the reason Tables is: ABSENT means this
 	// folder tracks no sidecar state, never "there are no sidecars".
 	TableDocs map[string]TableDocsState `json:"tableDocs,omitempty"`
+	// Metrics is a PIPELINE folder's per-METRIC-FILE state, and it is the LEGACY
+	// half of the pair Lock.Metrics owns — the same fork, for the same reason,
+	// as TableDocs above: a folder on a NAMED STACK keeps its metric recordings
+	// in the committed lock, where a fresh CI checkout can read them, and a
+	// legacy unnamed instances[] folder has nowhere committed to put one. The
+	// fork is spelled once, in the commands package's liveHashes.
+	//
+	// omitempty and three-state-safe, for the reason Tables is: ABSENT means this
+	// folder tracks no metric state, never "there are no metrics".
+	Metrics map[string]MetricState `json:"metrics,omitempty"`
+}
+
+// MetricState is one metric file's recorded state in a LEGACY folder's local
+// baseline — the mirror of wfdir.LockMetric, and it obeys the same invariant:
+// A HASH IS ONLY EVER COMPARED AGAINST THE ROW IT WAS TAKEN FROM. MetricID says
+// which row that was, so a metric file rebound to a different row drops the
+// fingerprint with it.
+type MetricState struct {
+	MetricID string `json:"metricID"`
+	// LiveSHA256 is the LIVE metric's recipe fingerprint — see
+	// LockMetric.LiveSHA256 for why it is taken over the row's canonicalized
+	// recipe and never over the file.
+	LiveSHA256 string `json:"liveSHA256,omitempty"`
+	// DeclaredSHA256 is what the FILE declared at the last push — see
+	// LockMetric.DeclaredSHA256 for why it is a second fingerprint rather than
+	// the same one.
+	DeclaredSHA256 string `json:"declaredSHA256,omitempty"`
 }
 
 // TableDocsState is one docs sidecar's recorded state in a LEGACY folder's local

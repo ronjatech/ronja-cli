@@ -32,8 +32,16 @@ Four things, for the instance this folder is bound to:
   LOCAL    .sql files added, modified or deleted since the last sync
   NEW      files that are not bound to a table yet — a push would create them
   HEALTH   each bound table's build state, and whether it has a failure recorded
-  DRIFT    tables whose SQL changed on the server since the last sync — chat and
-           the web builder edit the same rows, so this is a real collision
+  DRIFT    tables whose SQL, and metrics whose definition, changed on the server
+           since the last sync — chat and the web builder edit the same rows, so
+           this is a real collision
+
+Every metrics/*.json file gets a block of its own: the metric it defines and its
+trust badge (unvetted, verified or retired), whether the file defines something
+the metric does not hold yet, any draft you have staged and not published, and a
+drift line when the definition moved on the server — which on a VERIFIED metric
+adds that --force alone will not overwrite it. A file with no metric behind it
+says so instead: a push is what creates one.
 
 When you have a draft open, drift is reported for BOTH rows: your draft (the one
 a push writes to) and the live table underneath it, which a colleague can commit
@@ -45,21 +53,25 @@ inside the folder.
 With --json, one object carrying all of the above.
 
 The exit code answers one question — has anything moved on the server? — which
-makes this a CI gate that needs no parsing. Non-zero for drift, and equally for a
-table whose state could not be READ: an unreachable instance, an expired token, a
-binding that no longer resolves. "I could not look" is not the same answer as
-"nothing moved", and a gate that conflated them would go green on a revoked
-credential.
+makes this a CI gate that needs no parsing. Non-zero for drift, whether it is a
+table's SQL, a table's documentation or a metric's definition that moved. And
+equally non-zero for a table or a metric whose state could not be READ: an
+unreachable instance, an expired token, a binding that no longer resolves, a
+metrics/*.json file that does not parse or whose recipe.source names nothing
+this folder can resolve, or one bound to a row that turns out to be a table
+rather than a metric. "I could not look" is not the same answer as "nothing
+moved", and a gate that conflated them would go green on a revoked credential.
 
 Zero for everything local, and for a folder with nothing to compare against yet:
-a file you have only changed on disk, a file with no table behind it, and — in a
-folder that names no stacks — a fresh clone whose .ronja/ baseline was correctly
-never committed. Run a push to record one.
+a .sql or metrics/*.json file you have only changed on disk, a file with no table
+or metric behind it, and — in a folder that names no stacks — a fresh clone whose
+.ronja/ baseline was correctly never committed. Run a push to record one.
 
 A folder that names stacks is different, and a gate should expect it: the SQL
-each table last held is in the committed ronja.lock.json, so a fresh clone still
-compares against the live tables and can exit non-zero. Only your own open draft
-reads as unknown there, and the report says so.`,
+each table last held, and the definition each metric last held, are in the
+committed ronja.lock.json, so a fresh clone still compares against the live rows
+and can exit non-zero. Only your own open draft reads as unknown there, and the
+report says so.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
@@ -192,8 +204,47 @@ type pipelineRemoteReport struct {
 	Tables  []pipelineTableReport `json:"tables,omitempty"`
 	// Docs is one entry per DOCS SIDECAR — the tables this folder documents but
 	// does not build. Absent for the folders that keep none.
-	Docs  []pipelineDocsStatus `json:"docs,omitempty"`
-	Notes []string             `json:"notes,omitempty"`
+	Docs []pipelineDocsStatus `json:"docs,omitempty"`
+	// Metrics is one entry per METRIC FILE — the numbers this folder defines.
+	// Absent for the folders that keep none.
+	Metrics []pipelineMetricStatus `json:"metrics,omitempty"`
+	Notes   []string               `json:"notes,omitempty"`
+}
+
+// pipelineMetricStatus is one metric file's remote state.
+//
+// The same two-question split pipelineDocsStatus makes, plus the two facts that
+// only a metric has: whether a push would CREATE it (a metric file is the one
+// carrier in this folder that can name a row which does not exist yet and is not
+// a .sql file), and whether the row an overwrite would land on is VERIFIED.
+type pipelineMetricStatus struct {
+	Path     string `json:"path"`
+	Alias    string `json:"alias,omitempty"`
+	MetricID string `json:"metricID,omitempty"`
+	SourceID string `json:"sourceID,omitempty"`
+	Name     string `json:"name,omitempty"`
+	// MetricStatus is unvetted | verified | retired, straight off the row. Read
+	// here for one reason: `verified` is what makes forcing past drift cost a
+	// second flag, and somebody deciding whether to force needs to see it before
+	// they type the first one.
+	MetricStatus string `json:"metricStatus,omitempty"`
+	// DraftID is the caller's own staged draft, empty when there is none. It is
+	// what `publish` acts on, and it is neither drift nor pending: it is work
+	// this folder has done and not landed.
+	DraftID string `json:"draftID,omitempty"`
+	// Problem is why this file cannot be used as it stands — it does not parse,
+	// its source is not a table this folder can name here, the row could not be
+	// read, or the row is a table rather than a metric.
+	Problem string `json:"problem,omitempty"`
+	// WillCreate reports a file with no metric behind it yet: a push creates one.
+	// Its own field rather than a drift verdict, because "nothing is there" is
+	// not "something moved" and must not fail a gate asking about the server.
+	WillCreate bool `json:"willCreate,omitempty"`
+	// Drift is one of the drift* constants, measured on the LIVE metric's recipe.
+	Drift string `json:"drift,omitempty"`
+	// Pending reports that a push would write something: this folder has not
+	// pushed this file's current content here.
+	Pending bool `json:"pending,omitempty"`
 }
 
 // pipelineDocsStatus is one docs sidecar's remote state.
@@ -389,7 +440,19 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 			resolved.URL, wfdir.ManifestName)
 		return out
 	}
-	if len(f.Binding.Tables) == 0 {
+	// A metric is NOT in Binding.Tables — that map is keyed by .sql path, and a
+	// metric's identity lives in the lock — so a folder defining only metrics has
+	// an empty map and plenty to report. Taking the early return for it would
+	// answer "no tables exist on this instance yet" about a folder whose metrics
+	// are all deployed, and the tree gate reads that reason as a clean
+	// never-deployed verdict.
+	//
+	// A read that FAILS is treated as no metric files: this is the "nothing is
+	// bound" branch, and a folder whose metrics/ directory cannot be listed has a
+	// problem the metric leg below reports per file rather than one that should
+	// change what this branch says about its tables.
+	metricsOnDisk, _ := readMetricFiles(f.Root)
+	if len(f.Binding.Tables) == 0 && len(metricsOnDisk) == 0 {
 		out.NotCheckedReason = reasonNothingBound
 		return out
 	}
@@ -468,6 +531,12 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 
 	out.Tables = reports
 	out.Docs = pipelineDocsStatuses(ctx, client, f, live)
+	// The METRIC files, after the docs sidecars for the reason the push pass runs
+	// last: a report reads as "here is what I build, here is what I document,
+	// here is what I define". The codec is the one the caller built from this
+	// folder's own files, so a metric whose source names a sibling .sql file
+	// resolves to the same row a `{{ ref }}` to it would.
+	out.Metrics = pipelineMetricStatuses(ctx, client, f, codec, live)
 	if baseline == nil {
 		// ⚠️ Say WHICH half is unknown. On a stack folder the committed lock still
 		// carries the live fingerprints, so the live-drift line above is a real
@@ -660,6 +729,9 @@ func printPipelineStatus(r *pipelineStatusReport) {
 		for _, d := range r.Remote.Docs {
 			printPipelineDocsStatus(out, d)
 		}
+		for _, m := range r.Remote.Metrics {
+			printPipelineMetricStatus(out, m)
+		}
 	}
 	for _, note := range r.Remote.Notes {
 		fmt.Fprintf(out, "    note: %s\n", note)
@@ -745,6 +817,52 @@ func printPipelineDocsStatus(out *os.File, d pipelineDocsStatus) {
 	}
 }
 
+// printPipelineMetricStatus renders one metric file.
+func printPipelineMetricStatus(out *os.File, m pipelineMetricStatus) {
+	fmt.Fprintf(out, "    %s\n", m.Path)
+	if m.Problem != "" {
+		fmt.Fprintf(out, "      %s\n", m.Problem)
+		return
+	}
+	if m.WillCreate {
+		// No metric line and no drift line: there is no row to name and nothing
+		// to compare against. Said as what a push would DO, which is the only
+		// fact this file has here.
+		fmt.Fprintf(out, "      metric: none yet — a push creates one called %q reading %s\n", m.Alias, m.SourceID)
+		return
+	}
+	name := m.MetricID
+	if m.Name != "" {
+		name = fmt.Sprintf("%s (%s)", m.MetricID, m.Name)
+	}
+	fmt.Fprintf(out, "      metric: %s\n", name)
+	if m.MetricStatus != "" {
+		fmt.Fprintf(out, "      status: %s\n", m.MetricStatus)
+	}
+	if m.Pending {
+		fmt.Fprintf(out, "      local:  this file defines something the metric does not — a push would stage it\n")
+	} else {
+		fmt.Fprintf(out, "      local:  the metric already holds what this file defines\n")
+	}
+	if m.DraftID != "" {
+		fmt.Fprintf(out, "      draft:  %s staged and not published — `ronja pipeline publish` commits it\n", m.DraftID)
+	}
+	switch m.Drift {
+	case driftChanged:
+		// The one drift line in this command that names a consequence rather than
+		// only a fact: forcing past it overwrites the organization's definition of
+		// a number, and on a VERIFIED metric it costs a second flag.
+		fmt.Fprintf(out, "      drift:  the definition of %s changed since your last sync — a push would overwrite it\n", m.MetricID)
+		if m.MetricStatus == api.MetricStatusVerified {
+			fmt.Fprintf(out, "              this metric is VERIFIED, so --force alone will not overwrite it\n")
+		}
+	case driftNoBaseline:
+		fmt.Fprintf(out, "      drift:  nothing to compare against yet — the next push records a baseline\n")
+	case driftUnreadable:
+		fmt.Fprintf(out, "      drift:  not checked\n")
+	}
+}
+
 // pipelineStatusVerdict turns the report into an exit code, answering ONE
 // question: has anything moved on the server under this folder?
 //
@@ -778,17 +896,17 @@ func pipelineStatusVerdict(r *pipelineStatusReport) error {
 		return fmt.Errorf("%s", r.Remote.Problem)
 	}
 
-	var drifted, unchecked []string
+	var drifted, unchecked driftBucket
 	for _, t := range r.Remote.Tables {
 		switch {
 		case t.Drift == driftChanged || t.LiveDrift == driftChanged || t.DocsDrift == driftChanged:
-			drifted = append(drifted, t.Path)
+			drifted.tables = append(drifted.tables, t.Path)
 		// driftNoBaseline is deliberately absent: it is "not compared yet", not
 		// "could not be compared", and the two rows above are what tell them
 		// apart — an unreadable row is a row that was read and made no sense.
 		case t.Problem != "", t.Drift == "", t.Drift == driftUnreadable,
 			t.LiveDrift == driftUnreadable:
-			unchecked = append(unchecked, t.Path)
+			unchecked.tables = append(unchecked.tables, t.Path)
 		}
 	}
 	// The docs sidecars, on the same discipline: a row whose prose moved is
@@ -799,26 +917,94 @@ func pipelineStatusVerdict(r *pipelineStatusReport) error {
 	// moved under this folder; a file that says something the table does not is
 	// the ordinary state of a folder with work to push, exactly like a modified
 	// .sql file, and that is what a push is for.
+	//
+	// Counted as TABLES in the summary below, which is what they are about: a
+	// sidecar's drift is the prose on a table having moved.
 	for _, d := range r.Remote.Docs {
 		switch {
 		case d.Drift == driftChanged:
-			drifted = append(drifted, d.Path)
+			drifted.tables = append(drifted.tables, d.Path)
 		case d.Problem != "", d.Drift == "", d.Drift == driftUnreadable:
-			unchecked = append(unchecked, d.Path)
+			unchecked.tables = append(unchecked.tables, d.Path)
+		}
+	}
+	// The METRIC files, on the same discipline. A file whose LIVE metric's
+	// definition moved is drift; one that could not be resolved or read is
+	// UNCHECKED — never clean, because "I could not look" is not "nothing is
+	// there".
+	//
+	// A file with no metric yet (WillCreate) is deliberately NOT here, and
+	// neither is a PENDING one: both are the ordinary state of a folder with
+	// work to push, which is what a push is for. This gate asks whether the
+	// server moved under the folder.
+	for _, m := range r.Remote.Metrics {
+		switch {
+		case m.WillCreate:
+		case m.Drift == driftChanged:
+			drifted.metrics = append(drifted.metrics, m.Path)
+		case m.Problem != "", m.Drift == "", m.Drift == driftUnreadable:
+			unchecked.metrics = append(unchecked.metrics, m.Path)
 		}
 	}
 
 	switch {
-	case len(drifted) > 0 && len(unchecked) > 0:
-		return fmt.Errorf("%d %s drifted on the server (%s), and %d %s could not be checked (%s) — see above",
-			len(drifted), plural(len(drifted), "table"), strings.Join(drifted, ", "),
-			len(unchecked), plural(len(unchecked), "table"), strings.Join(unchecked, ", "))
-	case len(drifted) > 0:
-		return fmt.Errorf("%d %s changed on the server since your last sync: %s — push --force overwrites, or pull the change back into your file",
-			len(drifted), plural(len(drifted), "table"), strings.Join(drifted, ", "))
-	case len(unchecked) > 0:
-		return fmt.Errorf("%d %s could not be checked for drift (%s) — see the reason above; this is not the same as no drift",
-			len(unchecked), plural(len(unchecked), "table"), strings.Join(unchecked, ", "))
+	case !drifted.empty() && !unchecked.empty():
+		return fmt.Errorf("%s drifted on the server (%s), and %s could not be checked (%s) — see above",
+			drifted.describe(), drifted.paths(), unchecked.describe(), unchecked.paths())
+	case !drifted.empty():
+		// The remedy is the whole answer for a table and not quite the whole
+		// answer for a metric: pushOneMetric's destructive gate refuses --force
+		// alone on a VERIFIED one, so a summary that named only --force would send
+		// exactly those readers into a refusal. Said only where it can apply.
+		force := "push --force overwrites"
+		if len(drifted.metrics) > 0 {
+			force = "push --force overwrites (a VERIFIED metric needs --force-verified-metric as well)"
+		}
+		return fmt.Errorf("%s changed on the server since your last sync: %s — %s, or pull the change back into your file",
+			drifted.describe(), drifted.paths(), force)
+	case !unchecked.empty():
+		return fmt.Errorf("%s could not be checked for drift (%s) — see the reason above; this is not the same as no drift",
+			unchecked.describe(), unchecked.paths())
 	}
 	return nil
+}
+
+// driftBucket is one side of the verdict — what moved, or what could not be
+// looked at — with the two KINDS of file kept apart.
+//
+// Apart, because the summary quotes the paths it counted: a folder that defines
+// metrics produced "1 table changed on the server (metrics/average_order.json)",
+// where the sentence and its own parenthesis disagree and the reader goes
+// looking for SQL that does not exist. A mixed run cannot be described honestly
+// by either noun alone, which is why this counts rather than picks.
+type driftBucket struct {
+	// tables holds .sql paths AND docs sidecars, which are about a table.
+	tables  []string
+	metrics []string
+}
+
+func (b driftBucket) empty() bool { return len(b.tables)+len(b.metrics) == 0 }
+
+// describe renders "2 tables and 1 metric" — the counts, in the order paths()
+// lists them.
+func (b driftBucket) describe() string {
+	tables := fmt.Sprintf("%d %s", len(b.tables), plural(len(b.tables), "table"))
+	metrics := fmt.Sprintf("%d %s", len(b.metrics), plural(len(b.metrics), "metric"))
+	switch {
+	case len(b.metrics) == 0:
+		return tables
+	case len(b.tables) == 0:
+		return metrics
+	default:
+		return tables + " and " + metrics
+	}
+}
+
+// paths lists every file in the bucket, tables first, so the order matches the
+// order describe() names the two kinds in.
+func (b driftBucket) paths() string {
+	all := make([]string, 0, len(b.tables)+len(b.metrics))
+	all = append(all, b.tables...)
+	all = append(all, b.metrics...)
+	return strings.Join(all, ", ")
 }

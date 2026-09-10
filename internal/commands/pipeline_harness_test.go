@@ -1,6 +1,9 @@
 package commands
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -149,9 +152,21 @@ type fakePipelineInstance struct {
 	// `name_taken` with; "" is off. Its own knob rather than a status on
 	// failCreate because the BODY is what the CLI has to read.
 	nameTakenOnCreate string
-	failList          int
-	failFeature       int
-	failQuery         int
+	// nameTakenOnMetricCreate is the same coded 409 on POST /feature/model/metric,
+	// which is its own knob because the CLI's recovery there is DIFFERENT: a
+	// table create reports the collision, a metric create looks the name up in
+	// the feature and ADOPTS a metric it finds. "" is off.
+	nameTakenOnMetricCreate string
+	// failMetricCreate answers POST /feature/model/metric with a status; 0 is off.
+	failMetricCreate int
+	// failRecipePut answers PUT /feature/model/:id/metric/recipe with a status,
+	// keyed by the DRAFT id. Its own knob rather than a reuse of failPut, because
+	// the recipe route is a different handler with a different gate — a colleague's
+	// draft is 403 there even for an admin.
+	failRecipePut map[string]int
+	failList      int
+	failFeature   int
+	failQuery     int
 	// missTableStatus is what GET /feature/model/:id answers for a row this fake
 	// does not hold. BOTH generations are real and this binary talks to both:
 	// an older backend answers the lookup-miss sentinel `400 {"error":"no
@@ -160,6 +175,11 @@ type fakePipelineInstance struct {
 	missTableStatus int
 
 	// --- what the fake was asked to do, for assertions -----------------------
+	// metricsCreated and recipeWrites are the metric half's record of what was
+	// asked, kept apart from `created`/`updates` because the bodies are entirely
+	// different types and a shared slice would have to be one of them.
+	metricsCreated  []api.CreateMetricInput
+	recipeWrites    []recordedRecipeWrite
 	created         []api.CreateTableInput
 	updates         []recordedTableUpdate
 	checkouts       []string
@@ -209,6 +229,29 @@ type recordedTableUpdate struct {
 	BaseCodeSha256 *string
 }
 
+// recordedRecipeWrite is one PUT to the metric-recipe route, with the row it was
+// ADDRESSED TO.
+//
+// BaseRecipeSha256 and ReportingTimezone are POINTERS so the fake can tell
+// ABSENT from PRESENT-AND-EMPTY. Both fields read three states server-side and
+// answer differently to each — the precondition 400s on an empty string, and the
+// timezone RESETS on one — so collapsing them here would let a client that
+// dropped `omitempty` pass every test while 400ing (or silently resetting the
+// calendar of) every push in production.
+type recordedRecipeWrite struct {
+	ID                string
+	Recipe            string
+	ReportingTimezone *string
+	BaseRecipeSha256  *string
+}
+
+// recipeWriteBody is the recipe PUT's body as the SERVER sees it.
+type recipeWriteBody struct {
+	Recipe            json.RawMessage `json:"recipe"`
+	ReportingTimezone *string         `json:"reportingTimezone"`
+	BaseRecipeSha256  *string         `json:"baseRecipeSha256"`
+}
+
 // tableUpdateBody is the PUT body as the SERVER sees it, which is not quite
 // api.UpdateTableInput: the precondition is a pointer here for the reason above.
 type tableUpdateBody struct {
@@ -248,6 +291,7 @@ func newFakePipelineInstance(t *testing.T) *fakePipelineInstance {
 		failCommit:        map[string]int{},
 		nameTakenOnCommit: map[string]string{},
 		failReview:        map[string]int{},
+		failRecipePut:     map[string]int{},
 		missTableStatus:   http.StatusBadRequest,
 		privilegeLevel:    50,
 		queryCSV:          "id,total\n1,42\n2,17\n",
@@ -588,6 +632,13 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 		}
 		return
 	}
+	// POST "/metric" is a STATIC sibling of the "/:id" param child, exactly as
+	// POST "/draft" already is on the real router — so it is matched before the
+	// id split below, or "metric" would be read as a table id.
+	if rest == "metric" && r.Method == http.MethodPost {
+		f.serveCreateMetric(w, r)
+		return
+	}
 
 	id, action, _ := strings.Cut(rest, "/")
 	switch {
@@ -609,6 +660,9 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 			f.stateAfterRead = nil
 			hook()
 		}
+
+	case action == "metric/recipe" && r.Method == http.MethodPut:
+		f.serveWriteRecipe(w, r, id)
 
 	case action == "checkout" && r.Method == http.MethodPost:
 		f.serveCheckout(w, id)
@@ -875,6 +929,11 @@ func (f *fakePipelineInstance) serveCheckout(w http.ResponseWriter, liveID strin
 	f.draftOf[liveID] = draftID
 	draft.Description = live.Description
 	draft.DescriptionSource = live.DescriptionSource
+	// The metric axis rides the checkout too: a draft of a metric INHERITS its
+	// parent's recipe, which is what makes a timezone-only write expressible and
+	// what the CLI's baseRecipeSha256 is taken over on a resumed draft.
+	draft.MetricRecipe = live.MetricRecipe
+	draft.MetricStatus = live.MetricStatus
 	f.copyColumnDocs(liveID, draftID)
 	f.writeRow(w, draft)
 }
@@ -1037,6 +1096,11 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confi
 		// into a draft the right thing to do rather than a way of losing it.
 		parent.Description = draft.Description
 		parent.DescriptionSource = draft.DescriptionSource
+		// The recipe is copied with everything else, and metricStatus is NOT: a
+		// commit never verifies or unverifies. That is precisely why a recipe
+		// change lands DRIFTED — the definition moved and the verification did
+		// not — which is the one governance consequence the metric loop reports.
+		parent.MetricRecipe = draft.MetricRecipe
 		f.copyColumnDocs(draftID, parent.ID)
 		f.synced[parent.ID] = true
 	}
@@ -1372,4 +1436,165 @@ func assertPipelineBaselineMatchesDisk(t *testing.T, root string, key wfdir.Inst
 			t.Errorf("%s: baseline hash %s, disk hash %s", path, want, got)
 		}
 	}
+}
+
+// --- the metric authoring routes --------------------------------------------
+//
+// Two handlers, and between them they model the four server properties the
+// metric half of the pipeline loop is built around. A fake that skipped any of
+// them would let a CLI that got it wrong pass every test here and fail against a
+// real instance:
+//
+//  1. THE RECIPE IS CANONICALIZED ON THE WAY IN. What the row stores is not the
+//     bytes the client sent — a `version` is defaulted in — so a client that
+//     hashed its own local file for the compare-and-swap would be refused. The
+//     fake defaults the same key for that reason alone.
+//  2. THE PRECONDITION IS COMPARED AGAINST WHAT THE ROW STORES, whatever the
+//     client believed it was fingerprinting, and its three states answer
+//     differently: absent is no check, "" is a 400 rather than a silent
+//     no-check, and a digest is compare-and-swap.
+//  3. THE RECIPE ROUTE REFUSES A LIVE ROW, for every caller including an admin.
+//     That refusal is the whole reason the route is safe to publish, and a fake
+//     that accepted one would let a CLI that wrote the live metric's id pass —
+//     while in production it would leave a metric serving numbers from a
+//     definition nobody vetted.
+//  4. CREATING IS ADMIN-ONLY and lands `unvetted`, with every verification
+//     column empty. A metric born verified is the hole the create body was
+//     narrowed to close.
+
+// AddMetric registers a live metric row, filling in what every command reads.
+func (f *fakePipelineInstance) AddMetric(id, name, recipe string) *api.Table {
+	f.t.Helper()
+	return f.AddTable(&api.Table{
+		ID: id, Name: name, Kind: api.TableKindMetric,
+		MetricRecipe: json.RawMessage(recipe),
+		MetricStatus: api.MetricStatusUnvetted,
+	})
+}
+
+// RecipeOf reads one row's stored recipe back, for assertions.
+func (f *fakePipelineInstance) RecipeOf(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if row := f.tables[id]; row != nil {
+		return string(row.MetricRecipe)
+	}
+	return ""
+}
+
+// canonicalRecipe is the server's canonicalization, modelled to the one degree
+// that matters to a client: the stored bytes are NOT the sent bytes.
+//
+// `version` is defaulted to 1 when the caller omitted it, which is enough to
+// make the point — a client that hashed its own file rather than what the server
+// answered would be refused by the precondition, exactly as it would in
+// production. Everything else is carried through verbatim, because the recipe
+// grammar is the server's and the CLI passes it through untouched.
+func canonicalRecipe(t *testing.T, raw json.RawMessage) json.RawMessage {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw
+	}
+	if _, has := fields["version"]; !has {
+		fields["version"] = json.RawMessage("1")
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("canonicalRecipe: %v", err)
+	}
+	return out
+}
+
+// recipeDigest is the server's precondition digest: sha256 over the raw STORED
+// bytes, lowercase hex.
+func recipeDigest(recipe json.RawMessage) string {
+	sum := sha256.Sum256(recipe)
+	return hex.EncodeToString(sum[:])
+}
+
+// serveCreateMetric models POST /feature/model/metric.
+func (f *fakePipelineInstance) serveCreateMetric(w http.ResponseWriter, r *http.Request) {
+	// Answered first, and by CODE rather than by prose: the CLI's whole
+	// adopt-by-name recovery branches on it.
+	if f.nameTakenOnMetricCreate != "" {
+		http.Error(w, `{"error":`+strconv.Quote(f.nameTakenOnMetricCreate)+`,"code":"name_taken"}`, http.StatusConflict)
+		return
+	}
+	if f.failMetricCreate != 0 {
+		http.Error(w, `{"error":"admin required to create a metric"}`, f.failMetricCreate)
+		return
+	}
+	var in api.CreateMetricInput
+	decodeBody(f.t, r, &in)
+	f.metricsCreated = append(f.metricsCreated, in)
+	f.nextID++
+	row := f.AddTable(&api.Table{
+		ID:                fmt.Sprintf("table-metric-%d", f.nextID),
+		Name:              in.Name,
+		Kind:              api.TableKindMetric,
+		FeatureID:         in.FeatureID,
+		Status:            api.TableStatusPending,
+		Description:       in.Description,
+		DescriptionSource: api.DescriptionSourceUser,
+		MetricRecipe:      canonicalRecipe(f.t, in.Recipe),
+		// UNVETTED, forced, whatever the body said — and the body has no field
+		// for it, which is the other half of the same guarantee.
+		MetricStatus: api.MetricStatusUnvetted,
+	})
+	f.synced[row.ID] = false
+	writeJSON(w, map[string]any{"metric": row})
+}
+
+// serveWriteRecipe models PUT /feature/model/:id/metric/recipe.
+func (f *fakePipelineInstance) serveWriteRecipe(w http.ResponseWriter, r *http.Request, draftID string) {
+	if status := f.failRecipePut[draftID]; status != 0 {
+		http.Error(w, `{"error":"boom"}`, status)
+		return
+	}
+	row := f.tables[draftID]
+	if row == nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	if row.Kind != api.TableKindMetric {
+		http.Error(w, `{"error":"this is not a metric"}`, http.StatusBadRequest)
+		return
+	}
+	// DRAFTS ONLY. See the header above: a recipe written onto a live row would
+	// serve numbers from the new definition while the verification fingerprint
+	// sat still.
+	if row.ShadowStatus != api.ShadowStatusDraft {
+		http.Error(w, `{"error":"a metric's recipe is written on a draft — check one out first"}`, http.StatusBadRequest)
+		return
+	}
+	var in recipeWriteBody
+	decodeBody(f.t, r, &in)
+	f.recipeWrites = append(f.recipeWrites, recordedRecipeWrite{
+		ID: draftID, Recipe: string(in.Recipe),
+		ReportingTimezone: in.ReportingTimezone, BaseRecipeSha256: in.BaseRecipeSha256,
+	})
+	if in.BaseRecipeSha256 != nil {
+		if *in.BaseRecipeSha256 == "" {
+			http.Error(w, `{"error":"baseRecipeSha256 must be a 64-character lowercase hex sha256"}`, http.StatusBadRequest)
+			return
+		}
+		if recipeDigest(row.MetricRecipe) != *in.BaseRecipeSha256 {
+			http.Error(w, `{"error":"this draft's recipe changed since you last read it"}`, http.StatusConflict)
+			return
+		}
+	}
+	// An ABSENT recipe keeps whatever the draft holds, which is what makes a
+	// timezone-only re-declaration expressible.
+	if len(in.Recipe) > 0 {
+		row.MetricRecipe = canonicalRecipe(f.t, in.Recipe)
+	}
+	row.UpdatedAt = row.UpdatedAt.Add(time.Minute)
+	writeJSON(w, map[string]any{
+		"draftID": draftID, "metricID": row.ParentModelID,
+		"recipe": row.MetricRecipe, "additive": false,
+		"dimensions": []string{}, "timeColumn": "created_at",
+		"inputModels": []string{}, "sourceClosure": []string{},
+		"reportingTimezone": "",
+	})
 }

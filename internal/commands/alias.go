@@ -984,7 +984,11 @@ func folderStems(kind wfdir.Kind, files map[string]string) []string {
 // command.
 func folderFieldRefs(kind wfdir.Kind, root string, files map[string]string) []fieldRef {
 	if kind.Name == wfdir.KindPipeline {
-		return tableDocsFieldRefs(root)
+		// TWO carriers, both of which name aliases as FILE NAMES or as JSON
+		// values rather than as markers, so markers.Scan finds nothing in either
+		// and every dependency declared for one would otherwise be reported as
+		// dead config on every push, status and `sync check`.
+		return append(tableDocsFieldRefs(root), metricFieldRefs(root)...)
 	}
 	if kind.Name != wfdir.KindAutomation {
 		return nil

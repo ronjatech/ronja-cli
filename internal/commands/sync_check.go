@@ -612,7 +612,13 @@ func pipelineReferences(ctx context.Context, f *folder, checker *edgeChecker) (
 	// id deliberately is not.
 	docsEdges, docsFindings := tableDocsEdges(f)
 	edges = append(edges, docsEdges...)
-	return checker.apply(ctx, edges), docsFindings, aliases.Warnings, "", ""
+	// The METRIC FILES are references twice over — the stem names the row the
+	// file is, and `recipe.source` names the table it reads — and neither is a
+	// marker either. A metric whose source has stopped resolving is a folder that
+	// no longer deploys, which is exactly the question this command asks.
+	fromMetrics, metricFindings := metricEdges(f, pipe, f.live(f.State.For(f.Key)))
+	edges = append(edges, fromMetrics...)
+	return checker.apply(ctx, edges), append(docsFindings, metricFindings...), aliases.Warnings, "", ""
 }
 
 // dataAppReferences checks what a data app DECLARES, and compares it against

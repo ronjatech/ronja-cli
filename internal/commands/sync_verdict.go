@@ -232,6 +232,36 @@ func verdictOfPipelineStatus(r *pipelineStatusReport, localFiles int, undeployed
 		}
 	}
 
+	// The METRIC FILES, on the same discipline and with one arm the other two do
+	// not have. A metric file may legitimately name a row that does not exist —
+	// it is the one carrier in this folder that CREATES what it names without
+	// being a .sql file — and that is a LOCAL change ("this repository holds a
+	// definition the organization does not"), never drift and never unknown.
+	//
+	// The same two corrections as above otherwise: unknown dominates, and
+	// driftNoBaseline is unknown here even though the single-folder command reads
+	// it as green.
+	var metricsPending []string
+	for _, m := range r.Remote.Metrics {
+		switch {
+		case m.WillCreate:
+			// Owned by the pending clause below, which is the only place that says
+			// what a push will do about it.
+		case m.Problem != "", m.Drift == "", m.Drift == driftUnreadable, m.Drift == driftNoBaseline:
+			delta.Unchecked = append(delta.Unchecked, m.Path)
+		case m.Drift == driftChanged:
+			delta.Remote = append(delta.Remote, m.Path)
+		}
+		// A STAGED DRAFT counts as a local change too, and it is the metric half
+		// of what `undeployed` answers for a .sql file: the folder's definition is
+		// staged and the organization does not hold it, which is precisely what
+		// this command asks about. A metric has no committed content fingerprint
+		// to compute that from, so the draft is the answer there is.
+		if m.Pending || m.DraftID != "" {
+			metricsPending = append(metricsPending, m.Path)
+		}
+	}
+
 	// The LOCAL half, which nothing read before this. Three sources, deduped,
 	// because on a machine that HAS a baseline the same file legitimately shows
 	// up in two of them:
@@ -250,7 +280,7 @@ func verdictOfPipelineStatus(r *pipelineStatusReport, localFiles int, undeployed
 	// the folder committed. Gating it on the absence of a baseline would make the
 	// answer depend on whose machine it ran on, which is the exact property the
 	// lock file exists to remove.
-	delta.Local = dedupe(localChanges(r.Local), r.WillCreate, undeployed, docsPending)
+	delta.Local = dedupe(localChanges(r.Local), r.WillCreate, undeployed, docsPending, metricsPending)
 	return delta.verdict()
 }
 

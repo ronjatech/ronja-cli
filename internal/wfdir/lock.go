@@ -160,6 +160,29 @@ type LockStack struct {
 	// the live row — there is no draft in this path — so unlike a pipeline file
 	// there is no per-user half at all.
 	TableDocs map[string]LockTableDocs `json:"tableDocs,omitempty"`
+	// Metrics is a PIPELINE folder's per-METRIC-FILE state: the metric each
+	// committed `metrics/<alias>.json` defines, that row's recipe fingerprint as
+	// of the last moment this folder agreed with it, and the fingerprint of what
+	// the file itself last declared.
+	//
+	// Keyed by the metric file's slash-separated relative path
+	// (`metrics/average_order_value.json`), exactly as Tables, Automations and
+	// TableDocs are keyed by theirs.
+	//
+	// SEPARATE FROM Tables for TableDocs' reason and one more of its own. Tables
+	// is keyed by a .sql file, and a metric has none — a metric is a recipe, so
+	// there is no SQL a file could hold and no path in that map to key on. The
+	// two also carry different fingerprints of different things: LockTable's
+	// LiveSHA256 is the live table's SQL, this one is the live metric's
+	// canonicalized RECIPE, and folding them would compare a recipe against a
+	// hash taken from somebody's SELECT.
+	//
+	// Committed for Tables' reason: which row a path defines, and what that row's
+	// definition looked like when everybody last agreed with it, are facts about
+	// the ENVIRONMENT rather than about a person — and here that matters more
+	// than anywhere else in this file, because the row in question is the
+	// company's official definition of a number.
+	Metrics map[string]LockMetric `json:"metrics,omitempty"`
 
 	// ⚠️ There is deliberately NO per-file fingerprint for a workflow or a data
 	// app here, and the asymmetry with Tables above is not an oversight. Those
@@ -264,6 +287,50 @@ type LockTableDocs struct {
 	unknown unknownKeys
 }
 
+// LockMetric is one metric file's recorded state on one stack.
+//
+// ⚠️ LiveSHA256 obeys the invariant on LockTable, and it is the same invariant
+// for the same reason: A HASH IS ONLY EVER COMPARED AGAINST THE ROW IT WAS TAKEN
+// FROM. MetricID is which row that was, so a metric file rebound to a different
+// row — the alias repointed by `ronja bind`, a stack switched, a merge — drops
+// the fingerprint with it rather than comparing one metric's definition against a
+// hash taken from another's.
+type LockMetric struct {
+	// MetricID is the row this file's stem resolved to when the fingerprint was
+	// taken. It duplicates what the manifest's bind map says today on purpose:
+	// the recording has to name the row it describes, not merely that it
+	// describes one.
+	MetricID string `json:"metricID"`
+	// LiveSHA256 is the LIVE metric's recipe fingerprint (metricfile.RecipeSHA256
+	// over the bytes the server sent). Empty DISARMS the guard — "no answer",
+	// never "agreed" — which is the state of a folder cloned from git and of one
+	// written before this field existed.
+	//
+	// ⚠️ IT IS TAKEN OVER THE ROW'S CANONICALIZED RECIPE, NOT OVER THE FILE. The
+	// file carries an alias in `source` and may omit a defaultable key; the row
+	// carries a real id and every default filled in. Hashing the file here would
+	// report drift on every stack, on the first push, for ever.
+	LiveSHA256 string `json:"liveSHA256,omitempty"`
+	// DeclaredSHA256 is the fingerprint of what the FILE declared when it was
+	// last pushed (metricfile.Fingerprint over the resolved recipe and both
+	// three-state fields) — this metric's answer to "has the local file changed
+	// since the last sync", which for a .sql file is answered by the folder's own
+	// content baseline.
+	//
+	// It needs its own field for LockTableDocs.DeclaredSHA256's two reasons. A
+	// metric file is not in that baseline at all — a pipeline folder syncs
+	// `.sql`, so the enumeration never sees these files — and the file cannot be
+	// compared against the row directly, because the row holds the canonicalized
+	// recipe and the file does not. Without it every push would re-write, re-sync
+	// and re-BUILD every metric in the folder, which is expensive and, on a
+	// metric whose commit re-fingerprints, noisy in governance too.
+	DeclaredSHA256 string `json:"declaredSHA256,omitempty"`
+
+	// unknown is this entry's forward-compatibility sidecar, for the reason
+	// LockTable's has one: it is an object in a COMMITTED file.
+	unknown unknownKeys
+}
+
 // LockAutomation is one automation file's recorded state on one stack.
 //
 // Deliberately NO content fingerprint, and the asymmetry with LockTable is the
@@ -323,6 +390,7 @@ var (
 	lockStackKeys      = jsonFieldNames(reflect.TypeOf(LockStack{}))
 	lockTableKeys      = jsonFieldNames(reflect.TypeOf(LockTable{}))
 	lockTableDocsKeys  = jsonFieldNames(reflect.TypeOf(LockTableDocs{}))
+	lockMetricKeys     = jsonFieldNames(reflect.TypeOf(LockMetric{}))
 	lockAutomationKeys = jsonFieldNames(reflect.TypeOf(LockAutomation{}))
 	stackKeys          = jsonFieldNames(reflect.TypeOf(Stack{}))
 )
@@ -416,6 +484,24 @@ func (d LockTableDocs) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return d.unknown.merge(body)
+}
+
+func (m *LockMetric) UnmarshalJSON(data []byte) error {
+	var decoded plainLockMetric
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*m = LockMetric(decoded)
+	m.unknown.capture(data, lockMetricKeys)
+	return nil
+}
+
+func (m LockMetric) MarshalJSON() ([]byte, error) {
+	body, err := json.Marshal(plainLockMetric(m))
+	if err != nil {
+		return nil, err
+	}
+	return m.unknown.merge(body)
 }
 
 func (a *LockAutomation) UnmarshalJSON(data []byte) error {
@@ -803,6 +889,48 @@ func (l *Lock) SetTableDocsSeen(stack, path, tableID, meta, declared string) {
 	}
 	docs.TableID, docs.MetaSHA256, docs.DeclaredSHA256 = tableID, meta, declared
 	entry.TableDocs[path] = docs
+	l.Stacks[stack] = entry
+}
+
+// MetricSeen reads one metric file's recorded row id, the live metric's recipe
+// fingerprint this folder last agreed with, and what the file itself last
+// declared. An unrecorded path answers three empty strings, which disarms both
+// guards.
+func (l *Lock) MetricSeen(stack, path string) (metricID, live, declared string) {
+	if l == nil {
+		return "", "", ""
+	}
+	entry := l.Stacks[stack].Metrics[path]
+	return entry.MetricID, entry.LiveSHA256, entry.DeclaredSHA256
+}
+
+// SetMetricSeen records the row a metric file defines, that row's recipe
+// fingerprint at the moment this folder agreed with it, and what the file
+// declared then.
+//
+// ⚠️ A LEGACY instances[] folder has no stack name, and there is nowhere in a
+// lock keyed by stack name to put its recording — writing one anyway puts
+// `"stacks":{"":{…}}` into a committed file, which is the bug SetAutomationSeen
+// names. Its recording lives in .ronja/state.json instead; see the liveHashes
+// fork in the commands package.
+func (l *Lock) SetMetricSeen(stack, path, metricID, live, declared string) {
+	if stack == "" {
+		return
+	}
+	entry := l.stack(stack)
+	if entry.Metrics == nil {
+		entry.Metrics = map[string]LockMetric{}
+	}
+	// Read-edit-store rather than a fresh value, so the forward-compatibility
+	// sidecar survives — a rewritten value built from scratch is exactly how the
+	// keys a newer CLI wrote get dropped. Only for the SAME row: a path rebound
+	// to a different metric keeps nothing, by the invariant on LockMetric.
+	metric := entry.Metrics[path]
+	if metric.MetricID != metricID {
+		metric = LockMetric{}
+	}
+	metric.MetricID, metric.LiveSHA256, metric.DeclaredSHA256 = metricID, live, declared
+	entry.Metrics[path] = metric
 	l.Stacks[stack] = entry
 }
 

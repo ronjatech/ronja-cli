@@ -14,6 +14,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"net/url"
@@ -170,6 +171,37 @@ type Table struct {
 	// instance that does not send it at all.
 	BuildVerdict string `json:"buildVerdict,omitempty"`
 
+	// MetricRecipe is a metric's whole DEFINITION, in the canonical form the
+	// server stores: the version defaulted, `source` a real table id. Empty on
+	// every row that is not a metric.
+	//
+	// json.RawMessage AND NOT A TYPED STRUCT, which is the single most important
+	// decision on this type. The grammar belongs to rdb.ValidateMetricRecipe, and
+	// two things break if these bytes are ever decoded and re-encoded:
+	//
+	//   - THE COMPARE-AND-SWAP. baseRecipeSha256 is a digest over the bytes the
+	//     server has STORED, so a client that decoded a recipe into a map and
+	//     re-marshalled it would hash a different key order and be refused with a
+	//     409 describing an edit nobody made.
+	//   - THE PASS-THROUGH. A key this build has never heard of would be dropped
+	//     on the way back out, which is the failure the metric loop's
+	//     unknown-key rule exists to remove.
+	//
+	// Normalize turns a JSON `null` into nil, so "this row is not a metric" is
+	// one spelling rather than two.
+	MetricRecipe json.RawMessage `json:"metricRecipe"`
+	// MetricStatus is the VERIFICATION axis: unvetted | verified | retired, empty
+	// on a row that is not a metric. Read by the metric loop for exactly one
+	// thing, and it is a destructive gate rather than a display field —
+	// overwriting a colleague's committed change to a VERIFIED metric costs a
+	// second, metric-specific flag. See MetricStatusVerified.
+	//
+	// A plain string for the reason every other optional string here is one: the
+	// server's optional.V marshals as the bare value or `null`, and unmarshalling
+	// `null` into a non-pointer is a documented no-op, so "" is exactly what
+	// "unset" means.
+	MetricStatus string `json:"metricStatus"`
+
 	// LastBuildError is the last recorded failure, absent when there is none.
 	//
 	// DRAFT-AWARE, deliberately, and that is not the same scope as BuildVerdict:
@@ -233,13 +265,23 @@ type TableBuildError struct {
 }
 
 // Normalize replaces a nil InputModels with an empty slice, so callers can range
-// and compare without nil-checking.
+// and compare without nil-checking, and folds a JSON `null` metricRecipe into
+// nil.
+//
+// The recipe fold matters more than it looks: `metricRecipe` carries no
+// omitempty server-side, so EVERY row answers with the key, and a non-metric one
+// answers `null` — which decodes into a four-byte json.RawMessage that is not
+// empty and is not valid to send anywhere. One spelling of "this row has no
+// recipe" keeps the fingerprint helpers from having to know two.
 func (t *Table) Normalize() {
 	if t == nil {
 		return
 	}
 	if t.InputModels == nil {
 		t.InputModels = []string{}
+	}
+	if string(t.MetricRecipe) == "null" {
+		t.MetricRecipe = nil
 	}
 }
 

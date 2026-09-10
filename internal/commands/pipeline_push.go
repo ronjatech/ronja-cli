@@ -49,11 +49,11 @@ const (
 // network and their diagnosis is entirely local), then the files in topological
 // order, and per file the drift guard before the first byte is written.
 func newPipelinePushCmd() *cobra.Command {
-	var force bool
+	var force, forceVerifiedMetric bool
 	cmd := &cobra.Command{
 		Use:   "push [paths...]",
-		Short: "Sync changed .sql files into your drafts and build them",
-		Long: `Sync changed .sql files into your drafts and build them.
+		Short: "Sync changed .sql files and metrics into your drafts and build them",
+		Long: `Sync changed .sql files and metrics into your drafts and build them.
 
 Pushes to a DRAFT, always — the live table is never written, so a failed build
 changes nothing anyone else can see. For each file that differs from your last
@@ -90,10 +90,26 @@ have is REPORTED, not refused — the prose is kept and attaches by itself if a
 build later produces the column, which is what makes a committed file safe to
 keep in git alongside data that changes.
 
+METRICS. A metric is a recipe rather than SQL, so it lives in
+metrics/<name>.json, where <name> is the metric's own name (or a "table"
+dependency this folder declares and "ronja bind" points at an existing metric):
+
+  {"recipe": {"source": "orders", "time": {"column": "created_at",
+   "native_grain": "day"}, "base_measures": [{"name": "revenue", "agg": "sum",
+   "column": "amount"}], "value": "revenue"}, "description": "..."}
+
+It runs the identical cycle: your draft is staged, built and reported, and
+"ronja pipeline publish" commits it. "source" may name a table this folder
+builds — metrics are pushed after the SQL, so the table is always there first. A
+metric and a table cannot share a name inside one feature, and this command
+refuses a folder that claims one twice before it sends anything.
+
 It refuses a table whose SQL changed on the server since your last sync — chat
 and the web builder edit the same draft — naming what moved, and it refuses on
-the same terms when a documented table's DESCRIPTION or column prose moved.
---force overwrites.
+the same terms when a documented table's DESCRIPTION or column prose moved, or
+when a metric's DEFINITION did. --force overwrites, and prints the difference
+before it does — except on a metric an admin has VERIFIED, which additionally
+needs --force-verified-metric.
 
 A failed build is not the end of the push: the remaining files are still
 attempted, each result is reported, and the command exits non-zero.
@@ -108,6 +124,21 @@ Publishing is a separate step:
 		// visible where cobra reads it rather than only in the resolver.
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// --force-verified-metric ONLY WIDENS what --force overwrites: the
+			// refusal it unlocks is nested inside the --force arm of the metric
+			// drift guard, so on its own it changes nothing at all. Silently inert
+			// was the bug — an author reaching for what reads as the stronger of
+			// the two flags typed it alone, met the ordinary drift refusal, and was
+			// told nothing about the flag they had just passed.
+			//
+			// Refused HERE, before the folder is opened and before the first
+			// request, because a flag combination that cannot mean anything is
+			// answerable with no state at all — and because a folder push that has
+			// already created tables is the wrong moment to learn the command line
+			// was wrong.
+			if forceVerifiedMetric && !force {
+				return fmt.Errorf("--force-verified-metric does nothing on its own: it only widens what --force is allowed to overwrite.\n  Pass both (`--force --force-verified-metric`) to overwrite a VERIFIED metric whose definition changed on the server, or drop it and push with --force alone")
+			}
 			resolved, err := resolveInstance()
 			if err != nil {
 				return err
@@ -116,7 +147,8 @@ Publishing is a separate step:
 			if err != nil {
 				return err
 			}
-			result, err := runPipelinePush(cmd.Context(), f, args, pipelinePushOptions{Force: force})
+			result, err := runPipelinePush(cmd.Context(), f, args,
+				pipelinePushOptions{Force: force, ForceVerifiedMetric: forceVerifiedMetric})
 			// The report is emitted even on failure: a push that stopped part-way
 			// has already created tables and staged drafts, and "which ones" is
 			// the first thing anyone needs to know.
@@ -133,12 +165,26 @@ Publishing is a separate step:
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false,
-		"push even though a table's SQL changed on the server since your last sync")
+		"push even though a table's SQL, or a metric's definition, changed on the server since your last sync")
+	cmd.Flags().BoolVar(&forceVerifiedMetric, "force-verified-metric", false,
+		"with --force, also overwrite a VERIFIED metric whose definition a colleague changed — discarding the admin's verification of what is there now")
 	return cmd
 }
 
 type pipelinePushOptions struct {
 	Force bool
+	// ForceVerifiedMetric is the SECOND flag a metric an admin has verified
+	// costs, and it does nothing on its own — it only widens what --force is
+	// allowed to overwrite.
+	//
+	// Two flags rather than one because the two acts are not the same size.
+	// Forcing past drift on a .sql file overwrites SQL whose previous version is
+	// in the table's own history; forcing past drift on a VERIFIED metric
+	// overwrites the company's official definition of a number, discards an
+	// admin's assertion that the definition there now was checked, and does it
+	// under a flag whose message is about your own file. Overwriting that should
+	// cost a sentence you had to type.
+	ForceVerifiedMetric bool
 }
 
 // pipelinePushResult is the --json shape and the human renderer's input, so the
@@ -155,6 +201,10 @@ type pipelinePushResult struct {
 	// folder documents but does not build. Absent for the folders that keep
 	// none, which is every folder that has not adopted them.
 	Docs []pipelineDocsFileResult `json:"docs,omitempty"`
+	// Metrics is one entry per METRIC FILE this push attempted — the numbers this
+	// folder defines. Absent for the folders that keep none, which is every
+	// folder that has not adopted them.
+	Metrics []pipelineMetricFileResult `json:"metrics,omitempty"`
 	// UpToDate reports a push that found nothing to do.
 	UpToDate bool `json:"upToDate"`
 	// Error summarises a push that did not fully succeed. The per-file entries
@@ -229,6 +279,60 @@ func printPipelineDocsResult(out *os.File, doc pipelineDocsFileResult) {
 	if line := describeDocsResult(doc.Result); line != "" {
 		fmt.Fprintf(out, "    Docs:   %s\n", line)
 	}
+}
+
+// printPipelineMetricResult renders one metric file's outcome.
+//
+// It leads with the metric's DERIVED shape rather than with row counts, which is
+// the one place this renderer diverges from the .sql one and the divergence is
+// the point: a metric produces no table to sample, and what a reader has to
+// check before publishing is whether the server derived the definition they
+// meant — additivity above all, since a ratio that came out additive would
+// re-aggregate by summing and be wrong at every grain but one.
+func printPipelineMetricResult(out *os.File, metric pipelineMetricFileResult) {
+	switch metric.Outcome {
+	case metricOutcomeRefused:
+		fmt.Fprintf(out, "\n  %s — not pushed\n", metric.Path)
+		for _, line := range strings.Split(strings.TrimRight(metric.Error, "\n"), "\n") {
+			fmt.Fprintf(out, "    %s\n", line)
+		}
+		return
+	case metricOutcomeBuildFailed:
+		fmt.Fprintf(out, "\n  %s — build FAILED\n", metric.Path)
+		fmt.Fprintf(out, "    Draft:  %s (kept, so you can fix the recipe and push again)\n", metric.DraftID)
+		fmt.Fprintf(out, "    Metric: %s is untouched — a draft build never changes what anybody reads\n", metric.MetricID)
+		for _, line := range strings.Split(strings.TrimRight(metric.Error, "\n"), "\n") {
+			fmt.Fprintf(out, "    %s\n", line)
+		}
+		return
+	case metricOutcomeUpToDate:
+		fmt.Fprintf(out, "\n  %s — up to date\n", metric.Path)
+		fmt.Fprintf(out, "    Metric: %s\n", metric.MetricID)
+		return
+	case metricOutcomeDescriptionFailed:
+		fmt.Fprintf(out, "\n  %s — staged, description NOT written\n", metric.Path)
+		fmt.Fprintf(out, "    Draft:  %s (holds the definition, and is still publishable)\n", metric.DraftID)
+		for _, line := range strings.Split(strings.TrimRight(metric.Error, "\n"), "\n") {
+			fmt.Fprintf(out, "    %s\n", line)
+		}
+		return
+	}
+
+	verb := "staged"
+	if metric.Created {
+		verb = "created and staged"
+	}
+	fmt.Fprintf(out, "\n  %s — %s\n", metric.Path, verb)
+	fmt.Fprintf(out, "    Metric: %s\n", metric.MetricID)
+	fmt.Fprintf(out, "    Draft:  %s\n", metric.DraftID)
+	fmt.Fprintf(out, "    Reads:  %s\n", metric.SourceID)
+	for _, note := range metric.Notes {
+		fmt.Fprintf(out, "    Shape:  %s\n", note)
+	}
+	for _, warning := range metric.Warnings {
+		fmt.Fprintf(out, "    Note:   %s\n", warning)
+	}
+	printResourceURL(out, statusKeyWidth, metric.URL)
 }
 
 // pipelineReview is the confidence report: what committing this draft would
@@ -331,11 +435,38 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		return nil, err
 	}
 	sidecars = resolveTableDocsSidecars(f, sidecars)
+	// The METRIC files, read with no network in sight either. Resolution needs
+	// the baseline, because a metric's identity comes from the recorded id when
+	// no alias binds its stem — see resolveMetricFiles.
+	metrics, err := readMetricFiles(f.Root)
+	if err != nil {
+		return nil, err
+	}
+	// The one local guard the metric half adds, and it belongs beside
+	// checkPushable rather than inside the pass: a folder that names one thing
+	// twice fails server-side half way through, after some of it has already
+	// been created, and no per-file refusal can undo that.
+	//
+	// ⚠️ BEFORE splitFileKindArgs NARROWS `metrics` BELOW, and that ordering is
+	// the guard rather than an accident of layout. A collision is a property of
+	// the FOLDER, and only one of its two halves need be named on the command
+	// line — `ronja pipeline push metrics/Revenue.json` in a folder that also
+	// holds `metrics/revenue.json` is the whole failure. Run on the narrowed set
+	// this would see one file, find nothing, and let the push walk into exactly
+	// the half-finished server-side refusal it exists to pre-empt.
+	if err := checkMetricStemCollisions(local, metrics); err != nil {
+		return nil, err
+	}
+	// IDENTITIES ONLY, here. Which row each file is comes from the manifest and
+	// the lock and is needed NOW — the create decision below turns on it. The
+	// SOURCES are resolved after the .sql pass, because the main case is a metric
+	// reading a table this very push creates.
+	metrics = resolveMetricIdentities(f, f.live(baseline), metrics)
 
 	var targets []string
 	if len(args) > 0 {
 		var sqlArgs []string
-		sqlArgs, sidecars, err = splitDocsArgs(f.Root, args, sidecars)
+		sqlArgs, sidecars, metrics, err = splitFileKindArgs(f.Root, args, sidecars, metrics)
 		if err != nil {
 			return nil, err
 		}
@@ -357,7 +488,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 				wfdir.ManifestName)
 		}
 	}
-	if len(targets) == 0 && len(sidecars) == 0 {
+	if len(targets) == 0 && len(sidecars) == 0 && len(metrics) == 0 {
 		// The prune above is a real edit to the baseline, and this is the path it
 		// is most likely to be taken on: the ordinary way to reach it is a folder
 		// with nothing left to push. Saved here or the note is printed on every
@@ -402,6 +533,18 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	creating := false
 	for _, d := range decisions {
 		if d.Creates() {
+			creating = true
+		}
+	}
+	// A metric file with no row behind it creates one too, and it counts here for
+	// the same reason a .sql file does: a create WRITES a binding, and a binding
+	// must name its organization authoritatively. Folded into the same flag
+	// rather than checked separately, so a folder whose only creates are metrics
+	// binds exactly as one whose only creates are tables does — that folder
+	// otherwise reached the create with no organization resolved and wrote an
+	// entry no later command matches.
+	for _, metric := range metrics {
+		if metric.Problem == "" && metric.MetricID == "" {
 			creating = true
 		}
 	}
@@ -479,12 +622,36 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 			settledDocs++
 		}
 	}
+	// 7. The METRIC FILES — the numbers this folder defines. After the SQL for
+	// the reason wfdir.MetricsDirName states: a metric contributes no `{{ ref }}`
+	// edge and so cannot join topoOrder, and running last is what makes a metric
+	// reading a table this same push created land after that table's create.
+	// After the docs sidecars too, so the report reads as "built, documented,
+	// defined".
+	//
+	// THE SOURCES ARE RESOLVED HERE, not with the identities above: a metric
+	// reading a table this same push created resolves through
+	// f.Binding.Tables, which the loop above has just filled in.
+	result.Metrics = pushMetricFiles(ctx, client, f, inst, resolveMetricSources(f, codec, metrics), opts)
+	refusedMetrics, settledMetrics, metricProseFailed := 0, 0, 0
+	for _, metric := range result.Metrics {
+		switch metric.Outcome {
+		case metricOutcomeRefused, metricOutcomeBuildFailed:
+			refusedMetrics++
+		case metricOutcomeDescriptionFailed:
+			metricProseFailed++
+		case metricOutcomeUpToDate:
+			settledMetrics++
+		}
+	}
 	// UP TO DATE IS AN ANSWER ABOUT THE OUTCOMES, not about the early return that
 	// used to be its only home. That branch is now taken only by a folder with no
-	// sidecars at all, so any folder keeping one reported `upToDate: false` on
-	// every clean run — the one key a script watches to decide whether a push
-	// changed the organization, saying "yes" every time.
-	result.UpToDate = len(result.Files) == 0 && settledDocs == len(result.Docs)
+	// sidecars and no metrics at all, so any folder keeping one reported
+	// `upToDate: false` on every clean run — the one key a script watches to
+	// decide whether a push changed the organization, saying "yes" every time.
+	result.UpToDate = len(result.Files) == 0 &&
+		settledDocs == len(result.Docs) &&
+		settledMetrics == len(result.Metrics)
 
 	// The problems, counted apart and said apart. Three different things go wrong
 	// here and they have different fixes: a file that never landed, a file whose
@@ -500,6 +667,12 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	if refusedDocs > 0 {
 		problems = append(problems, fmt.Sprintf("%d of %d docs file(s) were refused", refusedDocs, len(result.Docs)))
 	}
+	if refusedMetrics > 0 {
+		problems = append(problems, fmt.Sprintf("%d of %d metric(s) did not land", refusedMetrics, len(result.Metrics)))
+	}
+	if metricProseFailed > 0 {
+		problems = append(problems, fmt.Sprintf("%d metric(s) were staged and built, and are publishable, but their description did not land", metricProseFailed))
+	}
 	if len(problems) == 0 {
 		return result, nil
 	}
@@ -507,42 +680,63 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	return result, fmt.Errorf("%s", result.Error)
 }
 
-// splitDocsArgs takes the docs sidecars out of a push's positional arguments.
+// splitFileKindArgs takes the docs sidecars and the metric files out of a push's
+// positional arguments.
 //
-// `ronja pipeline push tables/orders.json` is the obvious thing to type after
-// editing one, and resolveArgPaths would refuse it — correctly, for a .sql
-// resolver — with a message about a file that is not SQL. So the sidecars are
-// matched first, by path, and only what is left goes to the SQL resolver.
+// `ronja pipeline push tables/orders.json` — or `metrics/aov.json` — is the
+// obvious thing to type after editing one, and resolveArgPaths would refuse it,
+// correctly for a .sql resolver, with a message about a file that is not SQL. So
+// both non-SQL carriers are matched first, by path, and only what is left goes
+// to the SQL resolver.
 //
-// Naming ANY path narrows the docs pass to the sidecars named, exactly as it
-// narrows the SQL half to the files named: `push orders.sql` means that file and
-// nothing else, and quietly re-pushing eleven docs files beside it would be the
-// command doing more than it was asked.
-func splitDocsArgs(root string, args []string, sidecars []tableDocsSidecar) (sqlArgs []string, selected []tableDocsSidecar, err error) {
-	byPath := make(map[string]tableDocsSidecar, len(sidecars))
+// Naming ANY path narrows EVERY pass to what was named, exactly as it narrows
+// the SQL half to the files named: `push orders.sql` means that file and nothing
+// else, and quietly re-pushing eleven docs files and four metrics beside it
+// would be the command doing more than it was asked.
+//
+// THREE WAYS rather than two, and the split is on the DIRECTORY the path is in
+// rather than on its extension — both carriers are `.json`, so the extension
+// says nothing. A path that looks like one of them and is not in the folder is
+// refused by name, which is the difference between "you spelled it wrong" and
+// this file quietly going to the SQL resolver to be refused for the wrong reason.
+func splitFileKindArgs(root string, args []string, sidecars []tableDocsSidecar, metrics []pipelineMetricFile) (
+	sqlArgs []string, selectedDocs []tableDocsSidecar, selectedMetrics []pipelineMetricFile, err error) {
+
+	docsByPath := make(map[string]tableDocsSidecar, len(sidecars))
 	for _, file := range sidecars {
-		byPath[file.Path] = file
+		docsByPath[file.Path] = file
+	}
+	metricsByPath := make(map[string]pipelineMetricFile, len(metrics))
+	for _, file := range metrics {
+		metricsByPath[file.Path] = file
 	}
 	for _, arg := range args {
 		abs, absErr := filepath.Abs(arg)
 		if absErr != nil {
-			return nil, nil, fmt.Errorf("resolve %s: %w", arg, absErr)
+			return nil, nil, nil, fmt.Errorf("resolve %s: %w", arg, absErr)
 		}
 		rel, relErr := filepath.Rel(root, abs)
 		if relErr != nil {
-			return nil, nil, fmt.Errorf("resolve %s against %s: %w", arg, root, relErr)
+			return nil, nil, nil, fmt.Errorf("resolve %s against %s: %w", arg, root, relErr)
 		}
 		rel = filepath.ToSlash(rel)
-		if file, ok := byPath[rel]; ok {
-			selected = append(selected, file)
+		if file, ok := docsByPath[rel]; ok {
+			selectedDocs = append(selectedDocs, file)
+			continue
+		}
+		if file, ok := metricsByPath[rel]; ok {
+			selectedMetrics = append(selectedMetrics, file)
 			continue
 		}
 		if _, isSidecarPath := wfdir.TableDocsAlias(rel); isSidecarPath {
-			return nil, nil, fmt.Errorf("%s is not a docs file in this folder", arg)
+			return nil, nil, nil, fmt.Errorf("%s is not a docs file in this folder", arg)
+		}
+		if _, isMetricPath := wfdir.MetricAlias(rel); isMetricPath {
+			return nil, nil, nil, fmt.Errorf("%s is not a metric file in this folder", arg)
 		}
 		sqlArgs = append(sqlArgs, arg)
 	}
-	return sqlArgs, selected, nil
+	return sqlArgs, selectedDocs, selectedMetrics, nil
 }
 
 // explainUnreadableRefs names the `{{ ref }}` ids in this file that the caller
@@ -1423,7 +1617,7 @@ func describeLineageDelta(added, removed []string) string {
 func printPipelinePushReport(r *pipelinePushResult) {
 	out := os.Stdout
 	if r.UpToDate {
-		fmt.Fprintf(out, "  Up to date — every .sql file and docs sidecar in this folder matches your last sync.\n")
+		fmt.Fprintf(out, "  Up to date — every .sql file, docs sidecar and metric in this folder matches your last sync.\n")
 		return
 	}
 	for _, file := range r.Files {
@@ -1431,6 +1625,9 @@ func printPipelinePushReport(r *pipelinePushResult) {
 	}
 	for _, doc := range r.Docs {
 		printPipelineDocsResult(out, doc)
+	}
+	for _, metric := range r.Metrics {
+		printPipelineMetricResult(out, metric)
 	}
 	if r.Target != "" {
 		fmt.Fprintf(out, "\n  Target:   %s\n", r.Target)

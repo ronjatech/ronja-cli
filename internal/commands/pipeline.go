@@ -420,6 +420,72 @@ func (h liveHashes) setDocsSeen(path, tableID, meta, declared string) {
 	h.inst.TableDocs[path] = entry
 }
 
+// metricSeen and setMetricSeen are the METRIC half — a metric this folder
+// defines in `metrics/<alias>.json`, keyed by that file's path rather than by a
+// .sql file, since a metric is a recipe and has no SQL a file could hold.
+//
+// The same lock/baseline fork the sidecar pair makes, and it exists for the same
+// reason: wfdir.Lock.SetMetricSeen refuses an empty stack name outright rather
+// than writing `"stacks":{"":{…}}` into a committed file, so a legacy folder
+// needs somewhere else to keep a recording.
+//
+// ⚠️ A NIL inst IS THE ORDINARY CASE here too, and it is the trap the sidecar
+// pair's comment warns about: `.ronja/state.json` is gitignored, so
+// `f.State.For(f.Key)` is nil on every fresh clone — and `pipeline status`
+// passes that nil straight in, unlike push and publish which go through
+// pipelineBaseline. The read also runs inside a status worker goroutine, so a
+// miss is a raw process panic rather than an error anybody could act on.
+//
+// Empty strings are the right answer for a folder that has never synced here:
+// "no recording" disarms both guards, which is exactly what a fresh clone means.
+// The write is a no-op for the same reason the lock refuses an empty stack —
+// there is no baseline in memory to record into, and inventing one here would
+// write a file that `status` promises never to write.
+//
+// ⚠️ A DELETED `metrics/*.json` LEAVES ITS ENTRY STANDING, and that is the
+// decision rather than an oversight. It is parity with the sidecar pair above,
+// which prunes nothing either (nor does wfdir.Lock.SetTableDocsSeen), so pruning
+// one half would leave the two halves of one lock file disagreeing about what a
+// deleted carrier means. And pruning is the LESS safe side of the trade: a file
+// that vanishes and comes back is the ordinary git operation — a branch switch —
+// and on a legacy folder `.ronja/state.json` is gitignored, so it does NOT come
+// back with the branch. Dropping the recorded live fingerprint disarms the drift
+// guard, and the next push of the restored file would overwrite a colleague's
+// server-side change silently instead of refusing. A stale entry costs bytes in
+// a file; a pruned one costs the guard.
+func (h liveHashes) metricSeen(path string) (metricID, live, declared string) {
+	if h.stack != "" {
+		return h.lock.MetricSeen(h.stack, path)
+	}
+	if h.inst == nil {
+		return "", "", ""
+	}
+	entry := h.inst.Metrics[path]
+	return entry.MetricID, entry.LiveSHA256, entry.DeclaredSHA256
+}
+
+func (h liveHashes) setMetricSeen(path, metricID, live, declared string) {
+	if h.stack != "" {
+		h.lock.SetMetricSeen(h.stack, path, metricID, live, declared)
+		return
+	}
+	if h.inst == nil {
+		return
+	}
+	if h.inst.Metrics == nil {
+		h.inst.Metrics = map[string]wfdir.MetricState{}
+	}
+	// A metric file rebound to a DIFFERENT row drops the old row's fingerprint
+	// with it, by the invariant on wfdir.LockMetric: a hash is only ever compared
+	// against the row it was taken from.
+	entry := h.inst.Metrics[path]
+	if entry.MetricID != metricID {
+		entry = wfdir.MetricState{}
+	}
+	entry.MetricID, entry.LiveSHA256, entry.DeclaredSHA256 = metricID, live, declared
+	h.inst.Metrics[path] = entry
+}
+
 func (h liveHashes) set(path, tableID, liveCode string) {
 	if h.stack != "" {
 		h.lock.SetTableLive(h.stack, path, tableID, wfdir.HashString(liveCode))

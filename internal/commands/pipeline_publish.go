@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/metricfile"
 	"github.com/ronjatech/ronja-cli/internal/tabledocs"
 	"github.com/ronjatech/ronja-cli/internal/tablerefs"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
@@ -49,6 +50,10 @@ request, which is what CI wants when a merge is expected to land directly.
 
 A draft whose build failed is refused: publishing it would put a table live with
 no data behind it. Fix the SQL and push again.
+
+Metrics publish the same way. Committing a definition change re-fingerprints the
+metric, so one an admin had VERIFIED reads "verified · review pending" until it
+is verified again — this command says so when it happens.
 
 A draft whose table has been published to since it forked is refused too, and
 nothing is committed — landing it would revert whoever got there first. Push
@@ -102,10 +107,45 @@ type pipelinePublishResult struct {
 	FeatureID string                  `json:"featureID,omitempty"`
 	Target    string                  `json:"target,omitempty"`
 	Files     []pipelinePublishedFile `json:"files"`
+	// Metrics is one entry per METRIC FILE whose draft this publish acted on.
+	// Absent for the folders that keep none.
+	Metrics []pipelinePublishedMetric `json:"metrics,omitempty"`
 	// Nothing reports a publish that found no staged draft at all, which is a
 	// different answer from a publish that refused everything it found.
 	Nothing bool   `json:"nothing"`
 	Error   string `json:"error,omitempty"`
+}
+
+// pipelinePublishedMetric is what happened to one metric file's draft.
+//
+// Its own type rather than a reuse of pipelinePublishedFile, for the reason
+// api.TableListItem is its own type: the two are genuinely different shapes and
+// pretending otherwise would be a lie in the direction that costs. A metric has
+// no `cascade` (nothing in this folder reads a metric — no marker resolves one)
+// and it has a governance consequence a table does not, which is the field
+// below that no table result carries.
+type pipelinePublishedMetric struct {
+	Path     string `json:"path"`
+	MetricID string `json:"metricID"`
+	DraftID  string `json:"draftID,omitempty"`
+	// Outcome is outcomePublished, outcomeSubmittedForReview, outcomeConflict,
+	// outcomeNoDraft or pushOutcomeRefused — the same vocabulary the .sql half
+	// uses, so a caller scripting both branches on one set of strings.
+	Outcome string `json:"outcome"`
+	Detail  string `json:"detail,omitempty"`
+	Error   string `json:"error,omitempty"`
+	// Reverified reports the ONE governance consequence publishing a metric has
+	// and publishing a table does not: this metric was VERIFIED, the commit moved
+	// its definition, so it re-fingerprints and now reads "verified · review
+	// pending" until an admin verifies it again.
+	//
+	// A field rather than only a sentence because it is the thing a script
+	// deploying a repository most needs to be able to see: an admin has to be
+	// told, and nothing else in this output says so.
+	Reverified         bool     `json:"reverified,omitempty"`
+	Warnings           []string `json:"warnings,omitempty"`
+	OverwroteVersionID string   `json:"overwroteVersionID,omitempty"`
+	URL                string   `json:"-"`
 }
 
 type pipelinePublishedFile struct {
@@ -164,8 +204,16 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 		Files:     []pipelinePublishedFile{},
 	}
 
-	if !f.Bound || len(f.Binding.Tables) == 0 {
-		return nil, fmt.Errorf("nothing to publish — this folder has no tables on %s yet; run `ronja pipeline push` first",
+	// The METRIC FILES are read before the "nothing here" refusal, because a
+	// metric is not in Binding.Tables: that map is keyed by .sql path, and a
+	// metric's identity lives in the lock. A folder that defines only metrics has
+	// an empty map and perfectly real drafts.
+	metricsOnDisk, err := readMetricFiles(f.Root)
+	if err != nil {
+		return nil, err
+	}
+	if !f.Bound || (len(f.Binding.Tables) == 0 && len(metricsOnDisk) == 0) {
+		return nil, fmt.Errorf("nothing to publish — this folder has no tables or metrics on %s yet; run `ronja pipeline push` first",
 			f.Resolved.URL)
 	}
 
@@ -187,15 +235,39 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 	noteAliasReport(checkAliases(f.Manifest, f.selection(), f.Codec, local, folderStems(f.Kind, local), folderFieldRefs(f.Kind, f.Root, local)))
 	inst := pipelineBaseline(f)
 
+	// The METRIC FILES, resolved with no network in sight. Resolved before the
+	// argument split, because a path naming one has to be recognised rather than
+	// handed to the .sql resolver — which would refuse it with a message about a
+	// file that is not SQL.
+	metricFiles := resolveMetricFiles(f, codec, f.live(inst), metricsOnDisk)
+
 	var targets []string
 	if len(args) > 0 {
-		if targets, err = resolveArgPaths(f.Root, args, local); err != nil {
+		// The docs sidecars are read here ONLY so a path naming one is recognised
+		// and refused in its own words below — publish never acts on them.
+		sidecars, readErr := readTableDocsSidecars(f.Root)
+		if readErr != nil {
+			return nil, readErr
+		}
+		sqlArgs, namedDocs, namedMetrics, splitErr := splitFileKindArgs(f.Root, args, sidecars, metricFiles)
+		if splitErr != nil {
+			return nil, splitErr
+		}
+		// Refused rather than ignored. A docs sidecar writes STRAIGHT TO THE LIVE
+		// ROW — there is no draft in that path at all — so naming one here is
+		// somebody expecting a publish step that does not exist, and silently
+		// dropping it would look like it had happened.
+		if len(namedDocs) > 0 {
+			return nil, fmt.Errorf("a docs sidecar has no draft to publish — `ronja pipeline push` writes one straight to the live table")
+		}
+		metricFiles = namedMetrics
+		if targets, err = resolveArgPaths(f.Root, sqlArgs, local); err != nil {
 			return nil, err
 		}
 	} else {
 		targets = pipelineStagedDrafts(inst)
 	}
-	if len(targets) == 0 {
+	if len(targets) == 0 && len(metricFiles) == 0 {
 		result.Nothing = true
 		return result, nil
 	}
@@ -293,11 +365,256 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 		}
 	}
 
+	// The METRIC FILES, after the tables. A metric reads a table rather than the
+	// other way round — no marker resolves a metric, so nothing in this folder
+	// can read one — so publishing a metric after the table it reads is the same
+	// dependency order the .sql half computes, arrived at by construction.
+	for _, file := range metricFiles {
+		if ctx.Err() != nil {
+			result.Error = interruptedMessage
+			return result, errors.New(interruptedMessage)
+		}
+		metric := publishOneMetric(ctx, client, f, inst, file, routing)
+		if metric == nil {
+			continue
+		}
+		result.Metrics = append(result.Metrics, *metric)
+		if err := f.saveBaseline(); err != nil {
+			// A commit is irreversible server-side, and a baseline that cannot be
+			// written does not get better by committing more drafts into it. Same
+			// stop-and-say-so as the .sql loop above.
+			result.Error = fmt.Sprintf("%s was published, but the local baseline in %s could not be updated (%v) — the remaining drafts were left alone",
+				file.Path, wfdir.StatePath(f.Root), err)
+			return result, errors.New(result.Error)
+		}
+		if metric.Outcome == pushOutcomeRefused || metric.Outcome == outcomeConflict {
+			failed++
+		}
+	}
+	if len(result.Files) == 0 && len(result.Metrics) == 0 {
+		// Every metric file this run looked at had nothing staged, and there were
+		// no .sql targets either. The same answer the early return gives, reached
+		// from the other side.
+		result.Nothing = true
+		return result, nil
+	}
+
 	if failed > 0 {
-		result.Error = fmt.Sprintf("%d of %d draft(s) were not published", failed, len(result.Files))
+		result.Error = fmt.Sprintf("%d of %d draft(s) were not published", failed, len(result.Files)+len(result.Metrics))
 		return result, fmt.Errorf("%s", result.Error)
 	}
 	return result, nil
+}
+
+// publishOneMetric commits one metric file's staged draft, or files it for
+// review, and records what that leaves behind.
+//
+// It answers nil for a file with nothing staged, which is the ordinary case for
+// most metric files on most publishes and is why publish reads the server rather
+// than a recorded draft pointer: a metric's draft can be committed or discarded
+// from the web UI between two commands, exactly as a table's can, and this loop
+// keeps no per-file draft pointer for a metric to go stale in the first place.
+// A file this run could not READ is not that case, and is refused below.
+func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *wfdir.InstanceState,
+	file pipelineMetricFile, routing publishRouting) *pipelinePublishedMetric {
+
+	out := &pipelinePublishedMetric{Path: file.Path, MetricID: file.MetricID}
+	refuse := func(format string, args ...any) *pipelinePublishedMetric {
+		out.Outcome = pushOutcomeRefused
+		out.Error = fmt.Sprintf(format, args...)
+		fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n", file.Path, out.Error)
+		return out
+	}
+	conflict := func(format string, args ...any) *pipelinePublishedMetric {
+		out.Outcome = outcomeConflict
+		out.Error = fmt.Sprintf(format, args...)
+		fmt.Fprintf(os.Stderr, "  Conflict: %s — %s\n", file.Path, out.Error)
+		return out
+	}
+	if file.MetricID == "" {
+		// A FILE THIS RUN COULD NOT READ IS NOT A FILE WITH NOTHING STAGED, and
+		// answering both with silence is how a broken file becomes an unmentioned
+		// no-op: exit 0, no line in the report, and the draft it staged still on
+		// the server with nothing having said so.
+		//
+		// The two are told apart by the Problem rather than by the empty id.
+		// resolveMetricIdentities skips a file that already carries one, so a
+		// metric that really exists — created from this folder, its id in the
+		// lock — arrives here with an empty MetricID the moment its file stops
+		// parsing. (A Problem raised by the SOURCE pass is different: identities
+		// are resolved before it, and publish needs nothing else from the file —
+		// what it commits is the draft on the server — so such a file keeps its id
+		// and never reaches this branch.)
+		//
+		// Refused rather than skipped, which is the answer `push` gives the same
+		// file and the one `status` reports about it, so three verbs say one thing.
+		if file.Problem != "" {
+			return refuse("%s\n    Until that is fixed nothing here can tell which metric this file defines, so a draft it may have staged was left where it is. Fix the file, then publish again",
+				file.Problem)
+		}
+		// Nothing was ever created here, so there is nothing to commit. Silent
+		// rather than refused: `publish` with no arguments is not the command that
+		// should be teaching anybody that they have not pushed yet, and `push`
+		// says it in the one place it is actionable.
+		return nil
+	}
+
+	draft, err := client.GetTableDraft(ctx, file.MetricID)
+	if err != nil {
+		return refuse("check for your draft of %s: %v", file.MetricID, err)
+	}
+	if draft == nil {
+		return nil
+	}
+	out.DraftID = draft.ID
+
+	// The LIVE row BEFORE the commit, read for the one thing only it can say:
+	// whether this metric is VERIFIED, and what its definition was. Both are
+	// needed to report the governance consequence below, and both are gone the
+	// moment the commit lands.
+	liveBefore, liveBeforeErr := client.GetTable(ctx, file.MetricID)
+	if liveBeforeErr != nil {
+		fmt.Fprintf(os.Stderr, "  Note: could not read %s before committing it (%v) — publishing without the re-verification notice.\n",
+			file.MetricID, liveBeforeErr)
+	}
+
+	// The verdict lives only on the single-row GET, so the draft is read by its
+	// own id. Refusing a failed draft here rather than letting the commit through
+	// is the CLI naming the fix: the server would happily commit a definition
+	// that does not build, and the metric would go live with nothing behind it.
+	staged, err := client.GetTable(ctx, draft.ID)
+	if err != nil {
+		return refuse("read draft %s: %v", draft.ID, err)
+	}
+	switch staged.BuildVerdict {
+	case api.BuildVerdictFailed, api.BuildVerdictFailedStale:
+		reason := ""
+		if staged.LastBuildError != nil {
+			reason = ": " + staged.LastBuildError.Message
+		}
+		return refuse("draft %s did not build%s\n    Fix the recipe in %s and run `ronja pipeline push` again", draft.ID, reason, file.Path)
+	case api.BuildVerdictBuilding:
+		return refuse("draft %s is still building — wait for it to finish, or run `ronja pipeline push %s` to watch it", draft.ID, file.Path)
+	case api.BuildVerdictPending:
+		return refuse("draft %s has not been built — publishing it would put %s live with nothing behind it.\n    Run `ronja pipeline push %s` to build it (a queued build finishes there too)",
+			draft.ID, file.MetricID, file.Path)
+	}
+
+	if routing.ReviewUpFront {
+		if err := client.RequestTableReview(ctx, draft.ID); err != nil {
+			return refuse("submit %s for review: %v", draft.ID, err)
+		}
+		out.Outcome = outcomeSubmittedForReview
+		out.Detail = "this feature is shared, so an admin commits changes to it"
+		return out
+	}
+
+	commitErr := client.CommitTableDraft(ctx, draft.ID, "")
+	if why, taken := api.AsNameTaken(commitErr); taken {
+		return refuse("committing %s was refused — the name your draft would publish is taken:\n      %s\n    Nothing was committed and your draft is intact. A metric and a table share one namespace inside a feature; rename one of the two in the web app, then publish again",
+			file.MetricID, why)
+	}
+	if commitErr != nil && api.StatusOf(commitErr) == api.StatusConflict {
+		if !routing.OverwriteRemote {
+			return conflict("%s has been published to since your draft forked — nothing was committed, and your draft is intact:\n      %v\n    Re-apply your change on top of theirs (`ronja pipeline discard %s`, then `ronja pipeline push %s`), or re-run with --overwrite-remote to commit over their version",
+				file.MetricID, commitErr, file.Path, file.Path)
+		}
+		head, headErr := client.GetTableDraftReview(ctx, draft.ID)
+		switch {
+		case headErr != nil:
+			return refuse("committing %s was refused (%v), and reading the current version of %s in order to overwrite it failed too: %v",
+				draft.ID, commitErr, file.MetricID, headErr)
+		case head.HeadVersionID == "":
+			return refuse("committing %s was refused (%v), but %s reports no committed version to overwrite — --overwrite-remote has nothing to confirm",
+				draft.ID, commitErr, file.MetricID)
+		}
+		fmt.Fprintf(os.Stderr, "  --overwrite-remote: committing %s over version %s of %s, discarding what it changed.\n",
+			file.Path, head.HeadVersionID, file.MetricID)
+		if err := client.CommitTableDraft(ctx, draft.ID, head.HeadVersionID); err != nil {
+			// Deliberately not retried: an override authorizes overwriting the
+			// version it was shown, not whatever happens to be there by the time
+			// the request arrives.
+			if api.StatusOf(err) == api.StatusConflict {
+				return conflict("%s moved again while this was running — version %s is no longer the current one, so nothing was committed and your draft is intact: %v",
+					file.MetricID, head.HeadVersionID, err)
+			}
+			return refuse("commit %s over version %s: %v", draft.ID, head.HeadVersionID, err)
+		}
+		out.OverwroteVersionID = head.HeadVersionID
+		commitErr = nil
+	}
+	if commitErr != nil {
+		// The race the up-front routing cannot close: the feature was shared, or
+		// the caller's role changed, between the reads above and this commit.
+		if routing.NoRequestReview || !(routing.SharedFeature || routing.ScopeUnknown) || api.StatusOf(commitErr) != 400 {
+			return refuse("commit %s: %v", draft.ID, commitErr)
+		}
+		fmt.Fprintf(os.Stderr, "  Note: the commit of %s was refused (%v) — submitting the draft for review instead.\n", file.Path, commitErr)
+		if err := client.RequestTableReview(ctx, draft.ID); err != nil {
+			return refuse("commit %s was refused (%v), and submitting it for review failed too: %v", draft.ID, commitErr, err)
+		}
+		out.Outcome = outcomeSubmittedForReview
+		out.Detail = fmt.Sprintf("the commit was refused (%v), so the draft was submitted for review", commitErr)
+		return out
+	}
+
+	out.Outcome = outcomePublished
+	out.Detail = fmt.Sprintf("committed onto %s", file.MetricID)
+	if out.OverwroteVersionID != "" {
+		out.Detail = fmt.Sprintf("committed onto %s, overwriting version %s that was published after your draft was created",
+			file.MetricID, out.OverwroteVersionID)
+	}
+	out.URL = staged.URL
+
+	// THE BASELINE, AND WHAT IS WITHHELD FROM IT. `publish` runs in a separate
+	// process from the `push` that staged the recipe and remembers nothing about
+	// it, so whether the definition this folder declares is now the LIVE one is a
+	// question only the live row can answer — the same question docsLanded asks,
+	// for the same reason, and answered here by comparing the two rows rather
+	// than the file against a row: the commit copies the DRAFT onto the parent,
+	// so "did it land" is exactly "does live now hold what the draft held".
+	//
+	// GONE IS NOT LANDED. A draft also stops existing on a discard and on a
+	// reviewer's rejection, and reaching this point without checking would bank
+	// an agreement for a definition nobody ever committed.
+	live, liveErr := client.GetTable(ctx, file.MetricID)
+	recordedID, _, declared := f.live(inst).metricSeen(file.Path)
+	if recordedID != file.MetricID {
+		declared = ""
+	}
+	if liveErr != nil {
+		// The commit HAS happened; failing the command afterwards would report
+		// something that did happen as something that did not. The fingerprints
+		// are CLEARED rather than left: they describe a state that has certainly
+		// moved — this publish just moved it — so keeping them would refuse the
+		// next push and name a change this folder made itself.
+		fmt.Fprintf(os.Stderr, "  Note: %s was published, but its baseline could not be refreshed (%v) — `ronja pipeline status` will show it as not compared until the next push.\n",
+			file.Path, liveErr)
+		f.live(inst).setMetricSeen(file.Path, file.MetricID, "", "")
+		return out
+	}
+	landed := metricfile.RecipeSHA256(live.MetricRecipe) == metricfile.RecipeSHA256(staged.MetricRecipe)
+	if !landed {
+		fmt.Fprintf(os.Stderr, "  Note: %s was published, but %s does not hold the definition that draft held — it was discarded or rejected rather than committed, or something else was committed over it. The file is left as unsynced so the next `ronja pipeline push` stages it again.\n",
+			file.Path, file.MetricID)
+		declared = ""
+	}
+	f.live(inst).setMetricSeen(file.Path, file.MetricID, metricfile.RecipeSHA256(live.MetricRecipe), declared)
+
+	// THE ONE GOVERNANCE CONSEQUENCE A METRIC HAS AND A TABLE DOES NOT.
+	// Committing a definition change re-fingerprints the metric, and a metric
+	// whose definition_hash no longer equals its verified_against_definition_hash
+	// reads as DRIFTED — "verified · review pending" — until an admin verifies it
+	// again. The author caused it and would otherwise meet it in the UI, days
+	// later, as a badge that changed by itself.
+	if landed && liveBeforeErr == nil && liveBefore.MetricStatus == api.MetricStatusVerified &&
+		metricfile.RecipeSHA256(liveBefore.MetricRecipe) != metricfile.RecipeSHA256(live.MetricRecipe) {
+		out.Reverified = true
+		warning := fmt.Sprintf("%s was VERIFIED and its definition has now changed — it reads \"verified · review pending\" until an admin verifies it again", file.MetricID)
+		out.Warnings = append(out.Warnings, warning)
+		fmt.Fprintf(os.Stderr, "  Warning: %s\n", warning)
+	}
+	return out
 }
 
 // publishRouting is the decision, taken once for the whole run: it is a property
@@ -860,6 +1177,28 @@ func printPipelinePublishReport(r *pipelinePublishResult) {
 			fmt.Fprintf(out, "    %d table(s) in this folder read this one directly and will rebuild automatically.\n", file.Cascade)
 		}
 		printResourceURL(out, reportKeyWidth, file.URL)
+	}
+	for _, metric := range r.Metrics {
+		switch metric.Outcome {
+		case outcomeSubmittedForReview:
+			fmt.Fprintf(out, "\n  %s — submitted for review\n", metric.Path)
+		case pushOutcomeRefused:
+			fmt.Fprintf(out, "\n  %s — not published\n", metric.Path)
+		case outcomeConflict:
+			fmt.Fprintf(out, "\n  %s — not published (somebody committed first)\n", metric.Path)
+		default:
+			fmt.Fprintf(out, "\n  %s — published\n", metric.Path)
+		}
+		if metric.Detail != "" {
+			fmt.Fprintf(out, "    %s\n", metric.Detail)
+		}
+		if metric.Error != "" {
+			fmt.Fprintf(out, "    %s\n", metric.Error)
+		}
+		for _, w := range metric.Warnings {
+			fmt.Fprintf(out, "    Warning: %s\n", w)
+		}
+		printResourceURL(out, reportKeyWidth, metric.URL)
 	}
 	if r.Target != "" {
 		fmt.Fprintf(out, "\n  Target:   %s\n", r.Target)
