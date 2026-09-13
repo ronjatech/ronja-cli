@@ -162,10 +162,9 @@ type pipelinePublishedFile struct {
 	Detail  string `json:"detail,omitempty"`
 	Error   string `json:"error,omitempty"`
 	// Cascade is how many files IN THIS FOLDER read DIRECTLY from this table.
-	// Never a tenant-wide number and never a transitive one: GetDependents is not
-	// exposed over HTTP, and the real cascade is both wider (it leaves the folder)
-	// and conditional (a zero-partition parent defers it entirely) in ways a
-	// confident count would paper over.
+	// Never a tenant-wide number and never a transitive one: the real cascade is
+	// both wider (it leaves the folder) and conditional (a zero-partition parent
+	// defers it entirely) in ways a confident count would paper over.
 	Cascade  int      `json:"cascade"`
 	Warnings []string `json:"warnings,omitempty"`
 	// OverwroteVersionID names the committed version this publish deliberately
@@ -1101,11 +1100,10 @@ func staleInputs(code string, byID map[string]*api.TableListItem, builtAt time.T
 // grepping the folder into one they cannot.
 //
 // Folder-local on purpose. The real cascade is server-side and wider than this,
-// but its size is not something the CLI can know — GetDependents is not exposed
-// over HTTP — and its conditions (a zero-partition parent defers the cascade
-// entirely, a mid-build dependent is skipped, a dependent with a dangling input
-// is parked) mean a confident tenant-wide N would be wrong in ways nobody could
-// check. What this folder holds is a number the reader can verify by looking.
+// and its conditions (a zero-partition parent defers the cascade entirely, a
+// mid-build dependent is skipped, a dependent with a dangling input is parked)
+// mean a confident tenant-wide N would be wrong in ways nobody could check.
+// What this folder holds is a number the reader can verify by looking.
 func folderDependents(c pipelineCodec, local map[string]string, tableID string) int {
 	self := ""
 	for path, id := range c.f.Binding.Tables {

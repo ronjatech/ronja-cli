@@ -613,9 +613,10 @@ func TestPipelinePublishStillWarnsAboutStaleInputsWhenTheCodecRefusesTheFile(t *
 
 // TestPipelinePublishCountsTheFolderLocalCascade: committing cascades
 // server-side, which is why this loop needs no `run` verb. The number reported
-// is the FOLDER's own, counted from its ref graph — never a tenant-wide N, which
-// the CLI cannot know (GetDependents is not exposed over HTTP) and which has
-// conditions a confident count would paper over.
+// is the FOLDER's own, counted from its ref graph — never a tenant-wide N: the
+// real cascade is wider (it leaves the folder) and conditional (a zero-partition
+// parent defers it, a mid-build dependent is skipped, one with a dangling input
+// is parked), and a confident count would paper over both.
 func TestPipelinePublishCountsTheFolderLocalCascade(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)

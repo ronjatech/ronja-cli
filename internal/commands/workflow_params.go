@@ -60,8 +60,11 @@ func parseParams(specs []string, declared []api.WorkflowParameter) (map[string]a
 		values[name] = value
 	}
 
-	// A defaulted parameter is not missing: the server falls back to its
-	// default, which is the whole point of having one.
+	// A defaulted parameter is not missing: the server fills in its declared
+	// default at dispatch, which is the whole point of having one. That is
+	// rworkflow.ApplyParameterDefaults, called from the one run funnel every
+	// entry point converges on — so the value the script sees is the declared
+	// default, coerced exactly as a value passed here would have been.
 	var missing []string
 	for _, p := range declared {
 		if !p.Required || p.DefaultValue != nil {

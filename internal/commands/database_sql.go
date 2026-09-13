@@ -61,6 +61,14 @@ With --out alone, stdout stays empty and the row count is reported on stderr.
 A truncated result is reported on stderr and still exits zero — the rows you
 got are real, there are simply more of them.
 
+A write with no result set prints no CSV at all, so how many rows it changed
+is reported on stderr instead ("40 rows affected"). That count is the rows the
+statement's OUTER command affected: a write performed inside a data-modifying
+WITH clause is not counted in it. The line is absent, rather than zero, when
+the server cannot honestly say: a statement that returned rows, more than one
+statement sent in one call, or a command whose result carries no count (DO,
+CALL, SET, TRUNCATE, COMMENT).
+
 --env dev runs the statement against the database's DEV COPY — a separate
 Postgres database with the same schema and its own data. You still name the
 production database: the copy has no id you ever see. The redirect is reported
@@ -135,12 +143,29 @@ Mint one with:
 					result.RowCount, plural(result.RowCount, "row"))
 			}
 
+			// What a write CHANGED, which is otherwise invisible: a statement with
+			// no result set prints an empty CSV, so a run that touched 40 rows and
+			// one that touched none look identical on stdout. Suppressed under
+			// --json, whose envelope carries the field itself.
+			if !flagJSON {
+				reportRowsAffected(result.RowsAffected)
+			}
+
 			if out != "" {
 				if err := writeResultFile(out, result.Result); err != nil {
 					return err
 				}
-				fmt.Fprintf(os.Stderr, "  %d %s written to %s\n",
-					result.RowCount, plural(result.RowCount, "row"), out)
+				// ⚠️ RowCount is MULTIPLEXED — on a write it is rows AFFECTED, and
+				// nothing at all went into the file. "40 rows written to out.csv" for
+				// an empty file is a confident lie about a path the caller is about
+				// to hand to a parser, so the BODY decides what this line says; the
+				// affected count already had its own line above.
+				if result.Result == "" {
+					fmt.Fprintf(os.Stderr, "  no result set — %s is empty\n", out)
+				} else {
+					fmt.Fprintf(os.Stderr, "  %d %s written to %s\n",
+						result.RowCount, plural(result.RowCount, "row"), out)
+				}
 			}
 			if flagJSON {
 				return emitJSON(result)
@@ -167,6 +192,23 @@ Mint one with:
 	cmd.Flags().DurationVar(&timeout, "timeout", api.DefaultDatabaseSQLTimeout,
 		"how long to wait for the statement (0 waits as long as it takes)")
 	return cmd
+}
+
+// reportRowsAffected narrates what a write changed, on stderr, and says nothing
+// at all when the server did not report a number.
+//
+// ⚠️ nil is NOT zero. It is "not applicable, or not reliably knowable" — a
+// statement that returned rows, a body holding more than one statement, a driver
+// that reported no count — and printing "0 rows affected" for any of those would
+// be a confident lie about a statement that may have changed a great deal.
+// Silence is the honest rendering of a number nobody has.
+//
+// Never stdout: that is the CSV somebody is parsing.
+func reportRowsAffected(rowsAffected *int) {
+	if rowsAffected == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  %d %s affected\n", *rowsAffected, plural(*rowsAffected, "row"))
 }
 
 // parseSQLParams splits the --params JSON array into its raw elements.

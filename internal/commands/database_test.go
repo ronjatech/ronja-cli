@@ -387,3 +387,69 @@ func TestParseSQLParamsKeepsPrecision(t *testing.T) {
 		}
 	}
 }
+
+// TestReportRowsAffected pins the line that makes a write visible at all — a
+// statement with no result set prints an empty CSV, so without it a run that
+// changed 40 rows and one that changed none read identically.
+//
+// The nil case is the one that matters: nil is "the server could not honestly
+// say", and rendering it as "0 rows affected" would be a confident lie about a
+// statement that may have changed a great deal.
+func TestReportRowsAffected(t *testing.T) {
+	say := func(n *int) string {
+		return captureStderr(t, func() { reportRowsAffected(n) })
+	}
+
+	forty := 40
+	if got := say(&forty); !strings.Contains(got, "40 rows affected") {
+		t.Errorf("a write that changed rows must say so: %q", got)
+	}
+
+	// Zero is a REAL answer on this field — the statement ran and matched
+	// nothing — and it is the answer a caller most needs to see.
+	zero := 0
+	if got := say(&zero); !strings.Contains(got, "0 rows affected") {
+		t.Errorf("a write that matched nothing must say so rather than stay silent: %q", got)
+	}
+
+	one := 1
+	if got := say(&one); !strings.Contains(got, "1 row affected") {
+		t.Errorf("the singular must not read \"1 rows\": %q", got)
+	}
+
+	if got := say(nil); got != "" {
+		t.Errorf("with no number from the server the command must say NOTHING, not zero: %q", got)
+	}
+}
+
+// TestDatabaseSQLResultKeepsRowsAffectedNull pins the wire shape `--json`
+// emits. rowsAffected is the one field on this envelope where null and 0 are
+// different answers, so the key must always be present (no omitempty, per the
+// struct's own rule) and null must survive the round trip rather than
+// collapsing into 0.
+func TestDatabaseSQLResultKeepsRowsAffectedNull(t *testing.T) {
+	var res api.DatabaseSQLResult
+	if err := json.Unmarshal([]byte(`{"rowCount":3}`), &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if res.RowsAffected != nil {
+		t.Errorf("an ABSENT rowsAffected must decode to nil, got %d", *res.RowsAffected)
+	}
+	body, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"rowsAffected":null`) {
+		t.Errorf("--json must always carry the key, null included: %s", body)
+	}
+
+	zero := 0
+	res.RowsAffected = &zero
+	body, err = json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"rowsAffected":0`) {
+		t.Errorf("a real 0 must reach the envelope as 0, distinct from null: %s", body)
+	}
+}

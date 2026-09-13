@@ -47,7 +47,7 @@ Two commands make that HTTP half less unpleasant without describing any of it �
 `ronja api` (a request runner) and `ronja query` (read-only SQL). Both are
 below, and the doctrine that admits them is immediately below this.
 
-The exceptions are the five sync loops — `ronja wf` (workflows), `ronja app`
+The exceptions are the six sync loops — `ronja wf` (workflows), `ronja app`
 (data apps), `ronja pipeline` (derived tables), `ronja automation` (automations),
 `ronja db` (managed-database migrations) and `ronja module` (shared Python
 packages), each below. The rule they keep is
@@ -742,6 +742,12 @@ ronja api -X POST /api/v2/file/upload/report.pdf -F file=@./report.pdf
 # read one field out of the answer
 id=$(ronja api -X POST /api/v2/workflow -d @wf.json --jq '.id' -r)
 
+# organization settings: read every section, set currency and number format
+# together (admin), list the locales reportingLocale accepts
+ronja api /api/v2/organization/settings
+ronja api -X PUT /api/v2/organization/settings/reporting -d '{"reportingCurrency":"SEK","reportingLocale":"sv-SE"}'
+ronja api /api/v2/organization/settings/options --jq '.locales[].tag' -r
+
 # wait for asynchronous work (the /head sibling follows a run that parks and
 # resumes; wait for the statuses that mean FINISHED, not for "not running")
 ronja api "/api/v2/workflow/run/$runID/head" \
@@ -1063,6 +1069,25 @@ ledgers what it did.
 deliberately not the duckdb endpoint's 200-with-an-`error`-field. So there is no
 envelope to inspect and no trap to document: an ordinary non-zero exit covers
 it, for `ronja api` and `curl` as much as for this command.
+
+**A write says what it changed, on stderr — and silence is not zero.** A
+statement with no result set prints an empty CSV, so `N rows affected` is the
+only thing that distinguishes a run that touched forty rows from one that
+touched none. It counts the rows the statement's **outer** command affected, so
+a write tucked inside a `WITH` clause is not in it. The line is **absent**
+rather than zero whenever the server cannot honestly say — a statement that
+returned rows, more than one statement in one call, a command whose tag carries
+no count (`DO`, `CALL`, `SET`, `TRUNCATE`, `COMMENT`) — which is why
+`RowsAffected` is a `*int` and `--json` emits the key with `null` rather than
+omitting it: `null` is a value a script has to be able to tell apart from `0`,
+and printing `0 rows affected` for an unknown count would be a confident lie
+about a statement that may have written a great deal.
+
+**`--out` narrates the BODY, not the count.** With a result set it is
+`N rows written to <file>`; with none it is `no result set — <file> is empty`,
+because `rowCount` is multiplexed and "40 rows written" over an empty file is a
+lie about a path the caller is about to hand to a parser. The affected count has
+its own line, above.
 
 **`db migrate` keeps no local baseline and computes no hashes.** The migrations
 folder is `migrations/*.sql`, applied in filename order, each file's stem being
@@ -3688,11 +3713,12 @@ renamed upstream and under-reports one rebuilt without a row write.
 
 **Committing cascades.** The server marks every table that reads the one you
 published as `invalidated` and rebuilds it asynchronously — which is why this
-loop needs no `run` verb, and why the HTTP guide's "nothing cascades over the
-API" is true of `/sync` only. The report prints a **folder-local, direct** count
-("2 tables in this folder read this one directly and will rebuild
-automatically") — never transitive and never tenant-wide: `GetDependents` is not
-exposed over HTTP, and the real cascade is both wider (it leaves the folder) and
+loop needs no `run` verb. A push, by contrast, syncs your DRAFT, which no table
+reads, so it rebuilds nothing downstream (a sync of the LIVE table does cascade;
+the HTTP guide's "When dependents rebuild" section has the whole contract). The
+report prints a **folder-local, direct** count ("2 tables in this folder read
+this one directly and will rebuild automatically") — never transitive and never
+tenant-wide: the real cascade is both wider (it leaves the folder) and
 conditional (a zero-partition parent defers it entirely, a mid-build dependent is
 skipped, one with a dangling input is parked) in ways a confident N would paper
 over. A folder-local, direct number is one the reader can verify by looking.
@@ -5130,7 +5156,11 @@ If you are tempted to add `ronja auth token` back for convenience, that is the
 convenience being traded away on purpose.
 
 `RONJA_CONFIG_DIR` relocates the credential file; the tests use it to stay off
-the developer's real profile.
+the developer's real profile. It is also how a non-interactive caller — an agent
+signing in once with `--with-token` instead of carrying a token on every command
+— keeps its login out of the shared store: `ronja login` makes the profile it
+creates current, so the same login without the variable re-points which
+organization the developer's own bare `ronja api` reaches.
 
 ## Tests
 

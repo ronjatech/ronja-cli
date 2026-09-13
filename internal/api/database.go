@@ -127,6 +127,27 @@ type DatabaseSQLResult struct {
 	// result set — a plain INSERT, say — which is not the same as no rows.
 	Result   string `json:"result"`
 	RowCount int    `json:"rowCount"`
+	// RowsAffected is the number of rows affected by the statement's OUTER
+	// command, and nothing else — where RowCount multiplexes rows returned with
+	// rows affected and cannot say which it is holding.
+	//
+	// ⚠️ Postgres answers a statement with ONE command tag, the outer one, so
+	// the writes performed inside a data-modifying CTE are not counted in it:
+	// `WITH upd AS (UPDATE … RETURNING id) INSERT INTO ev SELECT … WHERE false`
+	// reports 0 while the inner UPDATE changed every row.
+	//
+	// nil means "not applicable, or not reliably knowable", NEVER zero: the
+	// statement returned a result set (a SELECT, or DML with RETURNING), the
+	// body held more than one statement, the command's result carries no count
+	// at all (DO, CALL, SET, TRUNCATE, COMMENT, CREATE …), or the driver
+	// reported no count. The server omits the key in those cases and it decodes
+	// to nil here, which is the same fact.
+	//
+	// It is a POINTER rather than an int precisely because of the struct's
+	// no-omitempty rule above: the key is always emitted by `--json`, and null
+	// is a value the caller must be able to tell apart from 0. Flattening it to
+	// an int would publish "changed nothing" for every read.
+	RowsAffected *int `json:"rowsAffected"`
 	// Truncated reports that the row cap cut the result off, so Result is a
 	// prefix rather than the answer.
 	Truncated  bool  `json:"truncated"`

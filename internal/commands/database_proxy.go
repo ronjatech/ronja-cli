@@ -59,12 +59,13 @@ const psqlKeepaliveIdle = "60"
 // Which is also why the remedy names its own consequence — CONDITIONALLY.
 // Re-minting is the right fix for that population (it is what the database
 // console prescribes, and it grants the sequence privileges an older read role
-// lacks), but minting a tier twice rotates the password, and anything holding
-// the old secret by reference — a workflow, a data app, a saved agent — stops
-// working. ReadRoleMinted cannot tell that population from a freshly
+// lacks). Minting a tier twice rotates the password IN PLACE under the same
+// secret id, so anything bound to the secret by reference — a workflow, a data
+// app, a saved agent — keeps working; what dies is any COPY of the old password
+// held outside Ronja. ReadRoleMinted cannot tell that population from a freshly
 // provisioned database, which by construction has no read credential at all, so
-// the warning says IF: telling someone their nonexistent credential is about to
-// be replaced is its own kind of untrue, and it is the commoner case.
+// the sentence says IF: telling someone their nonexistent credential is about
+// to be rotated is its own kind of untrue, and it is the commoner case.
 //
 // ⚠️ The CLI does not fill featureID in from an existing role, and NOT because
 // there is never one to read: this refusal fires when there is no READ role, so the
@@ -106,8 +107,8 @@ func proxyForDatabase(cmd *cobra.Command, databaseID string) (*api.DatabaseProxy
 				"reaching a member who does not own the feature. For your own psql sessions a private one is enough and narrower; "+
 				"the proxy resolves either. List them with:\n"+
 				"  ronja api /api/v2/feature/query --jq '.result[] | [.id, .scope, .name] | @tsv' -r\n"+
-				"If this database already has a read credential, minting replaces it, and anything still holding "+
-				"the old one stops working.",
+				"If this database already has a read credential, minting rotates it in place: the secret id is "+
+				"unchanged, so nothing bound to it breaks, but any copy of the old password held outside Ronja stops working.",
 			databaseID, databaseID)
 	}
 	return conn.Proxy, client, nil

@@ -320,8 +320,9 @@ func (c *Client) CheckoutTable(ctx context.Context, id string) (*Table, error) {
 //     syncing a table with no code at all — is reported on the ROW, never in
 //     this response. WaitForTableBuild is the other half of this call.
 //
-// A sync does NOT cascade: dependent tables are not rebuilt. Commit is what
-// cascades.
+// A sync does not mint a draft, so what cascades is decided by the id: syncing
+// the live table rebuilds its dependents, syncing a draft rebuilds nothing
+// (dependents read the live table). For a draft, commit is what cascades.
 func (c *Client) SyncTable(ctx context.Context, id string) error {
 	return c.Do(ctx, "POST", "feature/model/"+url.PathEscape(id)+"/sync", nil, nil)
 }
