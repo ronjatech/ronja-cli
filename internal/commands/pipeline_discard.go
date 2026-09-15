@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
 
@@ -296,6 +297,10 @@ func discardOneMetric(ctx context.Context, client *api.Client, f *folder,
 	// table: a draft can be committed or discarded from the web UI between two
 	// commands. For a metric there is no pointer to consult in any case.
 	draft, err := client.GetTableDraft(ctx, file.MetricID)
+	if api.StatusOf(err) == http.StatusNotFound {
+		noteUnreachable(file.Path, file.MetricID)
+		draft, err = nil, nil
+	}
 	if err != nil {
 		return refuse("check for your draft of %s: %v", file.MetricID, err)
 	}
@@ -348,6 +353,10 @@ func discardOneTable(ctx context.Context, client *api.Client, f *folder,
 	// The recorded draft id is a HINT: a draft can be committed or discarded
 	// from the web UI between two commands, so the server is asked.
 	draft, err := client.GetTableDraft(ctx, out.TableID)
+	if api.StatusOf(err) == http.StatusNotFound {
+		noteUnreachable(path, out.TableID)
+		draft, err = nil, nil
+	}
 	if err != nil {
 		return refuse("check for your draft of %s: %v", out.TableID, err)
 	}
@@ -371,6 +380,15 @@ func discardOneTable(ctx context.Context, client *api.Client, f *folder,
 	// table — the only row this file is synced with now.
 	recordDiscarded(f.live(inst), path, out.TableID)
 	return out
+}
+
+// noteUnreachable is the one line a discard prints when GET :id/draft answers
+// 404. That 404 is about the TABLE, never the draft (no draft is a 200 null), so
+// there is nothing of the caller's to discard and the outcome is the same as a
+// null draft; only a refusal would leave the folder wedged on a row it cannot
+// reach.
+func noteUnreachable(path, id string) {
+	fmt.Fprintf(os.Stderr, "  Note: %s — %s is no longer reachable (it or its feature is in the trash, or you have no access), so there is no draft to discard.\n", path, id)
 }
 
 func printPipelineDiscardReport(r *pipelineDiscardResult) {

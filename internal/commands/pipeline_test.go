@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -927,6 +928,45 @@ func TestPipelineDiscardDropsStagedDrafts(t *testing.T) {
 	}
 	if inst.Files["orders.sql"].SHA256 == "" {
 		t.Error("discard dropped the content baseline")
+	}
+}
+
+// TestPipelineDiscardTreatsAnUnreachableTableAsNoDraft: GET :id/draft answers
+// 404 when the TABLE is gone from reach (trashed, its feature trashed, no
+// access). There is nothing of the caller's left to discard, so it is the null
+// draft's outcome, not a refusal that wedges the folder.
+func TestPipelineDiscardTreatsAnUnreachableTableAsNoDraft(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedBoundFolder(t, f)
+	f.AddDraft("table-orders", "table-draft-3", "SELECT staged")
+	writePipelineBaseline(t, root, f.Key(), "collection-1",
+		map[string]string{
+			"orders.sql":  "SELECT * FROM raw",
+			"revenue.sql": "SELECT * FROM {{ ref('table-orders') }}",
+		},
+		map[string]wfdir.TableState{
+			"orders.sql":  {TableID: "table-orders", DraftID: "table-draft-3"},
+			"revenue.sql": {TableID: "table-revenue"},
+		})
+	f.failDraftGet["table-orders"] = http.StatusNotFound
+
+	out, stderr, err := runPipelineCLI(t, root, "pipeline", "discard", "--yes", "--json")
+	if err != nil {
+		t.Fatalf("an unreachable table must not refuse the discard: %v\n%s", err, stderr)
+	}
+	files := decodeJSON(t, out)["files"].([]any)
+	if len(files) != 1 || files[0].(map[string]any)["outcome"] != outcomeNoDraft {
+		t.Fatalf("files = %+v", files)
+	}
+	if len(f.discarded) != 0 {
+		t.Errorf("nothing was reachable to discard, but %v was", f.discarded)
+	}
+	if !strings.Contains(stderr, "no longer reachable") {
+		t.Errorf("the note naming why is missing: %q", stderr)
+	}
+	if inst := pipelineStateOf(t, root, f.Key()); inst.Tables["orders.sql"].DraftID != "" {
+		t.Errorf("the draft pointer survived: %+v", inst.Tables["orders.sql"])
 	}
 }
 

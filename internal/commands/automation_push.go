@@ -687,7 +687,7 @@ func checkAutomationMailboxAuthority(ctx context.Context, client *api.Client, fi
 			strings.Join(paths, ", "), agree(len(paths), "declares", "declare"), err)
 		return nil
 	}
-	if me.Role == nil || me.Role.PrivilegeLevel > adminPrivilegeLevel {
+	if !isAdmin(me) {
 		var lines []string
 		for _, path := range paths {
 			lines = append(lines, fmt.Sprintf("%s declares %s", path, needs[path]))
@@ -699,11 +699,6 @@ func checkAutomationMailboxAuthority(ctx context.Context, client *api.Client, fi
 		strings.Join(paths, ", "), agree(len(paths), "declares", "declare"))
 	return nil
 }
-
-// adminPrivilegeLevel mirrors sherlock.USR_ADMIN. LOWER is more privileged, so
-// the test is <=, and getting that backwards would let every read-only member
-// past a gate meant for admins.
-const adminPrivilegeLevel = 10
 
 func printAutomationPushReport(r *automationPushResult) {
 	out := os.Stdout

@@ -265,10 +265,9 @@ func (c *Client) CreateWorkflow(ctx context.Context, in CreateWorkflowInput) (*W
 
 // UpdateWorkflow patches a workflow's metadata.
 //
-// The endpoint answers with nothing, and it DROPS the save-time warnings the
-// file path returns (the server's own comment says to plumb a new endpoint
-// rather than overload this one) — so a caller that needs the row's current
-// state re-reads it afterwards.
+// The endpoint answers with `{warnings}` — save-time notices such as a draft's
+// non-member approvers — which this client does not decode, and it carries no
+// row, so a caller that needs the row's current state re-reads it afterwards.
 func (c *Client) UpdateWorkflow(ctx context.Context, id string, patch WorkflowPatch) error {
 	return c.Do(ctx, "PUT", "workflow/"+url.PathEscape(id), patch, nil)
 }

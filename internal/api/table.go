@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"net/url"
 	"strconv"
 	"time"
@@ -382,9 +383,18 @@ func (c *Client) GetTable(ctx context.Context, id string) (*Table, error) {
 //
 // `id` is the LIVE table's id; the row that comes back has its own, and that is
 // the id the rest of the edit loop takes.
+//
+// A 404 is about the PARENT, never the draft ("no draft" is the null above): the
+// route runs the table's read gate first, so a table that is trashed, whose
+// feature is trashed, or that the caller cannot read answers 404. Translated so
+// every pipeline command says that instead of "could not check for your draft:
+// not found"; the *Error stays wrapped, so StatusOf still reads 404.
 func (c *Client) GetTableDraft(ctx context.Context, id string) (*Table, error) {
 	var out *Table
 	if err := c.Do(ctx, "GET", "feature/model/"+url.PathEscape(id)+"/draft", nil, &out); err != nil {
+		if StatusOf(err) == http.StatusNotFound {
+			return nil, fmt.Errorf("table %s is not reachable — it may be in the trash, its feature may be, or you may not have access to it (%w)", id, err)
+		}
 		return nil, err
 	}
 	out.Normalize()

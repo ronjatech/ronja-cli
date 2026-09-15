@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,10 +60,32 @@ type fakeInstance struct {
 	// identity — a revoked or expired token, or an instance having a bad day.
 	// The acting commands must refuse on it and `status` must degrade.
 	failMe int
+	// failMeMessage is the `error` field that rides with failMe; "no" when
+	// unset. `context` keys a 403 on the server's WORDS (a scope verdict
+	// against a dead credential), so the message is stageable.
+	failMeMessage string
 	// noTenant answers the lookup successfully, for a user who belongs to no
 	// organization at all. A different state from failMe: the credential works,
 	// there is simply nothing to bind a folder to.
 	noTenant bool
+	// tenantName is the organization name /me reports; "Test Org" when unset.
+	// Stageable because it is admin-authored text `context` sets into its own
+	// framing line.
+	tenantName string
+	// policy is what GET /policy/org answers with. nil serves the GENESIS
+	// document (empty content at version 1) — what the real route answers for
+	// an organization nobody has written rules for, since the read never
+	// creates — so a test that stages nothing sees `context` say "none written
+	// yet" rather than a 404 the real instance never sends.
+	policy *api.Policy
+	// failPolicy answers the policy read with a status instead of a document.
+	// 403 is the one that matters: the route's role floor is the lowest there
+	// is, so a SCOPE refusal can only be a scoped token without analytics:read,
+	// and `context` says so in those words — but only when failPolicyMessage
+	// is the server's scope verdict; platform/auth 403s a dead credential with
+	// other words, and those get the generic line.
+	failPolicy        int
+	failPolicyMessage string
 	// failPut maps a file path to the status a PUT of it should answer with,
 	// which is how the mid-push failure case is staged.
 	failPut map[string]int
@@ -318,7 +341,11 @@ type fakeInstance struct {
 	// Requests records every request served as "METHOD /path", in order — the
 	// cheapest way to assert that a command did NOT make a round trip it
 	// should have avoided, and that it made the ones it did in the right
-	// order (push writes the entrypoint first).
+	// order (push writes the entrypoint first). Appended under mu: `context`
+	// sends its two reads side by side, and net/http serves each on its own
+	// goroutine. Tests read it after the command returns, which the
+	// response the client waited for orders after the append.
+	mu       sync.Mutex
 	Requests []string
 }
 
@@ -485,11 +512,13 @@ func (f *fakeInstance) AddDraft(liveID, draftID string, files ...api.WorkflowFil
 }
 
 func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
+	f.mu.Unlock()
 
 	if r.URL.Path == "/api/v2/authentication/me" {
 		if f.failMe != 0 {
-			http.Error(w, `{"error":"no"}`, f.failMe)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, orDefault(f.failMeMessage, "no")), f.failMe)
 			return
 		}
 		body := map[string]any{
@@ -498,10 +527,29 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			// A workflow folder's binding is keyed by organization, so the wf
 			// commands ask for it whenever the credential does not already name
 			// one — which is how every test here signs in.
-			"tenant": map[string]any{"id": testTenantID, "name": "Test Org"},
+			"tenant": map[string]any{"id": testTenantID, "name": orDefault(f.tenantName, "Test Org")},
 		}
 		if f.noTenant {
 			delete(body, "tenant")
+		}
+		writeJSON(w, body)
+		return
+	}
+	// GET /policy/org — the organization's standing rules, which `context`
+	// inlines. Read whenever a token is present, independently of /me, so
+	// failMe and failPolicy are staged separately on purpose.
+	if r.URL.Path == "/api/v2/policy/org" {
+		if f.failPolicy != 0 {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, orDefault(f.failPolicyMessage, "no")), f.failPolicy)
+			return
+		}
+		if f.policy == nil {
+			writeJSON(w, map[string]any{"scope": "org", "content": "", "version": 1, "maxChars": 20000})
+			return
+		}
+		body := map[string]any{"scope": "org", "content": f.policy.Content, "version": f.policy.Version, "maxChars": 20000}
+		if f.policy.UpdatedAt != "" {
+			body["updatedAt"] = f.policy.UpdatedAt
 		}
 		writeJSON(w, body)
 		return
@@ -1282,6 +1330,15 @@ func (f *fakeInstance) refusePrecondition(w http.ResponseWriter, noun string, co
 			wfdir.HashString(content)+`, the write expected `+*want+`)"}`, http.StatusConflict)
 	}
 	return true
+}
+
+// orDefault is the staged message, or the fallback when a test staged only a
+// status.
+func orDefault(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

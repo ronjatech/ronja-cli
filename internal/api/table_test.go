@@ -182,6 +182,26 @@ func TestGetTableDraftAnswersNilForNoDraft(t *testing.T) {
 	}
 }
 
+// TestGetTableDraftNamesTheUnreachableParent: a 404 on /draft is the PARENT
+// table's read gate (trashed, trashed feature, or no access), never "no draft",
+// so the error must say so and still carry the status for StatusOf.
+func TestGetTableDraftNamesTheUnreachableParent(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+	})
+	draft, err := client.GetTableDraft(context.Background(), "table-abc")
+	if err == nil {
+		t.Fatalf("a 404 must be an error, got draft %+v", draft)
+	}
+	if StatusOf(err) != http.StatusNotFound {
+		t.Errorf("StatusOf = %d, want 404 (the *Error must stay wrapped)", StatusOf(err))
+	}
+	if msg := err.Error(); !strings.Contains(msg, "table table-abc is not reachable") || !strings.Contains(msg, "trash") {
+		t.Errorf("error = %q, want it to name the unreachable table and the trash", msg)
+	}
+}
+
 func TestGetTableDraftDecodesADraft(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(tableFixture))

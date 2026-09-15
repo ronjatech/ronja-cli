@@ -21,7 +21,7 @@ do for itself — an interactive browser sign-in — and then hands over:
 
 ```
 ronja login    # device flow through the browser
-ronja context       # instance + identity + how to load the credential + the live API index
+ronja context       # instance + identity + the organization's policy + how to load the credential + the live API index
 ronja env           # export lines for RONJA_URL / RONJA_TOKEN — meant for eval
 ronja profile list  # which logins this machine holds
 ```
@@ -35,6 +35,94 @@ After `ronja context` an agent works over plain HTTP. `context` **fetches
 API can do, so it cannot drift from the API it describes. Everything it points
 at (`/llms.txt`, `/docs/api/endpoints.md`, `/docs/api/skills.md`,
 `/docs/api/openapi.json`) is served unauthenticated.
+
+`context` also **inlines the organization's policy** — the standing rules its
+admins wrote for how work here is done (`GET /api/v2/policy/org`), which
+Ronja's own agent is given on every turn and a coding agent working from
+outside was never told existed. It prints as `## Organization policy (version
+N)` right after the `Signed in:` line, one framing sentence then the content
+verbatim, so it is read before the first request is composed. The read goes
+out whenever a token is present and **independently of `/me`**: a role-bound
+scoped API token cannot call `/api/v2/authentication/me` at all (that group is
+admin-scoped) but reads the policy fine with `analytics:read`, and it is
+exactly the caller the policy was invisible to. Every way the document can be
+missing is one line, never silence, because a silent omission reads as "no
+rules":
+
+```
+Organization policy: none written yet.
+Organization policy: you are in no organization, so there is no policy to read.
+Organization policy: not readable with this token (needs analytics:read) — ask an admin for the rules.
+Organization policy: this instance does not serve GET /api/v2/policy/org yet — the CLI is newer than the instance.
+Organization policy: could not read GET /api/v2/policy/org — HTTP 503.
+```
+
+The first is keyed on trimmed `content == ""` whatever the version (a
+written-then-blanked document is still nothing to follow); the second on
+`/me` answering with no organization, and it is asked ahead of the read's own
+outcome because `/me` is the authority on identity; the third is keyed on the
+server's SCOPE verdict in the 403 body (`token scope … does not permit …` /
+`this route is not accessible to scoped tokens`), which on this route — role
+floor the lowest there is — can only be a scoped token without
+`analytics:read`; the fourth is a 404, which on a route every member of every
+organization is served can only be an instance older than the CLI (told
+`HTTP 404`, a reader goes looking for a missing document); the last is dropped
+only when its status repeats `/me`'s own refusal (both 401 — one dead
+credential, and `Signed in: NO` already said it). The identity line makes the
+same distinction: a scope-denied `/me` reads `Signed in: as a scoped token — …
+the calls it is scoped for still work` (keep going), while a 403 with any
+other words — the server's answer for a removed user, a deleted organization
+or a PAT with no bound user — reads `Signed in: NO — the stored token was
+rejected. Run `ronja login`.` and the policy line falls to the generic
+`HTTP 403`. The two reads go out side by side, so a degraded instance costs
+one client timeout, not two. `--no-docs` skips the API index and keeps the
+policy — it is context about the organization, not the docs.
+
+Under `--json` the document is `organizationPolicy: {content, version}`,
+carried whenever the server served it — an empty document INCLUDED, at its
+served `version`, which is the compare-and-swap token an admin's agent needs
+for the first write — and absent when the read failed or there was no
+organization to ask. Beside it `organizationPolicyStatus` is the key a
+consumer branches on: `ok` / `none` (nothing to follow: an empty document, or
+no organization) / `forbidden` (the scope verdict only) / `error` (every
+other failure, a 404 included), so "no rules" is read off the status and never
+off a `content` the consumer has to trim itself, and it is distinct from "the
+read was refused"; there is no error key, the human line is the only report
+of why. The credential gets the same treatment: `authenticated` stays the
+boolean it always was (`/me` answered) and `identityStatus` beside it is
+`ok` / `scoped` (`/me` refused with the scope verdict — a working scoped
+token, do not sign in again) / `rejected` (any other `/me` failure — run
+`ronja login`) / `none` (no token), because `authenticated: false` beside
+`organizationPolicyStatus: "ok"` sent a consumer keyed on the boolean off to
+replace a token that had just read the policy.
+
+**An admin can change it from here.** When `/me` reports the admin role the
+section ends with the write recipe, carrying the version just served as the
+compare-and-swap token — and the rule a coding agent holding an admin's token
+has to follow:
+
+```
+As an admin you can change it (a scoped token also needs `analytics:write`):
+    ronja api -X PUT /api/v2/policy/org -d '{"content":"…","expectedVersion":7}'
+(-d @body.json for a long document — the file holds the JSON body, not the bare text; a 409
+means it moved, and its body carries the current text as policyContent / policyVersion —
+re-apply against that, never retry blind.)
+Change it only when the admin you are working for asks you to, and show them the
+new text before the PUT — never on your own initiative.
+```
+
+The offer is "as an admin you can", not "you can": `/me` reports the role and
+nothing about a scope grant, so an admin's scoped token without
+`analytics:write` is refused the PUT by a gate `context` cannot see.
+
+Everybody else reads `Only an admin can change it.` The write is admitted for
+a personal access token bound to an admin (what `ronja login` mints) and
+refused for a role-bound API token, a Saved Agent run and Ronja's own
+in-process calls — the gate is `rpolicy.authorizeWrite`, and the CLI adds no
+check of its own. There is deliberately no `ronja policy` verb: a read and a
+write of one resource, and `ronja api` is the transport for both (a
+`pull`/`push` loop is the doctrine-consistent shape if the two-command CAS
+ever proves too fiddly; deferred).
 
 `context` also **notices which kind of folder you are standing in** — a
 workflow, data-app or pipeline folder, or a loose `.py` — reports it as `kind`

@@ -53,7 +53,8 @@ Each reference gets one of four answers:
                stack binds nothing to, a sibling file that is not there, an
                ambiguous name. Decided locally, and definite
   unreachable  a well-formed id the instance will not show us. Deleted,
-               trashed, another organization's, or simply not yours — the read
+               trashed (or in a feature that is), another organization's, or
+               simply not yours — the read
                gate answers the same way for all four, on purpose, so that
                existence does not leak
   not_checked  nobody asked, with a reason

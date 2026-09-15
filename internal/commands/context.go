@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
@@ -18,12 +19,18 @@ import (
 // one thing an agent genuinely cannot do for itself (an interactive browser
 // sign-in), and then hands over everything needed to call the API directly.
 //
-// "Everything needed" is three things, and only the first two are local:
+// "Everything needed" is four things, and only the first two are local:
 //
 //	1. Which instance, and who you are on it (the CLI knows; the API does not
 //	   advertise it).
 //	2. How to authenticate (the header shape, and where the token lives).
-//	3. What the API can do — which is /llms.txt, already curated and
+//	3. The organization's policy — the standing rules its admins wrote for
+//	   how work here is done. Ronja's own agent is given it on every turn; a
+//	   coding agent working from outside was never told it existed, so what
+//	   it built ignored the organization's own rules. Inlined, not pointed
+//	   at, and BEFORE the credential recipe: identity, then the rules of the
+//	   place you are acting in, then how to call it.
+//	4. What the API can do — which is /llms.txt, already curated and
 //	   server-authoritative. We fetch and inline it rather than restating it,
 //	   so this command cannot drift from the API it describes.
 
@@ -45,9 +52,10 @@ func newContextCmd() *cobra.Command {
 		Long: `Print everything needed to call the Ronja API directly.
 
 Intended to be the second thing an agent runs, after 'ronja login'. It
-reports which instance you are signed in to and as whom, how to authenticate,
-and then inlines the instance's own API index (/llms.txt) — so from here on you
-can work over plain HTTP and never touch this CLI again.
+reports which instance you are signed in to and as whom, the organization's
+policy (the standing rules its admins wrote for how work here is done), how
+to authenticate, and then inlines the instance's own API index (/llms.txt) —
+so from here on you can work over plain HTTP and never touch this CLI again.
 
 The token is never printed. This shows how to LOAD it instead —
 'eval "$(ronja env)"' puts it in $RONJA_TOKEN without displaying it — and
@@ -65,8 +73,39 @@ reports the credential file for callers that are not a POSIX shell.`,
 			// URL should still learn where to read.
 			var me *api.Me
 			var authErr error
+			// The policy read is independent of Me, not gated on it:
+			// /api/v2/authentication is admin-scoped, so a role-bound scoped
+			// API token (say analytics:read in CI) always fails Me — and it
+			// is exactly the caller the policy was invisible to. Both go out
+			// whenever there is a token; each reports its own verdict.
+			//
+			// Side by side, not in sequence: each is bounded by the client's
+			// own timeout, and a degraded instance that lets both run out
+			// would otherwise cost the sum. Each goroutine writes its own
+			// pair and nothing else, and the WaitGroup is the happens-before
+			// for the reads below.
+			var policy *api.Policy
+			var policyErr error
 			if resolved.Token != "" {
-				me, authErr = client.Me(cmd.Context())
+				var wg sync.WaitGroup
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					me, authErr = client.Me(cmd.Context())
+				}()
+				go func() {
+					defer wg.Done()
+					policy, policyErr = client.OrgPolicy(cmd.Context())
+				}()
+				wg.Wait()
+			}
+			// A Ctrl-C during the reads is not a verdict on the credential.
+			// Both errors above would read as a rejection ("the stored token
+			// was rejected", "could not read … context canceled") and the
+			// command would exit zero on output that says nothing true; the
+			// caller asked to stop, so stop, non-zero.
+			if err := cmd.Context().Err(); err != nil {
+				return err
 			}
 
 			var llms string
@@ -82,20 +121,22 @@ reports the credential file for callers that are not a POSIX shell.`,
 
 			here := localWork()
 			if flagJSON {
-				payload := contextPayload(resolved, me, llms)
+				payload := contextPayload(resolved, me, authErr, policy, policyErr, llms)
 				if here != nil {
 					payload["localWorkflow"] = here.payload()
 				}
 				return emitJSON(payload)
 			}
-			printContext(resolved, me, authErr, llms, !noDocs)
+			printContext(resolved, me, authErr, policy, policyErr, llms, !noDocs)
 			printLocalWork(here)
 			return nil
 		},
 	}
 
+	// The policy is NOT under this flag: it is context about the organization,
+	// not the API docs, and the flag's text has to say so or it lies.
 	cmd.Flags().BoolVar(&noDocs, "no-docs", false,
-		"skip the inlined API index; print only the connection details")
+		"skip the inlined API index; print the connection details and the organization's policy only")
 	return cmd
 }
 
@@ -110,19 +151,51 @@ func storedExpiry(resolved *config.Resolved) string {
 	return resolved.Entry.TokenExpiry
 }
 
-func contextPayload(resolved *config.Resolved, me *api.Me, llms string) map[string]any {
+// identityStatus is the --json verdict on the credential, from a closed set,
+// and the fork the human `Signed in:` line takes — one reading, so the two
+// outputs cannot disagree about what a refused /me means:
+//
+//	"ok"       — /me answered; userID, tenantID and role are carried
+//	"scoped"   — /me was refused with the server's SCOPE verdict (scopeDenied):
+//	             a role-bound scoped token, which cannot call the admin-scoped
+//	             authentication group at all and is still a working credential
+//	             for the routes it is scoped for
+//	"rejected" — /me failed any other way: a 401, a dead credential's 403, a
+//	             network failure — run `ronja login`
+//	"none"     — there was no token to ask with
+//
+// It exists because `authenticated` alone lied by omission: a scoped token
+// reported `authenticated: false` beside `organizationPolicyStatus: "ok"`,
+// and a consumer keyed on the boolean would sign in again to replace a token
+// that had just read the policy. `authenticated` keeps its type and its
+// meaning (/me answered) so nothing keyed on it changes; this is the finer
+// answer beside it.
+func identityStatus(resolved *config.Resolved, me *api.Me, authErr error) string {
+	switch {
+	case resolved.Token == "":
+		return "none"
+	case me != nil:
+		return "ok"
+	case scopeDenied(authErr):
+		return "scoped"
+	}
+	return "rejected"
+}
+
+func contextPayload(resolved *config.Resolved, me *api.Me, authErr error, policy *api.Policy, policyErr error, llms string) map[string]any {
 	docs := map[string]string{}
 	for _, d := range docPaths {
 		docs[strings.TrimPrefix(d.path, "/")] = resolved.URL + d.path
 	}
 	payload := map[string]any{
-		"baseURL":       resolved.URL,
-		"apiBase":       resolved.URL + "/api/v2",
-		"authHeader":    "Authorization: Bearer <token>",
-		"tokenEnvVar":   config.EnvToken,
-		"tokenFromEnv":  resolved.FromEnv,
-		"authenticated": me != nil,
-		"docs":          docs,
+		"baseURL":        resolved.URL,
+		"apiBase":        resolved.URL + "/api/v2",
+		"authHeader":     "Authorization: Bearer <token>",
+		"tokenEnvVar":    config.EnvToken,
+		"tokenFromEnv":   resolved.FromEnv,
+		"authenticated":  me != nil,
+		"identityStatus": identityStatus(resolved, me, authErr),
+		"docs":           docs,
 	}
 	// The credential is located, never quoted. A consumer reads the file at
 	// tokenFile and takes the value at tokenJSONPath; nothing here carries the
@@ -155,6 +228,31 @@ func contextPayload(resolved *config.Resolved, me *api.Me, llms string) map[stri
 			payload["role"] = me.Role.Name
 		}
 	}
+	// The documented contract is `content` + `version`, carried whenever the
+	// server served the document — a document with no rules INCLUDED, at its
+	// served `version`, because that version is the CAS token an admin's agent
+	// needs for the first write and there is nowhere else to get it without a
+	// second read. Beside it, `organizationPolicyStatus` is the verdict a
+	// consumer keys on: "no rules" (build freely) is `none`, never an empty
+	// `content` it has to trim for itself, and it is distinct from "the read
+	// was refused" (ask the admin for the rules before building), which
+	// absence alone would conflate with it. The status is a closed set, never
+	// the error text; the human output is still the only place the reason is
+	// spelled out. Absent, like the document, when no token was in play —
+	// there was no organization to ask. And absent when Me says there is no
+	// organization: the status is `none` there too, but there is no document
+	// and no version to write against.
+	if status := policyStatus(me, policy, policyErr); status != "" {
+		payload["organizationPolicyStatus"] = status
+	}
+	if policy != nil && !noOrganization(me) {
+		// Verbatim, as GET /api/v2/policy/org serves it.
+		doc := map[string]any{"content": policy.Content, "version": policy.Version}
+		if policy.UpdatedAt != "" {
+			doc["updatedAt"] = policy.UpdatedAt
+		}
+		payload["organizationPolicy"] = doc
+	}
 	if llms != "" {
 		payload["llmsText"] = llms
 	}
@@ -164,7 +262,7 @@ func contextPayload(resolved *config.Resolved, me *api.Me, llms string) map[stri
 // docsWanted distinguishes "the index was skipped" from "the index could not be
 // fetched" — reporting a failure that never happened would send someone
 // debugging their network for no reason.
-func printContext(resolved *config.Resolved, me *api.Me, authErr error, llms string, docsWanted bool) {
+func printContext(resolved *config.Resolved, me *api.Me, authErr error, policy *api.Policy, policyErr error, llms string, docsWanted bool) {
 	out := os.Stdout
 
 	fmt.Fprintf(out, "# Ronja API access\n\n")
@@ -174,8 +272,10 @@ func printContext(resolved *config.Resolved, me *api.Me, authErr error, llms str
 		fmt.Fprintf(out, "Profile:   %s\n", resolved.Profile)
 	}
 
-	switch {
-	case me != nil:
+	// The same closed-set verdict --json carries as identityStatus, so the
+	// prose and the key cannot fork on what a refused /me means.
+	switch identityStatus(resolved, me, authErr) {
+	case "ok":
 		fmt.Fprintf(out, "Signed in: %s", describeUser(me))
 		if me.Tenant != nil {
 			fmt.Fprintf(out, " — organization %q", me.Tenant.Name)
@@ -184,11 +284,29 @@ func printContext(resolved *config.Resolved, me *api.Me, authErr error, llms str
 			fmt.Fprintf(out, ", role %s", me.Role.Name)
 		}
 		fmt.Fprintln(out)
-	case authErr != nil:
+	case "scoped":
+		// /api/v2/authentication is admin-scoped, so a role-bound scoped API
+		// token (analytics:read in CI, say) is refused THERE and nowhere else
+		// it is scoped for. Telling it to run `ronja login` would send an
+		// agent off to replace a credential that works — and the policy
+		// section right below may well have just been read with it.
+		//
+		// Keyed on the server's SCOPE verdict, not on the status: platform/auth
+		// answers 403 for a dead credential too (a removed user, a deleted
+		// organization, a PAT with no bound user), and "still works" is the
+		// wrong thing to tell every one of those.
+		fmt.Fprintf(out, "Signed in: as a scoped token — it cannot call /api/v2/authentication/me, so who you\n")
+		fmt.Fprintf(out, "are is not shown; the calls it is scoped for still work.\n")
+	case "rejected":
 		fmt.Fprintf(out, "Signed in: NO — the stored token was rejected. Run `ronja login`.\n")
 	default:
 		fmt.Fprintf(out, "Signed in: NO — run `ronja login` first.\n")
 	}
+
+	// Identity, then the rules of the place you are acting in, then how to
+	// call it: the policy sits between the two so it is read before the first
+	// request is composed, not found after the index.
+	printOrganizationPolicy(out, me, authErr, policy, policyErr)
 
 	// Named distinctly from the "## Authentication" section inside the inlined
 	// llms.txt below: that one explains where a credential comes from in

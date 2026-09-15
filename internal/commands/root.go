@@ -213,7 +213,8 @@ This CLI is a bootstrap, not a wrapper around the API. Start here:
                        can't do for itself)
   ronja whoami         who you are, on which instance, in which organization
   ronja context        print everything needed to call the API directly —
-                       instance, identity, auth header, and the API index
+                       instance, identity, the organization's policy, auth
+                       header, and the API index
   ronja env            load the credential into a shell without printing it:
                        eval "$(ronja env)"
 

@@ -65,19 +65,36 @@ func parseParams(specs []string, declared []api.WorkflowParameter) (map[string]a
 	// rworkflow.ApplyParameterDefaults, called from the one run funnel every
 	// entry point converges on — so the value the script sees is the declared
 	// default, coerced exactly as a value passed here would have been.
-	var missing []string
+	var missing, blank []string
 	for _, p := range declared {
 		if !p.Required || p.DefaultValue != nil {
 			continue
 		}
-		if _, ok := values[p.Name]; !ok {
+		// A blank value is refused too, as the server rules: `required` means a
+		// value with content. Every parameter except a select with static
+		// options — that select's blank never reaches here unless "" is a
+		// declared option (coerceParam refuses any non-option first), which is
+		// the author saying an empty choice is meaningful. Options on any other
+		// type are ignored (coerceParam and the server check them only on a
+		// select), so they exempt nothing: exempting them would accept a blank
+		// the server refuses. Kept apart from missing so `--param body=` is not
+		// told it has no value.
+		v, ok := values[p.Name]
+		if !ok {
 			missing = append(missing, p.Name)
+		} else if s, isStr := v.(string); isStr && !(p.Type == "select" && len(p.Options) > 0) && strings.TrimSpace(s) == "" {
+			blank = append(blank, p.Name)
 		}
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		return nil, fmt.Errorf("this workflow requires %s %s, which has no value and no default — pass --param %s=<value>",
 			plural(len(missing), "parameter"), strings.Join(quoteAll(missing), ", "), missing[0])
+	}
+	if len(blank) > 0 {
+		sort.Strings(blank)
+		return nil, fmt.Errorf("this workflow requires %s %s, which was passed empty and has no default — pass --param %s=<value>",
+			plural(len(blank), "parameter"), strings.Join(quoteAll(blank), ", "), blank[0])
 	}
 	if len(values) == 0 {
 		return nil, nil
