@@ -2754,6 +2754,29 @@ compiler does not check types, so a mistyped prop, a hook called after an early
 return, a wrong table id, or a component that mounts and returns `null`
 publishes green too. `status` prints the app's URL; open it.
 
+**Some of what compiles clean fails silently, and `push` names what it can.**
+Every successful file write also lints the whole set for the handful of shapes
+the frame quietly swallows — a `layout.title` the chart theme strips, a kit app
+with nothing to compile its classes (no `import "@/styles/theme"` and
+`import "@tailwindcss/browser"` at the top of the entrypoint), `enableTailwind()`
+beside the kit's own runtime — and `push` prints them under the verdict as a
+`Warnings:` block, one `file:line: message` per finding (`file: message` for a
+finding about the set as a whole). They are advisory: `Compiles: yes` stays yes,
+the exit code is unchanged, and `--json` carries them as `warnings` (omitted
+when there are none). What you see is the answer to the **last** file write of
+the push, because that is the write that saw the folder complete — each write
+lints the set as it stands, so an earlier write's findings (the kit component
+that landed before the entrypoint importing the theme) are superseded, not
+merged. Two pushes print none by construction: one whose only change is a
+delete, since a file DELETE is not linted, and one that had nothing to push. Nor
+does a push that stopped part-way or whose set does not compile, and a finding
+about a file the same push deleted is dropped. `app validate` does not
+repeat them; edit and push again, or edit through the app. A last write the
+instance never answered but did land leaves the retry up to date and therefore
+silent, and its warnings surface on the next edit. `ronja sync apply` carries
+them too, as the folder's `note` lines — and still publishes, since a warning is
+not a verdict.
+
 **Forking a kit component is a local file copy.** Every app compiles against an
 embedded component kit (the shadcn/ui primitives and Ronja's operator
 components, imported as `@/components/ui/button` and friends), and an app file
@@ -3470,7 +3493,9 @@ The grammar in full: leading blank lines are skipped; a plain `-- text` line
 description or a column note may run over several lines; `-- @column <name>:
 <text>` opens a column, and everything after the *first* colon is the text; a
 **bare `--`** ends the documentation, so anything below it in the same comment
-block is ordinary commentary and is neither read nor reported. A malformed line
+block is ordinary commentary and is not read — but a `@table` or `@column` down
+there is *reported*, once, with a count, because a documented name that goes
+nowhere on a push that reports success is a drop nobody can see. A malformed line
 — no colon, no name, no text, an unknown `@directive`, a second `@table` — is
 **warned about and dropped**, never a refusal: nothing about a comment should be
 able to stop a push of SQL that is perfectly good.
@@ -4973,6 +4998,15 @@ about from its name.
 drift the escape is the folder's own command, run by somebody looking at that one
 folder — and the refusal says so, because the first operator to hit thirty
 refusals with no named escape asks for a flag instead.
+
+**A data app's lint warnings ride as notes, and apply publishes past them.**
+`ronja app push` prints the write-time lint under its verdict; apply runs that
+same push and then publishes, and dropping `push.Warnings` on the way would
+deploy straight past "fix them before publishing" with nothing in the log to
+say so. Each finding is one `note` line on the folder (`notes` in `--json`),
+the verdict is unchanged, and there is deliberately no "run `ronja app push` to
+see them" hint: after apply the folder is up to date, so a re-push writes
+nothing and prints nothing.
 
 **It publishes with `--no-request-review`.** `publishRouting` sends a non-admin
 caller on a shared feature to `request-review`, and `runPipelinePublish` counts

@@ -87,8 +87,10 @@ func (p *DataAppPatch) SetAccess(access DataAppAccess) {
 	p.Capabilities = &n.Capabilities
 }
 
-// CompileDiagnostic is one author-readable build error, mirroring
-// dataappbundle.Diagnostic.
+// CompileDiagnostic is one author-readable build error — or, on
+// DataAppFileSaveResponse.Warnings, one lint warning — mirroring
+// dataappbundle.Diagnostic. Line is 0 for a set-wide finding the server reports
+// against the entrypoint as a whole.
 type CompileDiagnostic struct {
 	Message string `json:"message"`
 	Line    int    `json:"line"`
@@ -118,6 +120,13 @@ type CompileError struct {
 type DataAppFileSaveResponse struct {
 	DataAppFile
 	CompileError *CompileError `json:"compileError,omitempty"`
+	// Warnings is the server's write-time lint over the WHOLE file set the write
+	// landed on: the shapes that compile clean and fail silently in the frame —
+	// a chart title the theme strips, a kit app with nothing to compile its
+	// classes, two Tailwinds. Present only after a clean compile with at least
+	// one finding, so it is never set beside CompileError. Advisory: it is not a
+	// verdict, and ValidateDataApp does not repeat it.
+	Warnings []CompileDiagnostic `json:"warnings,omitempty"`
 }
 
 // DataAppFileDeleteResponse is the body of DELETE :id/files/*path. DataAppID is

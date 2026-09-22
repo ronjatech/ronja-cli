@@ -134,6 +134,18 @@ type appPushResult struct {
 	Compiles *bool `json:"compiles"`
 	// CompileError is the diagnostics from a failed final compile.
 	CompileError *api.CompileError `json:"compileError,omitempty"`
+	// Warnings is the server's write-time lint as reported by the LAST file
+	// write this push made — the shapes that compile clean and fail silently in
+	// the frame. Every write lints the whole set, so the last write's answer is
+	// the one that describes the folder as pushed and an earlier write's is
+	// superseded, not merged. Advisory: never a verdict and never the exit code.
+	// Absent when the last write compiled clean with nothing to say, when it
+	// did not compile (the lint runs on the success path only), when the push
+	// wrote no file at all — a delete-only push included, since a DELETE is
+	// not linted server-side — when the push did not complete, and when the
+	// set did not compile. A finding about a file this push then deleted is
+	// dropped on its own.
+	Warnings []api.CompileDiagnostic `json:"warnings,omitempty"`
 	// CompileCheck is set only when the closing validate did not ANSWER — an
 	// outage, a 429, a 5xx. It is what separates the two ways Compiles can be
 	// nil, and without it a machine reader could not tell "nobody asked" from
@@ -425,14 +437,24 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// 7. Files: everything but the entrypoint, then the entrypoint, then the
 	// deletions. See the command comment for why the entrypoint goes last and
 	// not first as a workflow's does.
-	compileErr, err := putAppFiles(ctx, client, f.Codec, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
+	compileErr, warnings, err := putAppFiles(ctx, client, f.Codec, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
 	if err != nil {
 		return stop(err)
 	}
-
 	if err := deleteAppFiles(ctx, client, f.Codec, target.ID, local, remoteFiles, landed, preconditions, result); err != nil {
 		return stop(err)
 	}
+	// Recorded only once every write AND every delete landed: a push that
+	// stopped part-way has no complete set for a lint to have described, and a
+	// stop on a delete leaves the server holding a set the last write's lint
+	// did not look at.
+	//
+	// Minus the findings about files the deletes just removed. The lint runs
+	// over the files map, not the bundle graph, so an orphan the last write
+	// still reached is linted, then deleted, then reported under a verdict
+	// about a draft that no longer holds it. A delete of an UNRELATED file does
+	// not stale the rest: those files are still there, still as linted.
+	result.Warnings = withoutDeletedFiles(warnings, result.Deleted)
 
 	// 8. A push that wrote nothing at all, against a baseline that already
 	// described the server, has nothing to re-read.
@@ -513,6 +535,10 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 				Detail: verr.Error(),
 			}
 		default:
+			// A stop prints no verdict and no warnings; --json must agree
+			// with it (the ONE predicate rule below, applied to the arm that
+			// returns before reaching it).
+			result.Warnings = nil
 			return stop(fmt.Errorf("check whether %s compiles: %w", target.ID, verr))
 		}
 		if result.CompileCheck != nil {
@@ -522,6 +548,15 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 			// the one outcome this whole path exists for. The human report does
 			// NOT print it as a stop — see stoppedPartWay.
 			result.Error = compileNotKnownSentence(result.CompileCheck, target.ID)
+		}
+		// ONE predicate, after the switch, because Compiles turns false in TWO
+		// arms — the 400 refusal and a 200 whose validated_at is nil — and the
+		// lint the last clean write returned describes a set a later change (a
+		// delete, in practice) has since broken. --json and the human report
+		// read the same struct so that they cannot describe different things;
+		// `warnings` beside `compiles: false` would be exactly that.
+		if result.Compiles != nil && !*result.Compiles {
+			result.Warnings = nil
 		}
 	}
 
@@ -759,7 +794,18 @@ func checkAppDrift(f *folder, remote map[string]string, force bool, head headAgr
 // (api.DataAppFileSaveResponse) — because pushing a multi-file app walks through
 // states that cannot compile by construction. So diagnostics are collected and
 // the sync continues; anything else stops it.
-func putAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targetID, entrypoint string, local, remote, landed map[string]string, pre filePreconditions, result *appPushResult) (*api.CompileError, error) {
+//
+// The lint warnings returned are the LAST write's, overwritten on every write
+// rather than accumulated: each write lints the whole set as it stands, so an
+// earlier answer describes a set that no longer exists — including the
+// intermediate one where the entrypoint had not been written yet and a kit
+// component file fired "nothing compiles these classes" on its own. Overwritten
+// with nothing when the last write did not compile, because the server lints
+// on the success path only. "Last" means "the set the folder describes"
+// because every write lints the WHOLE set, whichever file it was — the
+// ordering above only bounds the intermediate noise, and says nothing about
+// which file's write comes last when the entrypoint is unchanged.
+func putAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targetID, entrypoint string, local, remote, landed map[string]string, pre filePreconditions, result *appPushResult) (*api.CompileError, []api.CompileDiagnostic, error) {
 	order := []string{}
 	for _, path := range sortedPaths(local) {
 		if path != entrypoint {
@@ -771,6 +817,7 @@ func putAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targ
 	}
 
 	var lastCompileErr *api.CompileError
+	var lastWarnings []api.CompileDiagnostic
 	for _, path := range order {
 		if remoteContent, ok := remote[path]; ok && remoteContent == local[path] {
 			result.Unchanged++
@@ -798,7 +845,7 @@ func putAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targ
 			if api.StatusOf(err) == api.StatusConflict {
 				result.Conflict = true
 				noteFileConflict("app", "app", "overwritten", path)
-				return lastCompileErr, fmt.Errorf("push %s: %w", path, err)
+				return lastCompileErr, lastWarnings, fmt.Errorf("push %s: %w", path, err)
 			}
 			// Whether the write LANDED is a different question from whether the
 			// request succeeded, and the answer decides what the baseline may say.
@@ -838,15 +885,16 @@ func putAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targ
 					result.Uncertain = append(result.Uncertain, path)
 				}
 			}
-			return lastCompileErr, fmt.Errorf("push %s: %w", path, err)
+			return lastCompileErr, lastWarnings, fmt.Errorf("push %s: %w", path, err)
 		}
 		landed[path] = local[path]
 		result.Pushed = append(result.Pushed, path)
 		if saved.CompileError != nil {
 			lastCompileErr = saved.CompileError
 		}
+		lastWarnings = saved.Warnings
 	}
-	return lastCompileErr, nil
+	return lastCompileErr, lastWarnings, nil
 }
 
 // writeOutcomeUncertain reports whether a failed file write could have taken
@@ -1121,6 +1169,69 @@ func printAppPushReport(r *appPushResult) {
 	printCompileVerdict(out, r)
 }
 
+// printLintWarnings renders appPushResult.Warnings under the verdict, one
+// `file:line: message` per finding — `file: message` for a set-wide finding the
+// server reports against the entrypoint with no line — followed by the one
+// sentence that says what they are. Nothing when there are none.
+//
+// Called from every verdict arm EXCEPT `Compiles: NO`, where the reader has a
+// compile error to fix first. runAppPush already nils Warnings on that verdict,
+// so the omission there is a no-op kept for safety, not the suppression itself.
+//
+// Before the `Next:` line rather than after the whole block: "fix these before
+// publishing" belongs ahead of "Next: ronja app publish", not behind it.
+//
+// No stripBundleNamespace here: the lint's File is the author path as the
+// files map keys it, never the bundler's `ronja-app:` namespace — that prefix
+// is esbuild's, and the lint does not run esbuild's bundle.
+func printLintWarnings(out io.Writer, r *appPushResult) {
+	if len(r.Warnings) == 0 {
+		return
+	}
+	fmt.Fprintf(out, "\n  Warnings:\n")
+	for _, w := range r.Warnings {
+		fmt.Fprintf(out, "    %s\n", formatLintWarning(w))
+	}
+	fmt.Fprintf(out, "  These compile but fail silently in the frame — fix them before publishing.\n")
+	fmt.Fprintf(out, "  They do not change the verdict above.\n")
+}
+
+// formatLintWarning is the `file:line: message` form, with `:line` omitted for
+// a line of 0 — the server's shape for a finding about the set as a whole,
+// where the remedy is an import at the top of the entrypoint rather than a fix
+// at a position, and where `App.tsx:0:` would send the reader to a line that
+// does not exist. It mirrors dataappbundle.Diagnostic.Render, so a push prints
+// the same line the in-app tool result carries.
+func formatLintWarning(w api.CompileDiagnostic) string {
+	switch {
+	case w.File == "":
+		return w.Message
+	case w.Line == 0:
+		return w.File + ": " + w.Message
+	}
+	return fmt.Sprintf("%s:%d: %s", w.File, w.Line, w.Message)
+}
+
+// withoutDeletedFiles drops every finding about a file in deleted, keeping the
+// rest in order. Nil when nothing survives, so the --json field stays absent
+// rather than becoming `[]`.
+func withoutDeletedFiles(warnings []api.CompileDiagnostic, deleted []string) []api.CompileDiagnostic {
+	if len(warnings) == 0 || len(deleted) == 0 {
+		return warnings
+	}
+	gone := make(map[string]bool, len(deleted))
+	for _, path := range deleted {
+		gone[path] = true
+	}
+	var kept []api.CompileDiagnostic
+	for _, w := range warnings {
+		if !gone[w.File] {
+			kept = append(kept, w)
+		}
+	}
+	return kept
+}
+
 // printAppPushURLs prints where to look at what was pushed. When the push wrote
 // to an edit draft of a live app, BOTH links are printed: the draft's, which is
 // where these files are, and the live app's, which is unchanged — the server
@@ -1198,16 +1309,20 @@ func printCompileVerdict(out *os.File, r *appPushResult) {
 		fmt.Fprintf(out, "  Compiles: not known — %s.\n", describeCompileDeadline(r.CompileCheck))
 		fmt.Fprintf(out, "            Your files are saved on draft %s, and the compile may still be running.\n", r.DraftID)
 		fmt.Fprintf(out, "            Run `ronja app validate` to ask for the verdict again.\n")
+		printLintWarnings(out, r)
 	case r.CompileCheck != nil:
 		fmt.Fprintf(out, "  Compiles: not known — the compiler did not answer (%s).\n",
 			describeCompileNonAnswer(r.CompileCheck, r.DraftID))
 		fmt.Fprintf(out, "            That is not a verdict on your files; they are saved on draft %s.\n", r.DraftID)
 		fmt.Fprintf(out, "            Run `ronja app validate` again in a moment; if it keeps failing, report it.\n")
+		printLintWarnings(out, r)
 	case r.Compiles == nil:
 		fmt.Fprintf(out, "  Compiles: not checked (--no-validate)\n")
+		printLintWarnings(out, r)
 		fmt.Fprintf(out, "\n  Next: ronja app validate\n")
 	case *r.Compiles:
 		fmt.Fprintf(out, "  Compiles: yes\n")
+		printLintWarnings(out, r)
 		fmt.Fprintf(out, "\n  Next: ronja app publish\n")
 	default:
 		fmt.Fprintf(out, "  Compiles: NO\n")

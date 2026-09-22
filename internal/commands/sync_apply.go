@@ -178,8 +178,10 @@ type syncApplyFolderReport struct {
 	// null for a folder that never got that far.
 	Units []syncApplyUnitReport `json:"units"`
 	// Notes are true, worth printing and not a refusal: the alias pre-flight's
-	// warnings, which every push loop prints and which a tree run would
-	// otherwise swallow.
+	// warnings and, for a data app, the write-time lint the push's last file
+	// write returned (appPushResult.Warnings, one `file:line: message` each) —
+	// which every push loop prints and which a tree run would otherwise
+	// swallow.
 	Notes []string `json:"notes,omitempty"`
 }
 
@@ -632,11 +634,15 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 		line.Detail = describeAttempt(plan.f.Kind, plan.decisions)
 		return
 	}
-	detail, created, reviewed, err := applyFolder(ctx, plan.f)
+	detail, created, reviewed, notes, err := applyFolder(ctx, plan.f)
 	// Counted whatever the verdict: a push that made two rows and then failed on
 	// the third made two rows, and a run that reported none would be the report
 	// contradicting the organization.
 	plan.created = created
+	// Appended whatever the verdict too, beside the alias pre-flight's: a lint
+	// warning describes files that landed, which is true whether or not the
+	// publish after them did.
+	line.Notes = append(line.Notes, notes...)
 	switch {
 	case err != nil && ctx.Err() != nil:
 		// ⚠️ THE INTERRUPT IS ASKED ABOUT FIRST, because it is the case where the
@@ -857,7 +863,7 @@ func describeAttempt(kind wfdir.Kind, decisions []applyDecision) string {
 //     live;
 //   - automation: nothing at all. That loop writes production directly, so there
 //     is no publish here to skip.
-func applyFolder(ctx context.Context, f *folder) (detail string, created int, reviewed bool, err error) {
+func applyFolder(ctx context.Context, f *folder) (detail string, created int, reviewed bool, notes []string, err error) {
 	switch f.Kind.Name {
 	case wfdir.KindPipeline:
 		push, pushErr := runPipelinePush(ctx, f, nil, pipelinePushOptions{})
@@ -866,7 +872,7 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// send the reader looking for rows that are already there.
 		created = countPipelineCreates(push)
 		if pushErr != nil {
-			return "", created, false, pushErr
+			return "", created, false, notes, pushErr
 		}
 		// Nothing to push AND nothing staged. With a draft recorded the publish
 		// still has work — an earlier run's, whose commit never landed — and
@@ -874,16 +880,16 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// no-argument selection is this same list, and an empty one returns
 		// `Nothing` before it makes a single request.
 		if push.UpToDate && len(pipelineStagedDrafts(pipelineBaseline(f))) == 0 {
-			return "nothing to push", created, false, nil
+			return "nothing to push", created, false, notes, nil
 		}
 		pushed := countPipelinePushed(push)
 		published, pubErr := runPipelinePublish(ctx, f, nil, true, false)
 		if pubErr != nil {
-			return "", created, false, pubErr
+			return "", created, false, notes, pubErr
 		}
 		if published.Nothing {
 			return fmt.Sprintf("pushed %d %s; no draft was staged to publish",
-				pushed, plural(pushed, "file")), created, false, nil
+				pushed, plural(pushed, "file")), created, false, notes, nil
 		}
 		// ⚠️ UNREACHABLE TODAY, and kept for symmetry with the data-app branch
 		// below, which is not. runPipelinePublish reaches outcomeSubmittedForReview
@@ -894,7 +900,7 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// the loop is one comparison per file.
 		for _, file := range published.Files {
 			if file.Outcome == outcomeSubmittedForReview {
-				return fmt.Sprintf("%s was submitted for admin review rather than committed, so this folder is NOT live", file.Path), created, true, nil
+				return fmt.Sprintf("%s was submitted for admin review rather than committed, so this folder is NOT live", file.Path), created, true, notes, nil
 			}
 		}
 		// COUNTED BY OUTCOME, not by the length of the list. published.Files holds
@@ -906,43 +912,55 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 				live++
 			}
 		}
-		return fmt.Sprintf("pushed and published %d %s", live, plural(live, "table")), created, false, nil
+		return fmt.Sprintf("pushed and published %d %s", live, plural(live, "table")), created, false, notes, nil
 
 	case wfdir.KindAutomation:
 		// No draft, no publish: this loop writes production directly.
 		push, pushErr := runAutomationPush(ctx, f, automationPushOptions{})
 		created, written := countAutomationWrites(push)
 		if pushErr != nil {
-			return "", created, false, pushErr
+			return "", created, false, notes, pushErr
 		}
 		if push.UpToDate {
-			return "nothing to push", created, false, nil
+			return "nothing to push", created, false, notes, nil
 		}
 		// WRITTEN, not enumerated. push.Files carries one entry per file including
 		// the `unchanged` ones, and "wrote 9 automations" about a run that wrote
 		// one is the report over-claiming on the line an operator reads first.
-		return fmt.Sprintf("wrote %d %s", written, plural(written, "automation")), created, false, nil
+		return fmt.Sprintf("wrote %d %s", written, plural(written, "automation")), created, false, notes, nil
 
 	case wfdir.KindDataApp:
 		push, pushErr := runAppPush(ctx, f, appPushOptions{Validate: true})
 		if push != nil && push.Created {
 			created = 1
 		}
+		// The write-time lint the push's last file write returned, carried as
+		// notes because apply is the one loop that publishes straight past them:
+		// `ronja app push` prints them under its verdict, and a tree run that
+		// swallowed them would deploy the one advisory the deploy should have
+		// shown. Advisory, not a verdict — the publish below still runs — and
+		// with no "push again to see them" hint, because after apply the folder
+		// is up to date and a re-push writes nothing and prints nothing.
+		if push != nil {
+			for _, w := range push.Warnings {
+				notes = append(notes, formatLintWarning(w))
+			}
+		}
 		if pushErr != nil {
-			return "", created, false, pushErr
+			return "", created, false, notes, pushErr
 		}
 		if push.UpToDate {
 			staged, err := appDraftAwaitsPublish(ctx, f, push)
 			if err != nil {
-				return "", created, false, err
+				return "", created, false, notes, err
 			}
 			if !staged {
-				return "nothing to push", created, false, nil
+				return "nothing to push", created, false, notes, nil
 			}
 		}
 		published, pubErr := runAppPublish(ctx, f, true)
 		if pubErr != nil {
-			return "", created, false, pubErr
+			return "", created, false, notes, pubErr
 		}
 		// ⚠️ REACHABLE, and NOT merely defensive. --no-request-review closes the
 		// publishRouting leg, but runAppPublish sets outcomeSubmittedForReview a
@@ -952,9 +970,9 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// that is exactly the run apply makes, and without this scan it would report
 		// `applied` for an app that only became somebody's proposal.
 		if published.Outcome == outcomeSubmittedForReview {
-			return "the draft was submitted for admin review rather than committed, so this folder is NOT live", created, true, nil
+			return "the draft was submitted for admin review rather than committed, so this folder is NOT live", created, true, notes, nil
 		}
-		return published.Detail, created, false, nil
+		return published.Detail, created, false, notes, nil
 
 	default:
 		push, pushErr := runPush(ctx, f, pushOptions{Validate: true})
@@ -962,25 +980,25 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 			created = 1
 		}
 		if pushErr != nil {
-			return "", created, false, pushErr
+			return "", created, false, notes, pushErr
 		}
 		if push.UpToDate {
 			staged, err := workflowDraftAwaitsPublish(ctx, f, push)
 			if err != nil {
-				return "", created, false, err
+				return "", created, false, notes, err
 			}
 			if !staged {
-				return "nothing to push", created, false, nil
+				return "nothing to push", created, false, notes, nil
 			}
 		}
 		published, pubErr := runPublish(ctx, f, publishOptions{NoRequestReview: true})
 		if pubErr != nil {
-			return "", created, false, pubErr
+			return "", created, false, notes, pubErr
 		}
 		if published.Outcome == outcomeSubmittedForReview {
-			return "the draft was submitted for admin review rather than committed, so this folder is NOT live", created, true, nil
+			return "the draft was submitted for admin review rather than committed, so this folder is NOT live", created, true, notes, nil
 		}
-		return published.Detail, created, false, nil
+		return published.Detail, created, false, notes, nil
 	}
 }
 

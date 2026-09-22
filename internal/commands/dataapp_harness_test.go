@@ -96,6 +96,13 @@ type fakeAppInstance struct {
 	// write still SUCCEEDS — that is the whole point of the 200 — so this
 	// models an author's syntax error, not a rejected request.
 	compileFails map[string]string
+	// lintWarnings maps a file path to the write-time lint warnings its PUT
+	// reports beside a CLEAN compile — the real server lints the whole set on
+	// every successful write, so keying by the path written is how a test
+	// stages "the set as it stood after this write". Never emitted beside a
+	// compileFails entry for the same path, because the server lints on the
+	// success path only.
+	lintWarnings map[string][]api.CompileDiagnostic
 	// validateFails, when non-empty, makes POST :id/validate answer with it.
 	// The status is validateStatus, defaulting to 400 — a compile refusal, which
 	// is what almost every test wants. Setting validateStatus to a 5xx models
@@ -104,6 +111,10 @@ type fakeAppInstance struct {
 	// one.
 	validateFails  string
 	validateStatus int
+	// validateUnstamped makes POST :id/validate answer 200 with the row's
+	// validated_at left nil — the OTHER shape a compile refusal arrives in,
+	// which the CLI reads through IsValidated rather than through a status.
+	validateUnstamped bool
 	// failPut / failDelete map a path to a status code, for genuine request
 	// failures as opposed to compile failures.
 	failPut    map[string]int
@@ -205,6 +216,7 @@ func newFakeAppInstance(t *testing.T) *fakeAppInstance {
 		featureScope:   map[string]string{},
 		featureStatus:  map[string]int{},
 		compileFails:   map[string]string{},
+		lintWarnings:   map[string][]api.CompileDiagnostic{},
 		failPut:        map[string]int{},
 		failDelete:     map[string]int{},
 		kit:            map[string]string{},
@@ -682,6 +694,11 @@ func (f *fakeAppInstance) serveValidate(w http.ResponseWriter, id string) {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, f.validateFails), status)
 		return
 	}
+	if f.validateUnstamped {
+		app.ValidatedAt = nil
+		f.writeRow(w, app)
+		return
+	}
 	stamped := app.UpdatedAt.Add(time.Second)
 	app.ValidatedAt = &stamped
 	app.BundleFileKey = "dataapp/" + id + "-fresh.html"
@@ -779,6 +796,8 @@ func (f *fakeAppInstance) serveFile(w http.ResponseWriter, r *http.Request, id, 
 				"diagnostics": []map[string]any{{"message": message, "line": 1, "column": 0, "file": filePath}},
 			}
 			f.apps[target].ValidatedAt = nil
+		} else if warnings := f.lintWarnings[filePath]; len(warnings) > 0 {
+			resp["warnings"] = warnings
 		}
 		writeJSON(w, resp)
 

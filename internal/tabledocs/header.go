@@ -44,8 +44,11 @@ const HeaderPrefix = "-- " + tableDirective
 //   - `-- @column <name>: <text>` opens a column. Everything after the FIRST
 //     colon is the text, so a description may contain colons.
 //   - A BARE `--` line ends the documentation. Anything after it in the same
-//     comment block is ordinary commentary and is neither read nor reported —
-//     which is how an author writes a normal note under a documented header.
+//     comment block is ordinary commentary and is not read — which is how an
+//     author writes a normal note under a documented header. A `@table` or
+//     `@column` down there is still not read, but it IS reported, once, with a
+//     count: a documented name that goes nowhere on a push that reports success
+//     is the one drop nobody can see.
 //
 // Warnings, never errors. A malformed line is dropped and named; nothing about a
 // comment should be able to stop a push of SQL that is perfectly good, and a
@@ -134,8 +137,11 @@ func ParseHeader(sql string) (Docs, []string) {
 			// rather than one target: everything below is the author's own
 			// commentary — a directive included — and reading any of it would be
 			// a header swallowing a note that has nothing to do with it.
+			//
+			// Not read, but NAMED: a `@column` below the line is the one shape
+			// where a documented name is lost on a push that reports success.
 			flush()
-			return docs, warnings
+			return docs, append(warnings, orphanedDirectives(lines, i+1)...)
 		case strings.HasPrefix(payload, "@"):
 			flush()
 			open = true
@@ -180,6 +186,72 @@ func ParseHeader(sql string) (Docs, []string) {
 	}
 	flush()
 	return docs, warnings
+}
+
+// orphanedDirectives counts the documentation directives written BELOW a bare
+// `--` and returns 0 or 1 warning naming how many there are. They are still not
+// READ — the terminator is deliberate — but a `@column` that is silently not
+// read is the one shape where a documented name is lost on a push that reports
+// success.
+//
+// READ-ONLY over `lines`, and that is the property to check: it never touches
+// docs, warnings, open, target or parts, so the directive state machine is
+// structurally unreachable from here and this cannot write documentation. The
+// count is the whole payload for the same reason — naming the columns would
+// mean parsing `@column <name>:` below the terminator, which is exactly the
+// boundary this keeps sharp. The caller already names the file.
+//
+// ONE warning, however many orphans: the push prints a stderr line AND appends
+// a `notes[]` entry per warning, so a warning each would be 26 of both for a
+// single mistake.
+//
+// It scans to the end of the comment RUN. A second bare `--` is more of the
+// same commentary and the scan WALKS PAST IT — the reported shape was
+// directives under bare `--` paragraph separators, PLURAL, and a scan that
+// stopped at the second would name the first group, earn a clean push and lose
+// the rest, which is worse than saying nothing. The first non-comment line — a
+// BLANK one included — stops it, because that is where ParseHeader's own block
+// ends; a directive in a later comment block was unreachable before the bare
+// `--` existed, and blaming the terminator for it would print a false
+// explanation.
+//
+// The trigger is `@table` and `@column` only, matched with isDirective so
+// `@tablespace` is not `@table`. The region below the terminator is DEFINED as
+// the author's own commentary, so an `-- @see ticket 41` convention there is
+// legitimate — and a warning that fires on legitimate prose is one people learn
+// to mute. The accepted cost is that a typo'd directive down there stays silent.
+func orphanedDirectives(lines []string, from int) []string {
+	count := 0
+	for i := from; i < len(lines); i++ {
+		payload, isComment := commentPayload(lines, i)
+		if !isComment {
+			break
+		}
+		if isDirective(payload, columnDirective) || isDirective(payload, tableDirective) {
+			count++
+		}
+	}
+	if count == 0 {
+		return nil
+	}
+	// Five values, and the assignment is ORDER-SENSITIVE in a way no compiler
+	// check reaches — `go vet` counts the `fmt` arguments and nothing reads what
+	// is in them. Swapping the last two here ships "drop the `@` if a note it is
+	// rather than documentation", green. TestParseHeaderOrphanRemedyIsNonDestructive
+	// asserts the whole rendered string for BOTH branches for that reason.
+	directives, are, them, theyAre, notes := "directives", "are", "them", "they are", "notes"
+	if count == 1 {
+		directives, are, them, theyAre, notes = "directive", "is", "it", "it is", "a note"
+	}
+	// The remedy must never be "delete the bare `--`": that does not just
+	// activate the directives, it turns every prose line between the terminator
+	// and them into a CONTINUATION of the table description, so an author's TODO
+	// silently becomes the customer-visible prose on the table. Both branches
+	// here are non-destructive, and dropping the `@` is also the way to park a
+	// directive block without this warning.
+	return []string{fmt.Sprintf(
+		"a bare `--` ends the header: %d documentation %s below it %s not read, so that prose is left alone — move %s above the `--` line, or drop the `@` if %s %s rather than documentation",
+		count, directives, are, them, theyAre, notes)}
 }
 
 // commentPayload returns the text of a `--` comment line with the marker and the

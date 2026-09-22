@@ -1049,6 +1049,63 @@ func TestPipelinePushWarnsAboutAnEmptySidecarRatherThanRefusing(t *testing.T) {
 	}
 }
 
+// TestPipelinePushWarnsAboutOrphanedColumnDirectives: a `-- @column` written
+// below a bare `--` is not read — that terminator is deliberate — and until now
+// it was not REPORTED either, which is the one shape where a documented name is
+// silently lost. The observed case was 26 of them below `--` paragraph
+// separators: the push said "description written" and 0/26 columns landed.
+//
+// ONE note, however many orphans: push prints one stderr line AND appends one
+// notes[] entry per warning, so a warning per directive would be 26 of each for
+// a single mistake.
+func TestPipelinePushWarnsAboutOrphanedColumnDirectives(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedBoundFolder(t, f)
+	editFile(t, root, "revenue.sql", "-- @table One row per invoice line.\n"+
+		"--\n"+
+		"-- the numbers below are the ones finance signed off on\n"+
+		"-- @column id: the line's own id\n"+
+		"-- @column total: SEK, ex VAT\n"+
+		"SELECT * FROM {{ ref('table-orders') }}")
+
+	out, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json")
+	if err != nil {
+		t.Fatalf("a comment must never fail a push: %v\n%s", err, stderr)
+	}
+	if got := strings.Count(stderr, "Note: revenue.sql — a bare `--` ends the header"); got != 1 {
+		t.Fatalf("want exactly one Note line for the file, got %d:\n%s", got, stderr)
+	}
+	if !strings.Contains(stderr, "2 documentation directives below it are not read") {
+		t.Errorf("the note does not name the count:\n%s", stderr)
+	}
+	// And machine-readable, so a CI run sees what a person does. Selected by
+	// CONTENT, never by position or by the length of the slice: `notes[]` is a
+	// shared channel — upstream validation appends its own "validated against
+	// live" line there — so a length check or a `notes[0]` index would go red
+	// for a reason that has nothing to do with this warning, and a guard that
+	// goes spuriously red is a guard somebody deletes.
+	var matched []string
+	for _, entry := range decodeJSON(t, out)["files"].([]any) {
+		file := entry.(map[string]any)
+		if file["path"] != "revenue.sql" {
+			continue
+		}
+		notes, _ := file["notes"].([]any)
+		for _, note := range notes {
+			if text, ok := note.(string); ok && strings.Contains(text, "a bare `--` ends the header") {
+				matched = append(matched, text)
+			}
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("want exactly one machine-readable note about the terminator, got %v\n%s", matched, out)
+	}
+	if !strings.Contains(matched[0], "2 documentation directives below it are not read") {
+		t.Errorf("the machine-readable note does not name the count: %q", matched[0])
+	}
+}
+
 // TestPipelineStatusDoesNotFailOnAnEmptySidecar is the same rule on the read
 // side, and it is the one a CI gate feels: pipelineStatusVerdict scores Problem
 // and Drift, so an empty sidecar reported as a Problem failed a gate that was

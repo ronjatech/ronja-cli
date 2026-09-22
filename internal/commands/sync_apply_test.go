@@ -3,6 +3,7 @@ package commands
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1206,6 +1207,113 @@ func TestSyncApplyPublishesAnUnpublishedDataAppWithNothingLeftToPush(t *testing.
 		t.Fatalf("committed = %v — the app was reported deployed while it was still nobody's but its author's\n%s",
 			f.committed, out)
 	}
+}
+
+// lintNotesTree stages a bound, edited data-app folder under a tree, so an
+// apply pushes it (the one write returns whatever f.lintWarnings["App.tsx"]
+// says) and then publishes it.
+func lintNotesTree(t *testing.T, f *fakeAppInstance) string {
+	t.Helper()
+	f.AddApp(&api.DataApp{ID: "data_app-new-1", Lifecycle: api.LifecycleDraft},
+		api.DataAppFile{Path: "App.tsx", Content: "const x = 1;\n"})
+	f.featureScope["feat-1"] = "private"
+	signInApp(t, f)
+
+	tree := t.TempDir()
+	root := filepath.Join(tree, "explorer")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &wfdir.Manifest{
+		Kind: wfdir.KindDataApp, Title: "Revenue explorer",
+		Stacks: map[string]wfdir.Stack{
+			"prod": {URL: f.URL(), TenantID: testTenantID, FeatureID: "feat-1"},
+		},
+	}
+	writeAppFolder(t, root, manifest, map[string]string{"App.tsx": "const x = 2;\n"})
+	lock := &wfdir.Lock{}
+	lock.SetBinding("prod", wfdir.Binding{DataAppID: "data_app-new-1", FeatureID: "feat-1"})
+	if err := wfdir.SaveLock(root, lock); err != nil {
+		t.Fatal(err)
+	}
+	state := &wfdir.State{}
+	state.Set(f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-new-1"],
+		[]api.DataAppFile{{Path: "App.tsx", Content: "const x = 1;\n"}}))
+	if err := wfdir.SaveState(root, state); err != nil {
+		t.Fatal(err)
+	}
+	return tree
+}
+
+// THE ADVISORY THE DEPLOY WOULD OTHERWISE SWALLOW. `ronja app push` prints the
+// write-time lint under its verdict; apply runs that same push and then
+// publishes, and it used to drop push.Warnings on the floor — publishing
+// straight past "fix them before publishing" with nothing in the log to say
+// so. They ride as the folder's notes: one line each in the report, one entry
+// each in --json, and no change to the verdict, because a warning is not one.
+// A clean push carries none.
+//
+// No "run `ronja app push` to see them" hint, and deliberately: after apply
+// the folder is up to date, so a re-push writes nothing and prints nothing.
+func TestSyncApplyCarriesThePushesLintWarningsAsNotes(t *testing.T) {
+	warnings := []api.CompileDiagnostic{lintWarningIntermediate, lintWarningFinal}
+
+	t.Run("--json", func(t *testing.T) {
+		f := newFakeAppInstance(t)
+		f.lintWarnings["App.tsx"] = warnings
+		tree := lintNotesTree(t, f)
+
+		out, err := runCLI(t, tree, "sync", "apply", "--stack", "prod", "--json")
+		if code := exitCodeOf(err); code != syncExitClean {
+			t.Fatalf("exit = %d (%v), want %d — a warning is not a verdict\n%s", code, err, syncExitClean, out)
+		}
+		if len(f.committed) != 1 {
+			t.Fatalf("committed = %v — apply still publishes past a warning", f.committed)
+		}
+		folder := applyFolderLine(t, applyReportOf(t, out), "explorer")
+		if folder.Verdict != verdictApplied {
+			t.Fatalf("folder = %+v, want %s", folder, verdictApplied)
+		}
+		want := []string{formatLintWarning(lintWarningIntermediate), formatLintWarning(lintWarningFinal)}
+		if !slices.Equal(folder.Notes, want) {
+			t.Errorf("notes = %q, want %q", folder.Notes, want)
+		}
+	})
+
+	t.Run("the report", func(t *testing.T) {
+		f := newFakeAppInstance(t)
+		f.lintWarnings["App.tsx"] = warnings
+		tree := lintNotesTree(t, f)
+
+		out, err := runCLI(t, tree, "sync", "apply", "--stack", "prod")
+		if code := exitCodeOf(err); code != syncExitClean {
+			t.Fatalf("exit = %d (%v), want %d\n%s", code, err, syncExitClean, out)
+		}
+		if got := strings.Count(out, "             note       "); got != 2 {
+			t.Errorf("expected two note lines, got %d:\n%s", got, out)
+		}
+		for _, w := range warnings {
+			if !strings.Contains(out, "note       "+formatLintWarning(w)+"\n") {
+				t.Errorf("expected a note line for %+v, got:\n%s", w, out)
+			}
+		}
+		if strings.Contains(out, "ronja app push") {
+			t.Errorf("a re-push after apply prints nothing, so the report must not send the reader there:\n%s", out)
+		}
+	})
+
+	t.Run("a clean push carries none", func(t *testing.T) {
+		f := newFakeAppInstance(t)
+		tree := lintNotesTree(t, f)
+
+		out, err := runCLI(t, tree, "sync", "apply", "--stack", "prod", "--json")
+		if code := exitCodeOf(err); code != syncExitClean {
+			t.Fatalf("exit = %d (%v), want %d\n%s", code, err, syncExitClean, out)
+		}
+		if folder := applyFolderLine(t, applyReportOf(t, out), "explorer"); len(folder.Notes) != 0 {
+			t.Errorf("notes = %q, want none", folder.Notes)
+		}
+	})
 }
 
 // THE PIPELINE HALF, which the lock already answers: a file with a recorded
