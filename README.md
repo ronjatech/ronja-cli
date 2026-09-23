@@ -2754,13 +2754,33 @@ compiler does not check types, so a mistyped prop, a hook called after an early
 return, a wrong table id, or a component that mounts and returns `null`
 publishes green too. `status` prints the app's URL; open it.
 
+**The app's spec version decides who styles it, and the folder does not own it.**
+An app carries a `specVersion`: 1 means styling is the author's job (the
+entrypoint imports `@/styles/theme` and `@tailwindcss/browser` itself), 2 means
+the compiler installs both into the bundle and the entrypoint writes neither. An
+app created today — including one `ronja app init` creates — is spec 2, because
+that is the server's create default. The CLI's data-app **row mirror carries the
+field**, so the generation an instance reports is decoded rather than guessed,
+and a `0` from an older instance reads as spec 1 exactly as the server reads it.
+
+There is deliberately **no `specVersion` key in `ronja.json`**, and no way to
+push a migration from a folder. A CLI-created app already takes the server's
+default, and nothing in a folder can usefully drive the 1 → 2 upgrade, so a key
+would buy a manifest field, a drift-baseline entry and a load-time validator for
+no behaviour at all. Migrate through the API instead —
+`PUT /api/v2/dataapp/<id> {"specVersion": 2}` — or ask the agent to. ⚠️ **If the
+key is ever added it MUST validate at load**, the way `wfdir.ValidRuntime` does
+for a workflow's `runtime`: the record of what skipping that cost is in the
+workflow `manifest.go`, and a hand-edited generation that only fails at push is
+the same bug again.
+
 **Some of what compiles clean fails silently, and `push` names what it can.**
 Every successful file write also lints the whole set for the handful of shapes
-the frame quietly swallows — a `layout.title` the chart theme strips, a kit app
-with nothing to compile its classes (no `import "@/styles/theme"` and
-`import "@tailwindcss/browser"` at the top of the entrypoint), `enableTailwind()`
-beside the kit's own runtime — and `push` prints them under the verdict as a
-`Warnings:` block, one `file:line: message` per finding (`file: message` for a
+the frame quietly swallows — a `layout.title` the chart theme strips, a
+**spec-1** kit app with nothing to compile its classes (no
+`import "@/styles/theme"` and `import "@tailwindcss/browser"` at the top of the
+entrypoint), `enableTailwind()` beside the kit's own runtime — and `push` prints
+them under the verdict as a `Warnings:` block, one `file:line: message` per finding (`file: message` for a
 finding about the set as a whole). They are advisory: `Compiles: yes` stays yes,
 the exit code is unchanged, and `--json` carries them as `warnings` (omitted
 when there are none). What you see is the answer to the **last** file write of
@@ -2776,6 +2796,14 @@ instance never answered but did land leaves the retry up to date and therefore
 silent, and its warnings surface on the next edit. `ronja sync apply` carries
 them too, as the folder's `note` lines — and still publishes, since a warning is
 not a verdict.
+
+One of those lines is not a mistake at all. Pushing to a **spec-1** app that
+already renders with Tailwind prints the **migration advisory**: it names both
+doors, `updateDataApp(specVersion: 2)` and
+`PUT /api/v2/dataapp/:id {"specVersion": 2}`, because from a folder the second
+one is the one you can actually call. Migrating needs no edit to the source —
+the two import lines stay harmless under spec 2 — so bump the version on its own
+and leave the folder alone.
 
 **Forking a kit component is a local file copy.** Every app compiles against an
 embedded component kit (the shadcn/ui primitives and Ronja's operator

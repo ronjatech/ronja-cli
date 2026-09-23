@@ -470,3 +470,73 @@ func TestFormatLintWarning(t *testing.T) {
 		})
 	}
 }
+
+// theMigrationAdvisory is the server's lintMsgMigrateToSpec2, verbatim
+// (backend/platform/dataappbundle/lint.go). Copied rather than approximated,
+// because the CLI's split keys on its opening clause and the point of this
+// test is that the two stay in step: reword it on the server and this fails
+// here, not in a customer's terminal.
+const theMigrationAdvisory = `this app is spec 1, where styling is the author's job. Apps are spec 2 now: the theme and the Tailwind runtime are installed for you. Migrate with updateDataApp(specVersion: 2), or over HTTP with PUT /api/v2/dataapp/:id {"specVersion": 2} — the page renders identically, and the two import lines are then redundant but harmless.`
+
+// TestPrintLintWarningsSplitsTheAdvisory pins the one line in this channel that
+// is NOT a defect.
+//
+// Every lint line used to print under `Warnings:` beneath a footer reading
+// "These compile but fail silently in the frame — fix them before publishing."
+// The migration advisory fires on a HEALTHY app, so that footer told the author
+// of a working app that it is broken. It now prints under `Note:` with a footer
+// that says nothing is wrong, and a defect in the same push still gets the
+// original block.
+func TestPrintLintWarningsSplitsTheAdvisory(t *testing.T) {
+	advisory := api.CompileDiagnostic{File: "App.tsx", Message: theMigrationAdvisory}
+	defect := api.CompileDiagnostic{File: "lib/chart.tsx", Line: 12, Message: "layout.title is stripped by the chart theme"}
+
+	t.Run("the advisory alone gets no defect footer", func(t *testing.T) {
+		var sb strings.Builder
+		printLintWarnings(&sb, &appPushResult{Warnings: []api.CompileDiagnostic{advisory}})
+		got := sb.String()
+		if strings.Contains(got, "Warnings:") {
+			t.Errorf("a healthy app's advisory must not be reported as a warning:\n%s", got)
+		}
+		if strings.Contains(got, "fail silently in the frame") {
+			t.Errorf("the defect footer must not follow an advisory:\n%s", got)
+		}
+		if !strings.Contains(got, "Note:") || !strings.Contains(got, "Nothing is wrong") {
+			t.Errorf("the advisory must print under Note: with its own footer:\n%s", got)
+		}
+		if !strings.Contains(got, theMigrationAdvisory) {
+			t.Errorf("the advisory text itself must still be printed:\n%s", got)
+		}
+	})
+
+	t.Run("a defect alongside keeps its own block", func(t *testing.T) {
+		var sb strings.Builder
+		printLintWarnings(&sb, &appPushResult{Warnings: []api.CompileDiagnostic{advisory, defect}})
+		got := sb.String()
+		if !strings.Contains(got, "Warnings:") || !strings.Contains(got, "fail silently in the frame") {
+			t.Errorf("a real defect must keep the Warnings block and its footer:\n%s", got)
+		}
+		if !strings.Contains(got, "Note:") {
+			t.Errorf("the advisory must still be split out:\n%s", got)
+		}
+		if strings.Index(got, "Warnings:") > strings.Index(got, "Note:") {
+			t.Errorf("the defects come first — they are what the reader must act on:\n%s", got)
+		}
+	})
+
+	t.Run("the F1 remedy is a defect, not advice", func(t *testing.T) {
+		// F1 carries the migration remedy as a SECOND sentence on an app that
+		// renders unstyled today. That app is broken, so the line belongs under
+		// Warnings whatever remedy it names.
+		f1 := api.CompileDiagnostic{File: "App.tsx", Message: "this app renders unstyled … Or migrate with updateDataApp(specVersion: 2)"}
+		var sb strings.Builder
+		printLintWarnings(&sb, &appPushResult{Warnings: []api.CompileDiagnostic{f1}})
+		got := sb.String()
+		if strings.Contains(got, "Note:") {
+			t.Errorf("an unstyled page is a defect, not a note:\n%s", got)
+		}
+		if !strings.Contains(got, "Warnings:") {
+			t.Errorf("F1 must keep the Warnings block:\n%s", got)
+		}
+	})
+}

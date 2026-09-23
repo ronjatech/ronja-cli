@@ -37,6 +37,26 @@ type DataApp struct {
 
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	// SpecVersion is the app's semantics generation: 1 (styling is the author's
+	// job — the entrypoint imports "@/styles/theme" and "@tailwindcss/browser"
+	// itself) or 2 (the compiler installs both, so the entrypoint needs
+	// neither). REPORTED ONLY, and `ronja app status` is where it is reported:
+	// the README's migration advice assumes the reader can see which
+	// generation their app is, and with no manifest key that command is the
+	// only place a CLI user can find out. There is no manifest key for it: a
+	// CLI-created app already takes the server's create default, and nothing in
+	// a folder can usefully push a migration yet, so a key would buy a field, a
+	// drift-baseline entry and a load-time validator for no behaviour. If one is
+	// added later it MUST validate at load, the way wfdir.ValidRuntime does —
+	// see the record in workflow manifest.go of the bug skipping that caused for
+	// `runtime`.
+	//
+	// ⚠️ 0 means the server predates the column (or is an older instance), not
+	// "spec 0": read it as 1, exactly as the server does. And the tag has to
+	// match the server's `specVersion` character for character — a typo here
+	// decodes silently to zero and `app status` would report every app as
+	// legacy.
+	SpecVersion int `json:"specVersion"`
 	// Entrypoint names the file the bundle compiles from. Reported, never
 	// pushed: rdataapp.Patch has no entrypoint field, so a data app's is fixed
 	// at "App.tsx" from the moment the row is created.

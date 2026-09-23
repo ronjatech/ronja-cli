@@ -20,6 +20,7 @@ const dataAppFixture = `{
   "featureID": "feat-1",
   "name": "Revenue explorer",
   "description": "Last twelve months",
+  "specVersion": 2,
   "entrypoint": "App.tsx",
   "bundleFileKey": "dataapp/file-1.html",
   "bundleCompiledAt": "2026-08-04T09:00:00Z",
@@ -73,6 +74,11 @@ func TestGetDataAppDecodesEveryMirroredField(t *testing.T) {
 	}
 	if app.Entrypoint != "App.tsx" {
 		t.Errorf("entrypoint = %q", app.Entrypoint)
+	}
+	// The tag is the whole test: `specVersion` mistyped decodes to 0, which
+	// reads as "this app styles itself" — the opposite of what the server said.
+	if app.SpecVersion != 2 {
+		t.Errorf("specVersion = %d, want 2 (a mistyped tag decodes silently to zero)", app.SpecVersion)
 	}
 	if app.BundleFileKey != "dataapp/file-1.html" {
 		t.Errorf("bundleFileKey = %q", app.BundleFileKey)

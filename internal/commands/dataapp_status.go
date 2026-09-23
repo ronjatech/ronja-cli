@@ -159,10 +159,17 @@ type appRemoteReport struct {
 	// NOT called "skipped": appStatusReport.Skipped already means "a local file
 	// that will never be synced", and one JSON document using one word for two
 	// unrelated things is a trap for anything parsing it.
-	NotCheckedReason string       `json:"notCheckedReason,omitempty"`
-	Problem          string       `json:"problem,omitempty"`
-	Lifecycle        string       `json:"lifecycle,omitempty"`
-	Draft            *draftReport `json:"draft,omitempty"`
+	NotCheckedReason string `json:"notCheckedReason,omitempty"`
+	Problem          string `json:"problem,omitempty"`
+	Lifecycle        string `json:"lifecycle,omitempty"`
+	// SpecVersion is the app's semantics generation as the server reports it,
+	// 0 when the remote half was not checked. It is here because the CLI
+	// README's migration advice assumes the reader can SEE which generation
+	// their app is: nothing in a folder carries the version (there is
+	// deliberately no manifest key), so `app status` is the only place a CLI
+	// user can find out before deciding whether to migrate.
+	SpecVersion int          `json:"specVersion,omitempty"`
+	Draft       *draftReport `json:"draft,omitempty"`
 	// Validated reports whether the row DRIFT was measured against currently
 	// compiles — i.e. whether `app publish` could commit it as it stands. Only
 	// meaningful for a draft, so nil for a folder with none.
@@ -244,6 +251,15 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 	// one a reader means by "the app", whoever happens to have a draft open.
 	pageURL := target.App.URL
 	out.Lifecycle = target.App.Lifecycle
+	// The LIVE app's generation, not the draft's, for the same reason pageURL
+	// is the app's page: this is the row the binding names. A draft that has
+	// been migrated and not yet published has not changed what the app IS.
+	// A 0 means the server predates the column — read as 1, exactly as the
+	// server reads it.
+	out.SpecVersion = target.App.SpecVersion
+	if out.SpecVersion == 0 {
+		out.SpecVersion = 1
+	}
 	out.RemoteAccess = describeAccess(target.Access())
 
 	// The row a push would target: your draft if you have one, else the live app
@@ -334,6 +350,14 @@ func printAppStatus(r *appStatusReport) {
 		fmt.Fprintf(out, "    %s\n", r.Remote.Problem)
 	default:
 		fmt.Fprintf(out, "    lifecycle: %s\n", api.DescribeLifecycle(r.Remote.Lifecycle))
+		if r.Remote.SpecVersion == 1 {
+			// Named only when it is the OLDER generation, because that is the
+			// only case the reader can act on. Worded in the CLI's own
+			// vocabulary — the terminal never says "spec version" — and it
+			// states where the change is made, since there is no manifest key
+			// and therefore nothing to push from this folder.
+			fmt.Fprintf(out, "    styling:   the app's own (an older app) — ask Ronja to bring it up to date, or use the API\n")
+		}
 		if r.Remote.Draft != nil {
 			fmt.Fprintf(out, "    your draft: %s\n", r.Remote.Draft.ID)
 			if r.Remote.Validated != nil && !*r.Remote.Validated {

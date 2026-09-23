@@ -1188,12 +1188,72 @@ func printLintWarnings(out io.Writer, r *appPushResult) {
 	if len(r.Warnings) == 0 {
 		return
 	}
-	fmt.Fprintf(out, "\n  Warnings:\n")
+	var defects, notes []api.CompileDiagnostic
 	for _, w := range r.Warnings {
-		fmt.Fprintf(out, "    %s\n", formatLintWarning(w))
+		if isAdvisoryWarning(w) {
+			notes = append(notes, w)
+			continue
+		}
+		defects = append(defects, w)
 	}
-	fmt.Fprintf(out, "  These compile but fail silently in the frame — fix them before publishing.\n")
-	fmt.Fprintf(out, "  They do not change the verdict above.\n")
+	if len(defects) > 0 {
+		fmt.Fprintf(out, "\n  Warnings:\n")
+		for _, w := range defects {
+			fmt.Fprintf(out, "    %s\n", formatLintWarning(w))
+		}
+		fmt.Fprintf(out, "  These compile but fail silently in the frame — fix them before publishing.\n")
+		fmt.Fprintf(out, "  They do not change the verdict above.\n")
+	}
+	if len(notes) > 0 {
+		fmt.Fprintf(out, "\n  Note:\n")
+		for _, w := range notes {
+			fmt.Fprintf(out, "    %s\n", formatLintWarning(w))
+		}
+		fmt.Fprintf(out, "  Nothing is wrong: the app works either way, and this is not a defect to fix\n")
+		fmt.Fprintf(out, "  before publishing.\n")
+	}
+}
+
+// advisoryLintPrefixes are the server lint lines that are NOT defects.
+//
+// The lint carries exactly one such line today — the migration advisory, which
+// fires on a HEALTHY app to say it could be brought up to date — and the server
+// is explicit that everything else in the list is a mistake (`lint.go`:
+// "everything else here is still a defect"). The CLI was the only place that
+// distinction was lost: every line landed under `Warnings:` beneath a footer
+// reading "These compile but fail silently in the frame", which told the author
+// of a perfectly working app that it is broken.
+//
+// ⚠️ MATCHED ON THE SERVER'S PROSE, because the wire carries no severity: a
+// CompileDiagnostic is {message, line, column, file} and adding a field would
+// change a shared response type for one renderer. The coupling is named at the
+// server end too (`lintMsgMigrateToSpec2`). If it ever drifts, the failure is
+// benign and visible — the advisory reappears under `Warnings:`, which is where
+// it was before — and TestPrintLintWarningsSplitsTheAdvisory pins the current
+// literal so the drift shows up here rather than in a customer's terminal.
+//
+// Deliberately a PREFIX rather than the whole message: the advisory names the
+// remedy in both its tool and HTTP forms, and that half is the likeliest to be
+// reworded.
+var advisoryLintPrefixes = []string{
+	"this app is spec 1, where styling is the author's job.",
+}
+
+// isAdvisoryWarning reports a lint line that is advice rather than a defect.
+//
+// An F line that CARRIES the migration remedy as a second sentence is NOT one
+// of these — F1, F2 and F3 all can — because each of those apps renders
+// unstyled today, which is a real defect, and the remedy is one of two ways to
+// fix it. The prefix match keys on the F clause, which is the app's own defect,
+// so all three keep landing under `Warnings:`. Only a line that is advisory in
+// whole belongs under `Note:`.
+func isAdvisoryWarning(w api.CompileDiagnostic) bool {
+	for _, p := range advisoryLintPrefixes {
+		if strings.HasPrefix(w.Message, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // formatLintWarning is the `file:line: message` form, with `:line` omitted for
