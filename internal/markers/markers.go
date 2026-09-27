@@ -224,8 +224,15 @@ var families = []struct {
 	// tablerefs.idRefPattern, which is this same regex read for a different
 	// question. It matches a positional ref too (digits are an arbitrary
 	// string); Occurrence.Positional is how the two are told apart.
+	//
+	// ⚠️ The argument is an ALTERNATION over the two quote characters rather
+	// than one `['"]` class, because a table HANDLE quotes a segment containing
+	// the separator with double quotes (`Sales."v2.1 forecast"`) — a form the
+	// old class matched nowhere at all. RE2 has no backreferences, so matching
+	// quotes can only be spelled as two alternatives, which is why this is the
+	// one family carrying TWO capture groups. scan reads whichever participated.
 	{Family{Verb: "ref", Kind: KindTable, Args: 1}, "tableIDRefPattern",
-		regexp.MustCompile(`\{\{+\s*ref\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}+`)},
+		regexp.MustCompile(`\{\{+\s*ref\(\s*(?:'([^']+)'|"([^"]+)")\s*\)\s*\}\}+`)},
 	// backend/engine/pymarkers/markers.go, secretMarkerPattern.
 	{Family{Verb: "secret", Kind: KindSecret, Args: 2}, "secretMarkerPattern",
 		regexp.MustCompile(`\{\{+\s*secret\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)\s*\}\}+`)},
@@ -481,23 +488,38 @@ func Rewrite(content string, sub func(Occurrence) (string, error)) (string, erro
 	return b.String(), nil
 }
 
+// argSpan returns the span of a marker's FIRST argument: the first capture
+// group that participated in the match. Every family carries one argument group
+// except `ref`, whose quote alternation carries two — of which exactly one ever
+// participates — so "the first group present" is the ONE rule that reads all of
+// them, and a family that later gains an alternation needs no change here.
+func argSpan(span []int) (start, end int, ok bool) {
+	for i := 2; i+1 < len(span); i += 2 {
+		if span[i] >= 0 {
+			return span[i], span[i+1], true
+		}
+	}
+	return 0, 0, false
+}
+
 // scan is the shared half of Scan and Rewrite, so the two can never disagree
 // about what a marker is or where it sits.
 func scan(content string) []Occurrence {
 	var out []Occurrence
 	for _, f := range families {
 		for _, span := range f.pattern.FindAllStringSubmatchIndex(content, -1) {
-			if len(span) < 4 || span[2] < 0 {
+			argStart, argEnd, ok := argSpan(span)
+			if !ok {
 				continue
 			}
-			arg := content[span[2]:span[3]]
+			arg := content[argStart:argEnd]
 			out = append(out, Occurrence{
 				Family:     f.Family,
 				Arg:        arg,
 				Marker:     content[span[0]:span[1]],
 				Positional: f.Kind == KindTable && isAllDigits(arg),
-				argStart:   span[2],
-				argEnd:     span[3],
+				argStart:   argStart,
+				argEnd:     argEnd,
 				matchStart: span[0],
 				matchEnd:   span[1],
 			})

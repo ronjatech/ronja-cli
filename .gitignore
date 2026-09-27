@@ -1,5 +1,6 @@
-# GoReleaser build output. Ignored here and, because this directory is synced
-# to the public mirror, in the mirror repo where the release actually runs.
+# GoReleaser build output. The release builds in the monorepo (cli/) and syncs
+# this directory to the public mirror, so this also keeps dist/ out of the
+# mirror; the release workflow's rsync excludes it as well.
 dist/
 
 # `go build -o ronja ./cmd/ronja` per README — a local binary, never committed.

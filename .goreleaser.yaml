@@ -98,28 +98,56 @@ homebrew_casks:
       # push to another one.
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Casks
-    homepage: https://ronja.tech
-    description: Command-line access to Ronja — sign in, then work against the API over plain HTTP
+    # The trailing slash and the <= 80-character description are Homebrew's
+    # own cask rules (`brew style`: HomepageUrlStyling, Desc).
+    homepage: https://ronja.tech/
+    description: Command-line access to Ronja — sign in, then work against the API over HTTP
     # No `license:` here on purpose: a cask has no license stanza (that is a
     # formula field), so the key validates but renders nothing. The licence
     # travels in the archive as LICENSE + NOTICE.
-    hooks:
-      post:
-        # These binaries are not signed with a Developer ID or notarized, and
-        # unlike a formula, a cask install DOES set the Gatekeeper quarantine
-        # bit. Without this hook macOS refuses to run the binary and reports it
-        # as "damaged", which looks like a corrupt download rather than a
-        # signing gap. Removing the bit here is Homebrew's documented escape
-        # hatch for an unsigned cask in a third-party tap.
-        #
-        # Note for later: unsigned casks are being removed from Homebrew's
-        # OFFICIAL taps in September 2026. That does not affect our own tap,
-        # but signing + notarization is the prerequisite if we ever want
-        # homebrew-cask to carry this.
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/ronja"]
-          end
+    #
+    # These binaries are not signed with a Developer ID or notarized, and
+    # unlike a formula, a cask install DOES set the Gatekeeper quarantine bit.
+    # Without the step below macOS refuses to run the binary and reports it as
+    # "damaged", which looks like a corrupt download rather than a signing gap.
+    # Removing the bit after install is Homebrew's documented escape hatch for
+    # an unsigned cask in a third-party tap.
+    #
+    # Why a hand-written `custom_block` and not `hooks.post.install`: GoReleaser
+    # (through v2.18) wraps a hook in Homebrew's `postflight do … end` stanza,
+    # which Homebrew 7.0 deprecated in favour of `postflight_steps`. The result
+    # was a warning on every `brew install`/`upgrade` telling our users to
+    # report a bug to our tap (goreleaser#6870). The upstream fix,
+    # `hooks.post.install_steps` (goreleaser#6873), was not released yet, so we
+    # write the new stanza ourselves. Once `~> v2` resolves to a GoReleaser
+    # that has it, move this block there (BL-5c7e).
+    #
+    # Three things to know about this block:
+    # - `postflight_steps` is Homebrew's sandboxed step DSL, not Ruby. `run` and
+    #   `on_macos` inside it need Homebrew >= 6.0.13 (2026-07); an older brew
+    #   cannot load the cask at all. `brew install` auto-updates Homebrew first
+    #   unless HOMEBREW_NO_AUTO_UPDATE is set, so that is an accepted floor.
+    # - `{{staged_path}}` is Homebrew's placeholder, and GoReleaser templates
+    #   this block with the same delimiters, so it is escaped once as
+    #   `{{ "{{staged_path}}" }}`. GoReleaser renders the block in exactly one
+    #   pass. If a release ever fails with "function staged_path not defined",
+    #   GoReleaser has started templating it twice: escape it twice. The
+    #   release workflow checks the generated cask before publishing, so that
+    #   failure happens before anything is published.
+    # - GoReleaser emits `custom_block` at the TOP of the cask, so
+    #   `brew style` reports Cask/StanzaOrder. That is a lint only; install and
+    #   upgrade never run it.
+    #
+    # Note for later: unsigned casks are being removed from Homebrew's OFFICIAL
+    # taps in September 2026. That does not affect our own tap, but signing +
+    # notarization is the prerequisite if we ever want homebrew-cask to carry
+    # this, and it would make this step unnecessary.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/ronja"]
+        end
+      end
 
 release:
   github:

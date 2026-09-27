@@ -343,3 +343,46 @@ func TestIDPrefixesExcludesMarkerlessKinds(t *testing.T) {
 		}
 	}
 }
+
+// A `{{ ref }}` argument may be a table HANDLE, and a handle quotes a segment
+// containing the separator with double quotes: `Sales."v2.1 forecast"`. The
+// server's pattern alternates over the two quote characters so that form
+// matches; this package mirrors it byte for byte (TestPatternParity), which
+// means `ref` is the one family whose argument lives in a second capture group
+// half the time. Reading it by number would report an empty argument for every
+// double-quoted ref — and Rewrite splices by the same offsets, so an empty span
+// would corrupt the file rather than merely misread it.
+func TestScanReadsBothQuoteAlternatives(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"single-quoted id", `{{ ref('table-abc') }}`, "table-abc"},
+		{"double-quoted id", `{{ ref("table-abc") }}`, "table-abc"},
+		{"quoted handle segment", `{{ ref('Sales."v2.1 forecast"') }}`, `Sales."v2.1 forecast"`},
+		{"apostrophe in a double-quoted marker", `{{ ref("Bob's tables") }}`, "Bob's tables"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Scan(c.content)
+			if len(got) != 1 {
+				t.Fatalf("Scan(%q) = %d occurrences, want 1", c.content, len(got))
+			}
+			if got[0].Arg != c.want {
+				t.Errorf("Arg = %q, want %q", got[0].Arg, c.want)
+			}
+			if got[0].Marker != c.content {
+				t.Errorf("Marker = %q, want %q", got[0].Marker, c.content)
+			}
+			// The offsets Rewrite splices by must bracket exactly the argument.
+			out, err := Rewrite(c.content, func(o Occurrence) (string, error) { return "table-zzz", nil })
+			if err != nil {
+				t.Fatalf("Rewrite: %v", err)
+			}
+			if !strings.Contains(out, "table-zzz") || strings.Contains(out, c.want) {
+				t.Errorf("Rewrite(%q) = %q, want the argument replaced whole", c.content, out)
+			}
+		})
+	}
+}

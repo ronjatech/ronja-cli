@@ -58,7 +58,15 @@ var (
 	// idRefPattern matches a ref carrying an arbitrary string, which is how an
 	// id-form ref is found. It also matches a positional one — the digits are an
 	// arbitrary string — so callers that mean "ids only" filter with IsTableID.
-	idRefPattern = regexp.MustCompile(`\{\{+\s*ref\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}+`)
+	//
+	// ⚠️ Its argument is an ALTERNATION over the two quote characters, not one
+	// `['"]` class, because a ref may name a table by HANDLE and a handle quotes
+	// a segment containing the separator with double quotes
+	// (`Sales."v2.1 forecast"`). RE2 has no backreferences, so matching quotes
+	// are two alternatives and therefore two capture groups, of which exactly
+	// one ever participates — read the argument with refArg, never by number, or
+	// a double-quoted ref reads as empty and drops out of DeriveInputModels.
+	idRefPattern = regexp.MustCompile(`\{\{+\s*ref\(\s*(?:'([^']+)'|"([^"]+)")\s*\)\s*\}\}+`)
 )
 
 // The id prefixes a table row can carry, mirroring rrn.IsTable
@@ -183,10 +191,10 @@ func DeriveInputModels(code string) []string {
 	seen := make(map[string]struct{}, len(matches))
 	var ids []string
 	for _, m := range matches {
-		if len(m) < 2 {
+		id := refArg(m)
+		if id == "" {
 			continue
 		}
-		id := m[1]
 		if !IsTableID(id) {
 			continue
 		}
@@ -198,4 +206,17 @@ func DeriveInputModels(code string) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// refArg returns the argument of one idRefPattern submatch: whichever of the
+// two quote alternatives participated. Returns "" when the slice is not a match
+// of that pattern.
+func refArg(sub []string) string {
+	if len(sub) < 3 {
+		return ""
+	}
+	if sub[1] != "" {
+		return sub[1]
+	}
+	return sub[2]
 }

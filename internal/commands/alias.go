@@ -690,9 +690,17 @@ func checkAliases(m *wfdir.Manifest, sel wfdir.Selection, codec aliasCodec, file
 
 	out.Refusals = append(out.Refusals, literalBindTargets(codec, files, access, fields)...)
 	out.Refusals = append(out.Refusals, misusedAliases(m, files)...)
+	out.Refusals = append(out.Refusals, unresolvedTableNames(m, files, stems)...)
 	out.Warnings = append(out.Warnings, unusedAliases(m, files, access, fields)...)
 	return out
 }
+
+// deadMarkerNote is the tail every refusal that read source as TEXT owes its
+// reader: markers.Scan cannot see that the server ignores a marker inside a `#`
+// comment or a triple-quoted block, so a commented-out one trips these checks.
+// One string, because two refusals reached by the same reader through the same
+// misunderstanding must not explain it two ways.
+const deadMarkerNote = " (markers are read as text here, so a commented-out one still counts — delete the dead line if that is what this is)"
 
 // misusedAliases refuses a marker argument this folder's own declarations say is
 // wrong, in the two cases where nothing else would ever notice.
@@ -737,7 +745,6 @@ func misusedAliases(m *wfdir.Manifest, files map[string]string) []string {
 	if len(m.Dependencies) == 0 {
 		return nil
 	}
-	const deadCodeNote = " (markers are read as text here, so a commented-out one still counts — delete the dead line if that is what this is)"
 	var out []string
 	for _, path := range sortedPaths(files) {
 		seen := map[aliasKey]bool{}
@@ -750,7 +757,7 @@ func misusedAliases(m *wfdir.Manifest, files map[string]string) []string {
 			if dep, declared := m.Dependencies[o.Arg]; declared && dep.Kind != o.Family.Kind {
 				out = append(out, fmt.Sprintf(
 					"%s writes %q, and %s declares %q as a %s, not a %s — so this marker resolves nothing and the literal name %q is what the server receives. Declare a %s dependency for it under another name, or fix the marker%s",
-					path, o.Marker, wfdir.ManifestName, o.Arg, dep.Kind, o.Family.Kind, o.Arg, o.Family.Kind, deadCodeNote))
+					path, o.Marker, wfdir.ManifestName, o.Arg, dep.Kind, o.Family.Kind, o.Arg, o.Family.Kind, deadMarkerNote))
 				continue
 			}
 			if o.Family.Kind != markers.KindSecret {
@@ -758,7 +765,85 @@ func misusedAliases(m *wfdir.Manifest, files map[string]string) []string {
 			}
 			out = append(out, fmt.Sprintf(
 				"%s writes %q, and %q is neither a secret id nor a secret %s declares — and a secret is the one marker the server SOFT-FAILS into a warning instead of refusing the save, so this would push green and run with nothing bound. Declare it (\"%s\": {\"kind\": \"secret\"}) and bind it, or write the secret's id%s",
-				path, o.Marker, o.Arg, wfdir.ManifestName, o.Arg, deadCodeNote))
+				path, o.Marker, o.Arg, wfdir.ManifestName, o.Arg, deadMarkerNote))
+		}
+	}
+	return out
+}
+
+// unresolvedTableNames refuses a `{{ ref('x') }}` whose argument is a NAME this
+// folder cannot turn into an id: not a table id, not a positional index, not a
+// sibling file's stem, not a declared dependency.
+//
+// ── WHY THIS IS NEW, AND WHY IT IS A REFUSAL ──────────────────────────────
+//
+// It used to be the server's job and the server did it well: a `ref` naming
+// nothing was a hard rejection of the save, so a folder like this could not be
+// pushed at all and no local rule was needed. That is over. The server now
+// RESOLVES a table name — `Sales.orders`, or a bare `orders` inside the
+// resource's own feature — and, crucially, STORES THE ID. The name is a way of
+// writing the reference, not a thing the row remembers.
+//
+// Which is right for the server and fatal for a folder. The push succeeds; the
+// remote copy holds `{{ ref('table-…') }}`; the de-alias on the way back has no
+// mapping for that id, because no alias is bound to it; so the file on disk says
+// `orders`, its remote twin says `table-…`, and the two hashes differ FOR EVER.
+// The folder reads as drifted on every `status`, is re-pushed by every `push`,
+// and there is nothing the author can edit that fixes it — which is the exact
+// failure literalBindTargets exists for, arrived at from the opposite direction:
+// there the file writes an id an alias answers to, here it writes a name no
+// alias answers to.
+//
+// So it is a refusal, and the fix is one line in `dependencies`. A bound alias
+// makes the round trip a function again: `orders` goes out as the id, and the id
+// comes back as `orders`.
+//
+// ── SCOPE ─────────────────────────────────────────────────────────────────
+//
+// `ref` ONLY, because `ref` is the only alias-eligible family whose argument the
+// server resolves by name; every other family still hard-rejects an unresolvable
+// argument (or, for `secret`, soft-fails it — which misusedAliases owns). Adding
+// a family here before the server resolves names for it would refuse source the
+// server accepts.
+//
+// NOT gated on the folder declaring dependencies at all, which is the one place
+// this leg parts company with misusedAliases. That gate exists there to keep the
+// alias layer inert for folders in the field; it cannot exist here, because the
+// folder this is about is precisely the one that declares nothing and writes a
+// bare name — and until this deploy such a folder could not push, so refusing it
+// takes nothing away that ever worked.
+//
+// ⚠️ markers.Scan reads source as TEXT, so a commented-out `{{ ref('orders') }}`
+// trips this too, where the server would have ignored it. Accepted for
+// misusedAliases' reason — a second copy of the comment stripper would drift
+// silently in both directions, and deleting a dead line is a real fix — and the
+// message says so.
+func unresolvedTableNames(m *wfdir.Manifest, files map[string]string, stems []string) []string {
+	sibling := make(map[string]bool, len(stems))
+	for _, stem := range stems {
+		sibling[stem] = true
+	}
+	var out []string
+	for _, path := range sortedPaths(files) {
+		seen := map[string]bool{}
+		for _, o := range markers.Scan(files[path]) {
+			if o.Family.Kind != markers.KindTable || o.Positional || seen[o.Arg] {
+				continue
+			}
+			if markers.IsResourceID(o.Family.Kind, o.Arg) || sibling[o.Arg] {
+				continue
+			}
+			// Declared under ANY kind is enough to stay quiet: declared as a
+			// `table` it resolves, and declared as something else it is
+			// misusedAliases' refusal to make. Two messages about one line is
+			// how a reader learns to skim them.
+			if _, declared := m.Dependencies[o.Arg]; declared {
+				continue
+			}
+			seen[o.Arg] = true
+			out = append(out, fmt.Sprintf(
+				"%s writes %q, and %q is neither a table id nor a name this folder resolves — Ronja will resolve it and store the ID, so its copy reads back as an id while your file keeps the name, and this folder reads as drifted for ever with nothing to edit that fixes it. Declare it in %s (\"dependencies\": {%q: {\"kind\": \"table\"}}) and bind it, or write the table's id%s",
+				path, o.Marker, o.Arg, wfdir.ManifestName, o.Arg, deadMarkerNote))
 		}
 	}
 	return out

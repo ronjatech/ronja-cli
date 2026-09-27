@@ -400,6 +400,13 @@ func deriveTitle(fromPath, root string) string {
 //
 // The rule is stated, not demonstrated: a commented-out tools.query call would
 // have to name a table id, and a fake id is a line nobody can run.
+//
+// ⚠️ The placeholder is `table-…` and MUST stay id-SHAPED. markers.Scan reads
+// source as text and cannot see that this line is a comment, so the ref in it is
+// scanned like any other — and a placeholder that is not id-shaped and not a
+// declared alias is refused by unresolvedTableNames, which would make this
+// scaffold a file `ronja wf init` writes and `ronja wf push` then refuses. That
+// is the failure checkStacks forbids one file over.
 func durableScaffoldHeader(runtime int) string {
 	header := fmt.Sprintf(`# Durable workflow (runtime %d). Every @tools.step result is journaled, so
 # `+"`ronja wf test --resume`"+` replays the steps that already finished and re-runs
@@ -407,7 +414,7 @@ func durableScaffoldHeader(runtime int) string {
 `, runtime)
 	if runtime >= wfdir.RuntimeQuery {
 		header += `#
-# Read a Ronja table ONLY with tools.query("… FROM {{ ref('tbl-id') }} …") — the
+# Read a Ronja table ONLY with tools.query("… FROM {{ ref('table-…') }} …") — the
 # marker goes inside the SQL string, and the container holds no credential for
 # the table's files.
 `

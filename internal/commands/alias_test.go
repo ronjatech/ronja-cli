@@ -827,6 +827,116 @@ func TestPushDoesNotRefuseANonIdSecretInAFolderThatDeclaresNothing(t *testing.T)
 	}
 }
 
+// TestPushRefusesABareTableNameNothingResolves is the refusal the server's own
+// name resolution made necessary.
+//
+// The server now RESOLVES `{{ ref('orders') }}` — a table's name is a handle
+// into its feature — and stores the ID it resolved to. So this push used to be
+// rejected server-side and now SUCCEEDS, and the folder is then permanently
+// drifted: the remote copy holds an id, the local file holds `orders`, the
+// de-alias has no mapping for that id because no alias is bound to it, and the
+// two hashes never agree again. Nothing the author can edit fixes it after the
+// fact, which is why this is a refusal and not a warning.
+//
+// The folder declares NOTHING, deliberately. That is the case this leg exists
+// for and the one place it parts company with the secret and wrong-family legs
+// above, which are gated on the folder declaring dependencies at all: a folder
+// like this could not push before this deploy, so refusing it takes nothing away
+// that ever worked.
+func TestPushRefusesABareTableNameNothingResolves(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	root := initFolder(t, f, map[string]string{
+		"main.py": "read(\"{{ ref('orders') }}\")\n",
+	})
+	f.Requests = nil
+
+	_, err := runCLI(t, root, "wf", "push", "--json")
+	if err == nil {
+		t.Fatal("expected a refusal — the server would resolve this name and store the id")
+	}
+	if !strings.Contains(err.Error(), `"orders"`) {
+		t.Errorf("refusal does not name the ref: %v", err)
+	}
+	// The FIX has to be in the message. A refusal that only says the folder is
+	// wrong leaves the author with a marker the server accepts and a CLI that
+	// will not send it, and no third option.
+	if !strings.Contains(err.Error(), "dependencies") {
+		t.Errorf("refusal does not say to declare it: %v", err)
+	}
+	for _, req := range f.Requests {
+		if strings.Contains(req, "PUT") || strings.Contains(req, "POST") {
+			t.Errorf("the refusal came after a write: %v", f.Requests)
+		}
+	}
+}
+
+// TestPushAcceptsAnIdRefInAFolderThatDeclaresNothing is the negative control for
+// the test above, and it is not redundant with it: without this leg the refusal
+// could be "every ref in an undeclared folder", which would break every workflow
+// folder in the field on the day it shipped.
+func TestPushAcceptsAnIdRefInAFolderThatDeclaresNothing(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	root := initFolder(t, f, map[string]string{
+		// An id, a POSITIONAL ref (an index into input_models, not a name), and
+		// a legacy-prefixed id — the three shapes that must stay legal.
+		"main.py": "a = \"{{ ref('table-orders') }}\"\nb = f\"{{{{ ref('0') }}}}\"\nc = \"{{ ref('modelv2-old') }}\"\n",
+	})
+
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("a folder writing only id and positional refs was refused: %v", err)
+	}
+}
+
+// TestPushOfADottedAliasIsUpToDateOnTheSecondRun pins the shape the QUALIFIED
+// handle takes in a folder.
+//
+// `Sales.orders` is a legal alias name — ValidAliasName admits the dot — and it
+// is the obvious thing to call the declaration once the server reads
+// `feature.table`. But the alias is resolved LOCALLY, before the server ever
+// sees it: what goes on the wire is the bound id, exactly as for an undotted
+// name, and what comes back de-aliases to the dotted name again. If the dot
+// broke either direction the folder would read as drifted for ever, which is the
+// same failure this whole file is about and would be invisible on a first push.
+func TestPushOfADottedAliasIsUpToDateOnTheSecondRun(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	root := t.TempDir()
+	manifest := &wfdir.Manifest{
+		Kind: wfdir.KindWorkflow, Title: "Monthly report", Entrypoint: "main.py",
+		Dependencies: map[string]wfdir.Dependency{"Sales.orders": {Kind: markers.KindTable}},
+		Stacks: map[string]wfdir.Stack{
+			"dev": {
+				URL: f.URL(), TenantID: testTenantID, FeatureID: "feat-1",
+				Bind: map[string]string{"Sales.orders": "table-orders"},
+			},
+		},
+	}
+	if err := wfdir.SaveFolder(root, manifest, &wfdir.Lock{}); err != nil {
+		t.Fatalf("save folder: %v", err)
+	}
+	writeLocal(t, root, "main.py", "read(\"{{ ref('Sales.orders') }}\")\n")
+
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	if got := f.FileContents(workflowIDOf(t, root))["main.py"]; got != "read(\"{{ ref('table-orders') }}\")\n" {
+		t.Fatalf("the dotted alias did not resolve on the wire: %q", got)
+	}
+	if got := readLocal(t, root, "main.py"); got != "read(\"{{ ref('Sales.orders') }}\")\n" {
+		t.Fatalf("the local file was rewritten to %q", got)
+	}
+
+	out, err := runCLI(t, root, "wf", "push", "--json")
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if decodeJSON(t, out)["upToDate"] != true {
+		t.Fatalf("second push was not up to date — the dot broke the de-alias:\n%s", out)
+	}
+}
+
 // TestValidateFailsOnAnAliasRefusal.
 //
 // `validate` is what a CI job gates on, and its verdict is the one people trust

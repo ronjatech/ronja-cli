@@ -255,9 +255,15 @@ choice.** We ship a *cask*, because GoReleaser's formula support is deprecated
 and a formula was always the wrong shape for a pre-built binary — and Homebrew
 does not support casks on Linux. Linux and CI take `go install` or the tarball.
 
-The binaries are unsigned, so the cask carries a `postflight` hook that strips
-the Gatekeeper quarantine bit. Without it macOS reports a freshly installed
-`ronja` as "damaged" — which is not a message anyone connects to code signing.
+The binaries are unsigned, so the cask carries a `postflight_steps` stanza that
+strips the Gatekeeper quarantine bit. Without it macOS reports a freshly
+installed `ronja` as "damaged" — which is not a message anyone connects to code
+signing. The stanza is written by hand in `.goreleaser.yaml`'s `custom_block`,
+because GoReleaser's own hook still emits the `postflight` stanza Homebrew 7.0
+deprecated, and that made every `brew install` warn and blame our tap. It needs
+Homebrew 6.0.13 or later. `brew install` normally auto-updates Homebrew first,
+but not when `HOMEBREW_NO_AUTO_UPDATE` is set: an older Homebrew then reports
+`Cask 'ronja' is unreadable`, and `brew update` fixes it.
 
 ### Keeping it current
 
@@ -2004,6 +2010,12 @@ says which of *its* organization's rows answers to that name:
 }
 ```
 
+**A dotted alias is legal and is the natural name for a qualified handle.** The
+charset admits `.`, so a folder may declare `"Sales.orders"` and write
+`{{ ref('Sales.orders') }}`. It is resolved LOCALLY like any other alias — the
+bound id is what reaches the wire — so the dot is a spelling choice for readers
+of the folder, not a request for the server to resolve `feature.table`.
+
 **The alias namespace is the FOLDER's own**, and that is the property that pays
 for the whole layer. Two tables called `orders` in one organization stop being a
 problem to manage and become a problem to *bind once*: whatever the rows are
@@ -2060,9 +2072,9 @@ UNKNOWN-KIND refusal for the same reason — adding a kind adds no key, so the
 version gate cannot catch a folder written by a newer CLI, and refusing that at
 load would take `status` away from the person best placed to see why.
 
-**Two ways of using an alias wrongly are refused**, and both are otherwise
-completely silent, because the codec keys on `(kind, name)` and a MISS leaves the
-argument exactly as found:
+**Three ways of using an alias wrongly are refused**, and all three are
+otherwise completely silent, because the codec keys on `(kind, name)` and a MISS
+leaves the argument exactly as found:
 
 - **A declared alias under the WRONG marker family**, any kind. `orders` is
   declared a `table`, the code writes `{{ secret('orders', 'token') }}`, and
@@ -2078,11 +2090,32 @@ argument exactly as found:
   older and better-aimed than anything invented client-side, so those are left
   alone.
 
-Both are GATED on the folder declaring dependencies at all, which keeps the layer
-inert for every folder in the field, and both scan source as TEXT — so a
-commented-out marker trips them. Accepted rather than mirroring
-`stripLineComments` and `stripTripleQuotedBlocks`, whose drift would be silent in
-both directions; deleting a dead line is a real fix, and the messages say so.
+- **A `{{ ref }}` naming a table nothing here resolves** — not a table id, not a
+  positional index, not a sibling file's stem, not a declared dependency. This
+  one is newer than the other two and exists because the SERVER changed: a
+  table's name is now a handle into its feature, so Ronja resolves
+  `{{ ref('Sales.orders') }}` — or a bare `{{ ref('orders') }}` inside the
+  resource's own feature — and **stores the id**. Which is right for the server
+  and fatal for a folder: the push succeeds, the remote copy holds an id, no
+  alias is bound to that id so the de-alias leaves it alone, and the file on disk
+  keeps the name. The two hashes never agree again and there is nothing to edit
+  that fixes it — the same permanent drift as writing a bound id literally,
+  reached from the opposite direction. Declaring the name under `dependencies`
+  and binding it makes the round trip a function again: the name goes out as the
+  id and the id comes back as the name.
+
+The first two are GATED on the folder declaring dependencies at all, which keeps
+the layer inert for every folder in the field. The third cannot be: the folder it
+is about is precisely the one that declares nothing and writes a bare name — and
+until names resolved server-side such a folder could not push at all, so refusing
+it takes away nothing that ever worked.
+
+All three scan source as TEXT — so a commented-out marker trips them. Accepted
+rather than mirroring `stripLineComments` and `stripTripleQuotedBlocks`, whose
+drift would be silent in both directions; deleting a dead line is a real fix, and
+the messages say so. (`ronja wf init`'s runtime-3 scaffold writes its example ref
+as `{{ ref('table-…') }}` for exactly this reason: an id-shaped placeholder, so
+the CLI never writes a file it would then refuse to push.)
 
 **`wf validate` and `app validate` fail on an alias refusal** — non-zero, `ok:
 false`, and the refusals in the `--json` payload under `aliasRefusals`. They are

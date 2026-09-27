@@ -291,7 +291,7 @@ func TestQueryRuntimeScaffoldStatesTheTableRule(t *testing.T) {
 	if want := "# Durable workflow (runtime 3). Every @tools.step result is journaled, so\n"; !strings.HasPrefix(scaffold, want) {
 		t.Errorf("the runtime-3 scaffold does not open with %q:\n%s", want, scaffold)
 	}
-	const rule = "#\n# Read a Ronja table ONLY with tools.query(\"… FROM {{ ref('tbl-id') }} …\") — the\n" +
+	const rule = "#\n# Read a Ronja table ONLY with tools.query(\"… FROM {{ ref('table-…') }} …\") — the\n" +
 		"# marker goes inside the SQL string, and the container holds no credential for\n" +
 		"# the table's files.\n"
 	if !strings.Contains(scaffold, rule) {
