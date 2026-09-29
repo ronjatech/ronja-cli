@@ -65,6 +65,38 @@ type QueryResult struct {
 	// that buckets by day/week/month can therefore return different numbers on
 	// the two surfaces, and this is the only field that says so.
 	ZoneUsed string `json:"zoneUsed"`
+	// Advice is NON-FATAL authoring advice about the SQL — today, backslash
+	// escapes that mean one thing under the old embed and another under raw
+	// semantics (see api/sqlsemantics.go).
+	//
+	// It says nothing about whether the query ran: a query with advice on it has
+	// succeeded, and Error is still the only field that reports a failure. An
+	// instance older than the field sends none, so an ABSENT array is the
+	// ordinary case rather than a signal, and the CLI prints nothing for it.
+	//
+	// No omitempty, on this struct's own rule — `ronja query --json` emits the
+	// envelope verbatim and a key that disappears when it is empty makes the
+	// payload a different shape depending on the answer.
+	Advice []QueryAdvice `json:"advice"`
+}
+
+// QueryAdvice is one non-fatal note about the SQL that was run.
+//
+// Every field is optional on the wire and the renderer treats it that way: a
+// server that grows a new advice kind with no snippet must still print
+// something legible here, and an offset of 0 is a real position rather than
+// "unknown". Message is the only field a reader is guaranteed.
+type QueryAdvice struct {
+	// Kind is the machine-readable class of the advice, for a --json caller
+	// that wants to branch rather than match on prose.
+	Kind string `json:"kind"`
+	// Message is the sentence a person reads.
+	Message string `json:"message"`
+	// Snippet is the fragment of SQL the advice is about, empty when the advice
+	// is about the statement as a whole.
+	Snippet string `json:"snippet"`
+	// Offset is the byte offset of Snippet within the SQL that was sent.
+	Offset int `json:"offset"`
 }
 
 // Failed reports a query the server accepted and could not run.
@@ -86,6 +118,13 @@ func (c *Client) Query(ctx context.Context, in QueryInput, timeout time.Duration
 	var out QueryResult
 	if err := c.do(ctx, timeout, "POST", "duckdb/query", in, &out); err != nil {
 		return nil, err
+	}
+	// The server omits `advice` when it has nothing to say, and an older one
+	// never sends it. `--json` and `--jq` re-encode this struct, so an absent
+	// array would come out as `"advice": null` — normalised to `[]`, so a
+	// caller iterating `.advice[]` never has to guard against null.
+	if out.Advice == nil {
+		out.Advice = []QueryAdvice{}
 	}
 	return &out, nil
 }

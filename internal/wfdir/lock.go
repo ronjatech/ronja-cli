@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 )
 
 // LockFormatVersion is the highest ronja.lock.json format this build can read.
@@ -183,6 +184,15 @@ type LockStack struct {
 	// than anywhere else in this file, because the row in question is the
 	// company's official definition of a number.
 	Metrics map[string]LockMetric `json:"metrics,omitempty"`
+	// Checks is a PIPELINE folder's per-CHECKS-FILE state: which live table a
+	// committed `checks/<stem>.json` last applied to, and the checks on it the
+	// folder owns — keyed by the checks file's slash-separated relative path.
+	//
+	// Recorded PER CHECK rather than per file: a maintainer who cannot create a
+	// table's `fail` checks must not lose the `warn` ones that did land, and have
+	// every push retry all of them. Committed for Tables' reason — which checks a
+	// folder owns on a live table is a fact about the environment.
+	Checks map[string]LockChecks `json:"checks,omitempty"`
 
 	// ⚠️ There is deliberately NO per-file fingerprint for a workflow or a data
 	// app here, and the asymmetry with Tables above is not an oversight. Those
@@ -326,8 +336,101 @@ type LockMetric struct {
 	// metric whose commit re-fingerprints, noisy in governance too.
 	DeclaredSHA256 string `json:"declaredSHA256,omitempty"`
 
+	// TagsApplied is what this folder last applied to the metric through the
+	// file's `tags` key: one {id, name} per name the file asserted, taken from the
+	// server's answer.
+	//
+	// It is the TAG half's base, and it is independent of the three recipe
+	// fields above on purpose: the recipe setters (SetMetricSeen, called at
+	// eight moments by push, publish, discard and clone) carry it forward
+	// untouched, and only SetMetricTagsApplied writes it. It is reset with the
+	// rest of the entry on an id change, by the invariant above — tag ids
+	// recorded against one metric say nothing about another.
+	//
+	// Two things are read from it and both are why it holds IDS:
+	//
+	//   - REMOVALS. A name the file no longer lists is removed only if THIS
+	//     folder put it there, and by id — so a tag a colleague added in the web
+	//     app is never touched, and a tag renamed in the web app is still found.
+	//   - RENAMES. A recorded id still on the metric satisfies the file name it
+	//     was recorded under even after an admin renamed it, so a folder never
+	//     re-mints the old name beside the new one.
+	//
+	// ABSENT means "no record", never "nothing applied": a folder with no record
+	// reconciles ADDITIVELY ONLY, since it cannot tell its own tags from anybody
+	// else's.
+	TagsApplied []AppliedTag `json:"tagsApplied,omitempty"`
+	// TagsRefused records a tag reconcile the server refused with its 20-tag
+	// cap (code tag_limit) — the one tag refusal recorded, because it answers the
+	// same way for every caller — against the fingerprint of the file's tag list
+	// at the time. A 403, a 404 from an instance without the route, a race or a
+	// 5xx is never recorded: each is about the caller or the deploy, not the
+	// file.
+	//
+	// It exists so a refusal is said once and not re-attempted on every push:
+	// while the file's tag list still hashes to FileTagsHash, the metric is not
+	// tag-pending, so `sync apply` cannot loop on it. Editing the file's tags, or
+	// `push --retry-tags`, tries again.
+	TagsRefused *TagsRefusal `json:"tagsRefused,omitempty"`
+
 	// unknown is this entry's forward-compatibility sidecar, for the reason
 	// LockTable's has one: it is an object in a COMMITTED file.
+	unknown unknownKeys
+}
+
+// AppliedTag is one tag a folder put on a metric: the tag's id, which survives
+// a rename, and the name the FOLDER asserted it under.
+//
+// ⚠️ THE NAME IS THE FILE'S CLAIM, spelled as the server spells the tag it
+// matched. On an ordinary match that is the tag's current name (a file saying
+// `finance` records `Finance`); on a tag an admin renamed since, it is the name
+// recorded BEFORE the rename, because that is the name the file still says and
+// the entry is what tells the next push the file's name is already satisfied.
+type AppliedTag struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+
+	// unknown is this entry's forward-compatibility sidecar: it is an object in
+	// a COMMITTED file, so a key a newer CLI writes inside it has to survive an
+	// older one rewriting the file around it.
+	unknown unknownKeys
+}
+
+// TagsRefusal is a recorded tag refusal: the reason the server gave, and the
+// fingerprint (metricfile.TagsFingerprint) of the file's tag list it was given
+// for.
+type TagsRefusal struct {
+	FileTagsHash string `json:"fileTagsHash"`
+	Reason       string `json:"reason"`
+
+	// unknown is this entry's forward-compatibility sidecar, as AppliedTag's.
+	unknown unknownKeys
+}
+
+// LockChecks is one checks file's recorded state on one stack.
+//
+// TableID names the live table the recordings were taken from; a checks file
+// whose table is rebound keeps nothing, by LockTable's invariant.
+type LockChecks struct {
+	TableID string `json:"tableID"`
+	// Managed is what the folder owns on that table, keyed by the check's FOLDED
+	// name (lower case, trimmed — the server's unique index). A name in here that
+	// the file no longer declares is an ORPHAN, which a push refuses until
+	// `--prune` silences it.
+	Managed map[string]LockCheckEntry `json:"managed,omitempty"`
+
+	// unknown is this entry's forward-compatibility sidecar.
+	unknown unknownKeys
+}
+
+// LockCheckEntry is one check the folder owns.
+type LockCheckEntry struct {
+	CheckID string `json:"checkID"`
+	// LiveSHA256 is the live check's projection (checkfile.Entry.LiveSHA256 —
+	// only the fields the file declares) at the moment the folder last verified
+	// it matched. Empty disarms the drift guard for that check.
+	LiveSHA256 string `json:"liveSHA256,omitempty"`
+
 	unknown unknownKeys
 }
 
@@ -391,6 +494,10 @@ var (
 	lockTableKeys      = jsonFieldNames(reflect.TypeOf(LockTable{}))
 	lockTableDocsKeys  = jsonFieldNames(reflect.TypeOf(LockTableDocs{}))
 	lockMetricKeys     = jsonFieldNames(reflect.TypeOf(LockMetric{}))
+	appliedTagKeys     = jsonFieldNames(reflect.TypeOf(AppliedTag{}))
+	tagsRefusalKeys    = jsonFieldNames(reflect.TypeOf(TagsRefusal{}))
+	lockChecksKeys     = jsonFieldNames(reflect.TypeOf(LockChecks{}))
+	lockCheckEntryKeys = jsonFieldNames(reflect.TypeOf(LockCheckEntry{}))
 	lockAutomationKeys = jsonFieldNames(reflect.TypeOf(LockAutomation{}))
 	stackKeys          = jsonFieldNames(reflect.TypeOf(Stack{}))
 )
@@ -502,6 +609,78 @@ func (m LockMetric) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return m.unknown.merge(body)
+}
+
+func (a *AppliedTag) UnmarshalJSON(data []byte) error {
+	var decoded plainAppliedTag
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*a = AppliedTag(decoded)
+	a.unknown.capture(data, appliedTagKeys)
+	return nil
+}
+
+func (a AppliedTag) MarshalJSON() ([]byte, error) {
+	body, err := json.Marshal(plainAppliedTag(a))
+	if err != nil {
+		return nil, err
+	}
+	return a.unknown.merge(body)
+}
+
+func (r *TagsRefusal) UnmarshalJSON(data []byte) error {
+	var decoded plainTagsRefusal
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = TagsRefusal(decoded)
+	r.unknown.capture(data, tagsRefusalKeys)
+	return nil
+}
+
+func (r TagsRefusal) MarshalJSON() ([]byte, error) {
+	body, err := json.Marshal(plainTagsRefusal(r))
+	if err != nil {
+		return nil, err
+	}
+	return r.unknown.merge(body)
+}
+
+func (c *LockChecks) UnmarshalJSON(data []byte) error {
+	var decoded plainLockChecks
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = LockChecks(decoded)
+	c.unknown.capture(data, lockChecksKeys)
+	return nil
+}
+
+func (c LockChecks) MarshalJSON() ([]byte, error) {
+	body, err := json.Marshal(plainLockChecks(c))
+	if err != nil {
+		return nil, err
+	}
+	return c.unknown.merge(body)
+}
+
+func (e *LockCheckEntry) UnmarshalJSON(data []byte) error {
+	var decoded plainLockCheckEntry
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*e = LockCheckEntry(decoded)
+	e.unknown.capture(data, lockCheckEntryKeys)
+	return nil
+}
+
+func (e LockCheckEntry) MarshalJSON() ([]byte, error) {
+	body, err := json.Marshal(plainLockCheckEntry(e))
+	if err != nil {
+		return nil, err
+	}
+	return e.unknown.merge(body)
 }
 
 func (a *LockAutomation) UnmarshalJSON(data []byte) error {
@@ -931,6 +1110,146 @@ func (l *Lock) SetMetricSeen(stack, path, metricID, live, declared string) {
 	}
 	metric.MetricID, metric.LiveSHA256, metric.DeclaredSHA256 = metricID, live, declared
 	entry.Metrics[path] = metric
+	l.Stacks[stack] = entry
+}
+
+// MetricTags reads one metric file's TAG half: the row it was recorded against,
+// what the folder last applied there, and a recorded refusal. An unrecorded
+// path — or a nil lock, a fresh clone's — answers nothing, which reconciles
+// additively and retries any refusal.
+//
+// The id is returned so the caller can apply LockMetric's invariant: a record
+// taken against another row says nothing about this one.
+func (l *Lock) MetricTags(stack, path string) (metricID string, applied []AppliedTag, refused *TagsRefusal) {
+	if l == nil {
+		return "", nil, nil
+	}
+	entry := l.Stacks[stack].Metrics[path]
+	return entry.MetricID, entry.TagsApplied, entry.TagsRefused
+}
+
+// SetMetricTagsApplied records what a tag reconcile left on the metric, and
+// NOTHING ELSE: the three recipe fields are left exactly as they are, because a
+// tag write says nothing about the definition — a tag-only push must never
+// disarm the drift guard or claim a recipe was pushed.
+//
+// A path recorded against a DIFFERENT row is reset first, by the invariant on
+// LockMetric; the recipe fields that reset drops described that other row, and
+// every caller has already stopped comparing against them.
+func (l *Lock) SetMetricTagsApplied(stack, path, metricID string, applied []AppliedTag) {
+	l.editMetric(stack, path, metricID, func(m *LockMetric) {
+		m.TagsApplied = append([]AppliedTag(nil), applied...)
+	})
+}
+
+// SetMetricTagsRefused records (or, with nil, clears) a tag refusal, on
+// SetMetricTagsApplied's rules: nothing else in the entry moves.
+func (l *Lock) SetMetricTagsRefused(stack, path, metricID string, refused *TagsRefusal) {
+	l.editMetric(stack, path, metricID, func(m *LockMetric) {
+		if refused == nil {
+			m.TagsRefused = nil
+			return
+		}
+		copied := *refused
+		m.TagsRefused = &copied
+	})
+}
+
+// editMetric is the read-edit-store the two tag setters share, with
+// SetMetricSeen's two rules: an empty stack writes nothing (a legacy folder has
+// nowhere committed to put it), and a path rebound to a different row keeps
+// nothing.
+func (l *Lock) editMetric(stack, path, metricID string, edit func(*LockMetric)) {
+	if stack == "" || metricID == "" {
+		return
+	}
+	entry := l.stack(stack)
+	if entry.Metrics == nil {
+		entry.Metrics = map[string]LockMetric{}
+	}
+	metric := entry.Metrics[path]
+	if metric.MetricID != metricID {
+		metric = LockMetric{MetricID: metricID}
+	}
+	edit(&metric)
+	entry.Metrics[path] = metric
+	l.Stacks[stack] = entry
+}
+
+// ChecksSeen reads one checks file's recorded table id and managed checks. An
+// unrecorded path answers an empty id and a nil map.
+func (l *Lock) ChecksSeen(stack, path string) (tableID string, managed map[string]LockCheckEntry) {
+	if l == nil {
+		return "", nil
+	}
+	entry := l.Stacks[stack].Checks[path]
+	return entry.TableID, entry.Managed
+}
+
+// SetChecksSeen records the table a checks file applies to and the checks the
+// folder owns on it. A LEGACY folder has no stack name and keeps this in
+// .ronja/state.json instead — see SetMetricSeen.
+func (l *Lock) SetChecksSeen(stack, path, tableID string, managed map[string]LockCheckEntry) {
+	if stack == "" {
+		return
+	}
+	entry := l.stack(stack)
+	if entry.Checks == nil {
+		entry.Checks = map[string]LockChecks{}
+	}
+	// Read-edit-store so the forward-compatibility sidecar survives; a rebound
+	// table keeps nothing.
+	checks := entry.Checks[path]
+	if checks.TableID != tableID {
+		checks = LockChecks{}
+	}
+	checks.TableID = tableID
+	if len(managed) == 0 {
+		checks.Managed = nil
+	} else {
+		// Each entry keeps its own sidecar when the same check is re-recorded.
+		merged := make(map[string]LockCheckEntry, len(managed))
+		for name, m := range managed {
+			if prior, ok := checks.Managed[name]; ok && prior.CheckID == m.CheckID {
+				prior.LiveSHA256 = m.LiveSHA256
+				m = prior
+			}
+			merged[name] = m
+		}
+		checks.Managed = merged
+	}
+	entry.Checks[path] = checks
+	l.Stacks[stack] = entry
+}
+
+// ChecksPaths lists the checks files this stack has a record for, sorted — the
+// way a push finds a record whose file was deleted.
+func (l *Lock) ChecksPaths(stack string) []string {
+	if l == nil {
+		return nil
+	}
+	var out []string
+	for path := range l.Stacks[stack].Checks {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// DropChecksSeen forgets one checks file's record: its file is gone and nothing
+// it owned is still enabled.
+func (l *Lock) DropChecksSeen(stack, path string) {
+	if l == nil || stack == "" {
+		return
+	}
+	entry, ok := l.Stacks[stack]
+	if !ok || entry.Checks == nil {
+		return
+	}
+	delete(entry.Checks, path)
+	if len(entry.Checks) == 0 {
+		entry.Checks = nil
+	}
 	l.Stacks[stack] = entry
 }
 

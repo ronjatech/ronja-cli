@@ -133,3 +133,85 @@ func TestMetricSeenOnANilLockAnswersNothing(t *testing.T) {
 		t.Errorf("MetricSeen on a nil lock = %q %q %q", metricID, live, declared)
 	}
 }
+
+// TestMetricTagSettersNeverTouchTheRecipeFingerprints: the TAG half is a
+// separate base on the same entry, and the one property that matters is that
+// writing it cannot move the recipe's. A tag-only push that cleared
+// DeclaredSHA256 would re-stage and re-build the metric on the next run; one
+// that cleared LiveSHA256 would disarm the drift guard.
+//
+// And the converse: every recipe setter carries the tag half forward, because
+// SetMetricSeen runs at eight moments none of which is about tags.
+func TestMetricTagSettersNeverTouchTheRecipeFingerprints(t *testing.T) {
+	lock := &Lock{}
+	lock.SetMetricSeen("dev", "metrics/aov.json", "table-aov", "live-1", "file-1")
+	lock.SetMetricTagsApplied("dev", "metrics/aov.json", "table-aov",
+		[]AppliedTag{{ID: "tag-fin", Name: "Finance"}})
+	lock.SetMetricTagsRefused("dev", "metrics/aov.json", "table-aov",
+		&TagsRefusal{FileTagsHash: "h", Reason: "too many"})
+
+	if id, live, declared := lock.MetricSeen("dev", "metrics/aov.json"); id != "table-aov" || live != "live-1" || declared != "file-1" {
+		t.Fatalf("a tag write moved the recipe fingerprints: %q %q %q", id, live, declared)
+	}
+	// A recipe recording — the up-to-date arm, a publish, a discard — keeps both.
+	lock.SetMetricSeen("dev", "metrics/aov.json", "table-aov", "live-2", "")
+	id, applied, refused := lock.MetricTags("dev", "metrics/aov.json")
+	if id != "table-aov" || len(applied) != 1 || applied[0].ID != "tag-fin" || refused == nil || refused.Reason != "too many" {
+		t.Fatalf("a recipe write dropped the tag half: %q %+v %+v", id, applied, refused)
+	}
+	// Clearing a refusal is its own write.
+	lock.SetMetricTagsRefused("dev", "metrics/aov.json", "table-aov", nil)
+	if _, _, refused := lock.MetricTags("dev", "metrics/aov.json"); refused != nil {
+		t.Errorf("refusal not cleared: %+v", refused)
+	}
+
+	// Rebound to a DIFFERENT row: a tag record against another metric is reset,
+	// by the same invariant the recipe fingerprints obey.
+	lock.SetMetricSeen("dev", "metrics/aov.json", "table-other", "live-3", "")
+	if _, applied, _ := lock.MetricTags("dev", "metrics/aov.json"); len(applied) != 0 {
+		t.Errorf("a rebinding kept the old row's tag record: %+v", applied)
+	}
+	// And a tag write against a new id resets the old row's recipe fingerprints,
+	// rather than leaving them attributed to a row they were not taken from.
+	lock.SetMetricTagsApplied("dev", "metrics/aov.json", "table-third", []AppliedTag{{ID: "t", Name: "T"}})
+	if id, live, _ := lock.MetricSeen("dev", "metrics/aov.json"); id != "table-third" || live != "" {
+		t.Errorf("a tag write against a new row kept the old one's fingerprint: %q %q", id, live)
+	}
+
+	// An empty stack writes nothing, as every lock setter.
+	empty := &Lock{}
+	empty.SetMetricTagsApplied("", "metrics/aov.json", "table-aov", []AppliedTag{{ID: "t", Name: "T"}})
+	if len(empty.Stacks) != 0 {
+		t.Errorf("an empty stack name wrote %+v", empty.Stacks)
+	}
+}
+
+// TestAppliedTagsRoundTripThroughTheCommittedFile, with an unknown key inside a
+// tag entry surviving — the sidecar has to reach this nesting level too.
+func TestAppliedTagsRoundTripThroughTheCommittedFile(t *testing.T) {
+	root := t.TempDir()
+	body := `{"stacks":{"dev":{"metrics":{"metrics/aov.json":{"metricID":"table-aov",` +
+		`"tagsApplied":[{"id":"tag-fin","name":"Finance","addedBy":"future"}],` +
+		`"tagsRefused":{"fileTagsHash":"h","reason":"r","code":"future"}}}}}}` + "\n"
+	write(t, root, LockName, body)
+	lock, err := LoadLock(root)
+	if err != nil {
+		t.Fatalf("LoadLock: %v", err)
+	}
+	_, applied, refused := lock.MetricTags("dev", "metrics/aov.json")
+	if len(applied) != 1 || applied[0].Name != "Finance" || refused == nil || refused.FileTagsHash != "h" {
+		t.Fatalf("MetricTags = %+v %+v", applied, refused)
+	}
+	if err := SaveLock(root, lock); err != nil {
+		t.Fatalf("SaveLock: %v", err)
+	}
+	written, err := os.ReadFile(LockPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"addedBy"`, `"code": "future"`, `"tagsApplied"`} {
+		if !strings.Contains(string(written), want) {
+			t.Errorf("a load/save lost %s:\n%s", want, written)
+		}
+	}
+}

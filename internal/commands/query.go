@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -94,6 +95,10 @@ the browser reads at your own zone — a rollup bucketed by day, week or month
 can legitimately differ between the two. Check it first when CLI numbers
 disagree with the app.
 
+Authoring advice about the SQL — a backslash escape that reads differently
+under raw and legacy escape handling, say — is printed on stderr too, and
+carried as .advice. It is never a failure: a query with advice on it ran.
+
 A large query can be routed to bigger compute server-side and take minutes.
 Raise --timeout for those; the default is generous for an interactive query and
 too short for a heavy one.
@@ -165,6 +170,15 @@ is non-zero.`,
 			if err != nil {
 				return err
 			}
+
+			// Authoring advice, printed BEFORE the failure branch rather than
+			// after it: a backslash escape that means one thing under the old
+			// embed and another under raw semantics is a very good candidate
+			// for why the query that just failed did. It is stderr in every
+			// mode, so it never lands inside piped CSV or a --json envelope —
+			// and it is carried in that envelope too, for a caller that would
+			// rather branch on `.advice` than read prose.
+			printQueryAdvice(os.Stderr, result.Advice)
 
 			// The trap, handled once. Everything below this point is a query
 			// that actually ran.
@@ -239,6 +253,87 @@ is non-zero.`,
 		"with --jq, print string results unquoted")
 	return cmd
 }
+
+// printQueryAdvice writes the server's non-fatal notes about the SQL, ONE LINE
+// PER KIND, and nothing at all for the ordinary query that earns none.
+//
+// Per kind, not per entry. The server sends one entry per occurrence and their
+// messages are identical within a kind by construction, so a statement with
+// twenty doubled backslashes printed twenty copies of one sentence above the
+// answer the person actually asked for — which is how narration becomes
+// something a reader learns to skip. The snippets are what differ, so they are
+// gathered onto the one line, deduplicated and bounded by
+// queryAdviceSnippetsPerLine.
+//
+// GROUPED ON (kind, message), not on kind alone. An instance older than the
+// `kind` field, or one that grows a kind this build has never seen, sends
+// entries whose kind is empty or unknown; grouping on kind alone would merge
+// two unrelated sentences into one line and print only the first. The pair is
+// the exact test for "these two entries say the same thing".
+//
+// TOLERANT BY CONSTRUCTION, because the field is newer than the instances this
+// CLI talks to and newer than the advice kinds it will grow. An instance that
+// sends no `advice` at all, an entry with no snippet, an entry that is empty
+// but for its message: all of them print what there is and say nothing about
+// what is missing. The one entry that is dropped is the one with NO message,
+// which has nothing a person could read.
+//
+// STDERR, always. Advice is narration about a query whose ANSWER is on stdout,
+// and a line of prose in the middle of a CSV a pipeline is parsing is a bug in
+// the pipeline that this command caused.
+func printQueryAdvice(w io.Writer, advice []api.QueryAdvice) {
+	type group struct {
+		message  string
+		snippets []string
+		seen     map[string]bool
+		dropped  int
+	}
+	var order []string
+	byKey := map[string]*group{}
+	for _, note := range advice {
+		message := strings.TrimSpace(note.Message)
+		if message == "" {
+			continue
+		}
+		key := note.Kind + "\x00" + message
+		g, ok := byKey[key]
+		if !ok {
+			g = &group{message: message, seen: map[string]bool{}}
+			byKey[key] = g
+			order = append(order, key)
+		}
+		snippet := strings.TrimSpace(note.Snippet)
+		if snippet == "" || g.seen[snippet] {
+			continue
+		}
+		g.seen[snippet] = true
+		if len(g.snippets) >= queryAdviceSnippetsPerLine {
+			g.dropped++
+			continue
+		}
+		g.snippets = append(g.snippets, snippet)
+	}
+	for _, key := range order {
+		g := byKey[key]
+		switch {
+		case len(g.snippets) == 0:
+			fmt.Fprintf(w, "  advice: %s\n", g.message)
+		case g.dropped > 0:
+			fmt.Fprintf(w, "  advice: %s (at %s and %d more)\n",
+				g.message, strings.Join(g.snippets, ", "), g.dropped)
+		default:
+			fmt.Fprintf(w, "  advice: %s (at %s)\n", g.message, strings.Join(g.snippets, ", "))
+		}
+	}
+}
+
+// queryAdviceSnippetsPerLine bounds how many distinct literals one advice line
+// names. The server already caps what it sends per kind, so this is the floor
+// under an older or a newer instance rather than the primary bound — enough to
+// find the literals in the SQL, few enough that the line stays a line. Whatever
+// it drops is counted on the line, because a bounded list read as a complete
+// one is how somebody fixes five of twenty and calls it done.
+const queryAdviceSnippetsPerLine = 5
 
 // emitFiltered runs a jq filter over the query envelope.
 //

@@ -70,6 +70,12 @@ type DataApp struct {
 	// clean compile. It is the single gate POST :id/commit enforces, so it is
 	// also what `ronja app publish` checks before it tries.
 	ValidatedAt *time.Time `json:"validatedAt"`
+	// SQLSemantics is "legacy" when the SQL in this app's files still reaches
+	// DuckDB through the old Python-decoded embed, and EMPTY otherwise — the
+	// server reports only that one value (see sqlsemantics.go). Read-only: no
+	// write route takes it, because the next write that changes the code moves
+	// the app to raw on its own.
+	SQLSemantics string `json:"sqlSemantics,omitempty"`
 
 	DataAppAccess
 

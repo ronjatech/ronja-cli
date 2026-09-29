@@ -66,6 +66,12 @@ type Workflow struct {
 	// here is an instance predating durable workflows, and the caller falls back
 	// to what the folder's manifest declares rather than concluding v1.
 	RuntimeVersion int `json:"runtimeVersion"`
+	// SQLSemantics is "legacy" when the SQL in this workflow's files still reaches
+	// DuckDB through the old Python-decoded embed, and EMPTY otherwise — the
+	// server reports only that one value (see sqlsemantics.go). Read-only: no
+	// write route takes it, because the next write that changes the code moves
+	// the workflow to raw on its own.
+	SQLSemantics string `json:"sqlSemantics,omitempty"`
 
 	Parameters []WorkflowParameter `json:"parameters"`
 	Variables  map[string]any      `json:"variables"`

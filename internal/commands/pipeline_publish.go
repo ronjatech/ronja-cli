@@ -110,6 +110,10 @@ type pipelinePublishResult struct {
 	// Metrics is one entry per METRIC FILE whose draft this publish acted on.
 	// Absent for the folders that keep none.
 	Metrics []pipelinePublishedMetric `json:"metrics,omitempty"`
+	// Checks is one entry per checks file whose table this publish acted on:
+	// applied right after that table's commit landed, or still pending when the
+	// draft went to review instead. Absent for folders that keep none.
+	Checks []pipelineChecksResult `json:"checks,omitempty"`
 	// Nothing reports a publish that found no staged draft at all, which is a
 	// different answer from a publish that refused everything it found.
 	Nothing bool   `json:"nothing"`
@@ -229,6 +233,19 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 		return nil, err
 	}
 	codec := newPipelineCodec(f, local)
+	// The HEALTH-CHECK files, keyed by the .sql file they describe: a table's
+	// checks attach to the LIVE row, so the moment its commit lands is the
+	// moment they can be applied.
+	checksFiles, err := readChecksFiles(f.Root, local)
+	if err != nil {
+		return nil, err
+	}
+	checksBySQL := map[string]pipelineChecksFile{}
+	for _, file := range checksFiles {
+		if file.SQLPath != "" {
+			checksBySQL[file.SQLPath] = file
+		}
+	}
 	// Reported, never refused: publish acts on drafts that are already staged and
 	// built, and a bind that has gone missing since the push cannot un-build them.
 	noteAliasReport(checkAliases(f.Manifest, f.selection(), f.Codec, local, folderStems(f.Kind, local), folderFieldRefs(f.Kind, f.Root, local)))
@@ -338,7 +355,7 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 		}
 	}
 
-	failed := 0
+	failed, checksFailed := 0, 0
 	for _, path := range targets {
 		// One Ctrl-C, one message. Without this every remaining draft makes its
 		// own doomed commit attempt and prints its own refusal, turning a single
@@ -361,6 +378,26 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 		}
 		if file.Outcome == pushOutcomeRefused || file.Outcome == outcomeConflict {
 			failed++
+		}
+		if checks, has := checksBySQL[path]; has {
+			switch file.Outcome {
+			case outcomePublished:
+				// No --prune or --force here: publish acts on what push staged, and
+				// a checks file that needs either is refused and named, for a push
+				// to settle.
+				applied := applyChecksFile(ctx, client, f, inst, codec, local, checks, checksApplyOptions{}, checksClaim{})
+				result.Checks = append(result.Checks, applied)
+				if applied.failed() {
+					checksFailed++
+				}
+				if err := f.saveBaseline(); err != nil {
+					fmt.Fprintf(os.Stderr, "  Note: could not record the checks %s applied (%v).\n", checks.Path, err)
+				}
+			case outcomeSubmittedForReview:
+				result.Checks = append(result.Checks, pipelineChecksResult{Path: checks.Path, TableID: file.TableID,
+					Outcome: checksOutcomePendingPublish,
+					Error:   "the draft went to review — once an admin approves it, `ronja pipeline push` applies these checks"})
+			}
 		}
 	}
 
@@ -398,8 +435,21 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 		return result, nil
 	}
 
+	var problems []string
 	if failed > 0 {
-		result.Error = fmt.Sprintf("%d of %d draft(s) were not published", failed, len(result.Files)+len(result.Metrics))
+		problems = append(problems, fmt.Sprintf("%d of %d draft(s) were not published", failed, len(result.Files)+len(result.Metrics)))
+	}
+	if checksFailed > 0 {
+		problems = append(problems, fmt.Sprintf("%d checks file(s) did not fully apply", checksFailed))
+	}
+	if len(problems) > 0 {
+		result.Error = strings.Join(problems, ", and ")
+		// Every commit landed and only the checks after them did not: typed, so a
+		// caller can tell "the SQL is live, the checks are not" from a commit
+		// that failed.
+		if failed == 0 && ctx.Err() == nil {
+			return result, newChecksNotApplied(result.Error, result.Checks)
+		}
 		return result, fmt.Errorf("%s", result.Error)
 	}
 	return result, nil
@@ -1197,6 +1247,9 @@ func printPipelinePublishReport(r *pipelinePublishResult) {
 			fmt.Fprintf(out, "    Warning: %s\n", w)
 		}
 		printResourceURL(out, reportKeyWidth, metric.URL)
+	}
+	for _, checks := range r.Checks {
+		printPipelineChecksResult(out, checks)
 	}
 	if r.Target != "" {
 		fmt.Fprintf(out, "\n  Target:   %s\n", r.Target)

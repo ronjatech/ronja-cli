@@ -93,6 +93,13 @@ With --json, one object carrying all of the above.`,
 
 			report.Remote = moduleRemoteStatus(cmd.Context(), resolved, f)
 
+			// The one line a row still on the old SQL escape handling earns,
+			// on STDERR in both modes: the report on stdout is a document a
+			// script parses in --json, and this is an aside about how to
+			// the next push rather than part of the answer.
+			if report.Remote != nil {
+				printSQLSemanticsLine(os.Stderr, report.Remote.SQLSemanticsNotice)
+			}
 			if flagJSON {
 				return emitJSON(report)
 			}
@@ -165,6 +172,14 @@ type moduleRemoteReport struct {
 	NotCheckedReason string `json:"notCheckedReason,omitempty"`
 	Problem          string `json:"problem,omitempty"`
 	Lifecycle        string `json:"lifecycle,omitempty"`
+	// SQLSemanticsNotice is the one line a row still on the old escape handling
+	// earns — what it is, and that the next push changing its code moves it to
+	// raw. Empty when the row is already raw and when the instance does not
+	// report the field at all.
+	//
+	// Composed here rather than rendered by the printer: a --json caller sees
+	// the same finding a person does, and there is one sentence rather than two.
+	SQLSemanticsNotice string `json:"sqlSemanticsNotice,omitempty"`
 	// Draft describes the module's open draft, when there is one. ⚠️ A module
 	// has ONE draft, not one per author, so this may be a colleague's — which is
 	// why drafterUserID is reported rather than assumed.
@@ -280,6 +295,7 @@ func moduleRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folde
 		return out
 	}
 	out.ComparedAgainst = &comparedReport{ID: target.ID, Lifecycle: target.Lifecycle}
+	out.SQLSemanticsNotice = sqlSemanticsNotice(sqlSemanticsSubject(target.Title, target.ID), target.SQLSemantics)
 	baseline := f.State.For(f.Key)
 	drift := wfdir.DiffHashes(hashModuleFiles(files), baseline.Hashes())
 	out.Drift = &drift

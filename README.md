@@ -3184,7 +3184,8 @@ derived table.
 It also carries the **documentation** for those tables, in an opt-in header in
 each `.sql` file, and for tables it does *not* build — integration, foundation,
 dynamic, workflow-written — in a committed `tables/<alias>.json` sidecar. See
-**Documentation** below.
+**Documentation** below. A table's **health checks** live beside its SQL in
+`checks/<stem>.json` — see **Health checks** below.
 
 ```bash
 ronja pipeline clone collection-abc    # or: ronja pipeline init --feature collection-abc
@@ -3222,9 +3223,10 @@ it passes the same test `wf` does.
   costs a directory listing rather than a hash of every file in it. It filters the *skipped* list too: `.git/`, a `.venv/` and
   a dot-file were never candidates here, and reporting them on every command
   trains the reader past the line that matters — a `.sql` file that was skipped,
-  which is still reported. One kind of non-`.sql` file *is* read, and by a pass
-  of its own rather than by the walk: a `tables/<alias>.json` docs sidecar — see
-  **Documentation** below.
+  which is still reported. Three kinds of non-`.sql` file *are* read, each by a
+  pass of its own rather than by the walk: a `tables/<alias>.json` docs sidecar
+  (**Documentation**), a `metrics/<name>.json` definition (**Metrics**) and a
+  `checks/<stem>.json` list of health checks (**Health checks**).
 - **The binding is a map, not an id.** `ronja.json` records `tables`, relative
   path → the live `table-…` id that file builds, per (instance, organization)
   like every other binding:
@@ -3345,10 +3347,10 @@ ids in its SQL belong to that organization, and only re-pointing them fixes it.
 | Verb | Does | Flags worth knowing |
 |---|---|---|
 | `init` | writes `ronja.json` + `.ronja/`. Creates nothing server-side — each table comes into existence on the first push of its file | `--feature` (a push refuses without one), `--title` |
-| `clone` | writes one `.sql` per **derived** table and one `metrics/<name>.json` per **metric**, plus manifest, lock and baseline. Prefers your own open draft over live. Creates nothing server-side; the directory must be empty or absent | — |
-| `status` | local changes, per-table build health, open drafts and their verdicts, and drift since the last sync. Read-only — not even a checkout. **Exits non-zero on drift *and* on "not checked"** (see below) | `--json` |
-| `push [paths...]` | per changed file: create → resume/check out your draft → write SQL + derived inputs → sync → build → **documentation** → verdict and confidence report. Then, in passes of their own, each `tables/*.json` docs sidecar and each `metrics/*.json` definition | `--force`, `--force-verified-metric` |
-| `publish [paths...]` | per staged draft: commit onto the table or the metric, or submit it for review. A committed metric definition change re-fingerprints, so the report says the metric now reads *verified · review pending* | `--no-request-review`, `--overwrite-remote` |
+| `clone` | writes one `.sql` per **derived** table, one `metrics/<name>.json` per **metric** and one `checks/<stem>.json` per table with enabled health checks, plus manifest, lock and baseline. Prefers your own open draft over live. Creates nothing server-side; the directory must be empty or absent | — |
+| `status` | local changes, per-table build health, open drafts and their verdicts, drift since the last sync, and per checks file the health checks a push would write, pending publish, changed in the app, orphaned, silenced or refused (a kind change). Read-only — not even a checkout. **Exits non-zero on drift *and* on "not checked"** (see below) | `--json` |
+| `push [paths...]` | per changed file: create → resume/check out your draft → write SQL + derived inputs → sync → build → **documentation** → verdict and confidence report. Then, in passes of their own, each `tables/*.json` docs sidecar, each `metrics/*.json` definition and each `checks/*.json` list of health checks | `--force`, `--force-verified-metric`, `--prune` |
+| `publish [paths...]` | per staged draft: commit onto the table or the metric, or submit it for review; a committed table's `checks/` file is applied right after the commit — with no `--prune` or `--force`, so drift or orphans found then are reported (non-zero, the commit standing) and left for a `push` after the commit has landed. A committed metric definition change re-fingerprints, so the report says the metric now reads *verified · review pending* | `--no-request-review`, `--overwrite-remote` |
 | `discard [paths...]` | deletes your drafts, metric drafts included; the live rows and your local files are untouched | `--yes` |
 
 `push`, `publish` and `discard` all take file paths and act on the whole folder
@@ -3738,11 +3740,12 @@ publish, and those are the verbs this folder already has.
     "value": "revenue / orders"
   },
   "description": "Average order value, per day.",
-  "reportingTimezone": "Europe/Stockholm"
+  "reportingTimezone": "Europe/Stockholm",
+  "tags": ["Finance", "Sales"]
 }
 ```
 
-**Three keys, and the asymmetry inside them is deliberate.** Unknown keys at the
+**Four keys, and the asymmetry inside them is deliberate.** Unknown keys at the
 TOP level are refused where they were written, on the sidecar's rule — a dropped
 key is the failure this whole loop exists to remove, and a `verified` or an
 `owner` somebody adds expecting it to be honoured must not be ignored on every
@@ -3825,6 +3828,259 @@ bind an exact-name match of either. There is deliberately no `metric` dependency
 kind and there will not be one — a metric alias is spelled `{"kind": "table"}`,
 for the reason `allowedMetricIDs` is above. The mistake surfaces at push, by
 name, which is where it can be acted on.
+
+#### Tags — `"tags"` in the metric file
+
+`"tags": ["Finance", "Sales"]` is the folder's claim about the metric's tags,
+three-state like `description`: **absent** means the folder does not manage
+them (a push never reads or writes a tag), a **list** is the names the folder
+asserts, and **`[]`** asserts none. Names are trimmed and otherwise kept as
+spelled; every comparison is the server's, `lower(trim())`, so `finance` in the
+file is satisfied by a `Finance` tag. The parse refuses a non-string, a blank
+name, a name over **64 bytes** (bytes, as the server counts — 33 `ö`s are over),
+more than 20 names, and two names that fold together.
+
+**Tags are not drafted.** A tag sits on the LIVE metric, so a push reconciles
+it with one `PATCH /api/v2/tag/of/table/<metric id>` — no checkout, no build, no
+publish — and the tag half is independent of the recipe in both directions: an
+up-to-date definition, a drift refusal or a failed build never skips it, and a
+tag refusal never fails the recipe. `publish` and `discard` do not touch tags. A
+tag-only edit makes the push not up to date, so `ronja sync apply` deploys it;
+it is also kept out of the recipe fingerprint, so it never stages a draft.
+
+**The folder asserts its names, following tag ids.** The lock records
+`tagsApplied: [{id, name}]` — what this folder last put there — beside the
+recipe fingerprints (in the committed lock on a named stack, in
+`.ronja/state.json` on a legacy folder, and carried into the lock when the
+folder is named). From that, one predicate that `push` and `status` share:
+
+- a name the file lists that the metric does not hold is **added** — including
+  one a colleague **removed** in the web app. The folder wins, and the push says
+  `tags: +Sales`;
+- a recorded tag the file no longer lists is **removed, by id** — so a tag
+  renamed since is still found;
+- a tag a colleague **added** in the web app is never touched, and never makes
+  the folder pending;
+- a tag an admin **renamed** in the web app is **kept**: the recorded id still
+  on the metric satisfies the file's old name, so nothing is reverted and the
+  old name is never re-minted beside the new one. `status` says
+  `renamed in the web app: Fin → Finance — update the file`;
+- with **no record** (a legacy folder's first push, a rebind, a folder's first
+  `tags` key) the reconcile is **additive only**: nothing here can tell the
+  folder's tags from anybody else's.
+
+A direct name match wins over a renamed record: when the metric carries a tag
+spelled as the file's name, that tag is the one recorded, and a recorded tag an
+admin renamed away from it is no longer this folder's — it is **kept on the
+metric, never removed**, like any tag the web app put there.
+
+Push output is `Tags: +Sales −Operations`, one `created tag "Finanace"` note per
+name the push minted into the organization's catalog (so a typo is seen the
+first time it lands), and a note for a recorded tag already gone when the PATCH
+ran. `status` adds a `tags:` line per tagged file: in place, what a push would
+change, a rename, or a refusal. A pending tag change is local work in `ronja
+sync status`, never drift.
+
+**Archived or hidden metrics are skipped** — reported `skipped_archived`, not
+pending, never redeployed by `sync apply`. An admin can still tag them in the
+web app.
+
+**The cap is the only refusal recorded, because it is the same for every
+caller.** A change that would leave the metric over 20 tags — counting the
+ones added in the web app — is refused by the server with code `tag_limit`. It
+is reported as the tag half's `refused` outcome and recorded as
+`tagsRefused: {fileTagsHash, reason}`: while the file's tag list is unchanged
+the metric is not tag-pending and the request is not re-sent, so `sync apply`
+cannot loop on it. A recorded cap refusal stays until the file's tags change or
+`ronja pipeline push --retry-tags` asks again — nothing re-checks it when a tag
+is removed in the web app, so `--retry-tags` is the way out once there is room.
+It does not fail the push or the folder's `sync apply` verdict. The cap is
+recorded even when a colleague's concurrent add is what tipped it over: the
+server checks it under its lock. It is not purely the file's fault, which is
+why the flag exists.
+
+**Every other failure is never recorded, fails the push, and is retried by the
+next one.** Each is a fact about the caller or the deploy rather than the file,
+and recording it in the committed lock would stop every colleague's push — and
+this one's, after the fix — from ever trying again:
+
+- a role that may not change tags ("your role can't change tags");
+- a metric this caller cannot see ("you can't see this metric");
+- a token whose scope does not cover tags ("this token's scope doesn't allow
+  write on tags — use a token with data:write");
+- an organization whose Ronja has no tag route yet, a 404 or 405 ("this
+  organization's Ronja doesn't have tag support yet — push again after it's
+  updated");
+- any other 400 (a tag deleted mid-merge), a 5xx or a dropped connection, and a
+  rename race that repeats.
+
+These are the tag half's `failed` outcome, printed as **Tags: NOT applied**. A
+`failed` tag half makes the push exit non-zero and not up to date; `status`
+reports a read that failed this way as `not checked`. In `ronja sync apply` it
+does not hold the folder's SQL hostage — tags are not drafted, so the staged
+SQL is still published, on the health-checks precedent — and the folder's
+verdict is `tags_not_applied` (`unknown` when the tag write got no answer and
+may have landed), which still makes the run exit non-zero. A rename race is the
+server refusing the PATCH because an admin renamed a tag this push was removing
+to a name it was adding, between the push's read and its write: the push
+re-reads and re-plans **once**, and only a second race in a row is `failed`.
+
+**Clone** writes each metric's tags into its file and records them as applied,
+so the clone reads as clean. A metric with no tags gets no key. A tag read that
+fails gets no key and a note on stderr — never `[]`, which would assert no tags
+and strip every one on the next push.
+
+⚠️ **Version skew.** The `PATCH` route and this key ship together, in the first
+release after v0.32.0. Against an older organization, the tag half fails with
+"this organization's Ronja doesn't have tag support yet — push again after it's
+updated": never recorded, so the first push after the organization updates
+applies it, and never holding back the folder's SQL in `sync apply`. An older
+CLI meeting a folder whose metric files
+carry `"tags"` refuses the whole metric file as an unknown key — run
+`ronja update` (see [Keeping it current](#keeping-it-current)).
+
+**Stated limits.** A tag assignment carries no author, so removing a name from
+the file removes it for everyone who also chose it. A token's tags land in the
+organization's default Space. Tables, workflows, apps and modules have no
+`tags` key yet.
+
+### Health checks — `checks/<stem>.json`
+
+A table's health checks are code-defined beside its SQL: `checks/gl_lines.json`
+holds the checks on the table `gl_lines.sql` builds. One flat file per `.sql`
+stem; a checks file whose stem names no `.sql` file in the folder is refused
+(checks for a table built elsewhere stay in the app).
+
+```json
+{
+  "checks": [
+    {
+      "name": "Unik rad per id",
+      "expression": "count(*) = count(distinct id)",
+      "severity": "fail",
+      "description": "Dubbletter betyder oftast att en join har multiplicerat raderna."
+    },
+    { "name": "Bygger om dagligen", "expectedIntervalHours": 24 }
+  ]
+}
+```
+
+Each entry is a `name` and exactly one body — `expression` (a boolean SQL
+scalar over the table) or `expectedIntervalHours` (a freshness watchdog) — plus
+optional `severity` (`warn`/`fail`), `description` and `enabled`. The parser
+refuses an unknown key, both bodies or neither, two names that fold together
+(lower case, trimmed — the server's unique index), and a second watchdog. The
+expression grammar, lengths and the per-table cap are the server's.
+
+**Three-state, like an automation file.** An absent `severity`, `description` or
+`enabled` is a field the file does not manage: a create takes the server's
+default (`warn`, empty, enabled) and an update never sends it. So a check
+silenced in the app is not re-enabled by a push of a file that does not say
+`enabled`, and that silence is not drift. A NEW entry that says
+`"enabled": false` is created silenced in the one POST (the create takes
+`enabled`), so it never runs live or alerts between a create and a silence.
+
+**Not a `-- @check` header**, deliberately: a header lives inside the table's
+`code`, so every check edit would be a SQL change — a new draft, a rebuild, a
+commit, a version-history entry — for a thing that is ungoverned by design.
+
+**When they are written — the live-matches rule.** Checks attach to the LIVE
+table id (a check put on a draft would stay on the version snapshot the commit
+leaves behind), so the checks pass — after the `.sql`, docs and metric passes,
+over **every** checks file, not only the changed `.sql` files — writes a table's
+checks only when the live row's SQL equals the file and you have no open draft
+of it. Otherwise the file is `checks_pending_publish` and nothing is sent.
+`publish` applies a table's checks right after its commit lands; if the publish
+went to review instead, the next `push` after the approval lands them. A server
+`409 table_not_built` (a live row that never built, so the expression cannot be
+run) is pending too.
+
+**One table's checks, in a load-bearing order:**
+
+1. one `GET …/checks`;
+2. **drift** — a check this folder owns that was changed in the app since the
+   folder last verified it — refuses the table's checks before anything is
+   written; `--force` overwrites. It is the push's one `--force`: the same flag
+   that overwrites a table's SQL or a metric's definition changed on the server
+   overwrites the checks too — there is no checks-only flag;
+3. **orphans** — checks the folder created that no entry in the file resolves
+   to — refuse the table's checks until `--prune`, which **silences** them
+   (`enabled: false`; there is no delete) *before* any create, so renaming a
+   freshness watchdog (one enabled per table) or renaming at the per-table cap
+   lands in one push. An orphan is decided **by row**: each entry's live row is
+   found first (the check the folder owns under the entry's name, by id, then by
+   name), and an owned row some entry resolves to is never an orphan — so a
+   check renamed in the app and in the file is not silenced. Two entries that
+   resolve to one row refuse the file. An orphan **changed in the app** since the
+   folder last verified it is drift: `--prune` refuses it without `--force`. A
+   **deleted checks file** is a file with no entries: every check it created that
+   is still enabled is an orphan (a bare `push` visits the lock's record of it),
+   except a check another checks file on the same table declares or owns — so
+   renaming a table's stem with its checks file (and rebinding the table) hands
+   the checks over. Its record is dropped once nothing it owns is still enabled;
+4. **updates, then creates.** An update sends only the declared fields that
+   differ — never an unchanged `severity` beside an edited expression, which
+   would trip the admin gate on a `fail` check. An edited expression or
+   interval is re-run by the server, and a check that cannot be evaluated is a
+   400 and is NOT saved. A kind change is refused (and `status` lists it as
+   `refused`, not pending): give the check a new name and `--prune` the old one.
+   A lost create race (`409 name_taken`) re-reads the table and re-enters the
+   diff for the check that won, as an adoption — never as one this folder
+   created. A create that **timed out** is re-read too: a row saying exactly
+   what the entry says is ours (`applied`, "created; verdict not returned"),
+   anything else re-enters the diff. A name Go and Postgres fold differently
+   (`İ`, `ß`) is not found by the re-read and ends `refused` with the server's
+   `name_taken` message;
+5. **verify, then record, per check.** One more read; a written check is
+   recorded in `ronja.lock.json` (or `.ronja/state.json` on a legacy folder)
+   only if the live row now says what the file says, otherwise `not_applied` —
+   which is what catches an older server whose `PUT` accepts `{enabled,
+   expression}` with a 200 and drops the expression.
+
+A same-named check that pre-dates the file is **adopted** (`adopted`, or
+`adopted_changed` when the push rewrote it — said apart, so overwriting a
+colleague's chat-authored check is visible). A declared check that is silenced
+on the table, with `enabled` undeclared, is `silenced`, never `unchanged`. Checks
+on the table that are neither declared nor owned are left alone and listed.
+Matching is by name, so **renaming a check in the file creates a new one** and
+orphans the old; its history does not follow.
+
+| outcome (`--json` `checks[]`) | means | exit |
+|---|---|---|
+| `applied` | created or updated; `changed` names the fields, `verdict` the run | 0 |
+| `unchanged` / `adopted` | already matches (adopted: not created by this folder) | 0 |
+| `adopted_changed` | a same-named check this folder did not create was rewritten | 0 |
+| `silenced` | declared, silenced on the table, `enabled` undeclared | 0 |
+| `checks_pending_publish` | the live table does not hold the file yet, or has never built (push its SQL and publish it — the checks are applied after its first build) | 0 |
+| `drift` / `orphaned` | refused as above | non-zero |
+| `refused` | 403, 400 (unevaluable, cap), a table the caller cannot read, or a write that got no answer (the file's result is then `unknown` to `sync apply`) | non-zero |
+| `not_applied` | the write answered but the read-back disagrees | non-zero |
+| `unsupported` | the server has no check-authoring route — a 405, or a 404 without a Ronja error body (an older server, or a proxy in front of one) — or its `PUT` is the older silence-only one (`400 enabled is required`, so a `--prune` still works and an edit does not); upgrade the server | non-zero |
+
+A checks problem fails `push` and `publish` (exit non-zero) but blocks nothing
+else they do: the SQL, docs and metric passes have already run, and a
+`publish` whose commit landed keeps it. `ronja sync apply` goes one step
+further and publishes a folder's SQL past a checks leg that did not apply,
+reporting `checks_not_applied` — see [`sync apply`](#sync-apply--the-deploy).
+
+A `fail` verdict is not a push failure: the check was stored and said something
+true. **Over HTTP, a check that is failing when it is written notifies the
+organization's admins like a background failure** (at most once per check per
+day), unlike one authored in chat — a CI `ronja sync apply` creating an
+already-failing check must not go unnoticed.
+
+**Who can apply a folder with `fail` checks.** Creating, silencing or
+downgrading a `fail` check needs an admin token (the store enforces it). A
+maintainer's push lands the `warn` checks, reports each `fail` one `refused —
+needs admin for a fail check, or no write access to this table` (the server does
+not say which), and exits non-zero until an admin pushes; because recording is
+per check, that retry covers only the refused checks.
+
+`clone` writes each table's **enabled** checks — never an `enabled` key, since
+silencing is the operator's — and records them as owned, so the push after it
+is a no-op. Silenced checks are left out and read as unmanaged; a watchdog whose
+interval is not a whole number of hours is skipped with a note. `discard` never
+touches checks: they are never on a draft.
 
 ### Publishing, and why there is no `run`
 
@@ -4522,6 +4778,48 @@ from {{ module('module-abc123') }} import tracker   # → from emab_tracker impo
 `ronja wf clone` of a consumer is exactly as it was; module sources never appear
 in a workflow folder. That is the whole point — one copy, one id, one version
 history, and a graph that can answer "what does editing this affect".
+
+## SQL escapes (`sqlSemantics`)
+
+Ronja used to hand your SQL to DuckDB through a non-raw Python string, so
+Python decoded the backslash escapes first: `'\\s'` on disk arrived as `'\s'`,
+and `'\t'` arrived as a real tab.
+Artifacts created from now on run **raw** — the bytes in the file are the bytes
+DuckDB gets — and everything that already existed stays **legacy**, because
+silently re-reading live SQL under new rules would change answers nobody asked
+to change.
+
+**Nothing in a folder declares this, and no push sends it.** The server moves a
+legacy artifact to raw on its own the first time a write changes its code — a
+push whose files or `.sql` differ from what the row holds. A push that changes
+only metadata (a title, an allowlist, a runtime, a `tables/<name>.json` docs
+sidecar) moves nothing, and neither does one that sends back the bytes already
+stored. A `-- @table`/`-- @column` header is different: it lives inside the
+`.sql` file's code, so editing a note there DOES move the table. For a
+table, workflow, app or module the move lands on the draft the push writes (a
+draft records the rules of the bytes it was checked out with, so it moves only
+when its own code changes) and reaches the live artifact at `publish`, so a module keeps its old meaning for
+every workflow that imports it until `module publish`. Restoring a version
+brings back the escape handling that version was written under.
+
+The server reports `"sqlSemantics": "legacy"` on a legacy row (for a table, only
+one whose code is DuckDB SQL — never a metric or a table with no SQL) and omits the
+key otherwise, and the CLI only reads it: `status` prints one line per legacy
+artifact — `<name>: legacy SQL escapes — publishing a change to its code moves it to
+the current behaviour` — on stderr (and as `sqlSemanticsNotice` in `--json`), so
+the author can rewrite any backslash literal in the same edit. `ronja query` prints any
+authoring advice the server returns about escapes on stderr, beside the
+reporting timezone.
+
+**Accepted residual.** Cloning a **legacy** artifact and pushing it as a
+CREATE — into a new feature, or into another organization through `ronja bind` —
+produces an artifact that is born **raw**, although its text was authored under
+the old decoding. Nothing in the create path can say otherwise: a create makes a
+new artifact, and new artifacts are raw. No push result says so — the author
+learns it from `ronja query`'s advice when the SQL is run — and the population this
+can reach today is effectively our own folders, so it is a thing to know rather than
+a thing to guard.
+
 ## Whole-tree checks (`ronja sync`)
 
 A repository holds many folders. The six loops each answer "is this folder in
@@ -4558,6 +4856,12 @@ folds that report into is the tree's own, and it reads signals the per-folder
 commands deliberately leave out of theirs (see below). There is no repo-level
 file to declare: a read-only command does not need one, and a committed file
 format is the most expensive thing to get wrong.
+
+A pipeline folder's verdict covers every carrier it holds — `.sql` files, docs
+sidecars, metrics and `checks/` files. A health check the organization does not
+hold yet (to create or update, waiting on a publish, or an orphan a push would
+silence) is a local change; one changed in the app is drift; a checks file that
+could not be judged is unknown.
 
 `status` and `check` are read-only, and enforced: `TestSyncStatusWritesNothing`
 and `TestSyncCheckWritesNothing` snapshot a fixture tree before and after and assert
@@ -5075,6 +5379,26 @@ only `refused`/`conflict` as failed — so `submitted_for_review` returns a nil
 error and reads as success. A naive apply from a CI credential would file one
 review request per folder and exit 0 saying "published". Apply fails instead, and
 independently treats a review request as a **non-deploy** in its own verdict.
+
+**A pipeline folder's health checks never hold its SQL back — and still fail
+the run.** When the ONLY problems a pipeline push reports are in its
+`checks/` leg (orphans, drift, a refused or unsupported check write — decided
+from the push's own problem tally, never from its error string), apply still
+runs the publish; and a publish whose every commit landed but whose checks did
+not apply is told apart from a commit that failed. Either way the folder's
+verdict is **`checks_not_applied`**: `refused` (exit `1`) for an answer,
+`unknown` (exit `2`) when the checks leg got none — a timeout, a 5xx, a read-back
+that could not be read — and the detail names the tables that WERE published
+and each checks file that did not apply. The asymmetry is deliberate: health
+checks are ungoverned and advisory ("a failing check never blocks anything"),
+so an unfinished checks leg must not hold a table deploy hostage, while a docs
+sidecar or a metric's prose is governed and a failure there still blocks the
+publish. Never on an interrupt: a Ctrl-C during the checks pass leaves what it
+did not reach refused, and apply does not read that as "only the checks". Apply
+passes neither `--prune` nor `--force`: silencing a check or overwriting one
+changed in the app stays a per-folder `ronja pipeline push` decision. ⚠️ So a
+tree run against an **older server** that has no check-authoring route
+publishes the SQL and exits non-zero on every run until the server is upgraded.
 
 **Order is path order and the report names it.** That is for determinism and
 diffable CI logs, nothing more: a derived table's draft always builds against its

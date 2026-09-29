@@ -121,6 +121,17 @@ type InstanceState struct {
 	// omitempty and three-state-safe, for the reason Tables is: ABSENT means this
 	// folder tracks no metric state, never "there are no metrics".
 	Metrics map[string]MetricState `json:"metrics,omitempty"`
+	// Checks is the LEGACY half of Lock.Checks — a checks file's recorded table
+	// and managed checks on a folder with no named stack. The fork is spelled
+	// once, in the commands package's liveHashes.
+	Checks map[string]ChecksState `json:"checks,omitempty"`
+}
+
+// ChecksState is one checks file's recorded state in a LEGACY folder's local
+// baseline — the mirror of wfdir.LockChecks.
+type ChecksState struct {
+	TableID string                    `json:"tableID"`
+	Managed map[string]LockCheckEntry `json:"managed,omitempty"`
 }
 
 // MetricState is one metric file's recorded state in a LEGACY folder's local
@@ -138,6 +149,12 @@ type MetricState struct {
 	// LockMetric.DeclaredSHA256 for why it is a second fingerprint rather than
 	// the same one.
 	DeclaredSHA256 string `json:"declaredSHA256,omitempty"`
+	// TagsApplied and TagsRefused are the TAG half — see LockMetric's fields of
+	// the same names. Kept here for a legacy folder on exactly the fork the
+	// recipe fields take, and carried into the lock by adoptLiveHashes when the
+	// folder is named.
+	TagsApplied []AppliedTag `json:"tagsApplied,omitempty"`
+	TagsRefused *TagsRefusal `json:"tagsRefused,omitempty"`
 }
 
 // TableDocsState is one docs sidecar's recorded state in a LEGACY folder's local

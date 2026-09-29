@@ -486,6 +486,132 @@ func (h liveHashes) setMetricSeen(path, metricID, live, declared string) {
 	h.inst.Metrics[path] = entry
 }
 
+// metricTags, setMetricTagsApplied and setMetricTagsRefused are the metric's
+// TAG half, on the same lock/baseline fork as metricSeen and with its nil-inst
+// answer: nothing recorded, which reconciles additively and retries a refusal.
+//
+// The read is keyed by the row the caller is acting on and answers NOTHING for a
+// record taken against another row — LockMetric's invariant, applied at the one
+// place every reader goes through, so no call site can compare one metric's tag
+// ids against another's.
+//
+// The writes never touch the recipe fingerprints; see
+// wfdir.Lock.SetMetricTagsApplied.
+func (h liveHashes) metricTags(path, metricID string) ([]wfdir.AppliedTag, *wfdir.TagsRefusal) {
+	var recorded string
+	var applied []wfdir.AppliedTag
+	var refused *wfdir.TagsRefusal
+	switch {
+	case h.stack != "":
+		recorded, applied, refused = h.lock.MetricTags(h.stack, path)
+	case h.inst == nil:
+		return nil, nil
+	default:
+		entry := h.inst.Metrics[path]
+		recorded, applied, refused = entry.MetricID, entry.TagsApplied, entry.TagsRefused
+	}
+	if metricID == "" || recorded != metricID {
+		return nil, nil
+	}
+	return applied, refused
+}
+
+func (h liveHashes) setMetricTagsApplied(path, metricID string, applied []wfdir.AppliedTag) {
+	if h.stack != "" {
+		h.lock.SetMetricTagsApplied(h.stack, path, metricID, applied)
+		return
+	}
+	h.editLegacyMetric(path, metricID, func(entry *wfdir.MetricState) {
+		entry.TagsApplied = append([]wfdir.AppliedTag(nil), applied...)
+	})
+}
+
+func (h liveHashes) setMetricTagsRefused(path, metricID string, refused *wfdir.TagsRefusal) {
+	if h.stack != "" {
+		h.lock.SetMetricTagsRefused(h.stack, path, metricID, refused)
+		return
+	}
+	h.editLegacyMetric(path, metricID, func(entry *wfdir.MetricState) {
+		entry.TagsRefused = nil
+		if refused != nil {
+			copied := *refused
+			entry.TagsRefused = &copied
+		}
+	})
+}
+
+// editLegacyMetric is the legacy baseline's read-edit-store for the tag half,
+// with setMetricSeen's rules: nowhere to write without a baseline, and a path
+// rebound to a different row keeps nothing.
+func (h liveHashes) editLegacyMetric(path, metricID string, edit func(*wfdir.MetricState)) {
+	if h.inst == nil || metricID == "" {
+		return
+	}
+	if h.inst.Metrics == nil {
+		h.inst.Metrics = map[string]wfdir.MetricState{}
+	}
+	entry := h.inst.Metrics[path]
+	if entry.MetricID != metricID {
+		entry = wfdir.MetricState{MetricID: metricID}
+	}
+	edit(&entry)
+	h.inst.Metrics[path] = entry
+}
+
+// checksSeen and setChecksSeen are the HEALTH-CHECKS half — which live table a
+// `checks/<stem>.json` last applied to and the checks the folder owns on it —
+// on the same lock/baseline fork as the metric pair, with the same nil-inst
+// answer: nothing recorded, which disarms the drift guard and orphan detection.
+func (h liveHashes) checksSeen(path string) (string, map[string]wfdir.LockCheckEntry) {
+	if h.stack != "" {
+		return h.lock.ChecksSeen(h.stack, path)
+	}
+	if h.inst == nil {
+		return "", nil
+	}
+	entry := h.inst.Checks[path]
+	return entry.TableID, entry.Managed
+}
+
+func (h liveHashes) setChecksSeen(path, tableID string, managed map[string]wfdir.LockCheckEntry) {
+	if h.stack != "" {
+		h.lock.SetChecksSeen(h.stack, path, tableID, managed)
+		return
+	}
+	if h.inst == nil {
+		return
+	}
+	if h.inst.Checks == nil {
+		h.inst.Checks = map[string]wfdir.ChecksState{}
+	}
+	h.inst.Checks[path] = wfdir.ChecksState{TableID: tableID, Managed: managed}
+}
+
+// checksPaths lists the checks files with a record, and dropChecksSeen forgets
+// one — for a checks file that is gone from the folder and owns nothing still
+// enabled. Unlike the metric pair above, a deleted checks file's record is NOT
+// left standing: it is how a push finds the checks that file created, which are
+// orphans until silenced. It is dropped only once they are.
+func (h liveHashes) checksPaths() []string {
+	if h.stack != "" {
+		return h.lock.ChecksPaths(h.stack)
+	}
+	if h.inst == nil {
+		return nil
+	}
+	return sortedKeys(h.inst.Checks)
+}
+
+func (h liveHashes) dropChecksSeen(path string) {
+	if h.stack != "" {
+		h.lock.DropChecksSeen(h.stack, path)
+		return
+	}
+	if h.inst != nil {
+		delete(h.inst.Checks, path)
+	}
+}
+
 func (h liveHashes) set(path, tableID, liveCode string) {
 	if h.stack != "" {
 		h.lock.SetTableLive(h.stack, path, tableID, wfdir.HashString(liveCode))

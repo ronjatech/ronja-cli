@@ -484,7 +484,13 @@ type pipelineMetricFileResult struct {
 	// Notes are what this push wants to say about the metric it staged: its
 	// derived shape, and the governance consequence of committing it.
 	Notes []string `json:"notes,omitempty"`
-	URL   string   `json:"-"`
+	// Tags is what this push did about the file's `tags` — nil when the file has
+	// no such key and so does not manage them. Its own outcome rather than a
+	// part of Outcome, because the two halves are independent in both
+	// directions: a recipe refusal, a failed build or an up-to-date definition
+	// never skips the tag half, and a tag refusal never fails the recipe.
+	Tags *pipelineMetricTagResult `json:"tags,omitempty"`
+	URL  string                   `json:"-"`
 }
 
 // pushMetricFiles is the METRIC half of a pipeline push.
@@ -560,6 +566,10 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 
 	// --- 1. Create, for a file with no metric behind it yet -----------------
 	if out.MetricID == "" {
+		// adoptedRow is the row a name_taken create adopted, nil on a create
+		// that succeeded — the tag half needs it, since an adopted row may be
+		// archived or hidden and a freshly created one is neither.
+		var adoptedRow *api.Table
 		created, err := client.CreateMetric(ctx, api.CreateMetricInput{
 			Name:              file.Alias,
 			FeatureID:         f.Binding.FeatureID,
@@ -587,6 +597,7 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 				file.Path, adopted.ID)
 			out.MetricID = adopted.IdentityID()
 			liveBase = metricfile.RecipeSHA256(adopted.MetricRecipe)
+			adoptedRow = adopted
 		case api.StatusOf(err) == 403:
 			// Creating is admin-only; EDITING a metric that already exists is
 			// not — the whole draft-and-review path this file drives is open to a
@@ -619,6 +630,9 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 			fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n  Add it by hand, or the next push will create a second metric for this file.\n", file.Path, out.Error)
 			return out
 		}
+		// THE TAG HALF, straight after the create: the row exists and is a metric
+		// by construction, and nothing the recipe steps below do may stop it.
+		out.Tags = reconcileMetricTags(ctx, client, live, file, out.MetricID, adoptedRow, opts)
 	}
 
 	// --- 2. Resolve the draft ----------------------------------------------
@@ -656,6 +670,11 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 			return refuse("%s is bound to %s, which is a %s table rather than a metric — a metric file cannot define one.\n    `ronja bind` cannot tell a metric from a table of the same name (the search API reports both as \"table\"), so re-point the alias at the metric's own id, or rename the file",
 				file.Path, out.MetricID, liveRow.Kind)
 		}
+		// THE TAG HALF, once the row is known to exist and to BE a metric — so a
+		// plain table a stem was bound to is never tagged — and BEFORE the drift
+		// refusals and the up-to-date return below, neither of which is about
+		// tags. See pipeline_metric_tags.go.
+		out.Tags = reconcileMetricTags(ctx, client, live, file, out.MetricID, liveRow, opts)
 		liveNow := metricfile.RecipeSHA256(liveRow.MetricRecipe)
 		if liveBase != "" && liveNow != liveBase {
 			if !opts.Force {
@@ -1142,6 +1161,7 @@ func oneMetricStatus(ctx context.Context, client *api.Client, live liveHashes, f
 		// exactly as a .sql file with no table behind it is.
 		out.WillCreate = true
 		out.Pending = true
+		out.Tags, out.TagsPending = metricTagStatus(ctx, client, live, file, nil)
 		return out
 	}
 	row, err := client.GetTable(ctx, file.MetricID)
@@ -1158,6 +1178,9 @@ func oneMetricStatus(ctx context.Context, client *api.Client, live liveHashes, f
 		out.Drift = driftUnreadable
 		return out
 	}
+	// The TAG half, on the one predicate a push runs. Independent of the recipe
+	// answers below, as it is in push.
+	out.Tags, out.TagsPending = metricTagStatus(ctx, client, live, file, row)
 	recordedID, liveBase, declared := live.metricSeen(file.Path)
 	if recordedID != file.MetricID {
 		// Rebound to a different row: the recording describes another metric, so

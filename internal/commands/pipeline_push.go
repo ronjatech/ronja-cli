@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -49,7 +50,7 @@ const (
 // network and their diagnosis is entirely local), then the files in topological
 // order, and per file the drift guard before the first byte is written.
 func newPipelinePushCmd() *cobra.Command {
-	var force, forceVerifiedMetric bool
+	var force, forceVerifiedMetric, prune, retryTags bool
 	cmd := &cobra.Command{
 		Use:   "push [paths...]",
 		Short: "Sync changed .sql files and metrics into your drafts and build them",
@@ -104,6 +105,29 @@ builds — metrics are pushed after the SQL, so the table is always there first.
 metric and a table cannot share a name inside one feature, and this command
 refuses a folder that claims one twice before it sends anything.
 
+A metric file may also list "tags": ["Finance", "Sales"]. Tags are not drafted:
+a push puts every listed name on the LIVE metric (re-adding one somebody
+removed in the web app), removes by id only the names this folder put there and
+the file no longer lists, never touches a tag added in the web app, and keeps a
+tag an admin renamed. No "tags" key leaves the metric's tags alone. A change the
+20-tag cap refuses is recorded and not re-sent until the file's tags change or
+you pass --retry-tags; any other tag failure is not recorded, fails the push,
+and is retried by the next one.
+
+HEALTH CHECKS. A table's checks live in checks/<stem>.json, beside the .sql
+file that builds it:
+
+  {"checks": [{"name": "Unique id", "expression": "count(*) = count(distinct id)",
+   "severity": "fail", "description": "..."},
+   {"name": "Rebuilds daily", "expectedIntervalHours": 24}]}
+
+Checks attach to the LIVE table, so they are written only once the live table
+holds the file's SQL and you have no open draft of it — otherwise they are
+reported "pending publish", and "ronja pipeline publish" applies them after the
+commit. Every checks file is visited, not only the changed .sql files. severity,
+description and enabled are managed only when present. A check removed from the
+file is refused until --prune, which silences it (there is no delete).
+
 It refuses a table whose SQL changed on the server since your last sync — chat
 and the web builder edit the same draft — naming what moved, and it refuses on
 the same terms when a documented table's DESCRIPTION or column prose moved, or
@@ -148,7 +172,7 @@ Publishing is a separate step:
 				return err
 			}
 			result, err := runPipelinePush(cmd.Context(), f, args,
-				pipelinePushOptions{Force: force, ForceVerifiedMetric: forceVerifiedMetric})
+				pipelinePushOptions{Force: force, ForceVerifiedMetric: forceVerifiedMetric, Prune: prune, RetryTags: retryTags})
 			// The report is emitted even on failure: a push that stopped part-way
 			// has already created tables and staged drafts, and "which ones" is
 			// the first thing anyone needs to know.
@@ -165,7 +189,11 @@ Publishing is a separate step:
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false,
-		"push even though a table's SQL, or a metric's definition, changed on the server since your last sync")
+		"push even though a table's SQL, a metric's definition, or a health check this folder owns changed on the server since your last sync")
+	cmd.Flags().BoolVar(&prune, "prune", false,
+		"silence the health checks this folder created that its checks/ files no longer declare (there is no delete)")
+	cmd.Flags().BoolVar(&retryTags, "retry-tags", false,
+		"re-send metric tags the 20-tag cap refused at an earlier push, even though the file's tags have not changed since")
 	cmd.Flags().BoolVar(&forceVerifiedMetric, "force-verified-metric", false,
 		"with --force, also overwrite a VERIFIED metric whose definition a colleague changed — discarding the admin's verification of what is there now")
 	return cmd
@@ -185,6 +213,14 @@ type pipelinePushOptions struct {
 	// under a flag whose message is about your own file. Overwriting that should
 	// cost a sentence you had to type.
 	ForceVerifiedMetric bool
+	// Prune silences the health checks this folder owns that its checks/ files
+	// no longer declare. Without it such an orphan refuses that table's checks.
+	Prune bool
+	// RetryTags re-sends a metric's tags that the 20-tag cap refused at an
+	// earlier push (recorded in tagsRefused) even though the file's tag list has
+	// not changed since — once tags were removed in the web app to make room.
+	// Without it a recorded refusal is reported and not re-sent.
+	RetryTags bool
 }
 
 // pipelinePushResult is the --json shape and the human renderer's input, so the
@@ -205,6 +241,9 @@ type pipelinePushResult struct {
 	// folder defines. Absent for the folders that keep none, which is every
 	// folder that has not adopted them.
 	Metrics []pipelineMetricFileResult `json:"metrics,omitempty"`
+	// Checks is one entry per CHECKS FILE this push visited. Absent for the
+	// folders that keep none.
+	Checks []pipelineChecksResult `json:"checks,omitempty"`
 	// UpToDate reports a push that found nothing to do.
 	UpToDate bool `json:"upToDate"`
 	// Error summarises a push that did not fully succeed. The per-file entries
@@ -290,6 +329,9 @@ func printPipelineDocsResult(out *os.File, doc pipelineDocsFileResult) {
 // meant — additivity above all, since a ratio that came out additive would
 // re-aggregate by summing and be wrong at every grain but one.
 func printPipelineMetricResult(out *os.File, metric pipelineMetricFileResult) {
+	// The TAG half, last in the block whichever way it ends: it is independent of
+	// the recipe outcome, so it is said under every one of them.
+	defer printMetricTagResult(out, metric.Tags)
 	switch metric.Outcome {
 	case metricOutcomeRefused:
 		fmt.Fprintf(out, "\n  %s — not pushed\n", metric.Path)
@@ -306,6 +348,20 @@ func printPipelineMetricResult(out *os.File, metric pipelineMetricFileResult) {
 		}
 		return
 	case metricOutcomeUpToDate:
+		if metric.Tags != nil && metric.Tags.Outcome == tagOutcomeApplied {
+			// "Up to date" alone would read as "nothing happened" over a block
+			// whose next line says the tags changed.
+			fmt.Fprintf(out, "\n  %s — definition up to date, tags changed\n", metric.Path)
+			fmt.Fprintf(out, "    Metric: %s\n", metric.MetricID)
+			return
+		}
+		if metric.Tags != nil && metric.Tags.Outcome == tagOutcomeFailed {
+			// Nor "up to date" over a block whose next line says the tag change
+			// this file asserts did not land.
+			fmt.Fprintf(out, "\n  %s — definition up to date, tags NOT applied\n", metric.Path)
+			fmt.Fprintf(out, "    Metric: %s\n", metric.MetricID)
+			return
+		}
 		fmt.Fprintf(out, "\n  %s — up to date\n", metric.Path)
 		fmt.Fprintf(out, "    Metric: %s\n", metric.MetricID)
 		return
@@ -462,19 +518,44 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	// SOURCES are resolved after the .sql pass, because the main case is a metric
 	// reading a table this very push creates.
 	metrics = resolveMetricIdentities(f, f.live(baseline), metrics)
+	// The HEALTH-CHECK files, read with no network in sight. With no arguments
+	// every one of them is visited — checks added to a table whose SQL did not
+	// move are the main case.
+	checksFiles, err := readChecksFiles(f.Root, local)
+	if err != nil {
+		return nil, err
+	}
 
 	var targets []string
 	if len(args) > 0 {
-		var sqlArgs []string
-		sqlArgs, sidecars, metrics, err = splitFileKindArgs(f.Root, args, sidecars, metrics)
+		var sqlArgs, rest []string
+		var namedChecks []pipelineChecksFile
+		if rest, namedChecks, err = splitChecksArgs(f.Root, args, checksFiles); err != nil {
+			return nil, err
+		}
+		sqlArgs, sidecars, metrics, err = splitFileKindArgs(f.Root, rest, sidecars, metrics)
 		if err != nil {
 			return nil, err
 		}
 		if targets, err = resolveArgPaths(f.Root, sqlArgs, local); err != nil {
 			return nil, err
 		}
+		// Naming a .sql file names its checks too.
+		named := map[string]bool{}
+		for _, file := range namedChecks {
+			named[file.Path] = true
+		}
+		for _, file := range checksFiles {
+			if !named[file.Path] && file.SQLPath != "" && slices.Contains(targets, file.SQLPath) {
+				namedChecks = append(namedChecks, file)
+			}
+		}
+		checksFiles = namedChecks
 	} else {
 		targets = pipelineChangedTargets(f, local, known)
+		// A checks file deleted from the folder is visited too, on a bare push
+		// only: the checks it created are orphans until --prune silences them.
+		checksFiles = withDeletedChecksFiles(checksFiles, f.live(baseline))
 	}
 	// A file removed from the folder is NOT a table this push deletes. There is
 	// no delete verb here on purpose (doctrine: sync verbs yes, resource verbs
@@ -488,7 +569,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 				wfdir.ManifestName)
 		}
 	}
-	if len(targets) == 0 && len(sidecars) == 0 && len(metrics) == 0 {
+	if len(targets) == 0 && len(sidecars) == 0 && len(metrics) == 0 && len(checksFiles) == 0 {
 		// The prune above is a real edit to the baseline, and this is the path it
 		// is most likely to be taken on: the ordinary way to reach it is a folder
 		// with nothing left to push. Saved here or the note is printed on every
@@ -633,15 +714,24 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	// reading a table this same push created resolves through
 	// f.Binding.Tables, which the loop above has just filled in.
 	result.Metrics = pushMetricFiles(ctx, client, f, inst, resolveMetricSources(f, codec, metrics), opts)
-	refusedMetrics, settledMetrics, metricProseFailed := 0, 0, 0
+	refusedMetrics, settledMetrics, metricProseFailed, failedTags := 0, 0, 0, 0
 	for _, metric := range result.Metrics {
+		if metric.Tags != nil && metric.Tags.Outcome == tagOutcomeFailed {
+			failedTags++
+		}
 		switch metric.Outcome {
 		case metricOutcomeRefused, metricOutcomeBuildFailed:
 			refusedMetrics++
 		case metricOutcomeDescriptionFailed:
 			metricProseFailed++
 		case metricOutcomeUpToDate:
-			settledMetrics++
+			// A definition that is up to date while the push CHANGED the metric's
+			// tags is not a settled metric: the organization moved, and `sync
+			// apply` reads upToDate to decide whether anything was deployed. Nor
+			// is one whose tag half FAILED: the change it asserts is not there.
+			if metric.Tags == nil || (metric.Tags.Outcome != tagOutcomeApplied && metric.Tags.Outcome != tagOutcomeFailed) {
+				settledMetrics++
+			}
 		}
 	}
 	// UP TO DATE IS AN ANSWER ABOUT THE OUTCOMES, not about the early return that
@@ -649,9 +739,25 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	// sidecars and no metrics at all, so any folder keeping one reported
 	// `upToDate: false` on every clean run — the one key a script watches to
 	// decide whether a push changed the organization, saying "yes" every time.
+	// 8. The HEALTH CHECKS, last: they attach to the live table, so they go after
+	// everything that could have changed it, and the live-matches rule is read
+	// against the state this push left behind (a table it just staged a draft
+	// for is pending publish).
+	result.Checks = pushChecksFiles(ctx, client, f, inst, codec, local, checksFiles,
+		checksApplyOptions{Prune: opts.Prune, Force: opts.Force})
+	failedChecks, settledChecks := 0, 0
+	for _, checks := range result.Checks {
+		if checks.failed() {
+			failedChecks++
+		}
+		if checks.settled() {
+			settledChecks++
+		}
+	}
 	result.UpToDate = len(result.Files) == 0 &&
 		settledDocs == len(result.Docs) &&
-		settledMetrics == len(result.Metrics)
+		settledMetrics == len(result.Metrics) &&
+		settledChecks == len(result.Checks)
 
 	// The problems, counted apart and said apart. Three different things go wrong
 	// here and they have different fixes: a file that never landed, a file whose
@@ -673,10 +779,39 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	if metricProseFailed > 0 {
 		problems = append(problems, fmt.Sprintf("%d metric(s) were staged and built, and are publishable, but their description did not land", metricProseFailed))
 	}
+	if failedTags > 0 {
+		// A problem, unlike a recorded tag refusal: nothing lasting was said, the
+		// tag change the file asserts is not on the metric, and a push that
+		// exited zero here would read as deployed to CI and to `sync apply`.
+		problems = append(problems, fmt.Sprintf("the tags of %d metric(s) could not be reconciled", failedTags))
+	}
+	if failedChecks > 0 {
+		problems = append(problems, fmt.Sprintf("%d of %d checks file(s) did not fully apply", failedChecks, len(result.Checks)))
+	}
 	if len(problems) == 0 {
 		return result, nil
 	}
 	result.Error = strings.Join(problems, ", and ")
+	// Typed when the health checks and/or the metric tag halves are the ONLY
+	// problems, decided from the tally above and never from the error string,
+	// so `sync apply` can publish the folder's SQL past them (applyFolder).
+	// Never on a cancelled context: an interrupted pass marks what it did not
+	// reach refused or failed, and an interrupt must not read as "only the
+	// checks" or "only the tags".
+	if ctx.Err() == nil {
+		switch {
+		case failedTags > 0 && failedChecks > 0 && len(problems) == 2:
+			// Tags AND checks, and nothing else: both advisory to the SQL, so
+			// typed as the tag leg carrying the checks leg.
+			return result, newTagsNotApplied(result.Error, result.Metrics, newChecksNotApplied(result.Error, result.Checks))
+		case failedTags > 0 && len(problems) == 1:
+			// The same on the tag half: it is not drafted, so a failed tag
+			// change never holds the folder's SQL publish hostage.
+			return result, newTagsNotApplied(result.Error, result.Metrics, nil)
+		case failedChecks > 0 && len(problems) == 1:
+			return result, newChecksNotApplied(result.Error, result.Checks)
+		}
+	}
 	return result, fmt.Errorf("%s", result.Error)
 }
 
@@ -1617,7 +1752,25 @@ func describeLineageDelta(added, removed []string) string {
 func printPipelinePushReport(r *pipelinePushResult) {
 	out := os.Stdout
 	if r.UpToDate {
-		fmt.Fprintf(out, "  Up to date — every .sql file, docs sidecar and metric in this folder matches your last sync.\n")
+		fmt.Fprintf(out, "  Up to date — every .sql file, docs sidecar, metric and health check in this folder matches your last sync.\n")
+		// A REFUSED tag half does not make a push "not up to date" — nothing
+		// changed, and counting it would have `sync apply` redeploy a folder for
+		// a refusal it cannot fix — but it must not vanish under the one line
+		// either. Said here, one line per metric, until the file or the server
+		// changes.
+		// Nor must a rename an admin made in the web app: it changes nothing
+		// here either, and the file is worth updating for it.
+		for _, metric := range r.Metrics {
+			if metric.Tags == nil {
+				continue
+			}
+			if metric.Tags.Outcome == tagOutcomeRefused {
+				fmt.Fprintf(out, "  Tags NOT applied on %s — %s\n", metric.Path, metric.Tags.Reason)
+			}
+			for _, rename := range metric.Tags.Renamed {
+				fmt.Fprintf(out, "  Note: %s — renamed in the web app: %s — update the file\n", metric.Path, rename)
+			}
+		}
 		return
 	}
 	for _, file := range r.Files {
@@ -1629,6 +1782,9 @@ func printPipelinePushReport(r *pipelinePushResult) {
 	for _, metric := range r.Metrics {
 		printPipelineMetricResult(out, metric)
 	}
+	for _, checks := range r.Checks {
+		printPipelineChecksResult(out, checks)
+	}
 	if r.Target != "" {
 		fmt.Fprintf(out, "\n  Target:   %s\n", r.Target)
 	}
@@ -1636,7 +1792,28 @@ func printPipelinePushReport(r *pipelinePushResult) {
 		fmt.Fprintf(out, "  %s. The drafts above hold what did land; fix and push again.\n", r.Error)
 		return
 	}
-	fmt.Fprintf(out, "\n  Next: ronja pipeline publish\n")
+	// Only after a push that STAGED something: a tag change lands on the live
+	// metric, a docs sidecar on the live row and a check on the live table, so
+	// a push made only of those has nothing for publish to commit.
+	if r.stagedDraft() {
+		fmt.Fprintf(out, "\n  Next: ronja pipeline publish\n")
+	}
+}
+
+// stagedDraft reports that this push wrote a .sql file or a metric recipe into
+// a draft — the only thing `pipeline publish` commits.
+func (r *pipelinePushResult) stagedDraft() bool {
+	for _, file := range r.Files {
+		if file.Outcome == pushOutcomePushed && file.DraftID != "" {
+			return true
+		}
+	}
+	for _, metric := range r.Metrics {
+		if metric.Outcome == metricOutcomePushed && metric.DraftID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func printPipelineFileResult(out *os.File, file pipelineFileResult) {

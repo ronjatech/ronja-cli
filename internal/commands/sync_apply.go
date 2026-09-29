@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -248,8 +249,9 @@ const ()
 // three-valued contract as `sync status`.
 func (r *syncApplyReport) exitError() error {
 	// Agreed with the REFUSED count, which is the subject of the sentence: "1 of
-	// 30 folders was not deployed", not "were".
-	verb := agree(r.Summary.Refused, "was not deployed", "were not deployed")
+	// 30 folders was not fully deployed", not "were". FULLY, because a
+	// checks_not_applied folder is refused with its tables published.
+	verb := agree(r.Summary.Refused, "was not fully deployed", "were not fully deployed")
 	if r.DryRun {
 		verb = "would be refused"
 	}
@@ -643,6 +645,8 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 	// warning describes files that landed, which is true whether or not the
 	// publish after them did.
 	line.Notes = append(line.Notes, notes...)
+	var checksErr *checksNotAppliedError
+	var tagsErr *tagsNotAppliedError
 	switch {
 	case err != nil && ctx.Err() != nil:
 		// ⚠️ THE INTERRUPT IS ASKED ABOUT FIRST, because it is the case where the
@@ -652,6 +656,25 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 		// genuinely unknown, and the folders after this one already say
 		// `interrupted` — see markApplyInterrupted.
 		unknown(syncReasonInterrupted, "%s", err.Error())
+	case errors.As(err, &tagsErr):
+		// The SQL was published and a metric's tag half did not apply — asked
+		// before the checks, which it may carry too. Split as the checks are: a
+		// tag write that got no answer may have landed.
+		if tagsErr.cause != nil {
+			unknown(syncReasonTagsNotApplied, "%s", err.Error())
+		} else {
+			refuse(syncReasonTagsNotApplied, "%s", err.Error())
+		}
+	case errors.As(err, &checksErr):
+		// The SQL was published and the health checks were not all applied. A
+		// definite refusal is a refusal; a checks leg that got no answer — a
+		// timeout, a 5xx, a read-back that could not be read — is unknown, under
+		// the same reason, because a write that timed out may have landed.
+		if checksErr.cause != nil {
+			unknown(syncReasonChecksNotApplied, "%s", err.Error())
+		} else {
+			refuse(syncReasonChecksNotApplied, "%s", err.Error())
+		}
 	case err != nil && (api.Unanswered(err) || api.IsTimeout(err)):
 		// THE INSTANCE DID NOT ANSWER: a connection that never landed, a 429, a
 		// 5xx — or our own deadline, which is worse, because a write that timed
@@ -710,7 +733,46 @@ const (
 	// the other a write that may well have committed — and only one of them can
 	// honestly be re-run without looking first.
 	syncReasonUnanswered = "unanswered"
+	// syncReasonChecksNotApplied — a pipeline folder's SQL was published (or had
+	// nothing to publish) and its health checks did not all apply: refused,
+	// orphaned, drifted, unsupported by an older server — or, as `unknown`,
+	// unanswered. Its own reason rather than not_deployed, because the tables ARE
+	// live: checks are ungoverned and advisory, so their leg never holds a table
+	// deploy back, and the run still exits non-zero until it is settled.
+	syncReasonChecksNotApplied = "checks_not_applied"
+	// syncReasonTagsNotApplied — a pipeline folder's SQL was published (or had
+	// nothing to publish) and the tag half of one or more metric files did not
+	// apply: a failure that says nothing lasting about the file, which the next
+	// run retries. Its own reason on the checks precedent: tags are not drafted,
+	// so their leg never holds the SQL publish back, and the run still exits
+	// non-zero until it lands. When the checks leg failed too, this reason wins
+	// and the detail names both.
+	syncReasonTagsNotApplied = "tags_not_applied"
 )
+
+// checksNotAppliedAfter folds the checks legs of a push and a publish into the
+// folder's error, naming the tables that WERE published. nil when both legs
+// applied.
+func checksNotAppliedAfter(detail string, published []string, legs ...*checksNotAppliedError) error {
+	out := &checksNotAppliedError{}
+	for _, leg := range legs {
+		if leg == nil {
+			continue
+		}
+		out.problems = append(out.problems, leg.problems...)
+		if out.cause == nil {
+			out.cause = leg.cause
+		}
+	}
+	if len(out.problems) == 0 {
+		return nil
+	}
+	if len(published) > 0 {
+		detail += " (" + strings.Join(published, ", ") + ")"
+	}
+	out.msg = fmt.Sprintf("%s, but the health checks did not all apply: %s", detail, strings.Join(out.problems, "; "))
+	return out
+}
 
 // syncApplyGate is the whole of what `sync apply` ADDS to the loops it runs: the
 // three answers it refuses to act on. An empty reason means "go ahead".
@@ -871,7 +933,29 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// failed on the third made two tables, and a report that said none would
 		// send the reader looking for rows that are already there.
 		created = countPipelineCreates(push)
-		if pushErr != nil {
+		// ⚠️ THE HEALTH-CHECK LEG DOES NOT HOLD THE SQL HOSTAGE. A push whose ONLY
+		// problems are its checks (typed by runPipelinePush from its own tally)
+		// still publishes: checks are ungoverned and advisory — "a failing check
+		// never blocks anything" — while a docs or metric-prose failure is
+		// governed and still blocks. The checks problem is not forgiven: it comes
+		// back as the folder's verdict, checks_not_applied, after the publish.
+		// Never on a cancelled context — an interrupted checks pass must not
+		// read as "only the checks" and go on to commit.
+		//
+		// The TAG leg is the same, for the same reason: tags sit on the live
+		// metric and are not drafted, so a tag half that failed — an
+		// organization with no tag route yet, a role 403, a 5xx — publishes the
+		// SQL anyway and comes back as tags_not_applied after it.
+		var pushChecks *checksNotAppliedError
+		var pushTags *tagsNotAppliedError
+		switch {
+		case pushErr == nil:
+		case ctx.Err() != nil:
+			return "", created, false, notes, pushErr
+		case errors.As(pushErr, &pushTags):
+			pushChecks = pushTags.checks
+		case errors.As(pushErr, &pushChecks):
+		default:
 			return "", created, false, notes, pushErr
 		}
 		// Nothing to push AND nothing staged. With a draft recorded the publish
@@ -879,17 +963,34 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// running it costs nothing when there is none: runPipelinePublish's own
 		// no-argument selection is this same list, and an empty one returns
 		// `Nothing` before it makes a single request.
-		if push.UpToDate && len(pipelineStagedDrafts(pipelineBaseline(f))) == 0 {
+		if pushErr == nil && push.UpToDate && len(pipelineStagedDrafts(pipelineBaseline(f))) == 0 {
 			return "nothing to push", created, false, notes, nil
 		}
 		pushed := countPipelinePushed(push)
 		published, pubErr := runPipelinePublish(ctx, f, nil, true, false)
-		if pubErr != nil {
+		// The same split on the publish leg: every commit landed and only the
+		// checks applied after them did not.
+		var pubChecks *checksNotAppliedError
+		if pubErr != nil && !errors.As(pubErr, &pubChecks) {
 			return "", created, false, notes, pubErr
 		}
+		// A TAG change is deployed by the push itself — tags sit on the live
+		// metric and are not drafted — so it is said here, where "no draft was
+		// staged" would otherwise read as "nothing was deployed".
+		tagged := countPipelineTagsApplied(push)
 		if published.Nothing {
-			return fmt.Sprintf("pushed %d %s; no draft was staged to publish",
-				pushed, plural(pushed, "file")), created, false, notes, nil
+			detail := fmt.Sprintf("pushed %d %s; no draft was staged to publish", pushed, plural(pushed, "file"))
+			if tagged > 0 {
+				detail = fmt.Sprintf("changed the tags on %d %s; no draft was staged to publish", tagged, plural(tagged, "metric"))
+				if pushed > 0 {
+					detail = fmt.Sprintf("pushed %d %s and changed the tags on %d %s; no draft was staged to publish",
+						pushed, plural(pushed, "file"), tagged, plural(tagged, "metric"))
+				}
+			}
+			if err := tagsNotAppliedAfter(detail, nil, pushTags, checksNotAppliedAfter(detail, nil, pushChecks, pubChecks)); err != nil {
+				return "", created, false, notes, err
+			}
+			return detail, created, false, notes, nil
 		}
 		// ⚠️ UNREACHABLE TODAY, and kept for symmetry with the data-app branch
 		// below, which is not. runPipelinePublish reaches outcomeSubmittedForReview
@@ -907,12 +1008,21 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// one entry per candidate, and reporting them all as published is a claim
 		// about rows this run may not have moved.
 		live := 0
+		var livePaths []string
 		for _, file := range published.Files {
 			if file.Outcome == outcomePublished {
 				live++
+				livePaths = append(livePaths, file.Path)
 			}
 		}
-		return fmt.Sprintf("pushed and published %d %s", live, plural(live, "table")), created, false, notes, nil
+		detail := fmt.Sprintf("pushed and published %d %s", live, plural(live, "table"))
+		if tagged > 0 {
+			detail += fmt.Sprintf(", and changed the tags on %d %s", tagged, plural(tagged, "metric"))
+		}
+		if err := tagsNotAppliedAfter(detail, livePaths, pushTags, checksNotAppliedAfter(detail, livePaths, pushChecks, pubChecks)); err != nil {
+			return "", created, false, notes, err
+		}
+		return detail, created, false, notes, nil
 
 	case wfdir.KindAutomation:
 		// No draft, no publish: this loop writes production directly.
@@ -1092,6 +1202,19 @@ func countPipelinePushed(push *pipelinePushResult) int {
 	n := 0
 	for _, file := range push.Files {
 		if file.Outcome != pushOutcomeRefused {
+			n++
+		}
+	}
+	return n
+}
+
+// countPipelineTagsApplied counts the metrics whose TAGS this push changed.
+// Counted apart from countPipelinePushed, which counts .sql files: a tag change
+// stages nothing and so is invisible to every count the publish leg reports.
+func countPipelineTagsApplied(push *pipelinePushResult) int {
+	n := 0
+	for _, metric := range push.Metrics {
+		if metric.Tags != nil && metric.Tags.Outcome == tagOutcomeApplied {
 			n++
 		}
 	}

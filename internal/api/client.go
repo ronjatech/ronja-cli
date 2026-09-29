@@ -223,6 +223,34 @@ func CodeOf(err error) string {
 	return ""
 }
 
+// WireCodeOf is the body's machine-readable `code` field — gt.NewCodedError's
+// additive discriminator — or "" when the error is not an HTTP error or carries
+// none.
+//
+// Not CodeOf, whose name is older than the field: CodeOf answers the `error`
+// MESSAGE. A caller that must tell two refusals of one status apart keys on this
+// and never on the prose, which the server rewords whenever that reads better.
+func WireCodeOf(err error) string {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		return ""
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(apiErr.Body), &body) != nil {
+		return ""
+	}
+	return body.Code
+}
+
+// InsufficientScopeCode is the wire discriminator on the server's scoped-token
+// 403 (gt.InsufficientScopeCode, backend/lib/api/gt/scope.go): THIS TOKEN may
+// not do that, which says nothing about the resource and is fixed by using
+// another token. A handler's own 403 — "you may not see or change this row" —
+// carries no such code.
+const InsufficientScopeCode = "insufficient_scope"
+
 // NameTakenCode is the wire discriminator on the 409 every naming surface
 // answers when a name already identifies another row in the same namespace — a
 // table's feature, a feature's organization — mirrored from gt.NameTakenCode

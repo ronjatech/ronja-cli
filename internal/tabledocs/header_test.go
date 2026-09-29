@@ -370,3 +370,14 @@ func TestParseHeaderOrphanRemedyIsNonDestructive(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// A `-- @sqlSemantics` line is not a directive this package knows — the server
+// moves a table to raw escapes on its own when its code changes, so nothing in a
+// file declares it. At the top of a file it is an ordinary leading comment: the
+// file has not opted in to documentation, and nothing is refused or warned.
+func TestParseHeaderTreatsAStraySQLSemanticsLineAsAComment(t *testing.T) {
+	docs, warnings := ParseHeader("-- @sqlSemantics raw\nSELECT 1")
+	if !docs.Empty() || len(warnings) != 0 {
+		t.Fatalf("docs = %+v, warnings = %v; want an ordinary comment", docs, warnings)
+	}
+}

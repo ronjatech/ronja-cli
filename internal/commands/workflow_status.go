@@ -54,6 +54,13 @@ With --json, one object carrying all of the above.`,
 				return err
 			}
 
+			// The one line a row still on the old SQL escape handling earns,
+			// on STDERR in both modes: the report on stdout is a document a
+			// script parses in --json, and this is an aside about how to
+			// the next push rather than part of the answer.
+			if report.Remote != nil {
+				printSQLSemanticsLine(os.Stderr, report.Remote.SQLSemanticsNotice)
+			}
 			if flagJSON {
 				return emitJSON(report)
 			}
@@ -199,7 +206,15 @@ type remoteReport struct {
 	Problem          string `json:"problem,omitempty"`
 	Lifecycle        string `json:"lifecycle,omitempty"`
 	// Draft describes the caller's own open draft, when they have one.
-	Draft *draftReport `json:"draft,omitempty"`
+	// SQLSemanticsNotice is the one line a row still on the old escape handling
+	// earns — what it is, and that the next push changing its code moves it to
+	// raw. Empty when the row is already raw and when the instance does not
+	// report the field at all.
+	//
+	// Composed here rather than rendered by the printer: a --json caller sees
+	// the same finding a person does, and there is one sentence rather than two.
+	SQLSemanticsNotice string       `json:"sqlSemanticsNotice,omitempty"`
+	Draft              *draftReport `json:"draft,omitempty"`
 	// ComparedAgainst names the row DRIFT was measured against — the draft when
 	// there is one (it is what a push would write to), otherwise the live row.
 	ComparedAgainst *comparedReport `json:"comparedAgainst,omitempty"`
@@ -380,6 +395,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 		return out, pageURL
 	}
 	out.ComparedAgainst = &comparedReport{ID: target.ID, Lifecycle: target.Lifecycle}
+	out.SQLSemanticsNotice = sqlSemanticsNotice(sqlSemanticsSubject(target.Title, target.ID), target.SQLSemantics)
 	baseline := f.State.For(f.Key)
 	drift := wfdir.DiffHashes(hashFiles(f.Codec, files), baseline.Hashes())
 	out.Drift = &drift

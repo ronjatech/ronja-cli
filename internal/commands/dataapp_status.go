@@ -54,6 +54,13 @@ With --json, one object carrying all of the above.`,
 				return err
 			}
 
+			// The one line a row still on the old SQL escape handling earns,
+			// on STDERR in both modes: the report on stdout is a document a
+			// script parses in --json, and this is an aside about how to
+			// the next push rather than part of the answer.
+			if report.Remote != nil {
+				printSQLSemanticsLine(os.Stderr, report.Remote.SQLSemanticsNotice)
+			}
 			if flagJSON {
 				return emitJSON(report)
 			}
@@ -170,6 +177,14 @@ type appRemoteReport struct {
 	// user can find out before deciding whether to migrate.
 	SpecVersion int          `json:"specVersion,omitempty"`
 	Draft       *draftReport `json:"draft,omitempty"`
+	// SQLSemanticsNotice is the one line a row still on the old escape handling
+	// earns — what it is, and that the next push changing its code moves it to
+	// raw. Empty when the row is already raw and when the instance does not
+	// report the field at all.
+	//
+	// Composed here rather than rendered by the printer: a --json caller sees
+	// the same finding a person does, and there is one sentence rather than two.
+	SQLSemanticsNotice string `json:"sqlSemanticsNotice,omitempty"`
 	// Validated reports whether the row DRIFT was measured against currently
 	// compiles — i.e. whether `app publish` could commit it as it stands. Only
 	// meaningful for a draft, so nil for a folder with none.
@@ -281,6 +296,7 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 		return out, pageURL
 	}
 	out.ComparedAgainst = &comparedReport{ID: row.ID, Lifecycle: row.Lifecycle}
+	out.SQLSemanticsNotice = sqlSemanticsNotice(sqlSemanticsSubject(row.Name, row.ID), row.SQLSemantics)
 	baseline := f.State.For(f.Key)
 	drift := wfdir.DiffHashes(hashAppFiles(f.Codec, files), baseline.Hashes())
 	out.Drift = &drift

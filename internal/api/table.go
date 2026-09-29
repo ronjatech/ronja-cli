@@ -127,6 +127,12 @@ type Table struct {
 	// Never hash or write this field raw; use CanonicalCode.
 	Code        string   `json:"code"`
 	InputModels []string `json:"inputModels"`
+	// SQLSemantics is "legacy" when this row's `code` still reaches DuckDB
+	// through the old Python-decoded embed, and EMPTY otherwise — the server
+	// reports only that one value (see sqlsemantics.go). Read-only: no write
+	// route takes it, because the next push that changes the code moves the
+	// table to raw on its own.
+	SQLSemantics string `json:"sqlSemantics,omitempty"`
 
 	// Description is the table's prose, and DescriptionSource is who wrote it —
 	// "user" (protected from the agent's regeneration) or "ai". Mirrored from
@@ -202,6 +208,17 @@ type Table struct {
 	// `null` into a non-pointer is a documented no-op, so "" is exactly what
 	// "unset" means.
 	MetricStatus string `json:"metricStatus"`
+
+	// Archived and Hidden mirror feature.TableView's two flags of the same
+	// names, which every TableView has always carried and this mirror did not.
+	//
+	// Read by the metric loop's TAG half for one decision: a metric that is
+	// archived or hidden is not tag-reconciled at all. The tag route gates on
+	// visibility, so a non-admin's PATCH on an archived metric is a 403 that
+	// would repeat on every push; skipping it — and saying so — is the honest
+	// answer, and an admin can still tag it in the web app.
+	Archived bool `json:"archived"`
+	Hidden   bool `json:"hidden"`
 
 	// LastBuildError is the last recorded failure, absent when there is none.
 	//

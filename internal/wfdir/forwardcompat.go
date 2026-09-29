@@ -285,6 +285,10 @@ type (
 	plainLockTable      LockTable
 	plainLockTableDocs  LockTableDocs
 	plainLockMetric     LockMetric
+	plainAppliedTag     AppliedTag
+	plainTagsRefusal    TagsRefusal
+	plainLockChecks     LockChecks
+	plainLockCheckEntry LockCheckEntry
 	plainLockAutomation LockAutomation
 )
 
@@ -302,6 +306,10 @@ var publicTwin = map[reflect.Type]reflect.Type{
 	reflect.TypeOf(plainLockTable{}):      reflect.TypeOf(LockTable{}),
 	reflect.TypeOf(plainLockTableDocs{}):  reflect.TypeOf(LockTableDocs{}),
 	reflect.TypeOf(plainLockMetric{}):     reflect.TypeOf(LockMetric{}),
+	reflect.TypeOf(plainAppliedTag{}):     reflect.TypeOf(AppliedTag{}),
+	reflect.TypeOf(plainTagsRefusal{}):    reflect.TypeOf(TagsRefusal{}),
+	reflect.TypeOf(plainLockChecks{}):     reflect.TypeOf(LockChecks{}),
+	reflect.TypeOf(plainLockCheckEntry{}): reflect.TypeOf(LockCheckEntry{}),
 	reflect.TypeOf(plainLockAutomation{}): reflect.TypeOf(LockAutomation{}),
 }
 

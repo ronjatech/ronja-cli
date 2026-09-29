@@ -223,3 +223,123 @@ func TestResolveDoesNotMutateTheParsedFile(t *testing.T) {
 		t.Errorf("resolve mutated the parsed recipe: source is now %q", source)
 	}
 }
+
+// --- tags -------------------------------------------------------------------
+
+// TestParseTagsIsThreeState: ABSENT is a folder that does not manage the
+// metric's tags, a list is the names it asserts, and `[]` asserts none. The
+// three have to stay distinguishable all the way out of the parser, or "stop
+// managing tags" and "assert no tags" become the same edit.
+func TestParseTagsIsThreeState(t *testing.T) {
+	absent, err := Parse([]byte(`{"recipe":{"source":"orders"}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if absent.Tags != nil {
+		t.Errorf("an absent key parsed as %v, want nil", *absent.Tags)
+	}
+	empty, err := Parse([]byte(`{"recipe":{"source":"orders"},"tags":[]}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if empty.Tags == nil || len(*empty.Tags) != 0 {
+		t.Errorf("[] parsed as %v, want a non-nil empty list", empty.Tags)
+	}
+	listed, err := Parse([]byte(`{"recipe":{"source":"orders"},"tags":[" Finance ","Sales"]}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// TRIMMED, as the server trims, and otherwise spelled as written — the case
+	// is the server's to fold, not this parser's.
+	if listed.Tags == nil || strings.Join(*listed.Tags, "|") != "Finance|Sales" {
+		t.Errorf("tags = %v", listed.Tags)
+	}
+}
+
+// TestParseTagsRefusals: every shape the server would refuse, refused where it
+// was written and naming the offending entry.
+func TestParseTagsRefusals(t *testing.T) {
+	long := strings.Repeat("a", 65)
+	// 22 bytes of 2-byte runes: 11 characters, well under 64 CHARACTERS, and 66
+	// BYTES — the server's cap is len(), and a character count here would pass
+	// a name the server then refuses.
+	multibyte := strings.Repeat("ö", 33)
+	many := make([]string, 21)
+	for i := range many {
+		many[i] = `"t` + strings.Repeat("x", i) + `"`
+	}
+	for name, tc := range map[string]struct {
+		tags string
+		want string
+	}{
+		"not a list":       {`"Finance"`, "list"},
+		"null":             {`null`, "list"},
+		"a number":         {`["Finance", 3]`, "3"},
+		"an object":        {`[{"name":"x"}]`, "not a string"},
+		"blank":            {`["Finance", "  "]`, "empty"},
+		"over 64 bytes":    {`["` + long + `"]`, "64"},
+		"multibyte bytes":  {`["` + multibyte + `"]`, "64"},
+		"more than 20":     {`[` + strings.Join(many, ",") + `]`, "20"},
+		"duplicate folded": {`["Finance", " finance"]`, "finance"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(`{"recipe":{"source":"orders"},"tags":` + tc.tags + `}`))
+			if err == nil {
+				t.Fatalf("tags %s must be refused", tc.tags)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("refusal %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+	// Exactly 64 bytes and exactly 20 entries are fine: the caps are inclusive.
+	edge := make([]string, 20)
+	for i := range edge {
+		edge[i] = `"t` + strings.Repeat("x", i) + `"`
+	}
+	edge[0] = `"` + strings.Repeat("a", 64) + `"`
+	if _, err := Parse([]byte(`{"recipe":{"source":"orders"},"tags":[` + strings.Join(edge, ",") + `]}`)); err != nil {
+		t.Errorf("64 bytes and 20 entries must parse: %v", err)
+	}
+}
+
+// TestTagsAreNotPartOfTheRecipeFingerprint: a tag-only edit must never read as
+// a recipe change. If it did, every tag edit would check out a draft, stage an
+// identical recipe and rebuild the metric — and on a VERIFIED metric a publish
+// would then re-fingerprint a definition nobody changed.
+func TestTagsAreNotPartOfTheRecipeFingerprint(t *testing.T) {
+	a, err := Parse([]byte(`{"recipe":{"source":"orders"},"tags":["Finance"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Parse([]byte(`{"recipe":{"source":"orders"},"tags":["Sales","Ops"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ra, _ := a.Resolve("table-orders")
+	rb, _ := b.Resolve("table-orders")
+	if Fingerprint(ra, a.Description, a.ReportingTimezone) != Fingerprint(rb, b.Description, b.ReportingTimezone) {
+		t.Error("the recipe fingerprint moved with the tags")
+	}
+}
+
+// TestTagsFingerprintFollowsTheFoldedSet: the key a recorded refusal is held
+// against. It moves when the SET of names moves — a name added, removed or
+// renamed — and not when the file is merely reordered or recased, which the
+// server would answer identically.
+func TestTagsFingerprintFollowsTheFoldedSet(t *testing.T) {
+	base := TagsFingerprint([]string{"Finance", "Sales"})
+	if base == "" {
+		t.Fatal("empty fingerprint")
+	}
+	if TagsFingerprint([]string{"sales", " FINANCE"}) != base {
+		t.Error("reordering or recasing moved the fingerprint")
+	}
+	if TagsFingerprint([]string{"Finance"}) == base || TagsFingerprint([]string{"Finance", "Sales", "Ops"}) == base {
+		t.Error("a changed set kept the fingerprint")
+	}
+	// No separator collision: ["a b"] is not ["a", "b"].
+	if TagsFingerprint([]string{"a b"}) == TagsFingerprint([]string{"a", "b"}) {
+		t.Error("two different sets share a fingerprint")
+	}
+}

@@ -191,6 +191,12 @@ type fakePipelineInstance struct {
 	listCalls       int
 	nextID          int
 
+	// checkState is the health-check half of the fake; see serveChecks.
+	checkState fakeChecks
+
+	// tagState is the tag half of the fake; see serveTags.
+	tagState fakeTags
+
 	server *httptest.Server
 	// Requests records every request served as "METHOD /path", in order. The
 	// cheapest way to assert both that a command avoided a round trip and that it
@@ -592,6 +598,13 @@ func (f *fakePipelineInstance) serve(w http.ResponseWriter, r *http.Request) {
 		f.serveDraftGovernance(w, rest)
 		return
 	}
+	// The TAG routes, modelled in pipeline_tags_test.go. Absent on an older
+	// instance (noTagRoute), which then answers them as it answers any path it
+	// does not serve.
+	if rest, ok := strings.CutPrefix(r.URL.Path, "/api/v2/tag/of/table/"); ok && !f.tagState.noTagRoute {
+		f.serveTags(w, r, rest)
+		return
+	}
 	if rest, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/model"); ok && (rest == "" || strings.HasPrefix(rest, "/")) {
 		f.serveModel(w, r, strings.TrimPrefix(rest, "/"))
 		return
@@ -760,6 +773,9 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 			return
 		}
 		writeJSON(w, f.documentColumns(id, in.Fields))
+
+	case action == "checks" || strings.HasPrefix(action, "checks/"):
+		f.serveChecks(w, r, id, strings.TrimPrefix(strings.TrimPrefix(action, "checks"), "/"))
 
 	case action == "" && r.Method == http.MethodGet:
 		if status := f.failGet[id]; status != 0 {

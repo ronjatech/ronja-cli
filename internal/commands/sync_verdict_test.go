@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
@@ -426,5 +427,97 @@ func TestSyncWorstVerdict(t *testing.T) {
 		if got := worstVerdict(tc.in); got != tc.want {
 			t.Errorf("worstVerdict(%v) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// The HEALTH-CHECK arm. `ronja sync status` lists each leg by hand, so without
+// this arm a folder with checks to push — or checks changed in the app —
+// reported clean and exited zero.
+func TestSyncPipelineVerdictChecksArm(t *testing.T) {
+	report := func(checks ...pipelineChecksStatus) *pipelineStatusReport {
+		return &pipelineStatusReport{
+			Bound: true,
+			Remote: &pipelineRemoteReport{Checked: true,
+				Tables: []pipelineTableReport{{Path: "gl.sql", Drift: driftNone}},
+				Checks: checks},
+		}
+	}
+	tests := []struct {
+		name string
+		in   *pipelineStatusReport
+		want string
+	}{
+		{"checks that match are clean", report(pipelineChecksStatus{Path: "checks/gl.json"}), verdictClean},
+		{"a pending check is not clean", report(pipelineChecksStatus{Path: "checks/gl.json", Pending: []string{"Unik"}}), verdictDrifted},
+		{"checks waiting on a publish are not clean", report(pipelineChecksStatus{Path: "checks/gl.json", PendingPublish: "open draft"}), verdictDrifted},
+		{"an orphan is not clean", report(pipelineChecksStatus{Path: "checks/gl.json", Orphaned: []string{"Gammal"}}), verdictDrifted},
+		{"a check changed in the app is drift", report(pipelineChecksStatus{Path: "checks/gl.json", Drift: []string{"Unik"}}), verdictDrifted},
+		{"a checks file that could not be judged is unknown", report(pipelineChecksStatus{Path: "checks/gl.json", Problem: "unreadable"}), verdictUnknown},
+		{"a kind change is not clean", report(pipelineChecksStatus{Path: "checks/gl.json", KindChange: []string{"Unik"}}), verdictDrifted},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := verdictOfPipelineStatus(tc.in, 1, nil); got.Verdict != tc.want {
+				t.Fatalf("verdict = %q, want %q (detail: %s)", got.Verdict, tc.want, got.Detail)
+			}
+		})
+	}
+	// A kind change is said as a refusal, never as work a push would do.
+	if got := verdictOfPipelineStatus(report(pipelineChecksStatus{Path: "checks/gl.json", KindChange: []string{"Unik"}}), 1, nil); !strings.Contains(got.Detail, "a push would refuse checks/gl.json") ||
+		strings.Contains(got.Detail, "never been deployed") {
+		t.Errorf("kind change detail = %q", got.Detail)
+	}
+	// An orphan is said as a refusal too — sync apply never prunes, so a push
+	// from the tree refuses it — and never as work that has not been deployed.
+	if got := verdictOfPipelineStatus(report(pipelineChecksStatus{Path: "checks/gl.json", Orphaned: []string{"Gammal"}}), 1, nil); !strings.Contains(got.Detail, "a push would refuse checks/gl.json without --prune") ||
+		strings.Contains(got.Detail, "never been deployed") {
+		t.Errorf("orphan detail = %q", got.Detail)
+	}
+	// The per-folder verdict: drift and an unjudgeable file fail; the folder's
+	// own pending work does not.
+	if err := pipelineStatusVerdict(report(pipelineChecksStatus{Path: "checks/gl.json", Drift: []string{"Unik"}})); err == nil {
+		t.Error("pipeline status must fail on a check changed in the app")
+	}
+	if err := pipelineStatusVerdict(report(pipelineChecksStatus{Path: "checks/gl.json", Pending: []string{"Unik"}})); err != nil {
+		t.Errorf("a pending check is work for a push, not drift: %v", err)
+	}
+}
+
+// TestSyncPipelineVerdictMetricTagsArm: a tag change the organization does not
+// hold is a LOCAL change (a tag-only folder is not clean, or `sync status` would
+// call a folder deployed that `sync apply` then changes); a recorded refusal is
+// NOT pending and does not fail the folder; a tag read that failed for a reason
+// that says nothing lasting is unknown.
+func TestSyncPipelineVerdictMetricTagsArm(t *testing.T) {
+	report := func(m pipelineMetricStatus) *pipelineStatusReport {
+		m.Path, m.MetricID, m.Drift = "metrics/aov.json", "table-aov", driftNone
+		return &pipelineStatusReport{
+			Bound: true,
+			Remote: &pipelineRemoteReport{Checked: true,
+				Tables:  []pipelineTableReport{{Path: "gl.sql", Drift: driftNone}},
+				Metrics: []pipelineMetricStatus{m}},
+		}
+	}
+	tests := []struct {
+		name string
+		in   *pipelineStatusReport
+		want string
+	}{
+		{"tags in place are clean", report(pipelineMetricStatus{Tags: &pipelineMetricTagStatus{State: tagStateInPlace}}), verdictClean},
+		{"a pending tag change is not clean", report(pipelineMetricStatus{TagsPending: true,
+			Tags: &pipelineMetricTagStatus{State: tagStatePending, Add: []string{"Sales"}}}), verdictDrifted},
+		{"a recorded refusal does not fail the folder", report(pipelineMetricStatus{
+			Tags: &pipelineMetricTagStatus{State: tagStateRefused, Reason: "older"}}), verdictClean},
+		{"an archived skip does not fail the folder", report(pipelineMetricStatus{
+			Tags: &pipelineMetricTagStatus{State: tagStateSkippedArchived}}), verdictClean},
+		{"an unread tag state is unknown", report(pipelineMetricStatus{
+			Tags: &pipelineMetricTagStatus{State: tagStateUnread, Reason: "503"}}), verdictUnknown},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := verdictOfPipelineStatus(tc.in, 1, nil); got.Verdict != tc.want {
+				t.Fatalf("verdict = %q, want %q (detail: %s)", got.Verdict, tc.want, got.Detail)
+			}
+		})
 	}
 }

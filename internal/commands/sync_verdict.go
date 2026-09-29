@@ -95,6 +95,11 @@ type pushDelta struct {
 	// Meta is the declarations a push would change: parameters, the reporting
 	// timezone, the runtime generation, a data app's access grants.
 	Meta []string
+	// Refused is what this folder declares that a push would REFUSE rather than
+	// write — a health check whose kind the file changed, or checks it orphaned
+	// (refused without --prune, which sync apply never passes). Said apart from Local,
+	// which promises a push that lands.
+	Refused []string
 	// Unchecked is everything that could not be compared at all, and it wins —
 	// see verdict.
 	Unchecked []string
@@ -142,6 +147,10 @@ func (d pushDelta) changes() string {
 	if len(d.Meta) > 0 {
 		sort.Strings(d.Meta)
 		parts = append(parts, fmt.Sprintf("a push would change %s", strings.Join(d.Meta, ", ")))
+	}
+	if len(d.Refused) > 0 {
+		sort.Strings(d.Refused)
+		parts = append(parts, fmt.Sprintf("a push would refuse %s", strings.Join(d.Refused, ", ")))
 	}
 	return strings.Join(parts, "; ")
 }
@@ -257,7 +266,16 @@ func verdictOfPipelineStatus(r *pipelineStatusReport, localFiles int, undeployed
 		// staged and the organization does not hold it, which is precisely what
 		// this command asks about. A metric has no committed content fingerprint
 		// to compute that from, so the draft is the answer there is.
-		if m.Pending || m.DraftID != "" {
+		// A TAG change the organization does not hold is a local change too: the
+		// folder asserts names the metric lacks (or lists fewer than it put
+		// there), and `sync apply` deploys it. A tag read that failed for a
+		// reason that says nothing lasting is unknown, never clean; a recorded
+		// refusal is neither — it is reported by status and does not fail the
+		// folder's verdict.
+		if m.Tags != nil && m.Tags.State == tagStateUnread {
+			delta.Unchecked = append(delta.Unchecked, m.Path)
+		}
+		if m.Pending || m.DraftID != "" || m.TagsPending {
 			metricsPending = append(metricsPending, m.Path)
 		}
 	}
@@ -280,7 +298,34 @@ func verdictOfPipelineStatus(r *pipelineStatusReport, localFiles int, undeployed
 	// the folder committed. Gating it on the absence of a baseline would make the
 	// answer depend on whose machine it ran on, which is the exact property the
 	// lock file exists to remove.
-	delta.Local = dedupe(localChanges(r.Local), r.WillCreate, undeployed, docsPending, metricsPending)
+	// The HEALTH-CHECK files. A check the organization does not hold (pending,
+	// or waiting on a publish) is a LOCAL change — the folder says something the
+	// organization does not. An orphan (a check the file no longer declares, or
+	// that a deleted file created) is a REFUSAL, like a kind change: a push
+	// refuses it without --prune, and `sync apply` never prunes, so promising it
+	// as deployable work would be false. A check that moved in the app is remote
+	// drift, and a file that could not be judged is unknown. Without this arm a
+	// folder with checks to push reported clean.
+	var checksPending []string
+	for _, c := range r.Remote.Checks {
+		switch {
+		case c.Problem != "":
+			delta.Unchecked = append(delta.Unchecked, c.Path)
+		case len(c.Drift) > 0:
+			delta.Remote = append(delta.Remote, c.Path)
+		}
+		// A kind change is a declaration a push REFUSES, not work it would do.
+		if len(c.KindChange) > 0 {
+			delta.Refused = append(delta.Refused, c.Path)
+		}
+		if len(c.Orphaned) > 0 {
+			delta.Refused = append(delta.Refused, c.Path+" without --prune")
+		}
+		if c.PendingPublish != "" || len(c.Pending) > 0 {
+			checksPending = append(checksPending, c.Path)
+		}
+	}
+	delta.Local = dedupe(localChanges(r.Local), r.WillCreate, undeployed, docsPending, metricsPending, checksPending)
 	return delta.verdict()
 }
 

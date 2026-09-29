@@ -112,3 +112,26 @@ func TestHTTPForReusesTheSharedClientWithinTheCeiling(t *testing.T) {
 		t.Errorf("the copy does not share the transport, so it has its own connection pool")
 	}
 }
+
+// An envelope with no `advice` key — the server omits it when there is nothing
+// to say — re-encodes with `"advice": []`, never null, so `--json` and `--jq`
+// callers can iterate it unguarded.
+func TestQueryAdviceIsAnEmptyArrayWhenAbsent(t *testing.T) {
+	srv := slowQueryServer(t, 0)
+	client := &Client{BaseURL: srv.URL, HTTP: &http.Client{}}
+	result, err := client.Query(context.Background(), QueryInput{SQL: "SELECT 1"}, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(envelope["advice"]); got != "[]" {
+		t.Fatalf(`advice encoded as %s, want []`, got)
+	}
+}

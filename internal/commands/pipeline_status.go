@@ -43,6 +43,12 @@ drift line when the definition moved on the server — which on a VERIFIED metri
 adds that --force alone will not overwrite it. A file with no metric behind it
 says so instead: a push is what creates one.
 
+A metric file with a "tags" key adds a tags line: whether a push would change
+the metric's tags (+added −removed), a tag an admin renamed in the web app
+(kept — update the file), a tag change the server refused at an earlier push,
+or an archived or hidden metric whose tags are left alone. A tag change is local
+work for a push, never drift.
+
 When you have a draft open, drift is reported for BOTH rows: your draft (the one
 a push writes to) and the live table underneath it, which a colleague can commit
 to while your draft sits there.
@@ -88,6 +94,16 @@ report says so.`,
 			report, err := pipelineStatusReportAt(cmd.Context(), root, resolved)
 			if err != nil {
 				return err
+			}
+
+			// One line per table still on the old SQL escape handling, on STDERR
+			// in both modes: the report on stdout is a document a script parses
+			// in --json, and this is an aside about the next push rather than
+			// part of the answer.
+			if report.Remote != nil {
+				for _, table := range report.Remote.Tables {
+					printSQLSemanticsLine(os.Stderr, table.SQLSemanticsNotice)
+				}
 			}
 
 			// The report is emitted FIRST and the verdict decides only the exit
@@ -208,7 +224,10 @@ type pipelineRemoteReport struct {
 	// Metrics is one entry per METRIC FILE — the numbers this folder defines.
 	// Absent for the folders that keep none.
 	Metrics []pipelineMetricStatus `json:"metrics,omitempty"`
-	Notes   []string               `json:"notes,omitempty"`
+	// Checks is one entry per HEALTH-CHECKS FILE. Absent for folders that keep
+	// none.
+	Checks []pipelineChecksStatus `json:"checks,omitempty"`
+	Notes  []string               `json:"notes,omitempty"`
 }
 
 // pipelineMetricStatus is one metric file's remote state.
@@ -245,6 +264,16 @@ type pipelineMetricStatus struct {
 	// Pending reports that a push would write something: this folder has not
 	// pushed this file's current content here.
 	Pending bool `json:"pending,omitempty"`
+	// TagsPending reports that a push would change the metric's TAGS — a name
+	// the file lists that the metric does not hold, or one this folder put there
+	// that the file no longer lists. Its own field rather than folded into
+	// Pending, because Pending means a DEFINITION to stage and a tag change
+	// stages nothing. A recorded refusal, an archived metric and a failed read
+	// are never pending: promising a push there would send `sync apply` round a
+	// loop.
+	TagsPending bool `json:"tagsPending,omitempty"`
+	// Tags is the tag half's whole answer; nil when the file has no `tags` key.
+	Tags *pipelineMetricTagStatus `json:"tags,omitempty"`
 }
 
 // pipelineDocsStatus is one docs sidecar's remote state.
@@ -332,8 +361,16 @@ type pipelineTableReport struct {
 	// anybody's prose, so there is nothing to report and this stays empty, which
 	// is what keeps a status on a folder written before this feature unchanged
 	// down to the line.
-	DocsDrift string               `json:"docsDrift,omitempty"`
-	Draft     *pipelineDraftReport `json:"draft,omitempty"`
+	DocsDrift string `json:"docsDrift,omitempty"`
+	// SQLSemanticsNotice is the one line a table still on the old escape handling
+	// earns: the next push that changes its code moves it to raw. Empty for a
+	// table that is already raw and for an instance that does not report the
+	// field — see commands.sqlSemanticsNotice.
+	//
+	// Taken from the row a push would WRITE TO, exactly as Drift is: the draft
+	// when one is open, because that is the copy a commit publishes.
+	SQLSemanticsNotice string               `json:"sqlSemanticsNotice,omitempty"`
+	Draft              *pipelineDraftReport `json:"draft,omitempty"`
 	// URL is the table's frontend page as the SERVER stamped it, rendered by the
 	// human report only — see pushResult.URL for why links stay out of --json.
 	URL string `json:"-"`
@@ -537,6 +574,8 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 	// folder's own files, so a metric whose source names a sibling .sql file
 	// resolves to the same row a `{{ ref }}` to it would.
 	out.Metrics = pipelineMetricStatuses(ctx, client, f, codec, live)
+	// The HEALTH-CHECK files, last, for the order push applies them in.
+	out.Checks = pipelineChecksStatuses(ctx, client, f, codec, local, live)
 	if baseline == nil {
 		// ⚠️ Say WHICH half is unknown. On a stack folder the committed lock still
 		// carries the live fingerprints, so the live-drift line above is a real
@@ -617,11 +656,17 @@ func fillTableDrift(ctx context.Context, client *api.Client, codec pipelineCodec
 		}
 	}
 
+	// The escape handling of the row a push would write to.
+	noteSemantics := func(row string) {
+		report.SQLSemanticsNotice = sqlSemanticsNotice(report.Path, row)
+	}
+
 	if draft == nil {
 		report.URL = live.URL
 		report.ComparedAgainst = live.ID
 		report.Drift = liveDrift
 		report.Problem = liveProblem
+		noteSemantics(live.SQLSemantics)
 		return
 	}
 
@@ -641,6 +686,7 @@ func fillTableDrift(ctx context.Context, client *api.Client, codec pipelineCodec
 	}
 	report.ComparedAgainst = staged.ID
 	report.LiveDrift = liveDrift
+	noteSemantics(staged.SQLSemantics)
 
 	against := state.DraftSHA256
 	if state.DraftID != draft.ID {
@@ -731,6 +777,9 @@ func printPipelineStatus(r *pipelineStatusReport) {
 		}
 		for _, m := range r.Remote.Metrics {
 			printPipelineMetricStatus(out, m)
+		}
+		for _, c := range r.Remote.Checks {
+			printPipelineChecksStatus(out, c)
 		}
 	}
 	for _, note := range r.Remote.Notes {
@@ -824,6 +873,9 @@ func printPipelineMetricStatus(out *os.File, m pipelineMetricStatus) {
 		fmt.Fprintf(out, "      %s\n", m.Problem)
 		return
 	}
+	// Rendered LAST, whichever way this block ends — after the metric's own
+	// lines, since it is about the metric they name.
+	defer printMetricTagStatus(out, m.Tags)
 	if m.WillCreate {
 		// No metric line and no drift line: there is no row to name and nothing
 		// to compare against. Said as what a push would DO, which is the only
@@ -944,6 +996,20 @@ func pipelineStatusVerdict(r *pipelineStatusReport) error {
 			drifted.metrics = append(drifted.metrics, m.Path)
 		case m.Problem != "", m.Drift == "", m.Drift == driftUnreadable:
 			unchecked.metrics = append(unchecked.metrics, m.Path)
+		}
+	}
+
+	// The HEALTH-CHECK files, on the same discipline: a check this folder owns
+	// that moved in the app is drift, and a file that could not be judged is
+	// UNCHECKED. Pending, pending-publish, orphaned and silenced are the folder's
+	// own state — work for a push — not the server moving. Counted as tables,
+	// which is what a check is about.
+	for _, c := range r.Remote.Checks {
+		switch {
+		case c.Problem != "":
+			unchecked.tables = append(unchecked.tables, c.Path)
+		case len(c.Drift) > 0:
+			drifted.tables = append(drifted.tables, c.Path)
 		}
 	}
 

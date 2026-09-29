@@ -776,6 +776,30 @@ func (f *folder) adoptLiveHashes() {
 		}
 		f.Lock.SetTableLive(f.Stack, path, tableID, recorded.LiveSHA256)
 	}
+	// The METRIC entries, on the same one-direction, empty-slot-only rule: the
+	// row id, both recipe fingerprints and the TAG half together, since the tag
+	// record is meaningless without the id it was taken against. Without the tag
+	// half a named folder would lose the record of which tags it put there, and
+	// fall back to reconciling additively — never removing a name the file drops.
+	//
+	// A slot is empty when the lock names no row for the path. One that names
+	// ANY row is the lock's, whichever it is: the lock is authoritative once it
+	// has a value.
+	for path, recorded := range inst.Metrics {
+		if recorded.MetricID == "" {
+			continue
+		}
+		if id, _, _ := f.Lock.MetricSeen(f.Stack, path); id != "" {
+			continue
+		}
+		f.Lock.SetMetricSeen(f.Stack, path, recorded.MetricID, recorded.LiveSHA256, recorded.DeclaredSHA256)
+		if len(recorded.TagsApplied) > 0 {
+			f.Lock.SetMetricTagsApplied(f.Stack, path, recorded.MetricID, recorded.TagsApplied)
+		}
+		if recorded.TagsRefused != nil {
+			f.Lock.SetMetricTagsRefused(f.Stack, path, recorded.MetricID, recorded.TagsRefused)
+		}
+	}
 }
 
 // saveBaseline writes what a per-file loop just learned: the local baseline,

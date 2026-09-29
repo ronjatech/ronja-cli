@@ -200,3 +200,23 @@ func TestAsNameTakenNeverReturnsAnEmptySentence(t *testing.T) {
 		t.Error("message is empty — it must fall back to the error's own rendering")
 	}
 }
+
+// TestWireCodeOf pins that the body's `code` — not CodeOf's `error` message —
+// is what a caller keys on, and that an uncoded or non-HTTP error has none.
+func TestWireCodeOf(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"coded", errorFrom(403, []byte(`{"error":"token scope \"data\" does not permit write","code":"insufficient_scope"}`)), InsufficientScopeCode},
+		{"uncoded", errorFrom(403, []byte(`{"error":"forbidden"}`)), ""},
+		{"not JSON", errorFrom(502, []byte(`bad gateway`)), ""},
+		{"not an HTTP error", errors.New("dial tcp: refused"), ""},
+	}
+	for _, tc := range cases {
+		if got := WireCodeOf(tc.err); got != tc.want {
+			t.Errorf("%s: WireCodeOf = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

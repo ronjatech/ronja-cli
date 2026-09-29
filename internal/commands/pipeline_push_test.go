@@ -1851,3 +1851,32 @@ func TestPipelinePushNamesTheTableHoldingTheNameItWanted(t *testing.T) {
 		}
 	}
 }
+
+// TestPipelinePushTreatsAStraySQLSemanticsLineAsAComment: the server moves a
+// table to raw escapes on its own when its code changes, so a `-- @sqlSemantics`
+// line (written for a pre-release build of this CLI, or by hand) declares
+// nothing. It must push like any other comment — sent verbatim as part of the
+// code, never a refusal, whatever value it names.
+func TestPipelinePushTreatsAStraySQLSemanticsLineAsAComment(t *testing.T) {
+	for _, line := range []string{"-- @sqlSemantics raw", "-- @sqlSemantics legacy", "-- @sqlSemantics"} {
+		t.Run(line, func(t *testing.T) {
+			f := newFakePipelineInstance(t)
+			signInPipeline(t, f)
+			root := seedBoundFolder(t, f)
+			code := line + "\nSELECT 1 FROM {{ ref('table-orders') }}"
+			editFile(t, root, "revenue.sql", code)
+
+			out, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json")
+			if err != nil {
+				t.Fatalf("push refused a stray %q line: %v\n%s", line, err, stderr)
+			}
+			file := decodeJSON(t, out)["files"].([]any)[0].(map[string]any)
+			if file["outcome"] != pushOutcomePushed {
+				t.Fatalf("file = %+v\n%s", file, stderr)
+			}
+			if len(f.updates) != 1 || f.updates[0].Code != code {
+				t.Fatalf("updates = %+v, want the file's bytes sent verbatim", f.updates)
+			}
+		})
+	}
+}

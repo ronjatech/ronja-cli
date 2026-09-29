@@ -40,6 +40,12 @@ type Module struct {
 	Name        string `json:"name"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
+	// SQLSemantics is "legacy" when the SQL in this module's files still reaches
+	// DuckDB through the old Python-decoded embed, and EMPTY otherwise — the
+	// server reports only that one value (see sqlsemantics.go). Read-only: no
+	// write route takes it, because the next write that changes the code moves
+	// the module to raw on its own.
+	SQLSemantics string `json:"sqlSemantics,omitempty"`
 
 	// ParentModuleID is empty for a live row AND for a parentless draft (a
 	// brand-new module nobody has published yet). Non-empty on an edit draft

@@ -44,6 +44,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -61,10 +62,11 @@ import (
 //	    "value": "revenue / orders"
 //	  },
 //	  "description": "Average order value, per day.",
-//	  "reportingTimezone": "Europe/Stockholm"
+//	  "reportingTimezone": "Europe/Stockholm",
+//	  "tags": ["Finance", "Sales"]
 //	}
 //
-// Three keys and no more. The metric's NAME is the file's stem, not a key here,
+// Four keys and no more. The metric's NAME is the file's stem, not a key here,
 // for the reason a .sql file's table name is its stem: one carrier, one name,
 // and a `name` key would be a second place to say it that a rename would leave
 // disagreeing with the filename.
@@ -78,11 +80,35 @@ import (
 // none for verification state. Both absences are the point rather than an
 // oversight: a file that could set them could contradict its own recipe, or
 // mint a metric asserting it is verified.
+//
+// `tags` is three-state too, and RAW here so its refusals can name the entry
+// that caused them rather than surfacing encoding/json's "cannot unmarshal
+// number into Go struct field" at a person editing a list of names. See
+// parseTags.
 type metricFile struct {
 	Recipe            json.RawMessage `json:"recipe"`
 	Description       *string         `json:"description,omitempty"`
 	ReportingTimezone *string         `json:"reportingTimezone,omitempty"`
+	Tags              json.RawMessage `json:"tags,omitempty"`
 }
+
+// MaxTagNameBytes and MaxTagsPerMetric are the server's two tag caps
+// (rtag.MaxTagNameLen, rtag.MaxTagsPerResource), mirrored so a file that breaks
+// either is refused where it was written rather than at push time, half way
+// through a folder.
+//
+// ⚠️ BYTES, NOT CHARACTERS. The server measures a name with len(), so 33 `ö`s —
+// 33 characters — are 66 bytes and refused. A client counting runes would pass
+// exactly the names the server then refuses.
+//
+// ⚠️ MaxTagsPerMetric bounds the FILE, and only the file: the server's cap is on
+// the metric's FINAL set, which also holds whatever colleagues added in the web
+// app. A file within it can still be refused there, which the push reports and
+// records rather than predicting here.
+const (
+	MaxTagNameBytes  = 64
+	MaxTagsPerMetric = 20
+)
 
 // File is one parsed metric file.
 type File struct {
@@ -96,6 +122,17 @@ type File struct {
 	// An explicit "" is a RESET to the UTC literal, which the recipe route reads
 	// as its own third state; an absent key leaves the declaration alone.
 	ReportingTimezone *string
+	// Tags is the list of tag names the folder ASSERTS on the metric,
+	// three-state: nil is a folder that does not manage the metric's tags at
+	// all, an empty list asserts none, and names are trimmed and otherwise kept
+	// as spelled (case is the server's to fold).
+	//
+	// ⚠️ NOT PART OF Fingerprint, deliberately. Tags are not drafted — they sit
+	// on the live metric and a tag write needs no checkout, no build and no
+	// publish — so folding them into the recipe fingerprint would turn every tag
+	// edit into a re-staged, re-built draft of an unchanged definition. The tag
+	// half has its own record and its own pending question; see TagsFingerprint.
+	Tags *[]string
 }
 
 // Parse decodes one metric file.
@@ -142,7 +179,85 @@ func Parse(body []byte) (File, error) {
 		trimmed := strings.TrimSpace(*file.ReportingTimezone)
 		out.ReportingTimezone = &trimmed
 	}
+	if len(file.Tags) > 0 {
+		tags, err := parseTags(file.Tags)
+		if err != nil {
+			return File{}, err
+		}
+		out.Tags = &tags
+	}
 	return out, nil
+}
+
+// parseTags reads the `tags` value, refusing every shape the server would
+// refuse and one it would not.
+//
+// The one it would not is a DUPLICATE after case-folding. The server would
+// quietly collapse ["Finance", "finance"] into one tag, and the file would then
+// say two things where the metric holds one — a difference nothing reports.
+// Refusing it keeps one line of the file per tag on the metric.
+//
+// `null` is refused rather than read as absent: the two spellings of "this
+// folder does not manage tags" would otherwise be a key and no key, and the
+// person who wrote `null` more likely meant `[]`, which is the opposite.
+func parseTags(raw json.RawMessage) ([]string, error) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil || entries == nil {
+		return nil, fmt.Errorf("this file's \"tags\" is not a list of names (%s) — write [\"Finance\", \"Sales\"], write [] to assert none, or remove the key to leave the metric's tags alone", string(raw))
+	}
+	if len(entries) > MaxTagsPerMetric {
+		return nil, fmt.Errorf("this file's \"tags\" lists %d names, and a metric holds at most %d tags", len(entries), MaxTagsPerMetric)
+	}
+	out := make([]string, 0, len(entries))
+	seen := map[string]string{}
+	for i, entry := range entries {
+		var name string
+		if err := json.Unmarshal(entry, &name); err != nil {
+			return nil, fmt.Errorf("this file's \"tags\" entry %d is not a string (%s) — a tag is named by its name", i+1, string(entry))
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, fmt.Errorf("this file's \"tags\" entry %d is empty — a tag needs a name", i+1)
+		}
+		if len(name) > MaxTagNameBytes {
+			return nil, fmt.Errorf("this file's tag %q is %d bytes, over the %d-byte limit on a tag name", name, len(name), MaxTagNameBytes)
+		}
+		fold := FoldTagName(name)
+		if first, dup := seen[fold]; dup {
+			return nil, fmt.Errorf("this file's \"tags\" lists %q and %q, which are one tag — tag names are compared case-insensitively (as %q)", first, name, fold)
+		}
+		seen[fold] = name
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+// FoldTagName is the server's tag-name equality, lower(trim()), in Go — the ONE
+// comparison the metric loop's tag half makes, in the parser, the pending
+// predicate and the lock alike.
+//
+// It can disagree with Postgres' lower() on a few non-ASCII letters (İ, ß); the
+// server's handler folds the same way before its merge, so a name the two
+// disagree on is at worst reported pending once and then matched by id.
+func FoldTagName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// TagsFingerprint is the fingerprint of a file's tag list that a recorded tag
+// REFUSAL is held against: while the file still says the same thing, the
+// refusal stands and the metric is not tag-pending, so a folder whose tags the
+// server refused does not re-send the same doomed request on every push.
+//
+// Over the FOLDED, SORTED set rather than the file's bytes: reordering or
+// recasing the list changes nothing the server would answer, so it must not
+// read as an edit worth retrying. NUL-separated, so no two sets collide.
+func TagsFingerprint(tags []string) string {
+	folded := make([]string, 0, len(tags))
+	for _, name := range tags {
+		folded = append(folded, FoldTagName(name))
+	}
+	sort.Strings(folded)
+	return sha256Hex([]byte(strings.Join(folded, "\x00")))
 }
 
 // Source reads the name the recipe's `source` names — an alias this folder

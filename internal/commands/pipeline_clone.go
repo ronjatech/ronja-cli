@@ -115,6 +115,8 @@ directory must be empty or absent.`,
 			if err != nil {
 				return err
 			}
+			// Each cloned table's ENABLED health checks, as checks/<stem>.json.
+			checkFiles := fetchCloneChecks(cmd.Context(), client, sources)
 			// The binding is keyed by organization as well as instance, so it has
 			// to be known before one is written — and it is resolved BEFORE the
 			// first file is laid down, not after. A folder whose files landed and
@@ -171,6 +173,11 @@ directory must be empty or absent.`,
 					return fmt.Errorf("write %s: %w", m.Path, err)
 				}
 			}
+			for _, c := range checkFiles {
+				if err := wfdir.WriteFile(root, c.Path, string(c.Body)); err != nil {
+					return fmt.Errorf("write %s: %w", c.Path, err)
+				}
+			}
 
 			key := wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID}
 			manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: feature.Name}
@@ -224,6 +231,15 @@ directory must be empty or absent.`,
 				// reconcileMetricNameTaken rather than duplicating the row; a
 				// --stack folder has the recording committed and never gets there.
 				liveHash.setMetricSeen(m.Path, m.MetricID, m.LiveSHA256, m.Declared)
+				if len(m.Tags) > 0 {
+					liveHash.setMetricTagsApplied(m.Path, m.MetricID, m.Tags)
+				}
+			}
+			// Every check a clone writes is one the folder now owns, with the
+			// fingerprint it was read at — so the next push is a no-op, and an
+			// edit in the app after this is drift.
+			for _, c := range checkFiles {
+				liveHash.setChecksSeen(c.Path, c.TableID, c.Managed)
 			}
 			if err := recordFirstBindingInto(manifest, lock, key, binding); err != nil {
 				return err
@@ -273,10 +289,11 @@ directory must be empty or absent.`,
 					"files":       files,
 					"metrics":     len(metricSources),
 					"metricFiles": metricFiles,
+					"checkFiles":  len(checkFiles),
 					"skipped":     skippedPayload(skipped),
 				})
 			}
-			printPipelineCloneReport(root, resolved.URL, feature, sources, metricSources, skipped)
+			printPipelineCloneReport(root, resolved.URL, feature, sources, metricSources, checkFiles, skipped)
 			return nil
 		},
 	}
@@ -400,6 +417,12 @@ type metricCloneSource struct {
 	// disarms the drift guard rather than recording a hash of nothing.
 	LiveSHA256 string
 	URL        string
+	// Tags are the metric's tags as the clone read them, written into the file
+	// and recorded as this folder's own — so the clone reads as clean, and a
+	// name later dropped from the file is removed. Nil when the metric has none
+	// OR when they could not be read; the file then has no `tags` key, which
+	// leaves them alone.
+	Tags []wfdir.AppliedTag
 }
 
 // fetchCloneMetrics reads each metric's recipe and lays out the file that
@@ -455,7 +478,20 @@ func fetchCloneMetrics(ctx context.Context, client *api.Client, used map[string]
 				item.ID, item.Name)
 			continue
 		}
-		body, err := renderMetricFile(row)
+		// The TAGS, per metric. A read that fails — a non-admin on an archived
+		// metric, an instance with no tag route — writes NO key and says so,
+		// never `[]`: an empty list ASSERTS no tags, and the next push would strip
+		// every tag the metric has.
+		var tags []wfdir.AppliedTag
+		if live, err := client.ListTableTags(ctx, row.IdentityID()); err != nil {
+			fmt.Fprintf(os.Stderr, "  Note: the tags on metric %s (%s) could not be read (%v), so its file has no \"tags\" key and the folder leaves them alone.\n",
+				item.ID, item.Name, err)
+		} else {
+			for _, tag := range live {
+				tags = append(tags, wfdir.AppliedTag{ID: tag.ID, Name: tag.Name})
+			}
+		}
+		body, err := renderMetricFile(row, tags)
 		if err != nil {
 			return nil, fmt.Errorf("write the metric file for %s (%s): %w", item.ID, item.Name, err)
 		}
@@ -471,6 +507,7 @@ func fetchCloneMetrics(ctx context.Context, client *api.Client, used map[string]
 			Declared:   declared,
 			LiveSHA256: metricfile.RecipeSHA256(row.MetricRecipe),
 			URL:        row.URL,
+			Tags:       tags,
 		})
 	}
 	return out, nil
@@ -479,10 +516,21 @@ func fetchCloneMetrics(ctx context.Context, client *api.Client, used map[string]
 // renderMetricFile lays out one metric row as the file that defines it,
 // pretty-printed so the thing a person is about to edit reads as a document
 // rather than as one line of JSON.
-func renderMetricFile(row *api.Table) (string, error) {
+//
+// `tags` are written as a `tags` list only when there are some: a metric with
+// none gets no key, so the folder does not start out asserting "no tags" about
+// a metric a colleague may tag tomorrow.
+func renderMetricFile(row *api.Table, tags []wfdir.AppliedTag) (string, error) {
 	file := map[string]any{"recipe": row.MetricRecipe}
 	if row.Description != "" && row.DescriptionSource == api.DescriptionSourceUser {
 		file["description"] = row.Description
+	}
+	if len(tags) > 0 {
+		names := make([]string, 0, len(tags))
+		for _, tag := range tags {
+			names = append(names, tag.Name)
+		}
+		file["tags"] = names
 	}
 	body, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
@@ -670,7 +718,7 @@ func skippedPayload(s skippedTables) map[string]any {
 }
 
 func printPipelineCloneReport(root, url string, feature *api.Feature, sources []cloneSource,
-	metrics []metricCloneSource, skipped skippedTables) {
+	metrics []metricCloneSource, checks []checksCloneFile, skipped skippedTables) {
 
 	out := os.Stdout
 	fmt.Fprintf(out, "  Cloned %q into %s\n\n", feature.Name, root)
@@ -685,6 +733,9 @@ func printPipelineCloneReport(root, url string, feature *api.Feature, sources []
 	}
 	for _, m := range metrics {
 		fmt.Fprintf(out, "    %-40s %s\n", m.Path, m.MetricID)
+	}
+	for _, c := range checks {
+		fmt.Fprintf(out, "    %-40s %d health %s\n", c.Path, c.Count, plural(c.Count, "check"))
 	}
 	if notCloned := skipped.KindCount + skipped.RecipeUnavailable; notCloned > 0 {
 		fmt.Fprintf(out, "\n  Not cloned: %d\n", notCloned)
