@@ -145,6 +145,19 @@ HTTP handles badly. It still owns no list, browse or delete. If an agent needs s
 better pointer in `context` or a better guide behind `/llms.txt` — not a new
 command.
 
+A third kind sits beside the sync loops and the transport commands: **credential
+handshakes**. A credential needs an interactive half — an echo-off prompt, a
+browser approval, a provider's consent screen — and plain HTTP cannot do that
+half without putting the credential in an argument list, a shell history or a
+transcript. The CLI may own exactly that half. `ronja login`, `ronja secret
+create`, `ronja secret connect` and `ronja token create` are handshakes. Each
+one creates or stores one credential. None
+of them prints a credential. None of them grows a list, show, rotate or delete:
+whether a credential exists, and revoking it, stay on `ronja api` and in Ronja.
+(`ronja env` and `ronja db env`/`connect` are the loaders: they move a credential
+the CLI already holds into the place another program reads it, and only as
+something to `eval` or exec.)
+
 `ronja db promote` is the one verb in that set whose two ends are both remote,
 and it passes the same test rather than getting an exception: it moves a ledger
 **tail** from a database's dev copy onto the database, comparing the shared
@@ -218,6 +231,14 @@ the answer.
 
 Neither one moves the line on discovery. There is still no `list`, no `browse`,
 no `delete`: finding out what exists stays on plain HTTP behind `/llms.txt`.
+
+**Nor is there a `ronja mcp` verb.** An AI assistant that should *answer*
+questions from an organization's data connects to the backend's MCP endpoint
+(`POST /api/v2/mcp`, read-only tools) with the Personal Access Token
+`ronja login` minted — loaded, never printed: the client config names
+`${RONJA_TOKEN}` and the client is started after `eval "$(ronja env)"`. Recipe:
+`backend/lib/api/openapi/guides/mcp.md` (served at `/docs/api/guides/mcp.md`);
+design: `claude/MCP-ENDPOINT.md`.
 
 Customer-facing documentation lives at
 [`docs-site/src/content/docs/guides/use-the-cli.md`](https://ronja.tech/docs/guides/use-the-cli/),
@@ -814,6 +835,312 @@ port (`https://host:443`) is folded onto the implicit form, so a caller who type
 one is not refused for reaching the other; and the guard implements its own
 10-hop limit, because supplying a `CheckRedirect` **replaces** net/http's default
 policy, which was the only thing stopping a same-origin redirect loop.
+
+## Secrets (`ronja secret create`, `ronja secret connect`)
+
+```
+ronja secret create --feature <feature-id> --name <name>
+    (--host <host>... [--field <name>...] | --dialect <database>)
+    [--description <text>] [--from-file <path> | --in-browser [--no-browser]] [--json]
+```
+
+Stores a credential in Ronja with one `POST /api/v2/secret`, taking the value
+from a person in the one way plain HTTP cannot: without it ever being an
+argument. With `--in-browser` the CLI takes no value at all — see below.
+
+**Kind.**
+- `--host` (repeatable) makes an **API key**: each one is a host the value may
+  be sent to (`api.stripe.com`, `*.example.com`) — a bare hostname, since it is
+  matched against the hostname of the URL a request goes to; a URL, a path, a
+  port or a user is refused rather than stored to never match. It is `--host`
+  and not `--url` because `--url` is the global flag naming the Ronja instance. `--field`
+  (repeatable) names the values to store, default one called `apiKey`; every
+  field is also listed as one a Workflow may read, since a field left off that
+  list is one nothing can ever use.
+- `--dialect` (`postgres`, `mysql`, `sqlserver`, `snowflake`, `bigquery`, …)
+  makes a **database login**. The server applies the database's own list of
+  fields and refuses a login missing one it needs to connect, naming it.
+  `--host` and `--field` are refused beside it.
+
+**Where the value comes from**, decided in this order, with no fallback — and
+only once the CLI knows it is signed in, so a piped value is never read by a
+command that was always going to refuse:
+1. `--from-file <path>`, or stdin when it is not a terminal (both read whole,
+   capped at 1 MiB — no credential is that large, so over the cap is refused as
+   the wrong input on either). With one API-key field the content is the value,
+   minus one trailing newline (`\n` or `\r\n`); content that is a JSON object
+   carrying that field's name is stored whole as given, with a warning on stderr.
+   Otherwise it is a JSON object of field → value, each field named once; an API
+   key's object must carry exactly the `--field` names, each a string, and a
+   database login's is sent as written (numbers stay numbers). Empty input is
+   refused — `no value on stdin — pipe one in, or pass --in-browser to enter
+   it yourself in Ronja` — rather than becoming a prompt nobody will
+   answer, and never by quietly opening a browser.
+2. A terminal: each API-key field is prompted for on stderr with echo off, and
+   Ctrl-C at the prompt stops at once with nothing stored. A database login
+   takes a JSON object, so on a terminal without `--from-file` it is refused.
+
+```
+pbpaste | ronja secret create --feature collection-abc --name Stripe --host api.stripe.com
+ronja secret create --feature collection-abc --name Warehouse --dialect postgres --from-file db.json
+```
+
+**Refused before anything is sent:** a `--field apiKey=sk-…` (values are never
+flags — they end up in your shell history), an empty value, a `--field` given
+twice, a `--host` that is not a bare host, a JSON key given twice, `--dialect`
+with `--host` or `--field`. There is no `--value` flag, and a test pins that.
+
+**What it prints.** One line on stdout — the id, the name, the kind, the
+feature, and each field's name and length:
+
+```
+secret-abc123  Stripe (api_key, feature collection-abc, 1 field: apiKey — 107 chars)
+```
+
+A length is the one thing about a value that is safe to show, and it is what
+catches a truncated paste. `--json` prints the same as metadata (`id`, `name`,
+`secretType`, `featureID`, `fields[{name, length}]`). A server refusal is
+forwarded as the error, scrubbed first of every API-key value and of every
+database-login field whose name marks it sensitive (the server's own
+`password|key|secret|token|…` pattern) — the server does not echo a credential
+today, and this is the CLI's half of that guarantee. A login's other fields are
+left alone, since they are the very words a refusal is made of.
+
+**`--in-browser` — the value is entered in Ronja, not here.** For a value that
+must not pass through whatever runs the command: an AI agent has no terminal to
+be prompted at, and its transcript is no place for a key. Only when asked —
+there is no fallback into it. Nothing is read from stdin, a prompt or a file
+(`--from-file` is refused beside it). **The guarantee, and its limit:** the
+value never passes through the requesting program, its arguments, a shell
+history or a transcript; whoever can edit the secret or the feature's
+workflows — the same login included — can still use it and change where it
+goes.
+1. `POST /api/v2/secret/pending` creates a **pending** secret — the name, the
+   hosts (or the dialect) and the fields, no value — and answers `{secret, url,
+   reused, existing}`. Every requested API-key field is marked required in the
+   field schema; all must be filled before saving. Database fields use the
+   server's schema, including its optional fields. `url` is the secret's page,
+   built and org-stamped by the server; the CLI opens it as given and never
+   builds one. The server refuses,
+   on this route only, an allowlist a pasted value could leave by: `*`, a
+   wildcard over a suffix other people control (`*.com`, `*.co.uk`,
+   `*.github.io`, `*.googleapis.com`) and anything that is not a plain ASCII
+   hostname (an internationalised name goes in its `xn--` form). That refusal is
+   a floor, not an exhaustive list: the person still reads the hosts. It also
+   refuses a `pingConfig` (a health probe is a URL Ronja requests with the value
+   attached, so a requester would be choosing where the value first goes; set
+   one with `PUT /secret/:id` after the fill), and a control, bidi or zero-width
+   character in the name or description. The CLI sends none of these. The route
+   refuses an API token (its principal is not a person, so no one could fill
+   the secret): `--in-browser` needs a `ronja login`.
+2. `existing` — secrets you can already reach that point at the same host or
+   database engine — is printed on stderr as a notice. It never stops the run.
+3. The page is opened, or printed on stderr with `--no-browser` ("the form to
+   enter it shows only for you, signed in"). Anyone who can read the secret can
+   open the page; for the person the secret belongs to it is ONLY a short form
+   (**Connect** <name>): one line naming the registrable domain each host
+   belongs to ("Ronja will use this to connect to stripe.com."), plain-language
+   warnings for a non-ASCII host, an entry matching no host and a wildcard, the
+   fields, **Save**, and who asked (you, Ronja's agent in a chat, the access
+   token by name, or an app or automation). **Secret settings** opens the full
+   page at `?view=settings`, where the same form sits under **Enter the
+   value**. The save is refused (409, nothing stored) if the secret changed
+   after the page was rendered.
+4. The CLI polls `GET /api/v2/secret/<id>` every 3 s until `status` is `ready`
+   (pending → ready has no other cause). A 404 is terminal; transient failures
+   get the login poll's window; Ctrl-C stops the wait and leaves the secret
+   pending. After 15 minutes: `still waiting for the value after 15 minutes.
+   Secret <id> stays pending; finish it at <url> or re-run with the same
+   arguments`.
+
+A re-run with the same name in the same feature, once the first run has
+answered, gets the same pending secret back (`Using the pending secret you
+started earlier`) when nothing differs — two runs in flight at once may each
+create one; a
+difference is the server's 409, naming the field — finish or delete that one,
+or pick another name. A secret that is already ready is never reused. Against a
+server without the route: `this Ronja server can't take a value in the browser
+yet (the CLI is newer)`. The result line has the terminal path's shape, with
+`value entered in Ronja` (or `<dialect> login entered in Ronja`) where the
+lengths would be — they never passed through this process; `--json` adds
+`enteredInRonja: true`.
+
+A secret's existence, its value's lengths, and deleting it stay on `ronja api`
+(`/api/v2/secret/query`, `/api/v2/secret/:id/field-lengths`,
+`-X DELETE /api/v2/secret/:id`) and in Ronja.
+
+### Connecting a service (`ronja secret connect`)
+
+```
+ronja secret connect <service> [--feature <id>] [--scope <scope>...] [--no-browser] [--json]
+```
+
+Connects one of Ronja's managed OAuth services (`gmail`, `google_sheets`,
+`hubspot`, `fortnox`, …) by sending a person through the provider's own consent
+screen — from a page in Ronja, never by opening the provider out of a terminal.
+The CLI calls `POST /api/v2/oauth/<service>/initiate` with its login and opens
+the `url` it answers: the secret's page with `?connect=<service>` (and a
+`scope=` per `--scope`). For the secret's owner that page is only a **Connect**
+<service> view saying what Ronja is asking to do and who asked; the provider's
+sign-in opens, in the app's shared OAuth popup, only when they click
+**Continue to** <provider>, and that click runs the same initiate from the
+browser — so the `state` minted for the CLI's call simply expires unused. The
+CLI waits on `GET /api/v2/secret/<id>`. The provider still redirects to Ronja's
+registered callback, and the one-shot `state` is minted and consumed exactly as
+in the app, so the CLI never sees a provider token. Against a server whose
+initiate returns no `url`, the CLI opens the `authURL` itself, as it used to;
+the callback page, opened in a plain tab, then first tries to close itself and
+otherwise says "Connected. You can close this tab — if you started from a
+terminal, return to it." A failed sign-in there says "If you started from a
+terminal, return to it, press Ctrl-C and run the command again."
+
+1. Initiate answers `{authURL, secretID, requestedScopes}` — `requestedScopes`
+   is exactly what this run asks the provider for. Without `--scope`, a
+   service with no scope choice asks for its scopes plus the connection's
+   current grant, and one with a choice asks for its required scopes plus the
+   stored scopes still in its catalog (its default set when there are none) —
+   so a stored scope the catalog dropped is NOT in the request. With `--scope`
+   it is exactly the chosen set (plus anything the service requires), which
+   REPLACES the grant. There is one connection per provider and person, so
+   connecting a second Google service widens the Google connection;
+   `--feature` places a NEW connection, and when the connection already lives
+   elsewhere the command says so on stderr and uses it.
+2. **Already connected** — the secret is `ready` and its recorded grant COVERS
+   `requestedScopes` (without `--scope`) or EQUALS it as a set (with `--scope`)
+   — prints `already connected: …`, exits 0 and opens nothing. Coverage is
+   enough without `--scope` because a consent over a grant that already covers
+   the request could only REMOVE scopes the service does not use; `--scope`
+   replaces the grant, so a broader grant that covers a narrowing request is
+   not done. Coverage is the server's `ScopesCover` rule: `offline_access` asks
+   for a refresh token and is never granted back, and a full Google scope
+   covers its `.readonly` variant.
+3. Otherwise the page `url` is opened (http/https only, as `login` does) and
+   printed to stderr, or only printed with `--no-browser`; only the secret's
+   owner can connect from it. Against an older server the `authURL` takes its
+   place, with the old residual: it carries the `state`, and whoever completes
+   it connects THEIR provider account to the caller's secret. Neither is ever
+   on stdout or in `--json`.
+4. **Completion** (a 3 s poll, up to 15 minutes from the page — its link does
+   not expire, and Continue mints a fresh 10-minute `state` — or 10 minutes,
+   the `state`'s TTL, from an `authURL`): from
+   `pending` or `reauth_required`, the status reaching `ready`; from `ready`, a
+   CHANGE in `grantedScopes`, the column only the callback writes. `updatedAt`
+   is never read — a background token refresh bumps it. A 404 is terminal
+   ("the secret was deleted while waiting"); a dropped connection, a 429 or a
+   5xx is tolerated for 90 s like the login poll; Ctrl-C stops.
+5. **Report**: `connected: <secretID> (<name>, scopes: …)` on stdout. If the
+   recorded grant lacks some of `requestedScopes` (a granular consent screen
+   with a box unticked), the error names them and the command exits 1. A
+   timeout prints the grant recorded so far — a provider-side failure reads the
+   same as an abandoned sign-in, because the callback reports errors only to
+   the browser. Unticking exactly the new permissions on the consent screen of
+   a `ready` connection leaves its recorded grant unchanged, so there is nothing
+   to see and the command waits out its limit; its timeout then says "…, or the
+   consent finished without granting anything new: the recorded grant is
+   unchanged", the second reading offered only for a connect that started from
+   `ready`. From the page the timeout adds that connecting there still works.
+
+An older server answers without `requestedScopes`: the command then never
+claims "already connected", always opens the sign-in, and skips the coverage
+check with "this server can't confirm the scopes; check the secret in Ronja".
+Re-consenting a `ready` connection to the SAME grant has no server-visible
+change to wait on, so it is not offered; that stays on the Integrations page's
+Reconnect.
+
+**Refusals.** An unknown service is the server's 400, forwarded — it lists
+every service this deployment can connect. `outlook_mailbox` is refused: it is
+the mailbox-only Microsoft grant, connected by an admin as a mailbox. A scoped login without `secrets:write` gets "this login's
+token cannot write secrets (needs secrets:write)". `--json` prints
+`secretID`, `name`, `status`, `grantedScopes`, `missingScopes` (`null` when the
+server could not say), `featureID` and `alreadyConnected` (true when nothing
+had to be signed in to).
+
+## Tokens (`ronja token create`)
+
+```
+ronja token create --name <name> --scope <scope>:<read|write>...
+    [--expires <N>d|<YYYY-MM-DD>|never] [--no-browser] [--no-wait] [--json]
+```
+
+Gives an app its own Ronja token without the token ever reaching the terminal.
+A token is minted only by a person signed in to Ronja in a browser: `POST
+/api/v2/authentication/token` refuses every token, this CLI's login included,
+because a login is full access and "no wider than itself" would bound nothing.
+So the command does not mint. It hands the mint to the browser:
+
+1. `GET /api/v2/authentication/token-link?name=…&scope=…&expires=…` — the
+   server checks the caller is an **Admin** (403 with the Account page's own
+   sentence, "Only an Admin can create a personal access token."), checks every
+   scope against the one scope vocabulary, caps the name at 200 characters and
+   checks the expiry's shape — `<N>d` between `1d` and `3650d`, or a date no
+   earlier than today in UTC (400 naming the bad one, before any browser
+   opens) — and answers the URL of **Account → Access tokens** with the create
+   form pre-filled. The query is `new=1` first, then `expires`, `name`,
+   `scope`, then `org`: `/account?new=1&expires=…&name=…&scope=…
+   &org=<organization>#tokens`. The `org` is what makes a browser signed in to
+   another organization ask before it shows the form. The expiry is passed
+   through as given: the PAGE resolves `<N>d` to N days from its own today, in
+   the browser's timezone, since the date a token expires on is a date there.
+   The route mints nothing and writes nothing. The command then prints the
+   organization on stderr — the profile's name for it, or the link's `org` id
+   under an environment token.
+2. Unless `--no-wait`, the ids of the caller's tokens (`GET
+   /api/v2/authentication/token-mine`) are snapshotted **before** the link
+   opens.
+3. The link is opened as the server answered it, or printed to stderr with
+   `--no-browser`. The form opens pre-filled under "Pre-filled from the Ronja
+   CLI for <organization> — review before you create." and is never submitted
+   for the person; an unknown scope in a hand-edited link, or an expiry that is
+   not after the browser's today, shows in red and blocks **Create** (the
+   expiry until a date is picked or never is chosen, so a token never quietly
+   falls back to never expiring). The person clicks **Create token** and copies
+   the token from the page, where it is shown once.
+4. Unless `--no-wait`, the command reports the new token by diffing the
+   caller's token list: `token-mine` is polled (3 s, up to 10 minutes) for an
+   id that was **not** in the snapshot AND whose name is `--name` or whose
+   grant is exactly the requested scopes — so the person may rename the token
+   on the form, or change its scopes, but not both. A new token that matches
+   neither (another terminal's `ronja login`, an MCP client signing in: full
+   access, so never a scope match) is named on stderr as it appears and does
+   not end the wait. On stdout:
+
+   ```
+   created: api_token-d3f…  Sales dashboard  data:read, structure:write  expires never
+   ```
+
+   An expiry prints as an RFC 3339 instant with its offset
+   (`expires 2026-12-30T00:00:00+01:00`), never a bare date: the form sends
+   midnight in the browser's zone, which is the day before in a zone west of
+   it. The rows' `token` field is never decoded (the route blanks it anyway).
+
+   `--json` prints one object with `status: "created"` and a `tokens` array.
+   Each entry carries `id`, `name`, `scopeGrants` and `expiresAt` (an RFC 3339
+   instant, or `null` for no expiry). All matching new tokens are included.
+   With `--no-wait`, the object is `{"status":"pending","tokens":[]}`: creation
+   has not been observed. Links and progress stay on stderr; neither form
+   contains token values.
+
+`--scope` is required, repeatable and comma-separable. There is no
+`--full-access`: a token with full access is a choice made on the form, so
+nothing an agent passes can pre-select it. `--expires` defaults to **never** —
+an app built on the token must not stop working on a date nobody chose — and
+takes `90d` (days from when the form is opened) or a date; `never` sends no
+expiry at all.
+
+**Refusals.** A 403 from a scoped login without `admin` (on either route):
+"this login can't manage tokens (its token lacks admin scope). Create the
+token in Ronja under Account → Access tokens." A 404 on `token-link` is an
+older server: "this Ronja server is older than the CLI. Create the token in
+Ronja under Account → Access tokens." A 404 on `token-mine` mid-wait is
+terminal; a dropped connection, a 429 or a 5xx is tolerated for 90 s like the
+other waits; Ctrl-C stops waiting (the form stays open); after 10 minutes it
+says "no new token named "<name>" or with exactly the scopes asked for appeared
+within 10 minutes; if you created it, it is in Account → Access tokens", and
+lists the new tokens that did not match.
+
+Listing and revoking tokens stay on `ronja api`
+(`/api/v2/authentication/token-mine`, `-X DELETE
+/api/v2/authentication/token-mine/<id>`) and in Ronja.
 
 ## Requests (`ronja api`)
 
@@ -4005,7 +4332,7 @@ run) is pending too.
    overwrites the checks too — there is no checks-only flag;
 3. **orphans** — checks the folder created that no entry in the file resolves
    to — refuse the table's checks until `--prune`, which **silences** them
-   (`enabled: false`; there is no delete) *before* any create, so renaming a
+   (`enabled: false`; the CLI and the HTTP routes have no delete) *before* any create, so renaming a
    freshness watchdog (one enabled per table) or renaming at the per-table cap
    lands in one push. An orphan is decided **by row**: each entry's live row is
    found first (the check the folder owns under the entry's name, by id, then by
@@ -4044,6 +4371,16 @@ on the table, with `enabled` undeclared, is `silenced`, never `unchanged`. Check
 on the table that are neither declared nor owned are left alone and listed.
 Matching is by name, so **renaming a check in the file creates a new one** and
 orphans the old; its history does not follow.
+
+**A check deleted in chat comes back.** Ronja's agent can delete a table's
+checks (`setTableChecks` with `remove`); the CLI cannot, and `--prune` still
+only silences. A check the file still declares that a chat deleted is
+re-created by the next `push`: its recorded id no longer resolves and no row
+holds its name, so it is a create — a new id, no history — and, being an HTTP
+write, a re-created check that is already failing notifies the admins. `--prune` silences a check
+this folder manages; to remove one for good, take it out of the file, then ask
+Ronja to remove it in a chat. The agent's tool description tells it to change
+the file instead of deleting a check a file manages.
 
 | outcome (`--json` `checks[]`) | means | exit |
 |---|---|---|
@@ -5482,6 +5819,17 @@ These are load-bearing for the agent use case — please keep them true:
 
 - **Sync verbs yes, resource verbs no.** A stateful filesystem-to-resource loop
   earns a command; wrapping a call does not.
+- **A credential handshake creates or stores one credential and prints none.** The
+  interactive half of a credential (an echo-off prompt, a browser approval, a
+  value pasted on a Ronja page, a provider's consent screen) may be a command; listing, showing, rotating or
+  deleting one may not. No value is ever a flag, and no value reaches stdout,
+  stderr or an error message. A link that completes a handshake (a login code,
+  a provider sign-in) goes to stderr only, never into `--json`.
+- **A Ronja token is minted in a person's browser, never by the CLI.** `POST
+  /api/v2/authentication/token` refuses every machine credential, the CLI's own
+  login included, and no command calls it — a test fails the whole package on
+  any request to it. `ronja token create` hands the mint to the browser: it
+  opens a pre-filled form the server built, and learns only the new token's id.
 - **Transport may be a command; endpoints may not.** `ronja api` is allowed
   precisely because it describes nothing and so cannot drift. A subcommand that
   names a route, a resource kind or a field is the wrapper this rules out. See
@@ -5520,7 +5868,7 @@ These are load-bearing for the agent use case — please keep them true:
 ```
 cmd/ronja/           main package — its NAME is what makes the binary `ronja`
 internal/commands/   cobra command tree (root, auth, context, env, api, query,
-                     stdin, bind, sync_*, workflow_*)
+                     secret, stdin, bind, sync_*, workflow_*)
 internal/api/        HTTP client + the endpoint shapes it mirrors, plus raw.go
                      (transport only, mirrors nothing), query.go and search.go
 internal/config/     the CLI config file (os.UserConfigDir()/ronja/config.json),

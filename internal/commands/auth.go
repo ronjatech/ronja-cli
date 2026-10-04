@@ -31,7 +31,7 @@ import (
 // read as instance health, and this CLI already has a `status` that means
 // something else entirely (`wf status`, about a folder).
 
-// There is deliberately NO `ronja token` command.
+// No command prints a token; `ronja token create` hands the mint to the browser.
 //
 // A command whose whole purpose is printing a live credential puts that
 // credential into a terminal scrollback, a CI log, or an agent transcript every
@@ -676,13 +676,20 @@ func readTokenFromStdin() (string, error) {
 
 // openBrowser is best-effort; every caller has a printed-URL fallback.
 //
+// A package var so a test can stand in for it: the handshakes' tests must pin
+// WHEN a browser opens (never for an already-held connection) and WHAT it is
+// handed, without spawning one.
+var openBrowser = openBrowserURL
+
+// openBrowserURL is openBrowser's real implementation.
+//
 // The URL arrives verbatim from whichever instance --url pointed at, and the
 // platform openers dispatch on SCHEME: `open` will happily hand a non-http URL
 // to whatever local application has registered that scheme, or open a path. So
 // the scheme is checked before anything is spawned. Host-matching is
 // deliberately NOT attempted — the approval page legitimately lives on the
 // frontend origin, which differs from the API origin in every real deployment.
-func openBrowser(raw string) error {
+func openBrowserURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("unusable verification URL: %w", err)

@@ -2035,3 +2035,79 @@ func TestPushStopsWhenAFileToDeleteMovesUnderIt(t *testing.T) {
 		t.Errorf("lib/old.py = %q — the refused delete happened anyway", got)
 	}
 }
+
+// A save warning that is about the WORKFLOW rather than the file just written
+// — entrypoint_main_guard re-fires on every save until the guard is gone — comes
+// back on every PUT of a push. The report says it once, on both surfaces: N
+// copies of one sentence read as N problems, and bury the ones that differ.
+func TestPushReportsEachDistinctSaveWarningOnce(t *testing.T) {
+	const guard = `main.py: entrypoint "main.py" wraps code in ` + "`if __name__ == \"__main__\":`"
+	files := map[string]string{"main.py": "M\n", "lib/a.py": "A\n", "lib/b.py": "B\n"}
+	withWarnings := func(f *fakeInstance) {
+		for path := range files {
+			f.saveWarnings[path] = []string{guard}
+		}
+		// One genuinely different warning must survive the dedupe.
+		f.saveWarnings["lib/b.py"] = append(f.saveWarnings["lib/b.py"], "lib/b.py: something else")
+	}
+
+	f := newFakeInstance(t)
+	signIn(t, f)
+	withWarnings(f)
+	out, err := runCLI(t, initFolder(t, f, files), "wf", "push", "--json")
+	if err != nil {
+		t.Fatalf("push --json: %v", err)
+	}
+	got, _ := decodeJSON(t, out)["warnings"].([]any)
+	if len(got) != 2 || got[0] != guard || got[1] != "lib/b.py: something else" {
+		t.Errorf("--json warnings = %q, want the guard once and the other warning once", got)
+	}
+
+	f = newFakeInstance(t)
+	signIn(t, f)
+	withWarnings(f)
+	out, err = runCLI(t, initFolder(t, f, files), "wf", "push")
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if n := strings.Count(out, "warning  "+guard); n != 1 {
+		t.Errorf("the human report printed the guard warning %d times, want 1:\n%s", n, out)
+	}
+	if !strings.Contains(out, "warning  lib/b.py: something else") {
+		t.Errorf("the distinct warning was lost:\n%s", out)
+	}
+}
+
+// The metadata patch has warnings of its own — rworkflow.Update names a main
+// guard in the file the entrypoint just moved onto, a door no file save covers,
+// since the file was saved while it was still a helper. The push reports them
+// alongside the file saves' (and deduplicated with them, by the same append).
+func TestPushReportsTheMetadataPatchWarnings(t *testing.T) {
+	const guard = `run.py: entrypoint "run.py" wraps code in a guard`
+	f := newFakeInstance(t)
+	f.AddWorkflow(
+		&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft, Entrypoint: "main.py"},
+		api.WorkflowFile{Path: "main.py", Content: "M\n"},
+	)
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	writeLocal(t, root, "run.py", "R\n")
+	manifest, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	manifest.Entrypoint = "run.py"
+	if err := wfdir.SaveManifest(root, manifest); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+	f.patchWarnings = []string{guard}
+
+	out, err := runCLI(t, root, "wf", "push", "--json")
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	got, _ := decodeJSON(t, out)["warnings"].([]any)
+	if len(got) != 1 || got[0] != guard {
+		t.Errorf("--json warnings = %q, want the metadata patch's warning", got)
+	}
+}

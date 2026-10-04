@@ -275,6 +275,10 @@ type fakeInstance struct {
 	validated []api.ValidateInput
 	// saveWarnings maps a file path to the soft warnings its PUT returns.
 	saveWarnings map[string][]string
+	// patchWarnings is the `{warnings}` PUT :id (the metadata patch) answers
+	// with — rworkflow.Update's soft notices, e.g. the entrypoint moving onto a
+	// file that carries a main guard.
+	patchWarnings []string
 	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
 	// ordinary user), mirroring sherlock's downward-counting scale.
 	privilegeLevel int
@@ -1010,6 +1014,10 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			f.runtimePatches[id] = patch.RuntimeVersion
 		}
 		f.patchServed = true
+		if len(f.patchWarnings) > 0 {
+			writeJSON(w, map[string]any{"warnings": f.patchWarnings})
+			return true
+		}
 		writeJSON(w, nil)
 		return true
 	}

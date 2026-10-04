@@ -285,13 +285,13 @@ func TestCreateAndUpdateWorkflow(t *testing.T) {
 		t.Error("binding slices were not normalized")
 	}
 
-	if err := client.UpdateWorkflow(context.Background(), "wf-new", WorkflowPatch{Title: "New name"}); err != nil {
+	if _, err := client.UpdateWorkflow(context.Background(), "wf-new", WorkflowPatch{Title: "New name"}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if err := client.UpdateWorkflow(context.Background(), "wf-new", WorkflowPatch{Entrypoint: "run.py"}); err != nil {
+	if _, err := client.UpdateWorkflow(context.Background(), "wf-new", WorkflowPatch{Entrypoint: "run.py"}); err != nil {
 		t.Fatalf("entrypoint patch: %v", err)
 	}
-	if err := client.UpdateWorkflow(context.Background(), "wf-new", WorkflowPatch{}); err != nil {
+	if _, err := client.UpdateWorkflow(context.Background(), "wf-new", WorkflowPatch{}); err != nil {
 		t.Fatalf("empty patch: %v", err)
 	}
 	// Each field OMITTED when there is none: every field of the server's Patch

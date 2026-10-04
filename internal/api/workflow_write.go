@@ -31,6 +31,12 @@ import (
 // FindingSecretDropped.
 const SeverityError = "error"
 
+// SeverityInfo is mirrored for the same reason: the summary a person reads
+// counts it as a NOTE rather than a warning. Every other tier — `warning`, an
+// empty one, one this build has never heard of — is counted as a warning, so a
+// new tier is reported as something to read, never hidden behind "Clean".
+const SeverityInfo = "info"
+
 // FindingSecretDropped is the code the server reports for a binding its save
 // will FILTER OUT rather than refuse: a `{{ secret }}` marker naming a secret
 // the author cannot reach. The workflow saves, the binding is silently dropped,
@@ -263,13 +269,21 @@ func (c *Client) CreateWorkflow(ctx context.Context, in CreateWorkflowInput) (*W
 	return &out, nil
 }
 
-// UpdateWorkflow patches a workflow's metadata.
+// UpdateWorkflow patches a workflow's metadata and returns the endpoint's
+// `{warnings}` — soft save-time notices such as a draft's non-member approvers,
+// or an entrypoint moved onto a file that carries a main guard, which no file
+// save reports because that file was saved while it was still a helper.
 //
-// The endpoint answers with `{warnings}` — save-time notices such as a draft's
-// non-member approvers — which this client does not decode, and it carries no
-// row, so a caller that needs the row's current state re-reads it afterwards.
-func (c *Client) UpdateWorkflow(ctx context.Context, id string, patch WorkflowPatch) error {
-	return c.Do(ctx, "PUT", "workflow/"+url.PathEscape(id), patch, nil)
+// The response carries no row, so a caller that needs the row's current state
+// re-reads it afterwards.
+func (c *Client) UpdateWorkflow(ctx context.Context, id string, patch WorkflowPatch) ([]string, error) {
+	var out struct {
+		Warnings []string `json:"warnings"`
+	}
+	if err := c.Do(ctx, "PUT", "workflow/"+url.PathEscape(id), patch, &out); err != nil {
+		return nil, err
+	}
+	return out.Warnings, nil
 }
 
 // CheckoutWorkflow gets-or-creates the caller's own draft of a live workflow.

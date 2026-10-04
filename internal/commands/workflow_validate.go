@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 
@@ -85,7 +86,7 @@ With --json, the server's response verbatim plus an "ok" boolean and any local
 					return err
 				}
 			} else {
-				printValidateReport(result, len(aliases.Refusals))
+				printValidateReport(os.Stdout, result, len(aliases.Refusals))
 			}
 			if !result.OK() {
 				return fmt.Errorf("%s", countErrors(result))
@@ -329,11 +330,20 @@ func nonNilFindings(findings []api.ValidateFinding) []api.ValidateFinding {
 }
 
 func countErrors(result *api.ValidateResult) string {
-	errs := len(result.Errors())
-	warnings := len(result.Findings) - errs
-	msg := fmt.Sprintf("%d %s", errs, plural(errs, "error"))
-	if warnings > 0 {
-		msg += fmt.Sprintf(" and %d %s", warnings, plural(warnings, "warning"))
+	c := countFindings(result.Findings)
+	msg := fmt.Sprintf("%d %s", c.errors, plural(c.errors, "error"))
+	var rest []string
+	if c.warnings > 0 {
+		rest = append(rest, fmt.Sprintf("%d %s", c.warnings, plural(c.warnings, "warning")))
+	}
+	if c.notes > 0 {
+		rest = append(rest, fmt.Sprintf("%d %s", c.notes, plural(c.notes, "note")))
+	}
+	switch len(rest) {
+	case 1:
+		msg += " and " + rest[0]
+	case 2:
+		msg += ", " + rest[0] + " and " + rest[1]
 	}
 	return msg + " — nothing was saved"
 }
@@ -345,18 +355,22 @@ func countErrors(result *api.ValidateResult) string {
 // command is about to fail. The server genuinely found nothing — it was sent
 // unresolved names and had no opinion about them — so the two are reported as
 // the two separate answers they are rather than added together.
-func printValidateReport(result *api.ValidateResult, aliasRefusals int) {
-	printFindings(os.Stdout, result.Findings)
-	out := os.Stdout
-	errs := len(result.Errors())
-	warnings := len(result.Findings) - errs
+func printValidateReport(out io.Writer, result *api.ValidateResult, aliasRefusals int) {
+	printFindings(out, result.Findings)
+	// Never "Clean" over a warning: a warning is a finding on a candidate that
+	// SAVES, and some — entrypoint_main_guard — are never refused anywhere
+	// later either, so the headline is the last chance to get them read.
+	c := countFindings(result.Findings)
 	switch {
-	case errs > 0:
-		fmt.Fprintf(out, "\n  %d %s, %d %s — a save would be refused\n",
-			errs, plural(errs, "error"), warnings, plural(warnings, "warning"))
-	case warnings > 0:
+	case c.errors > 0:
+		fmt.Fprintf(out, "\n  %d %s, %d %s%s — a save would be refused\n",
+			c.errors, plural(c.errors, "error"), c.warnings, plural(c.warnings, "warning"), c.notesSuffix())
+	case c.warnings > 0:
+		fmt.Fprintf(out, "\n  No errors, %d %s%s — a save would succeed; read them above\n",
+			c.warnings, plural(c.warnings, "warning"), c.notesSuffix())
+	case c.notes > 0:
 		fmt.Fprintf(out, "\n  Clean, with %d %s — a save would succeed\n",
-			warnings, plural(warnings, "warning"))
+			c.notes, plural(c.notes, "note"))
 	default:
 		fmt.Fprintf(out, "  Clean.\n")
 	}
@@ -374,7 +388,7 @@ func printValidateReport(result *api.ValidateResult, aliasRefusals int) {
 // one file at a time, and an ID referenced from three files is three edits.
 // Files are ordered with the ones carrying errors first, so the thing that has
 // to be fixed is at the top rather than wherever it fell alphabetically.
-func printFindings(out *os.File, findings []api.ValidateFinding) {
+func printFindings(out io.Writer, findings []api.ValidateFinding) {
 	if len(findings) == 0 {
 		return
 	}

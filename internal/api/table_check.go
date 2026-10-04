@@ -5,7 +5,9 @@ package api
 // backend/api/v2/feature/api_model_check_authoring.go (the write bodies and
 // TableCheckWriteResult) and backend/resource/rtablecheck/model.go (Check).
 //
-// There is no delete, here or on the server.
+// There is no delete, here or anywhere over HTTP: only the in-app agent's
+// setTableChecks deletes a check. A pipeline push re-creates a check a chat
+// deleted if the folder's file still declares it.
 
 import (
 	"context"

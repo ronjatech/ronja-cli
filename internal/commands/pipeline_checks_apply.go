@@ -409,10 +409,10 @@ func applyTableChecks(ctx context.Context, client *api.Client, store liveHashes,
 			names = append(names, o.row.Name)
 		}
 		if file.Deleted {
-			return whole(checksOutcomeOrphaned, "%s is gone from this folder, and the checks it created on %s are still enabled: %s — push --prune silences them (there is no delete), or restore the file",
+			return whole(checksOutcomeOrphaned, "%s is gone from this folder, and the checks it created on %s are still enabled: %s — push --prune silences them (the CLI never deletes a check), or restore the file",
 				file.Path, tableID, quoteNames(names))
 		}
-		return whole(checksOutcomeOrphaned, "%s no longer declares %s, which this folder created — push --prune silences them (there is no delete), or put them back in the file",
+		return whole(checksOutcomeOrphaned, "%s no longer declares %s, which this folder created — push --prune silences them (the CLI never deletes a check), or put them back in the file",
 			file.Path, quoteNames(names))
 	}
 	pruned := map[string]bool{}

@@ -700,7 +700,16 @@ func edgesFromValidation(result *api.ValidateResult) (edges []syncEdgeReport, fi
 	for _, finding := range result.Findings {
 		kind, perReference := validateFindingKinds[finding.Code]
 		if !perReference {
-			if finding.IsError() {
+			// classifyFinding splits errors from the rest. Warnings and notes
+			// both land in `warnings` here, printed as `note` lines and never
+			// scored — deliberately NOT because the two tiers are equivalent
+			// (an entrypoint_main_guard warning is a real hazard), but because
+			// `sync check` answers ONE question, whether every reference the
+			// folder makes still resolves, and its `ok` is a verdict on
+			// references, not on the code. Carrying a tier would be a change to
+			// the --json `warnings []string` shape. The surfaces that judge the
+			// code — `wf validate`, `wf push`, `sync apply` — say "warning".
+			if classifyFinding(finding) == tierError {
 				findings = append(findings, fmt.Sprintf("%s: %s", finding.Code, finding.Message))
 			} else {
 				warnings = append(warnings, fmt.Sprintf("%s: %s", finding.Code, finding.Message))

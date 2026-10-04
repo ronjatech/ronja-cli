@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -363,9 +364,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 			result.Error = countErrors(validated)
 			return result, fmt.Errorf("%s", result.Error)
 		}
-		for _, finding := range validated.Findings {
-			fmt.Fprintf(os.Stderr, "  Warning: %s — %s\n", finding.Path, finding.Message)
-		}
+		printPushFindingLines(os.Stderr, validated.Findings)
 	}
 
 	// 4. Resolve the row to write to — the first step that changes anything.
@@ -470,7 +469,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// entrypoint — and the metadata patch below cannot name an entrypoint the
 	// row holds no file for.
 	warnings, err := putFiles(ctx, client, f.Codec, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
-	result.Warnings = append(result.Warnings, warnings...)
+	result.Warnings = appendDistinct(result.Warnings, warnings...)
 	if err != nil {
 		return stop(err)
 	}
@@ -483,9 +482,11 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	if !patch.Empty() {
 		// Read BEFORE applyPatch, which mirrors the accepted patch onto `target`.
 		runtimeBefore := target.RuntimeVersion
-		if err := client.UpdateWorkflow(ctx, target.ID, patch); err != nil {
+		patchWarnings, err := client.UpdateWorkflow(ctx, target.ID, patch)
+		if err != nil {
 			return stop(fmt.Errorf("update %s: %w", describePatch(patch), err))
 		}
+		result.Warnings = appendDistinct(result.Warnings, patchWarnings...)
 		if patch.RuntimeVersion != 0 {
 			result.RuntimeUpgradedFrom = runtimeBefore
 			result.RuntimeVersion = patch.RuntimeVersion
@@ -518,7 +519,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 
 	// 8. Deletions last.
 	warnings, err = deleteFiles(ctx, client, target.ID, local, remoteFiles, landed, preconditions, result)
-	result.Warnings = append(result.Warnings, warnings...)
+	result.Warnings = appendDistinct(result.Warnings, warnings...)
 	if err != nil {
 		return stop(err)
 	}
@@ -549,9 +550,9 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return result, refuseDroppedBindings(result)
 	}
 
-	// A re-read: PUT :id answers with nothing and drops the save-time warnings,
-	// and the file writes above have re-derived the row's bindings anyway, so
-	// the current row has to come from a fresh GET.
+	// A re-read: PUT :id answers with warnings but not the row, and the file
+	// writes above have re-derived the row's bindings anyway, so the current row
+	// has to come from a fresh GET.
 	updated, err := client.GetWorkflow(ctx, target.ID)
 	if err != nil {
 		return stop(fmt.Errorf("re-read %s after pushing: %w", target.ID, err))
@@ -1289,6 +1290,23 @@ func joinAnd(parts []string) string {
 		return strings.Join(parts, "")
 	}
 	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
+}
+
+// appendDistinct appends each of add that dst does not already hold, in order.
+//
+// A push's warnings are deduplicated because some are about the WORKFLOW rather
+// than the request that carried them: the server re-sends entrypoint_main_guard
+// (and the Durable advisories) on every file save until the code changes, so a
+// push of N files got N copies of one sentence — which read as N problems and
+// buried the warnings that differ. Exact-string equality is the whole rule; the
+// server's wording is verbatim, so two warnings that differ at all both print.
+func appendDistinct(dst []string, add ...string) []string {
+	for _, w := range add {
+		if !slices.Contains(dst, w) {
+			dst = append(dst, w)
+		}
+	}
+	return dst
 }
 
 // putFiles writes the folder's files into the target row, entrypoint leading

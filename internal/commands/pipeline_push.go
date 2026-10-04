@@ -126,7 +126,7 @@ holds the file's SQL and you have no open draft of it — otherwise they are
 reported "pending publish", and "ronja pipeline publish" applies them after the
 commit. Every checks file is visited, not only the changed .sql files. severity,
 description and enabled are managed only when present. A check removed from the
-file is refused until --prune, which silences it (there is no delete).
+file is refused until --prune, which silences it (the CLI never deletes a check).
 
 It refuses a table whose SQL changed on the server since your last sync — chat
 and the web builder edit the same draft — naming what moved, and it refuses on
@@ -191,7 +191,7 @@ Publishing is a separate step:
 	cmd.Flags().BoolVar(&force, "force", false,
 		"push even though a table's SQL, a metric's definition, or a health check this folder owns changed on the server since your last sync")
 	cmd.Flags().BoolVar(&prune, "prune", false,
-		"silence the health checks this folder created that its checks/ files no longer declare (there is no delete)")
+		"silence the health checks this folder created that its checks/ files no longer declare (the CLI never deletes a check)")
 	cmd.Flags().BoolVar(&retryTags, "retry-tags", false,
 		"re-send metric tags the 20-tag cap refused at an earlier push, even though the file's tags have not changed since")
 	cmd.Flags().BoolVar(&forceVerifiedMetric, "force-verified-metric", false,

@@ -233,6 +233,16 @@ through another interpreter to read it. api also has -F for file uploads and
   ronja api -X POST /api/v2/file/upload/uploads -F file=@report.pdf
   ronja api /api/v2/workflow/run/$id --wait-until '.status != "running"'
 
+And three credential handshakes, which own only the interactive half of a
+credential and never print one:
+
+  ronja secret create  store an API key or database login — typed at an
+                       echo-off prompt, piped, or read from a file, or
+                       with --in-browser entered by you in Ronja
+  ronja secret connect connect a service like Gmail by signing in to it
+  ronja token create   open Ronja's create-token form, pre-filled, for a
+                       person to create the token there
+
 And one command that talks to nothing on the server at all:
 
   ronja update         bring this binary forward to the newest release
@@ -315,7 +325,7 @@ credentials entirely and never touch disk.`,
 	root.AddCommand(newLoginCmd(), newLogoutCmd(), newWhoamiCmd(), newProfileCmd(),
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
 		newPipelineCmd(), newModuleCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(),
-		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newUpdateCmd())
+		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newSecretCmd(), newTokenCmd(), newUpdateCmd())
 	return root
 }
 
