@@ -69,26 +69,44 @@ func metadataPatch(manifest *wfdir.Manifest, target *api.Workflow) api.WorkflowP
 			patch.ReportingTimezone = &zone
 		}
 	}
-	// The runtime upgrade. Only ever RAISED, and only from a runtime the server
-	// actually told us about: a row whose runtimeVersion came back 0 is an
-	// instance that did not say (the field predates this CLI's contract with it),
-	// and patching a runtime on that guess would be changing semantics on a hunch.
-	// The DOWNGRADE half is not expressible here at all — checkRuntimeDrift
-	// refuses it before the push writes anything, because a folder that DECLARES
-	// runtime 1 against a Durable row is a mistake to report, not a patch to skip.
-	// A folder declaring NOTHING never reaches either branch: RuntimeVersion()
-	// answers RuntimeDefault for an absent key, and RuntimeDefault is the lowest
-	// runtime there is, so the `>` below cannot hold against any row the server
-	// actually reported.
-	if target.RuntimeVersion > 0 && manifest.RuntimeVersion() > target.RuntimeVersion {
-		patch.RuntimeVersion = manifest.RuntimeVersion()
-	}
+	// The runtime is NOT part of this patch: it is its own request, sent after
+	// the deletions (runtimeRaise).
 	return patch
 }
 
-// checkRuntimeDrift refuses the ONE runtime difference a push can never resolve:
-// a folder declaring the standard runtime against a workflow that is already
-// Durable.
+// runtimeRaise is the runtime a push raises the row to, 0 for none.
+//
+// Only ever RAISED, and only from a runtime the server actually told us about:
+// a row whose runtimeVersion came back 0 is an instance that did not say (the
+// field predates this CLI's contract with it), and raising a runtime on that
+// guess would be changing semantics on a hunch. The DOWNGRADE half is not
+// expressible here at all — checkRuntimeDrift refuses it before the push writes
+// anything, and refuses a raise to retired 2 the same way, so what reaches here
+// is always a raise to 3. A folder declaring NOTHING never raises:
+// RuntimeVersion() answers RuntimeDefault for an absent key, and RuntimeDefault
+// is the lowest runtime there is, so the `>` below cannot hold against any row
+// the server actually reported.
+//
+// It is sent ALONE and LAST — after the file writes, the metadata patch and the
+// deletions — because the server checks a raise to 3 against the file set the
+// row holds at that moment: sent with the metadata, before the deletions, a
+// legacy file this push is about to delete could fail the raise. Alone, so that
+// a refused raise refuses nothing else; and nothing records it in the baseline,
+// so a push that stops at it sends it again next time (metadataPatch and this
+// both compare the manifest with the SERVER's row).
+func runtimeRaise(manifest *wfdir.Manifest, target *api.Workflow) int {
+	if target.RuntimeVersion > 0 && manifest.RuntimeVersion() > target.RuntimeVersion {
+		return manifest.RuntimeVersion()
+	}
+	return 0
+}
+
+// checkRuntimeDrift refuses the runtime differences a push can never resolve: a
+// folder declaring a LOWER runtime than the workflow already runs, and — since
+// runtime 1 and 2 are retired — a folder that would CREATE a workflow on 1 or 2,
+// or raise a runtime-1 workflow to 2. The server refuses both of the last two
+// as well; refusing them here, before the first write, is what keeps a push
+// from landing its files and then stopping on the create or the raise.
 //
 // It is a refusal rather than a silent skip because the two readings of that
 // state are far apart — "my ronja.json predates the upgrade somebody made in the
@@ -112,13 +130,27 @@ func metadataPatch(manifest *wfdir.Manifest, target *api.Workflow) api.WorkflowP
 // against is a separate question, and RuntimeForValidate already answers it: the
 // live row's.
 func checkRuntimeDrift(f *folder, live *api.Workflow) error {
-	if live == nil || live.RuntimeVersion == 0 {
-		return nil
-	}
 	if f.Manifest.Runtime == 0 {
 		return nil
 	}
-	if f.Manifest.RuntimeVersion() >= live.RuntimeVersion {
+	declared := f.Manifest.RuntimeVersion()
+	if live == nil {
+		// A create. The instance would refuse it with "omit runtimeVersion";
+		// the folder's spelling of that is the manifest key.
+		if wfdir.RetiredRuntime(declared) {
+			return fmt.Errorf("this folder declares runtime %d, and runtime 1 and 2 are retired — a new workflow cannot be created on them.\n  %s",
+				declared, retiredRuntimeAdvice(f))
+		}
+		return nil
+	}
+	if live.RuntimeVersion == 0 {
+		return nil
+	}
+	if declared > live.RuntimeVersion && wfdir.RetiredRuntime(declared) {
+		return fmt.Errorf("this folder declares runtime %d, but %s is on runtime %d, and runtime 1 and 2 are retired — a push can only upgrade it to runtime 3.\n  %s, or set it back to %d to leave the runtime as it is",
+			declared, live.ID, live.RuntimeVersion, retiredRuntimeAdvice(f), live.RuntimeVersion)
+	}
+	if declared >= live.RuntimeVersion {
 		return nil
 	}
 	// The server's runtime is NAMED, not just numbered — the message asks the
@@ -131,6 +163,14 @@ func checkRuntimeDrift(f *folder, live *api.Workflow) error {
 	return fmt.Errorf("this folder declares runtime %d, but %s is already runtime %s on the server — the runtime is a one-way upgrade and cannot be lowered.\n  Set \"runtime\": %d in %s to match, or clone the workflow again into a fresh folder",
 		f.Manifest.RuntimeVersion(), live.ID, served,
 		live.RuntimeVersion, wfdir.ManifestPath(f.Root))
+}
+
+// retiredRuntimeAdvice is the way out of a retired-runtime refusal in a
+// folder's own words: the instance says "set runtimeVersion 3", and in a folder
+// that is the manifest key.
+func retiredRuntimeAdvice(f *folder) string {
+	return fmt.Sprintf("Set \"runtime\": %d in %s and read tables with tools.query (the {{ ref }} marker goes inside the SQL string)",
+		wfdir.RuntimeQuery, wfdir.ManifestPath(f.Root))
 }
 
 // sameParameters compares two declarations for sync purposes. Order is
@@ -163,9 +203,6 @@ func applyPatch(row *api.Workflow, patch api.WorkflowPatch) {
 	}
 	if patch.Parameters != nil {
 		row.Parameters = *patch.Parameters
-	}
-	if patch.RuntimeVersion != 0 {
-		row.RuntimeVersion = patch.RuntimeVersion
 	}
 }
 

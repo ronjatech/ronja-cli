@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,12 +19,14 @@ import (
 // ignored and the author never learned that the Durable code they had just
 // pushed would run under v1 semantics.
 //
-// The server now takes a ONE-WAY upgrade, which gives the folder two jobs and
-// exactly two: carry 1 → 2 up on the ordinary metadata patch, and REFUSE the
-// downgrade before it writes anything. Both are here.
+// The server now takes a ONE-WAY upgrade, to 3 only (runtime 1 and 2 are
+// retired), which gives the folder three jobs: carry the raise to 3 up as its
+// own request after the files land, REFUSE the downgrade before it writes
+// anything, and refuse the moves onto a retired runtime — a create on 1 or 2, a
+// raise from 1 to 2 — just as early. All are here.
 
 // setManifestRuntime marks a folder as declaring a runtime, the way a
-// hand-edited ronja.json (or `wf init --runtime 2`) does.
+// hand-edited ronja.json (or `wf clone` of a legacy workflow) does.
 func setManifestRuntime(t *testing.T, root string, runtime int) {
 	t.Helper()
 	m, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
@@ -36,15 +39,15 @@ func setManifestRuntime(t *testing.T, root string, runtime int) {
 	}
 }
 
-// The upgrade: the folder says Durable, the row says standard, and the push
-// carries it. This is the whole feature from the CLI's side.
+// The upgrade: the folder says 3, the row says 1, and the push carries it. This
+// is the whole feature from the CLI's side.
 func TestPushSendsTheRuntimeUpgrade(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, RuntimeVersion: wfdir.RuntimeDefault},
 		api.WorkflowFile{Path: "main.py", Content: "M\n"})
 	signIn(t, f)
 	root := cloneFolder(t, f, "wf-1")
-	setManifestRuntime(t, root, wfdir.RuntimeDurable)
+	setManifestRuntime(t, root, wfdir.RuntimeQuery)
 	writeLocal(t, root, "main.py", "M2\n")
 
 	out, err := runCLI(t, root, "wf", "push", "--json")
@@ -55,15 +58,15 @@ func TestPushSendsTheRuntimeUpgrade(t *testing.T) {
 	// to land: committing it is what publishes the flip onto the live workflow,
 	// with the code change that needs it.
 	draftID := decodeJSON(t, out)["draftID"].(string)
-	if got := f.runtimePatches[draftID]; got != wfdir.RuntimeDurable {
-		t.Fatalf("runtimeVersion patched on %s = %d, want 2 (patches: %v)", draftID, got, f.runtimePatches)
+	if got := f.runtimePatches[draftID]; got != wfdir.RuntimeQuery {
+		t.Fatalf("runtimeVersion patched on %s = %d, want 3 (patches: %v)", draftID, got, f.runtimePatches)
 	}
 	report := decodeJSON(t, out)
 	if got := report["runtimeUpgradedFrom"]; got != float64(wfdir.RuntimeDefault) {
 		t.Errorf("runtimeUpgradedFrom = %v, want 1", got)
 	}
-	if got := report["runtimeVersion"]; got != float64(wfdir.RuntimeDurable) {
-		t.Errorf("runtimeVersion = %v, want 2", got)
+	if got := report["runtimeVersion"]; got != float64(wfdir.RuntimeQuery) {
+		t.Errorf("runtimeVersion = %v, want 3", got)
 	}
 }
 
@@ -141,6 +144,29 @@ func TestStatusReportsRuntimeDrift(t *testing.T) {
 			api.WorkflowFile{Path: "main.py", Content: "M\n"})
 		signIn(t, f)
 		root := cloneFolder(t, f, "wf-1")
+		setManifestRuntime(t, root, wfdir.RuntimeQuery)
+
+		out, err := runCLI(t, root, "wf", "status", "--json")
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		runtime := decodeJSON(t, out)["remote"].(map[string]any)["runtime"].(map[string]any)
+		if runtime["local"] != float64(3) || runtime["remote"] != float64(1) {
+			t.Fatalf("runtime report = %v, want local 3 / remote 1", runtime)
+		}
+		if _, refused := runtime["refused"]; refused {
+			t.Errorf("an upgrade is reported as refused: %v", runtime)
+		}
+	})
+
+	// 1 → 2 is not an upgrade a push makes any more: runtime 2 is retired, and
+	// status must not call a folder pushable that the push then refuses.
+	t.Run("a raise to retired 2 a push would refuse", func(t *testing.T) {
+		f := newFakeInstance(t)
+		f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, RuntimeVersion: wfdir.RuntimeDefault},
+			api.WorkflowFile{Path: "main.py", Content: "M\n"})
+		signIn(t, f)
+		root := cloneFolder(t, f, "wf-1")
 		setManifestRuntime(t, root, wfdir.RuntimeDurable)
 
 		out, err := runCLI(t, root, "wf", "status", "--json")
@@ -148,11 +174,15 @@ func TestStatusReportsRuntimeDrift(t *testing.T) {
 			t.Fatalf("status: %v", err)
 		}
 		runtime := decodeJSON(t, out)["remote"].(map[string]any)["runtime"].(map[string]any)
-		if runtime["local"] != float64(2) || runtime["remote"] != float64(1) {
-			t.Fatalf("runtime report = %v, want local 2 / remote 1", runtime)
+		if runtime["refused"] != true {
+			t.Fatalf("a raise to retired runtime 2 is not reported as refused: %v", runtime)
 		}
-		if _, refused := runtime["refused"]; refused {
-			t.Errorf("an upgrade is reported as refused: %v", runtime)
+		text, err := runCLI(t, root, "wf", "status")
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if !strings.Contains(text, "refused   runtime: 2 here, 1 there — runtime 1 and 2 are retired, so the only upgrade is to 3; a push is refused") {
+			t.Errorf("status does not say why the raise is refused:\n%s", text)
 		}
 	})
 
@@ -203,30 +233,14 @@ func TestStatusReportsRuntimeDrift(t *testing.T) {
 // the word "Durable": runtime 3 IS durable, its label says so on purpose, and a
 // substring assertion here would assert nothing.
 
-// The create summary says what the runtime it just stamped MEANS, and the two
-// journaling runtimes do not mean the same thing: v2's line offers the resume
-// invocation, v3's states where a table comes from.
+// The create summary says what the runtime it just stamped MEANS: v3's line
+// states where a table comes from, and is not v2's resume sentence (a workflow
+// can no longer be created on 2, but the label table still describes one).
 func TestCreateSummaryDescribesTheRuntimeItStamped(t *testing.T) {
 	const (
 		durableLine = "    runtime  2 — steps are journaled; a failed run resumes with `ronja wf test --resume`\n"
 		queryLine   = "    runtime  3 — steps are journaled; tables are read only through `tools.query` — the container holds no table credential\n"
 	)
-
-	t.Run("runtime 2 is unchanged", func(t *testing.T) {
-		f := newFakeInstance(t)
-		signIn(t, f)
-		dir := t.TempDir()
-		if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "2"); err != nil {
-			t.Fatalf("init: %v", err)
-		}
-		out, err := runCLI(t, dir, "wf", "push")
-		if err != nil {
-			t.Fatalf("push: %v", err)
-		}
-		if !strings.Contains(out, durableLine) {
-			t.Errorf("the runtime-2 create summary changed:\n%s", out)
-		}
-	})
 
 	t.Run("runtime 3 says what runtime 3 is", func(t *testing.T) {
 		f := newFakeInstance(t)
@@ -260,7 +274,6 @@ func TestInitReportNamesTheRuntimeItStamped(t *testing.T) {
 		runtime int
 		want    string
 	}{
-		{2, "  Runtime:    2 — steps are journaled; a failed run resumes with `ronja wf test --resume`\n"},
 		{3, "  Runtime:    3 — steps are journaled; tables are read only through `tools.query` — the container holds no table credential\n"},
 	} {
 		f := newFakeInstance(t)
@@ -431,24 +444,55 @@ func TestCreateLeavesTheManifestAloneWhenTheServerReportsNoRuntime(t *testing.T)
 	}
 }
 
-// `--runtime 1` has to WRITE the key. An absent key means "the instance
-// chooses", and its choice is 3 — so a folder that asked for the standard
-// runtime and recorded nothing would be created on 3, the flag having done
-// nothing at all.
-func TestInitPinsAnExplicitStandardRuntime(t *testing.T) {
+// Runtime 1 and 2 are retired, so `wf init` refuses to set up a folder that
+// could never be created — in the instance's words, before a byte is written —
+// while its own default is 3, so a plain init never meets the refusal.
+func TestInitRefusesARetiredRuntime(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+
+	for _, value := range []string{"1", "2"} {
+		dir := t.TempDir()
+		_, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", value)
+		if err == nil {
+			t.Fatalf("init accepted --runtime %s", value)
+		}
+		for _, want := range []string{"runtime 1 and 2 are retired", "Omit --runtime (new workflows are runtime 3)", "tools.query"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("--runtime %s refusal does not say %q: %v", value, want, err)
+			}
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, wfdir.ManifestName)); !os.IsNotExist(statErr) {
+			t.Errorf("--runtime %s: a manifest was written despite the refusal", value)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, "main.py")); !os.IsNotExist(statErr) {
+			t.Errorf("--runtime %s: a scaffold was written despite the refusal", value)
+		}
+	}
+}
+
+// The flag's own default is 3 (B2): a check that ran on the flag's VALUE
+// whether or not it was passed refused a plain `wf init` when the default was
+// 1. A plain init still writes no runtime key — the instance chooses, and its
+// choice is 3 — and the help says 3.
+func TestInitDefaultsToRuntimeThree(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	dir := t.TempDir()
 
-	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "1"); err != nil {
-		t.Fatalf("init --runtime 1: %v", err)
+	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--json")
+	if err != nil {
+		t.Fatalf("a plain init was refused: %v", err)
 	}
-	if raw := readFile(t, dir, wfdir.ManifestName); !strings.Contains(raw, `"runtime": 1`) {
-		t.Errorf("`--runtime 1` did not pin the runtime in the manifest: %s", raw)
+	if got := decodeJSON(t, out)["runtime"]; got != float64(wfdir.RuntimeQuery) {
+		t.Errorf("a plain init reports runtime %v, want 3", got)
 	}
-	// And it stays runtime 1: no scaffold, and nothing said about journaling.
-	if _, err := os.Stat(filepath.Join(dir, "main.py")); !os.IsNotExist(err) {
-		t.Error("the standard runtime scaffolded a durable main.py")
+	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, `"runtime"`) {
+		t.Errorf("a plain init pinned a runtime the author never named: %s", raw)
+	}
+	// What --help prints as "(default N)" is the flag's DefValue.
+	if def := newWorkflowInitCmd().Flags().Lookup("runtime").DefValue; def != "3" {
+		t.Errorf("--runtime's default is %s, want 3 — --help would show it", def)
 	}
 }
 
@@ -579,5 +623,195 @@ func TestCloneDoesNotRecordARuntimeThisBuildCannotOpen(t *testing.T) {
 	}
 	if _, err := wfdir.LoadManifest(root, wfdir.WorkflowKind); err != nil {
 		t.Fatalf("the folder the clone created cannot be opened again: %v", err)
+	}
+}
+
+// ── Runtime 1 and 2 are retired ─────────────────────────────────────────────
+//
+// The instance refuses a create on 1 or 2 and a raise from 1 to 2, and checks a
+// raise to 3 against the file set the row holds when the raise arrives. So the
+// folder refuses the first two before it writes anything, and sends the raise
+// ALONE and LAST — after the files, the metadata and the deletions.
+
+// The raise is its own PUT, after the deletions: sent with the metadata, before
+// a legacy file this push deletes was gone, the server's v3 check would read it.
+func TestPushSendsTheRuntimeRaiseAloneAfterTheDeletes(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Title: "Old", Lifecycle: api.LifecycleLive, RuntimeVersion: wfdir.RuntimeDefault},
+		api.WorkflowFile{Path: "main.py", Content: "M\n"},
+		api.WorkflowFile{Path: "legacy.py", Content: "L\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	setManifestRuntime(t, root, wfdir.RuntimeQuery)
+	m, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	m.Title = "New"
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+	writeLocal(t, root, "main.py", "M2\n")
+	if err := os.Remove(filepath.Join(root, "legacy.py")); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runCLI(t, root, "wf", "push", "--json")
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	draftID := decodeJSON(t, out)["draftID"].(string)
+
+	if len(f.workflowPatches) != 2 {
+		t.Fatalf("push sent %d PUT :id, want 2 (the metadata, then the raise): %+v", len(f.workflowPatches), f.workflowPatches)
+	}
+	if meta := f.workflowPatches[0]; meta.Title != "New" || meta.RuntimeVersion != 0 {
+		t.Errorf("the metadata PUT = %+v, want the title and no runtime", meta)
+	}
+	if raise := f.workflowPatches[1]; raise != (api.WorkflowPatch{RuntimeVersion: wfdir.RuntimeQuery}) {
+		t.Errorf("the raise PUT = %+v, want runtimeVersion 3 and nothing else", raise)
+	}
+	lastDelete, lastPut := -1, -1
+	for i, req := range f.Requests {
+		switch req {
+		case "DELETE /api/v2/workflow/" + draftID + "/files/legacy.py":
+			lastDelete = i
+		case "PUT /api/v2/workflow/" + draftID:
+			lastPut = i
+		}
+	}
+	if lastDelete < 0 || lastPut < lastDelete {
+		t.Errorf("the raise was not sent after the deletion (delete at %d, last PUT :id at %d):\n%s",
+			lastDelete, lastPut, strings.Join(f.Requests, "\n"))
+	}
+}
+
+// B3: a push whose ONLY change is the raise is not "up to date". Before the
+// raise had its own request, the up-to-date check asked only the metadata patch.
+func TestARuntimeOnlyPushIsNotUpToDate(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, RuntimeVersion: wfdir.RuntimeDurable},
+		api.WorkflowFile{Path: "main.py", Content: "M\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	// A first push checks the draft out, so the second one starts clean.
+	writeLocal(t, root, "main.py", "M2\n")
+	if _, err := runCLI(t, root, "wf", "push"); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	setManifestRuntime(t, root, wfdir.RuntimeQuery)
+
+	out, err := runCLI(t, root, "wf", "push", "--json")
+	if err != nil {
+		t.Fatalf("runtime-only push: %v", err)
+	}
+	report := decodeJSON(t, out)
+	if report["upToDate"] == true {
+		t.Errorf("a push that raised the runtime reported itself up to date: %v", report)
+	}
+	if report["runtimeVersion"] != float64(wfdir.RuntimeQuery) {
+		t.Errorf("runtimeVersion = %v, want 3", report["runtimeVersion"])
+	}
+	draftID := report["draftID"].(string)
+	if f.runtimePatches[draftID] != wfdir.RuntimeQuery {
+		t.Errorf("the raise was not sent: %v", f.runtimePatches)
+	}
+}
+
+// A refused raise stops the push with the files it landed recorded, and the
+// retry sends the raise and nothing else — the baseline records no runtime, so
+// nothing there claims a raise that never happened.
+func TestARefusedRuntimeRaiseIsRetriedAlone(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, RuntimeVersion: wfdir.RuntimeDefault},
+		api.WorkflowFile{Path: "main.py", Content: "M\n"},
+		api.WorkflowFile{Path: "legacy.py", Content: "L\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	setManifestRuntime(t, root, wfdir.RuntimeQuery)
+	writeLocal(t, root, "main.py", "M2\n")
+	if err := os.Remove(filepath.Join(root, "legacy.py")); err != nil {
+		t.Fatal(err)
+	}
+
+	f.failRuntimePatch = http.StatusBadRequest
+	if _, err := runCLI(t, root, "wf", "push"); err == nil {
+		t.Fatal("a push whose raise was refused exited zero")
+	} else if !strings.Contains(err.Error(), "the raise was refused") {
+		t.Errorf("the push does not report the server's refusal: %v", err)
+	}
+	if len(f.runtimePatches) != 0 {
+		t.Fatalf("the refused raise was recorded as applied: %v", f.runtimePatches)
+	}
+
+	f.failRuntimePatch = 0
+	f.fileWrites = nil
+	f.workflowPatches = nil
+	out, err := runCLI(t, root, "wf", "push", "--json")
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if len(f.fileWrites) != 0 {
+		t.Errorf("the retry re-sent files the first push landed — its baseline did not record them: %+v", f.fileWrites)
+	}
+	if len(f.workflowPatches) != 1 || f.workflowPatches[0] != (api.WorkflowPatch{RuntimeVersion: wfdir.RuntimeQuery}) {
+		t.Errorf("the retry sent %+v, want the raise alone", f.workflowPatches)
+	}
+	if got := decodeJSON(t, out)["runtimeUpgradedFrom"]; got != float64(wfdir.RuntimeDefault) {
+		t.Errorf("runtimeUpgradedFrom = %v, want 1", got)
+	}
+}
+
+// 1 → 2 is refused by the folder, before a file is written: the instance would
+// refuse the raise anyway, and refusing it there would leave the files landed.
+func TestPushRefusesARaiseToARetiredRuntime(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, RuntimeVersion: wfdir.RuntimeDefault},
+		api.WorkflowFile{Path: "main.py", Content: "M\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	setManifestRuntime(t, root, wfdir.RuntimeDurable)
+	writeLocal(t, root, "main.py", "M2\n")
+
+	_, err := runCLI(t, root, "wf", "push")
+	if err == nil {
+		t.Fatal("push accepted a raise from runtime 1 to retired runtime 2")
+	}
+	for _, want := range []string{"runtime 1 and 2 are retired", `Set "runtime": 3`, "tools.query"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
+		}
+	}
+	if len(f.fileWrites) != 0 || len(f.workflowPatches) != 0 {
+		t.Fatalf("the refusal came after a write: files %+v, patches %+v", f.fileWrites, f.workflowPatches)
+	}
+}
+
+// A folder declaring 1 or 2 cannot CREATE a workflow — a hand-edited manifest,
+// or a cloned legacy folder pushed somewhere it is not bound. Refused before the
+// create, so no workflow is left behind for the push to have failed on.
+func TestPushRefusesToCreateOnARetiredRuntime(t *testing.T) {
+	for _, runtime := range []int{wfdir.RuntimeDefault, wfdir.RuntimeDurable} {
+		f := newFakeInstance(t)
+		signIn(t, f)
+		dir := t.TempDir()
+		if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1"); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		setManifestRuntime(t, dir, runtime)
+		writeLocal(t, dir, "main.py", "print('x')\n")
+
+		_, err := runCLI(t, dir, "wf", "push")
+		if err == nil {
+			t.Fatalf("push created a workflow on retired runtime %d", runtime)
+		}
+		for _, want := range []string{"runtime 1 and 2 are retired", "cannot be created", `Set "runtime": 3`} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("runtime %d refusal missing %q: %v", runtime, want, err)
+			}
+		}
+		if len(f.created) != 0 || len(f.fileWrites) != 0 {
+			t.Fatalf("runtime %d: the refusal came after a write: created %+v, files %+v", runtime, f.created, f.fileWrites)
+		}
 	}
 }

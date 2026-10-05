@@ -57,9 +57,11 @@ type Workflow struct {
 	// Kind is the output-channel discriminator: unspecified|function|report|pipeline.
 	Kind string `json:"kind"`
 	// RuntimeVersion is the semantics generation the code is written against: 1
-	// (the standard runtime) or 2 (durable — steps are journaled, so a failed
-	// run can be resumed). Stamped at create and afterwards raisable ONE WAY,
-	// 1 -> 2, through WorkflowPatch; the server refuses 2 -> 1 outright.
+	// (the standard runtime, retired), 2 (durable — steps are journaled, so a
+	// failed run can be resumed; retired) or 3 (durable, reading tables only
+	// through tools.query). Stamped at create — a new workflow is 3 — and a
+	// runtime-1/2 workflow is afterwards raisable ONE WAY, to 3, through
+	// WorkflowPatch; the server refuses a lowering outright.
 	//
 	// ZERO MEANS THE INSTANCE DID NOT SAY, not "runtime 1". The column is NOT
 	// NULL server-side, so an instance that has it always sends a value; a 0

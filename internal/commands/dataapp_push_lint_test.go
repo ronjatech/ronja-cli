@@ -79,6 +79,57 @@ func TestAppPushCarriesTheLastWritesLintWarnings(t *testing.T) {
 	}
 }
 
+// TestAppPushKeepsWarningsWhenTheIconIsWrittenLast pins the one write whose
+// answer says nothing about the set: the app icon. A root icon.svg compiles
+// nothing, so the server answers it with `status` and no lint at all — and an
+// icon written LAST would otherwise overwrite the whole-set warnings of the
+// write before it with nothing.
+//
+// The remote App.tsx is seeded identical to the folder's, so the push skips
+// the entrypoint and icon.svg really is the last write (sorted, it follows
+// components/chart.tsx). Nothing is deleted, so withoutDeletedFiles plays no
+// part in what lands.
+func TestAppPushKeepsWarningsWhenTheIconIsWrittenLast(t *testing.T) {
+	f := newFakeAppInstance(t)
+	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
+	draft := f.AddDraft(live.ID, "data_app-draft-1",
+		api.DataAppFile{Path: "App.tsx", Content: "entry"})
+	signInApp(t, f)
+	f.lintWarnings["components/chart.tsx"] = []api.CompileDiagnostic{lintWarningFinal}
+
+	root := writeAppFolder(t, t.TempDir(), &wfdir.Manifest{Title: live.Name},
+		map[string]string{
+			"App.tsx":              "entry",
+			"components/chart.tsx": "chart",
+			"icon.svg":             `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="32" cy="32" r="20" fill="ink"/></svg>`,
+		})
+	m := appManifestOf(t, root)
+	m.SetBinding(f.Key(), wfdir.Binding{DataAppID: live.ID, FeatureID: "feat-1"})
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatal(err)
+	}
+	state := &wfdir.State{}
+	state.Set(f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
+		{Path: "App.tsx", Content: "entry"},
+	}))
+	if err := wfdir.SaveState(root, state); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runCLI(t, root, "app", "push", "--json")
+	if err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+	var result appPushResult
+	decodeJSONInto(t, out, &result)
+	if !slices.Equal(result.Pushed, []string{"components/chart.tsx", "icon.svg"}) || len(result.Deleted) != 0 {
+		t.Fatalf("expected chart then the icon as the only writes and no deletes, got pushed=%v deleted=%v", result.Pushed, result.Deleted)
+	}
+	if !slices.Equal(result.Warnings, []api.CompileDiagnostic{lintWarningFinal}) {
+		t.Errorf("the icon's write lints nothing, so chart's whole-set warnings should stand, got %+v", result.Warnings)
+	}
+}
+
 // TestAppPushPrintsLintWarningsUnderTheVerdict pins the human half: a
 // `Warnings:` block between `Compiles: yes` and `Next:`, one `file:line:
 // message` per finding with `:line` omitted for a set-wide finding (line 0 —

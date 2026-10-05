@@ -264,6 +264,14 @@ var (
 // withholds every table credential from the container, so the workflow's code
 // reads a Ronja table only through tools.query.
 //
+// Runtime 1 and 2 are RETIRED on the instance: nothing new is created on them
+// and 1 → 2 is refused, so 3 is the only runtime a push may create or raise to
+// (see RetiredRuntime). A folder still DECLARING 1 or 2 stays loadable all the
+// same — `wf clone` of a legacy workflow records its true runtime, and that
+// folder keeps pushing files to the workflow's draft. RuntimeDefault keeps its
+// name and its value because it is still what an ABSENT key means to a folder
+// this CLI opens, which is a fact about old folders, not a recommendation.
+//
 // Listed rather than range-checked, because the CLI has to refuse a value it
 // does not know: the manifest is committed, and a folder declaring a runtime the
 // instance has never heard of would create a workflow whose runtime nobody can
@@ -293,6 +301,14 @@ const RuntimeCreateDefault = RuntimeQuery
 // that would have created it rather than at the first unattended run.
 func ValidRuntime(n int) bool {
 	return n == 0 || n == RuntimeDefault || n == RuntimeDurable || n == RuntimeQuery
+}
+
+// RetiredRuntime reports whether n is runtime 1 or 2, which an instance no
+// longer creates a workflow on or raises one to. Zero is not retired: it is a
+// folder that declares nothing, and the instance then creates on its default,
+// which is 3.
+func RetiredRuntime(n int) bool {
+	return n == RuntimeDefault || n == RuntimeDurable
 }
 
 // Runtimes is every runtime a folder may declare, for the messages that have to

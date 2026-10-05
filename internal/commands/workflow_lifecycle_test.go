@@ -360,6 +360,66 @@ func TestPublishFallsBackToReviewOnACommitRejection(t *testing.T) {
 	}
 }
 
+// The legacy freeze refuses BOTH halves of the fallback for a draft that
+// changes a runtime-1/2 workflow's code: the commit, and — so the admin inbox
+// never carries a review nobody can approve — the review request too. The
+// publish must then fail, not report the review it was refused as submitted,
+// and it must say so from the server's answers rather than from prose matching.
+func TestPublishFailsWhenTheFallbackReviewIsRefusedToo(t *testing.T) {
+	const retired = "this draft changes the code of a runtime-1 workflow (it differs from the live workflow in file \"main.py\"), so it cannot be run or committed; runtime 1 and 2 are retired"
+	f := newFakeInstance(t)
+	f.privilegeLevel = 10
+	f.failCommit = 400
+	f.failReview = 400
+	f.failReviewMessage = retired
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, FeatureScope: "organization"},
+		api.WorkflowFile{Path: "main.py", Content: "old\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	writeLocal(t, root, "main.py", "new\n")
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	_, err := runCLI(t, root, "wf", "publish", "--json")
+	if err == nil {
+		t.Fatal("publish exited zero although the commit and the review were both refused")
+	}
+	for _, want := range []string{"submitting it for review failed too", "runtime 1 and 2 are retired"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the publish error does not say %q: %v", want, err)
+		}
+	}
+	if len(f.reviewRequested) != 0 {
+		t.Errorf("a refused review was recorded as requested: %v", f.reviewRequested)
+	}
+}
+
+// The non-admin route goes straight to review; a refused review fails the
+// publish there too.
+func TestPublishFailsWhenTheDirectReviewIsRefused(t *testing.T) {
+	f := newFakeInstance(t)
+	f.privilegeLevel = 50
+	f.failReview = 400
+	f.failReviewMessage = "this draft changes the code of a runtime-1 workflow; runtime 1 and 2 are retired"
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, FeatureScope: "organization"},
+		api.WorkflowFile{Path: "main.py", Content: "old\n"})
+	signIn(t, f)
+	root := cloneFolder(t, f, "wf-1")
+	writeLocal(t, root, "main.py", "new\n")
+	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	_, err := runCLI(t, root, "wf", "publish", "--json")
+	if err == nil {
+		t.Fatal("publish exited zero although the review was refused")
+	}
+	if !strings.Contains(err.Error(), "runtime 1 and 2 are retired") {
+		t.Errorf("the publish error does not carry the server's refusal: %v", err)
+	}
+}
+
 func TestPublishNoRequestReviewSurfacesTheRejection(t *testing.T) {
 	f := newFakeInstance(t)
 	f.privilegeLevel = 50

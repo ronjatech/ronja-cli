@@ -127,6 +127,12 @@ type DataAppFileSaveResponse struct {
 	// one finding, so it is never set beside CompileError. Advisory: it is not a
 	// verdict, and ValidateDataApp does not repeat it.
 	Warnings []CompileDiagnostic `json:"warnings,omitempty"`
+	// Status is set only on a write that compiles NOTHING — today the app icon
+	// (icon.svg at the root), answered "icon_saved" — and absent on every
+	// write that recompiled. So a response carrying it has no compile result
+	// and no lint to report, and its empty Warnings say nothing about the set.
+	// An older server never sends it.
+	Status string `json:"status,omitempty"`
 }
 
 // DataAppFileDeleteResponse is the body of DELETE :id/files/*path. DataAppID is

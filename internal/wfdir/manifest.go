@@ -174,29 +174,31 @@ type Manifest struct {
 	// @tools.step results are journaled so a failed run can be resumed instead
 	// of re-run from the top, or 3, which is Durable plus a container that holds
 	// no table credential and reads tables only through tools.query. 3 is what a
-	// workflow is CREATED on; see the warning below on what an absent key means.
+	// workflow is CREATED on, and the only runtime it can be: 1 and 2 are
+	// retired, so a push refuses to create on them or to raise 1 to 2 (see
+	// wfdir.RetiredRuntime) — a folder cloned from a legacy workflow still
+	// declares its true 1 or 2. See the warning below on what an absent key means.
 	//
 	// A plain int with omitempty rather than the three-state pointer Parameters
 	// and Access carry, because the third state has nothing to describe: the
-	// runtime only ever moves UP (1 -> 2, 1 -> 3, 2 -> 3; every downgrade is
-	// refused), so a pointer would publish a distinction no code could act on.
+	// runtime only ever moves UP (1 -> 3, 2 -> 3; every downgrade is refused),
+	// so a pointer would publish a distinction no code could act on.
 	//
 	// It rides the create body of a first push, and after that a push RAISES a
-	// row still on a lower runtime to match (the patch lands on the draft;
-	// publish commits the flip). Declaring a LOWER runtime than the row already
+	// row still on a lower runtime to 3 (its own PUT, after the files land, on
+	// the draft; publish commits the flip). Declaring a LOWER runtime than the row already
 	// has is a REFUSAL, not a silent skip: the runtime cannot be lowered, and
 	// pushing code written for one runtime at a row running another is the
 	// outcome worth an error.
 	//
 	// ⚠️ ABSENT is NOT "the default runtime" any more — it is "let the SERVER
-	// choose", and the server's create default is 3. A folder that wants 1 or 2
-	// has to say so. RuntimeVersion() still answers RuntimeDefault for an absent
+	// choose", and the server's create default is 3. RuntimeVersion() still answers RuntimeDefault for an absent
 	// key, because that is what an absent key means to a workflow this CLI has
 	// already created (every such row predates the flip, or had the key written
 	// back onto it by the push that created it — see resolvePushTarget).
 	//
 	// So it is written down wherever an answer is actually known: `wf init` writes
-	// it whenever --runtime names one (1 included), `wf clone` writes the runtime
+	// it whenever --runtime names one (only 3 is accepted), `wf clone` writes the runtime
 	// the cloned row reports (1 included), and the first push of a folder that
 	// declared nothing writes back whatever the server stamped.
 	//

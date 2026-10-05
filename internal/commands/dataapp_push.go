@@ -801,7 +801,9 @@ func checkAppDrift(f *folder, remote map[string]string, force bool, head headAgr
 // intermediate one where the entrypoint had not been written yet and a kit
 // component file fired "nothing compiles these classes" on its own. Overwritten
 // with nothing when the last write did not compile, because the server lints
-// on the success path only. "Last" means "the set the folder describes"
+// on the success path only. A write that compiles nothing (one answered with a
+// status: the app icon) lints nothing either, and is skipped rather than
+// counted as the last answer. "Last" means "the set the folder describes"
 // because every write lints the WHOLE set, whichever file it was — the
 // ordering above only bounds the intermediate noise, and says nothing about
 // which file's write comes last when the entrypoint is unchanged.
@@ -892,7 +894,16 @@ func putAppFiles(ctx context.Context, client *api.Client, codec aliasCodec, targ
 		if saved.CompileError != nil {
 			lastCompileErr = saved.CompileError
 		}
-		lastWarnings = saved.Warnings
+		// A write the server answered with a status compiled nothing (the app
+		// icon is the one today), so its missing warnings are not a lint of
+		// the set and must not clear the answer of the last write that was.
+		// Without this, a folder whose icon.svg sorts after the code it changed
+		// would push clean of every warning that code earned. Decided on the
+		// server's answer rather than the path, so an older server — which
+		// sends no status and recompiles every write — keeps the old rule.
+		if saved.Status == "" {
+			lastWarnings = saved.Warnings
+		}
 	}
 	return lastCompileErr, lastWarnings, nil
 }

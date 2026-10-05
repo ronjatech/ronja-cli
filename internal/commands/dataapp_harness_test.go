@@ -799,6 +799,13 @@ func (f *fakeAppInstance) serveFile(w http.ResponseWriter, r *http.Request, id, 
 		} else if warnings := f.lintWarnings[filePath]; len(warnings) > 0 {
 			resp["warnings"] = warnings
 		}
+		// The server's icon answer: a root icon.svg compiles nothing, so its
+		// 200 carries a status and never a compileError or warnings
+		// (api/v2/dataapp FileSaveResponse). Staged by path because that is
+		// the server's own rule; a test stages no compile or lint for it.
+		if filePath == "icon.svg" {
+			resp["status"] = "icon_saved"
+		}
 		writeJSON(w, resp)
 
 	case http.MethodDelete:
@@ -824,7 +831,11 @@ func (f *fakeAppInstance) serveFile(w http.ResponseWriter, r *http.Request, id, 
 			http.Error(w, `{"error":"upload bundle: boom"}`, status)
 			return
 		}
-		writeJSON(w, map[string]any{"dataAppID": target})
+		resp := map[string]any{"dataAppID": target}
+		if filePath == "icon.svg" {
+			resp["status"] = "icon_deleted"
+		}
+		writeJSON(w, resp)
 
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)

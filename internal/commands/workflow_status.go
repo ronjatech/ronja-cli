@@ -273,9 +273,9 @@ type timezoneReport struct {
 }
 
 // runtimeReport is the runtime generation on each side. Distinct is what makes
-// it readable: Local above Remote is the upgrade a push would apply, Local BELOW
-// Remote is the downgrade a push refuses — and Refused says which without the
-// reader comparing two numbers.
+// it readable: Local above Remote is the upgrade a push would apply — unless
+// Local is retired 2, which a push refuses like the downgrade Local BELOW Remote
+// is — and Refused says which without the reader comparing two numbers.
 type runtimeReport struct {
 	Local   int  `json:"local"`
 	Remote  int  `json:"remote"`
@@ -430,10 +430,14 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 	// nothing to compare.
 	if f.Manifest.Runtime != 0 && target.RuntimeVersion > 0 &&
 		f.Manifest.RuntimeVersion() != target.RuntimeVersion {
+		// The same two refusals checkRuntimeDrift makes: a downgrade, and a
+		// raise that lands on retired 2.
+		refused := f.Manifest.RuntimeVersion() < target.RuntimeVersion ||
+			wfdir.RetiredRuntime(f.Manifest.RuntimeVersion())
 		out.Runtime = &runtimeReport{
 			Local:   f.Manifest.RuntimeVersion(),
 			Remote:  target.RuntimeVersion,
-			Refused: f.Manifest.RuntimeVersion() < target.RuntimeVersion,
+			Refused: refused,
 		}
 	}
 	switch {
@@ -555,6 +559,9 @@ func printStatus(r *statusReport) {
 					// this list a push does not resolve, it stops on.
 					label = "refused"
 					suffix = " — the runtime cannot be lowered; a push is refused"
+					if rt.Local > rt.Remote {
+						suffix = " — runtime 1 and 2 are retired, so the only upgrade is to 3; a push is refused"
+					}
 				}
 				fmt.Fprintf(out, "    %-9s runtime: %d here, %d there%s\n", label, rt.Local, rt.Remote, suffix)
 			}

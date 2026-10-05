@@ -532,7 +532,7 @@ func TestInitWithNoRuntimeFlagScaffoldsForTheCreateDefault(t *testing.T) {
 	}
 }
 
-// --runtime 2 has to produce both halves: the manifest key the first push sends
+// --runtime 3 has to produce both halves: the manifest key the first push sends
 // as runtimeVersion, and code written in the shapes a resume depends on. A
 // durable workflow scaffolded from v1 code journals nothing, which is a silent
 // failure — the run works, and the resume that was the point of it does not.
@@ -541,13 +541,13 @@ func TestInitDurableRuntimeWritesTheKeyAndAScaffold(t *testing.T) {
 	signIn(t, f)
 	dir := t.TempDir()
 
-	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "2", "--json")
+	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "3", "--json")
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
 	payload := decodeJSON(t, out)
-	if payload["runtime"] != float64(wfdir.RuntimeDurable) {
-		t.Errorf("runtime = %v, want %d", payload["runtime"], wfdir.RuntimeDurable)
+	if payload["runtime"] != float64(wfdir.RuntimeQuery) {
+		t.Errorf("runtime = %v, want %d", payload["runtime"], wfdir.RuntimeQuery)
 	}
 	if payload["scaffolded"] != true {
 		t.Errorf("scaffolded = %v, want true", payload["scaffolded"])
@@ -558,7 +558,7 @@ func TestInitDurableRuntimeWritesTheKeyAndAScaffold(t *testing.T) {
 		t.Fatalf("load manifest: %v", err)
 	}
 	if !manifest.IsDurable() {
-		t.Fatalf("manifest runtime = %d, want %d", manifest.RuntimeVersion(), wfdir.RuntimeDurable)
+		t.Fatalf("manifest runtime = %d, want %d", manifest.RuntimeVersion(), wfdir.RuntimeQuery)
 	}
 
 	// The scaffold is checked by the PROPERTIES that make a resume work, not by
@@ -567,13 +567,9 @@ func TestInitDurableRuntimeWritesTheKeyAndAScaffold(t *testing.T) {
 	// The HEADER is the exception, and it is pinned rather than sampled: it is
 	// the one part of the template that varies by runtime, and every property
 	// checked below lives in the shared body — so a header that named the wrong
-	// runtime, or leaked runtime 3's table rule into a runtime-2 folder (a rule
-	// that does not apply to it), would pass every other assertion here.
-	if want := "# Durable workflow (runtime 2). Every @tools.step result is journaled, so\n"; !strings.HasPrefix(scaffold, want) {
+	// runtime would pass every other assertion here.
+	if want := "# Durable workflow (runtime 3). Every @tools.step result is journaled, so\n"; !strings.HasPrefix(scaffold, want) {
 		t.Errorf("the durable scaffold does not open with %q:\n%s", want, scaffold)
-	}
-	if strings.Contains(scaffold, "Read a Ronja table ONLY") {
-		t.Errorf("a runtime-2 scaffold carries runtime 3's table rule:\n%s", scaffold)
 	}
 	for _, want := range []string{"@tools.step", "for order_id in load_orders():", "tools.now()"} {
 		if !strings.Contains(scaffold, want) {
@@ -598,8 +594,8 @@ func TestInitDurableRuntimeWritesTheKeyAndAScaffold(t *testing.T) {
 	}
 }
 
-// `wf init --runtime 2` inside a directory that already holds main.py is the
-// documented way to adopt a script you have. The scaffold is skipped, never
+// `wf init` inside a directory that already holds main.py is the documented
+// way to adopt a script you have. The scaffold is skipped, never
 // written over the file.
 func TestInitDurableRuntimeLeavesAnExistingEntrypointAlone(t *testing.T) {
 	f := newFakeInstance(t)
@@ -607,7 +603,7 @@ func TestInitDurableRuntimeLeavesAnExistingEntrypointAlone(t *testing.T) {
 	dir := t.TempDir()
 	writeLocal(t, dir, "main.py", "print('mine')\n")
 
-	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "2", "--json")
+	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "3", "--json")
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}

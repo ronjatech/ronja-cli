@@ -95,6 +95,16 @@ type fakeInstance struct {
 	// failPatch is the status PUT :id (the metadata patch) answers with, which
 	// stages a push that has written every file and then falls over.
 	failPatch int
+	// failRuntimePatch is failPatch for a PUT :id that carries a runtimeVersion
+	// only: the raise a push sends on its own, after the deletions. It stages a
+	// push whose files all landed and whose raise the server then refused.
+	failRuntimePatch int
+	// failReview is the status POST /workflow/draft/:id/request-review answers
+	// with, carrying failReviewMessage as the `error`; 0 is success. It stages
+	// the server refusing a submit — the legacy freeze refuses one for a draft
+	// that changes a runtime-1/2 workflow's code.
+	failReview        int
+	failReviewMessage string
 	// failCommit is the status POST :id/commit answers with; 0 is success.
 	// 400 is the shape that matters — it is the server's needs-review
 	// rejection, and the one publish falls back to a review request on.
@@ -316,6 +326,10 @@ type fakeInstance struct {
 	// int, unlike the pointer maps above: the field has no reset value and no
 	// third state — 0 is "the push did not send one".
 	runtimePatches map[string]int
+	// workflowPatches records every PUT :id body, in order, refused or not —
+	// the only way to tell which request carried which field, which is what
+	// "the runtime raise is its own request" is a claim about.
+	workflowPatches []api.WorkflowPatch
 	// tenantZone is what the fake stamps on a create that names no zone,
 	// mirroring rworkflow.stampDeclaredZone resolving the organization default.
 	tenantZone string
@@ -868,6 +882,10 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 	// POST /workflow/draft/:id/request-review — note the governance prefix.
 	if r.Method == "POST" && strings.HasPrefix(path, "workflow/draft/") && strings.HasSuffix(path, "/request-review") {
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "workflow/draft/"), "/request-review")
+		if f.failReview != 0 {
+			writeJSONStatus(w, f.failReview, map[string]any{"error": f.failReviewMessage})
+			return true
+		}
 		f.reviewRequested = append(f.reviewRequested, id)
 		writeJSON(w, nil)
 		return true
@@ -949,6 +967,12 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 	if r.Method == "PUT" && action == "" {
 		var patch api.WorkflowPatch
 		decodeBody(f.t, r, &patch)
+		f.workflowPatches = append(f.workflowPatches, patch)
+		if f.failRuntimePatch != 0 && patch.RuntimeVersion != 0 && patch.Title == "" &&
+			patch.Entrypoint == "" && patch.Parameters == nil && patch.ReportingTimezone == nil {
+			http.Error(w, `{"error":"the raise was refused"}`, f.failRuntimePatch)
+			return true
+		}
 		if f.failPatch != 0 {
 			http.Error(w, `{"error":"boom"}`, f.failPatch)
 			return true
@@ -1008,6 +1032,12 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		if patch.RuntimeVersion != 0 {
 			if patch.RuntimeVersion < wf.RuntimeVersion {
 				http.Error(w, `{"error":"runtimeVersion is a one-way upgrade"}`, http.StatusBadRequest)
+				return true
+			}
+			// And only to 3: runtime 1 and 2 are retired, so 1 → 2 is refused.
+			if patch.RuntimeVersion > wf.RuntimeVersion && patch.RuntimeVersion < wfdir.RuntimeQuery {
+				http.Error(w, `{"error":"a runtime-1 workflow can only be upgraded to runtime 3, not 2: runtime 1 and 2 are retired"}`,
+					http.StatusBadRequest)
 				return true
 			}
 			wf.RuntimeVersion = patch.RuntimeVersion

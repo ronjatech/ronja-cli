@@ -176,9 +176,10 @@ type CreateWorkflowInput struct {
 	// omitempty because a folder that does not manage parameters must create a
 	// workflow with none rather than assert an empty declaration.
 	Parameters []WorkflowParameter `json:"parameters,omitempty"`
-	// RuntimeVersion is 1, 2 or 3. Stamped at CREATE here, and afterwards
-	// raisable one way (1 -> 2, 1 -> 3, 2 -> 3) through WorkflowPatch — never
-	// lowered.
+	// RuntimeVersion is stamped at CREATE here, and the server creates a new
+	// workflow on runtime 3 only (1 and 2 are retired and refused). An existing
+	// runtime-1/2 workflow is raisable to 3 through WorkflowPatch — never
+	// lowered, and never moved to 2.
 	//
 	// omitempty, so a folder that declares no runtime sends no key and the SERVER
 	// chooses. Its default is no longer 1, so the answer is read back off the
@@ -221,11 +222,11 @@ type CreateWorkflowInput struct {
 // means — "I don't manage the zone" and "I declare UTC" — and a plain string
 // with omitempty collapses them into the first, making the reset unexpressible.
 // RuntimeVersion is a plain int with omitempty, and the third state the two
-// pointers carry has nothing to describe here: the field moves ONE WAY (1 -> 2,
-// the Durable runtime), so "the folder does not manage it" and "the folder
-// declares the runtime the row already has" both mean "send nothing". The server
-// refuses 2 -> 1 outright; the CLI refuses it earlier, before it has written
-// anything.
+// pointers carry has nothing to describe here: the field moves ONE WAY (to 3, as
+// runtime 1 and 2 are retired), so "the folder does not manage it" and "the
+// folder declares the runtime the row already has" both mean "send nothing". The
+// server refuses a lowering and a move to 2 outright; the CLI refuses a lowering
+// earlier, before it has written anything.
 type WorkflowPatch struct {
 	Title             string               `json:"title,omitempty"`
 	Entrypoint        string               `json:"entrypoint,omitempty"`

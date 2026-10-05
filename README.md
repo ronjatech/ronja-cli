@@ -1881,18 +1881,29 @@ why the third one exists:
   `clone` both write the key, so folders they create manage parameters from the
   start.
 
-  `runtime` is the workflow's runtime version — `1` for the standard runtime,
-  `2` for a **durable** workflow, `3` for a durable workflow whose container
-  additionally holds no credential for Ronja's table storage (its code reads a
-  table only through `tools.query`). **Absent means "let the instance choose",
-  and a new workflow is created on `3`** — so a folder that wants `1` or `2` has
-  to say so. Unlike `parameters` it is a plain int with no three-state pointer,
-  because the third state has nothing to describe: the runtime moves **one way**,
-  so a pointer would publish a distinction no code could act on. `wf init` writes
-  the key whenever `--runtime` names one (`1` included), `wf clone` writes the
-  runtime the cloned workflow is on (`1` included — the folder is committed, and
-  re-pushing it into a NEW workflow elsewhere has to recreate the runtime the
-  code was written for), and the push that CREATES a workflow records whatever
+  `runtime` is the workflow's runtime version: `3`, a **durable** workflow whose
+  container holds no credential for Ronja's table storage (its code reads a
+  table only through `tools.query`), is the only runtime a workflow is created
+  on. `1` (the original runtime) and `2` (durable, reading tables in the
+  container) are **retired**: a folder cloned from such a workflow records its
+  true `1` or `2` and keeps pushing files to its draft, but its code can be
+  test-run or published only once the folder says `"runtime": 3` — the folder's
+  spelling of the server's `runtimeVersion 3`. "Code" is more than the files:
+  changing `parameters` or `entrypoint` in `ronja.json` counts, and so do the
+  packages it installs and the tables, secrets, Agents and modules its files
+  use. What still publishes on such a workflow is its title, its description and
+  how it runs (reporting timezone, concurrency, dedicated compute, approval
+  defaults). **Absent means "let the instance
+  choose", and a new workflow is created on `3`.** Unlike `parameters` it is a
+  plain int with no three-state pointer, because the third state has nothing to
+  describe: the runtime moves **one way**, so a pointer would publish a
+  distinction no code could act on. `wf init` writes the key whenever
+  `--runtime` names one (a release with the freeze accepts only `3`; an older
+  one writes what it is given, and the server then refuses to create a workflow
+  on `1` or `2`), `wf clone` writes the runtime the
+  cloned workflow is on (`1` included — the folder is committed, and is the only
+  lasting statement of the runtime its code is written for), and the push that
+  CREATES a workflow records whatever
   runtime the instance stamped — but only a runtime this CLI knows, since
   recording a `4` it cannot open would brick the folder the push just created.
   The key is committed, and the folder is the only lasting statement of the
@@ -1902,13 +1913,16 @@ why the third one exists:
   `validate` — the standalone command and the
   pass inside `push` — rehearses against that same runtime, so a folder declaring
   none is checked against the one it is about to be created on rather than
-  against no runtime rules at all. A push carries the declaration to a workflow
-  on a lower runtime (`runtime  1 → 2 (Durable)` in the report; the patch lands
-  on your draft, and `wf publish` commits the flip).
+  against no runtime rules at all. A push raises a workflow on runtime 1 or 2 to
+  a folder's `3` (`runtime  1 → 3 (Durable, tables via tools.query)` in the
+  report; the raise lands on your draft as its own request, after the files,
+  and `wf publish` commits the flip).
   Declaring a runtime BELOW the one the workflow already has is **refused** — the
-  runtime cannot be lowered. A value this CLI does not know (`"runtime": 4`) is
-  refused when the folder is opened, so it fails at the push rather than at the
-  first unattended run.
+  runtime cannot be lowered — and so, before anything is written, is a folder
+  declaring `2` against a runtime-1 workflow (3 is the only upgrade) and a folder
+  declaring `1` or `2` that would CREATE a workflow. A value this CLI does not
+  know (`"runtime": 4`) is refused when the folder is opened, so it fails at the
+  push rather than at the first unattended run.
 
   `reportingTimezone` is the **calendar the workflow's runs execute on** — the
   IANA zone its DuckDB session is set to, so it is what `date_trunc`,
@@ -2307,6 +2321,13 @@ Four behaviours are deliberate and easy to undo by accident:
   during either stops the waiting, not the run — it is caught explicitly so the
   person is told that.
 
+**A folder on a retired runtime does not deploy to a new stack.** The first
+push to a stack creates the workflow, and a workflow is created only on runtime
+3 — so a committed folder declaring `"runtime": 1` or `2` keeps pushing to the
+stacks that already hold its workflow, but its first push to a new one (another
+organization, or a fresh environment) is refused at the create. Convert the
+code and declare `"runtime": 3` first.
+
 ### Dependencies (`ronja bind`)
 
 A **dependency** is a name this folder's *code* uses for a row it does not own,
@@ -2700,35 +2721,33 @@ types every time guards nothing.
   is read. `--no-validate` skips the pass that reports them, and so skips the
   verdict.
 
-### Durable workflows (`--runtime 2`, `--runtime 3`)
+### Durable workflows (runtime 3)
 
 A durable workflow journals the result of every `@tools.step` under a key
 DERIVED from the function and its arguments, so a failed run can be **resumed**
 instead of re-run: the journaled steps are replayed and only the work that never
 finished executes again.
 
-`--runtime 3` is durable **and** withholds every Ronja table credential from the
-container: its code reads a table only through
+**Runtime 3 is what a new workflow is, and the only runtime it can be.** It is
+durable **and** withholds every Ronja table credential from the container: its
+code reads a table only through
 `tools.query("SELECT ... FROM {{ ref('tbl::...') }}")`, never by reading a
-parquet file itself. Everything below about journaling, `--resume` and the
-one-way upgrade applies to it unchanged — it is a superset of runtime 2, and
-`wf init --runtime 3` scaffolds the same durable `main.py`, with a header stating
-that one rule.
+parquet file itself. A folder that declares no `runtime` creates a workflow on
+3, and the create summary names the runtime it was given; `wf init` scaffolds a
+durable `main.py` with a header stating the table rule. Runtime 1 and 2 are
+retired: a new workflow on either is refused. The server refuses the create on
+every CLI release; a release with the freeze refuses earlier — `wf init
+--runtime 1` and `--runtime 2`, and a push that would create a workflow from a
+folder declaring either, are refused before anything is written.
 
-**Runtime 3 is what a new workflow gets.** A folder that declares no `runtime`
-creates one on 3, and the create summary names the runtime it was given. Pass
-`--runtime 1` or `--runtime 2` — or edit `ronja.json` before the first push — for
-anything else; after the create it is a one-way upgrade, so the choice is made
-once.
-
-Resume itself is not durable-only. On the standard runtime a step is journaled
+Resume itself is not durable-only. On the original runtime 1 a step is journaled
 when the author gives it an explicit key (`tools.step("key", fn, ...)`), and
-`--resume` replays exactly those. What runtime 2 changes is that nobody has to
-write a key — so a loop journals per item, and forgetting one stops being
+`--resume` replays exactly those. What a durable runtime changes is that nobody
+has to write a key — so a loop journals per item, and forgetting one stops being
 possible.
 
 ```bash
-ronja wf init --feature collection-abc --runtime 2   # manifest key + a durable main.py
+ronja wf init --feature collection-abc        # a durable main.py on runtime 3
 ronja wf push                                 # the create stamps the runtime
 ronja wf test                                 # it fails somewhere in the middle
 $EDITOR main.py && ronja wf push              # fix the bug
@@ -2738,25 +2757,39 @@ ronja wf test --resume                        # continue from where it stopped
 Three things are worth knowing, and each is a place the obvious behaviour would
 be wrong:
 
-- **The runtime only ever goes up: 1 → 2, 1 → 3, 2 → 3.** The manifest's
+- **The runtime only ever goes up, and only to 3: 1 → 3, 2 → 3.** The manifest's
   `runtime` rides the `POST /workflow` body of the push that creates the
-  workflow, and afterwards a push **upgrades** a workflow on a lower runtime to
-  match — the patch lands on
-  your draft, so the flip is reviewed and published with the code change that
-  needs it (`ronja wf publish`). The upgrade is reported as
-  `runtime  1 → 2 (Durable)`, and `ronja wf status` shows it as pending drift
-  beforehand. The other direction does not exist: a durable workflow's journal is
-  keyed by the v2 derivation, so lowering it would orphan every journaled step
+  workflow, and afterwards a push from a folder declaring `3` **upgrades** a
+  workflow on runtime 1 or 2 — as its own request, sent after the files land,
+  because the server checks the raise against the file set it holds — on your
+  draft, so the flip is reviewed and published with the code change that needs
+  it (`ronja wf publish`). The upgrade is reported as
+  `runtime  1 → 3 (Durable, tables via tools.query)`, and `ronja wf status`
+  shows it as pending drift beforehand. A raise the server refuses stops the
+  push with the files it landed recorded, and the next push sends the raise
+  alone. The other direction does not exist: a durable workflow's journal is
+  keyed by the derived keys, so lowering it would orphan every journaled step
   and silently re-run the pipeline. A folder declaring a LOWER runtime than the
   workflow already has is refused before the push writes anything — fix `ronja.json`,
-  or clone the workflow again. A live workflow is also refused while one of its
-  runs is in flight; runs already started keep the runtime they began with,
-  resumes included.
+  or clone the workflow again — and so is one declaring `2` against a runtime-1
+  workflow. A raise is also refused while one of the workflow's runs is in
+  flight. A run already started keeps the runtime it began with. A `--resume`
+  after the raise continues a runtime-2 run on runtime 3 — the two key the
+  journal alike, so its finished steps replay — but is refused for a run that
+  began on runtime 1, whose author-keyed journal runtime 3 cannot match: start a
+  new run.
   Upgrading does not rewrite your Python. Convert the code in the same push:
-  keyless `tools.step`, `tools.now()` / `tools.uuid()` / `tools.random()`,
-  `tools.http` for outbound calls, and an entrypoint ending in a bare name.
-  `ronja wf push` validates against the declared runtime, so the Durable
-  advisories come back in the same command.
+  every table read through `tools.query`, keyless `tools.step`,
+  `tools.now()` / `tools.uuid()` / `tools.random()`, `tools.http` for outbound
+  calls, and an entrypoint ending in a bare name. `ronja wf push` validates
+  against the declared runtime, so the runtime-3 rules and the Durable
+  advisories come back in the same command. Until the folder says `3`, a legacy
+  workflow's changed code can be pushed to its draft but not test-run or
+  published: the server refuses both, and `wf publish` exits non-zero with its
+  sentence (a refused review included). Update the CLI (`ronja update`) before
+  moving a folder to `3`: an older release sends the raise before the push's
+  deletions, so a push that moves the folder and in the same change deletes a
+  file the runtime-3 rules refuse cannot finish on it.
 - **`--resume` finds its target on the SERVER.** It reads
   `GET /workflow/:id/runs` (newest first, explicitly ordered — the endpoint has
   no default ordering) and resumes the most recent **failed** run of the row
@@ -2905,7 +2938,7 @@ workflow this folder did not create. The manifest is the fallback for one case
 only — an instance predating durable workflows sends no `runtimeVersion`, and a
 0 means "the instance did not say", not "runtime 1".
 
-A durable `wf init` (`--runtime 2` or `--runtime 3`) also writes a `main.py` in
+`wf init` (runtime 3, which is durable) also writes a `main.py` in
 the shapes a resume depends on (decorated steps, keys derived rather than
 written, `tools.now()`, handles across step boundaries). A durable workflow scaffolded from v1 code journals
 nothing and fails silently: the run works, and the resume that was the point of
@@ -3178,6 +3211,23 @@ so the loop is fork → edit → `ronja app push`. An existing file at that path
 never overwritten; that file already *is* the fork, and deleting it goes back to
 the built-in component.
 
+**`icon.svg` at the folder root is the app's icon**, shown on its card on the
+Apps page. `push` sends it like any other file (and `clone` brings it down);
+the CLI never parses or checks the icon itself. The server checks it against
+the icon grammar in the `creating-data-apps` skill
+(`/docs/api/skills/creating-data-apps.md`) and refuses a file that breaks it with a 400 naming the problems. That refusal
+**stops the push at that file**: the files written before it stay written, and
+the entrypoint, which goes last, is not reached. Fix the file and push again —
+unchanged files are skipped. An icon write compiles nothing, so its response
+carries no `compileError` or `warnings` (a push whose only change is the icon
+prints no `Warnings:` block); the server marks it with a `status` field
+(`icon_saved` / `icon_deleted`). The CLI reads that status for one thing: a
+write answered with one linted nothing, so it does not replace the warnings of
+the last write that did — an icon pushed after a changed component still
+reports that component's warnings (with a CLI built after app icons shipped;
+an older binary prints no `Warnings:` block in that case). A `components/icon.svg`, or any icon not at
+the root, is an ordinary file.
+
 ### Four things that are not like a workflow
 
 These are not arbitrary; each falls out of how data apps work server-side.
@@ -3246,9 +3296,9 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   `ValidateDataAppScope` at checkout and `ValidateAllowlistRefsLive` at publish,
   plus admin-only commit for a shared app. `ronja.json` declares what the app
   should be allowed; the server decides what it is.
-- **Every file write recompiles the whole bundle.** A push of N files is N
-  esbuild compiles and N bundle uploads, so it takes a few seconds per file and
-  says which file it is on. It also means intermediate states that do not
+- **Every file write but the icon's recompiles the whole bundle.** A push of N
+  code files is N esbuild compiles and N bundle uploads, so it takes a few
+  seconds per file and says which file it is on. It also means intermediate states that do not
   compile are NORMAL — `App.tsx` importing a module one request away — so a
   compile failure mid-push is reported and not fatal. The file is saved either
   way; the compile check at the end is the verdict, and it is what decides
@@ -3303,11 +3353,11 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   **`null` means NOT KNOWN, never `false`.** Check `compiles === null` before
   treating it as a verdict.
 - **`app status` says `compiles: no clean build since the last change`, never
-  `NO`.** The row carries one column, `validated_at`: every file write clears it
-  in the same transaction and only a successful compile re-stamps it. So NULL is
-  equally true of a draft that failed to compile, one pushed with
-  `--no-validate`, and one whose compile check never answered — no compile
-  status is persisted anywhere. `ronja app validate` is what finds out which.
+  `NO`.** The row carries one column, `validated_at`: every file write but the
+  icon's clears it in the same transaction and only a successful compile
+  re-stamps it. So NULL is equally true of a draft that failed to compile, one
+  pushed with `--no-validate`, and one whose compile check never answered — no
+  compile status is persisted anywhere. `ronja app validate` is what finds out which.
   (`--json` is unchanged: `validated` is the same boolean it always was.)
 - **`app validate` means something different, and `app test` is a report rather
   than a run.** `wf validate` can check a candidate before the workflow exists,

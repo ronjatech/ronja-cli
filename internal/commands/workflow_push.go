@@ -292,12 +292,11 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return nil, err
 	}
 
-	// 2b. The runtime, which moves ONE WAY. A folder declaring runtime 1 against
-	// a workflow that is already Durable is refused HERE — still in the pure-read
-	// phase, before a draft is checked out or a file is written — because the
-	// push cannot resolve it in either direction and pushing v1 code at a v2 row
-	// is the outcome the refusal exists to prevent. The UPGRADE half needs no
-	// decision: it rides the ordinary metadata patch below.
+	// 2b. The runtime, which moves ONE WAY and only to 3. A folder declaring a
+	// lower runtime than the row, a CREATE on retired runtime 1 or 2, or a raise
+	// of a runtime-1 row to 2 is refused HERE — still in the pure-read phase,
+	// before a workflow is created, a draft is checked out or a file is written.
+	// The upgrade to 3 needs no decision: it is its own request, step 8b.
 	if err := checkRuntimeDrift(f, existing.Workflow); err != nil {
 		return nil, err
 	}
@@ -479,18 +478,15 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// server accepts the patch, and the row has to have stopped naming the old
 	// file before it will let that one be deleted.
 	patch := metadataPatch(f.Manifest, target)
+	// Read now, against the row as the push found it: a raise is decided by the
+	// manifest and the server's runtime, neither of which steps 7 and 8 change.
+	raise := runtimeRaise(f.Manifest, target)
 	if !patch.Empty() {
-		// Read BEFORE applyPatch, which mirrors the accepted patch onto `target`.
-		runtimeBefore := target.RuntimeVersion
 		patchWarnings, err := client.UpdateWorkflow(ctx, target.ID, patch)
 		if err != nil {
 			return stop(fmt.Errorf("update %s: %w", describePatch(patch), err))
 		}
 		result.Warnings = appendDistinct(result.Warnings, patchWarnings...)
-		if patch.RuntimeVersion != 0 {
-			result.RuntimeUpgradedFrom = runtimeBefore
-			result.RuntimeVersion = patch.RuntimeVersion
-		}
 		// The row holds this now, and `target` is what a baseline recorded from
 		// here on describes — including the one stop() writes if the deletions
 		// below fail. Leaving it stale would record metadata the server stopped
@@ -517,16 +513,39 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		result.Metadata = describePatch(applied)
 	}
 
-	// 8. Deletions last.
+	// 8. Deletions.
 	warnings, err = deleteFiles(ctx, client, target.ID, local, remoteFiles, landed, preconditions, result)
 	result.Warnings = appendDistinct(result.Warnings, warnings...)
 	if err != nil {
 		return stop(err)
 	}
 
+	// 8b. The runtime raise, alone and last: the server checks a raise to 3
+	// against the file set the row holds when it arrives, so it goes once that
+	// set is final — see runtimeRaise. A refusal stops the push with every file
+	// it landed recorded (stop), and the baseline records no runtime, so the next
+	// push sends the raise again and nothing else.
+	if raise != 0 {
+		runtimeBefore := target.RuntimeVersion
+		raisePatch := api.WorkflowPatch{RuntimeVersion: raise}
+		raiseWarnings, err := client.UpdateWorkflow(ctx, target.ID, raisePatch)
+		if err != nil {
+			return stop(fmt.Errorf("update %s: %w", describePatch(raisePatch), err))
+		}
+		result.Warnings = appendDistinct(result.Warnings, raiseWarnings...)
+		result.RuntimeUpgradedFrom = runtimeBefore
+		result.RuntimeVersion = raise
+		target.RuntimeVersion = raise
+		if result.Metadata != "" {
+			result.Metadata += " and "
+		}
+		result.Metadata += describePatch(raisePatch)
+	}
+
 	// 9. A push that wrote nothing at all, against a baseline that already
-	// described the server, has nothing to re-read.
-	if !result.Created && baselineClean && len(result.Pushed) == 0 && len(result.Deleted) == 0 && patch.Empty() {
+	// described the server, has nothing to re-read. A runtime raise is a write
+	// like any other: it takes the re-read below.
+	if !result.Created && baselineClean && len(result.Pushed) == 0 && len(result.Deleted) == 0 && patch.Empty() && raise == 0 {
 		result.UpToDate = true
 		// It may still have something to RECORD: a push that had no files to
 		// write can perfectly well have checked out a fresh draft on the way

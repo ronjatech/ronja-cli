@@ -192,7 +192,7 @@ func TestPushSendsTheDeclaredRuntimeAtCreate(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	dir := t.TempDir()
-	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "2", "--json"); err != nil {
+	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "3", "--json"); err != nil {
 		t.Fatalf("init: %v", err)
 	}
 
@@ -201,19 +201,19 @@ func TestPushSendsTheDeclaredRuntimeAtCreate(t *testing.T) {
 		t.Fatalf("push: %v", err)
 	}
 	payload := decodeJSON(t, out)
-	if payload["runtimeVersion"] != float64(wfdir.RuntimeDurable) {
-		t.Errorf("push reported runtimeVersion = %v, want %d", payload["runtimeVersion"], wfdir.RuntimeDurable)
+	if payload["runtimeVersion"] != float64(wfdir.RuntimeQuery) {
+		t.Errorf("push reported runtimeVersion = %v, want %d", payload["runtimeVersion"], wfdir.RuntimeQuery)
 	}
 	if len(f.created) != 1 {
 		t.Fatalf("created %d workflows, want 1", len(f.created))
 	}
-	if got := f.created[0].RuntimeVersion; got != wfdir.RuntimeDurable {
-		t.Errorf("create sent runtimeVersion %d, want %d", got, wfdir.RuntimeDurable)
+	if got := f.created[0].RuntimeVersion; got != wfdir.RuntimeQuery {
+		t.Errorf("create sent runtimeVersion %d, want %d", got, wfdir.RuntimeQuery)
 	}
 	// The candidate is validated against the runtime it was written for, or a
-	// v2-only construct is checked by v1 rules and passes for the wrong reason.
-	if len(f.validated) == 0 || f.validated[0].RuntimeVersion != wfdir.RuntimeDurable {
-		t.Errorf("validate sent runtimeVersion %+v, want %d", f.validated, wfdir.RuntimeDurable)
+	// v3-only rule is checked by v1 rules and passes for the wrong reason.
+	if len(f.validated) == 0 || f.validated[0].RuntimeVersion != wfdir.RuntimeQuery {
+		t.Errorf("validate sent runtimeVersion %+v, want %d", f.validated, wfdir.RuntimeQuery)
 	}
 
 	writeLocal(t, dir, "main.py", "print('changed')\n")
