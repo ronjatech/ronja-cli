@@ -123,7 +123,8 @@ type Table struct {
 	Status string `json:"status"`
 
 	// Code is the table's SQL, in whichever ref form the row happens to store —
-	// id form from an HTTP write, POSITIONAL form from any AI-assisted build.
+	// id form unless the writer sent positional refs, as the retired AI build
+	// always did.
 	// Never hash or write this field raw; use CanonicalCode.
 	Code        string   `json:"code"`
 	InputModels []string `json:"inputModels"`

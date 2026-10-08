@@ -182,10 +182,9 @@ type Occurrence struct {
 	// what it is talking about rather than describe it.
 	Marker string
 	// Positional reports a `{{ ref('0') }}` — an INDEX into the row's
-	// input_models, not a name. It is the form the AI build path persists (see
-	// the tablerefs package doc), so it is the steady state of any table a
-	// colleague has touched through chat, and a resolver must leave it exactly
-	// as it found it.
+	// input_models, not a name. It is the form the retired AI build persisted
+	// (see the tablerefs package doc), so every table it touched still holds
+	// it, and a resolver must leave it exactly as it found it.
 	//
 	// An alias can never collide with this grammar, because an all-digit alias
 	// is refused where an alias is declared — the two rules are halves of one

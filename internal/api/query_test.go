@@ -135,3 +135,31 @@ func TestQueryAdviceIsAnEmptyArrayWhenAbsent(t *testing.T) {
 		t.Fatalf(`advice encoded as %s, want []`, got)
 	}
 }
+
+// The CLI prints (or writes to --out) the csv_meta `result` verbatim, so the
+// text it shows is exactly what DuckDB's CSV writer produced server-side. This
+// pins that nothing on the client re-encodes it: a one-column NULL row stays
+// `""` (the server's repair, so the row survives any CSV reader the output is
+// piped into), a BOOLEAN stays `true`, a DECIMAL keeps its scale, and a script
+// whose last statement returns no rows reads as a zero-row `Success`.
+func TestQueryResultIsTheServersCSVVerbatim(t *testing.T) {
+	for _, body := range []QueryResult{
+		{Result: "x\n1\n\"\"\n3\n", RowCount: 3},
+		{Result: "b,d\ntrue,1.50\n,\n", RowCount: 2},
+		{Result: "Success\n", RowCount: 0},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(body)
+		}))
+		client := &Client{BaseURL: srv.URL, HTTP: &http.Client{Timeout: 5 * time.Second}}
+		got, err := client.Query(context.Background(), QueryInput{SQL: "SELECT 1", Format: QueryFormatCSVMeta}, 5*time.Second)
+		srv.Close()
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if got.Result != body.Result || got.RowCount != body.RowCount {
+			t.Fatalf("result = %q (%d rows), want %q (%d)", got.Result, got.RowCount, body.Result, body.RowCount)
+		}
+	}
+}

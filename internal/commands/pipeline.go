@@ -912,11 +912,11 @@ const sampleQueryTimeout = 45 * time.Second
 // maxSampledRowCount is the size past which a push stops reading sample rows.
 //
 // A sample is not a cheap read. `SELECT * … LIMIT 5` goes through the same
-// duckdb endpoint every other query does — an LLM routing call, and on anything
-// large an AWS Batch job — and what it buys is five rows of garnish under a
-// report whose verdict, schema delta and row counts are already complete. On a
-// table of this size that is real money and up to 45 seconds of a person
-// watching a push that has already succeeded.
+// duckdb endpoint every other query does — on anything large a query that can
+// take minutes — and what it buys is five rows of garnish under a report whose
+// verdict, schema delta and row counts are already complete. On a table of
+// this size that is real compute and time of a person watching a push that
+// has already succeeded.
 //
 // Measured against the DRAFT row count the confidence report already carries, so
 // the guard costs no extra request. A count of -1 ("not available") is NOT

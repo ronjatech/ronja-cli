@@ -16,14 +16,16 @@
 //   - ID form — `{{ ref('table-abc') }}`. What the write API stores verbatim,
 //     and what a human or an HTTP caller writes.
 //   - POSITIONAL form — `{{ ref('0') }}`, an index into the row's
-//     `input_models`. What the AI build path persists: `POST /:id/build`,
-//     `/fix` and the agent's own editDerivedTable all normalize to it.
+//     `input_models`. What the retired AI build wrote: `POST /:id/build` and
+//     `/fix` used to rewrite a table's SQL and store it positional. /build no
+//     longer rewrites code, but the rows it wrote still carry positional refs,
+//     and the write API still accepts them when `input_models` is declared.
 //
-// Positional is therefore the steady state of any table a colleague has touched
-// through chat, not a legacy edge case. A folder-sync loop hashes remote code to
+// Positional is therefore the stored form of every table the AI build ever
+// touched, not a rare edge case. A folder-sync loop hashes remote code to
 // decide whether the local file has drifted, so without a canonical form the
-// same SQL would hash two ways and every table last edited in chat would read as
-// permanently drifted.
+// same SQL would hash two ways and every such table would read as permanently
+// drifted.
 //
 // Canonicalize is the mirror of esql.IndexToTableIDRefs, byte-for-byte, and the
 // fixture suite in tablerefs_test.go carries that function's own test cases so

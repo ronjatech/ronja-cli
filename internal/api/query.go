@@ -8,9 +8,9 @@ import (
 // DefaultQueryTimeout bounds one query when the caller names no deadline.
 //
 // The slow bound rather than the read bound, for the usual reason — a query is
-// real work server-side. It is only a DEFAULT, though: a large query legitimately
-// routes to Batch compute and takes minutes, so `ronja query --timeout` can move
-// it, and Query honours a value past the client's own ceiling. See httpFor.
+// real work server-side. It is only a DEFAULT, though: a heavy query can
+// legitimately take minutes, so `ronja query --timeout` can move it, and Query
+// honours a value past the client's own ceiling. See httpFor.
 const DefaultQueryTimeout = slowRequestTimeout
 
 // The query endpoint, hand-mirrored from backend/api/v2 (POST
@@ -35,6 +35,10 @@ type QueryInput struct {
 	SQL     string `json:"sql"`
 	MaxRows int    `json:"maxRows,omitempty"`
 	Format  string `json:"format"`
+	// Attach names the databases a join reads, alias → secret id (the
+	// hidden `--attach`). omitempty: a query without one sends exactly the
+	// body it always did.
+	Attach map[string]string `json:"attach,omitempty"`
 }
 
 // QueryResult is the csv_meta envelope.
@@ -107,10 +111,10 @@ func (q *QueryResult) Failed() bool {
 // Query runs one SQL statement and returns the csv_meta envelope.
 //
 // timeout bounds the request. Zero or less means no client-side deadline at
-// all, which the command surfaces as `--timeout 0` — a query that has been
-// routed to Batch compute can legitimately outlast any number anyone would
-// think to type, and being told to go and look for a result that is still
-// coming is not an improvement on waiting for it.
+// all, which the command surfaces as `--timeout 0` — a heavy query can
+// legitimately outlast any number anyone would think to type, and being told
+// to go and look for a result that is still coming is not an improvement on
+// waiting for it.
 func (c *Client) Query(ctx context.Context, in QueryInput, timeout time.Duration) (*QueryResult, error) {
 	if in.Format == "" {
 		in.Format = QueryFormatCSVMeta

@@ -306,15 +306,14 @@ func (c *Client) CheckoutTable(ctx context.Context, id string) (*Table, error) {
 // SyncTable triggers a DETERMINISTIC materialization: the server executes the
 // stored `code` exactly as written, with no AI and no code rewriting.
 //
-// This is the golden path, and the distinction from POST /:id/build matters
-// enough to state: `/build` is AI-ASSISTED and may REWRITE the stored SQL, which
-// for a folder-synced table would silently replace the file's own content. The
-// CLI never calls it.
+// This is the golden path. POST /:id/build no longer rewrites code either — on
+// a table with code it is the same run — but it is admin-only, with none of
+// /sync's own-draft carve-out, so the CLI never calls it.
 //
 // Two further properties, both of which shape the loop around this call:
 //
-//   - It syncs EXACTLY the row named. It does not mint a draft (`/build` does),
-//     so the id passed here decides whether the live table or the draft is
+//   - It syncs EXACTLY the row named. It does not mint a draft, so the id
+//     passed here decides whether the live table or the draft is
 //     materialized.
 //   - The 200 means ACCEPTED, not started successfully. Every failure — down to
 //     syncing a table with no code at all — is reported on the ROW, never in

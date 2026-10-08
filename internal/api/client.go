@@ -387,10 +387,9 @@ func (c *Client) doSlow(ctx context.Context, method, path string, body, out any)
 // This exists because of the trap already documented on clientTimeout above,
 // seen from the other side: http.Client.Timeout is a CEILING, and a per-request
 // context can only ever SHORTEN a deadline. So a caller asking for LONGER than
-// the ceiling — a query routed to Batch compute, which is minutes by design —
-// would be silently capped at the ceiling and killed with a message about
-// nothing. That is the same bug the split timeouts fixed for the 30s read
-// bound, one level up.
+// the ceiling — a heavy query, which can take minutes — would be silently
+// capped at the ceiling and killed with a message about nothing. That is the
+// same bug the split timeouts fixed for the 30s read bound, one level up.
 //
 // Within the ceiling, the shared client is used unchanged. Beyond it (or with
 // no deadline at all), a SHALLOW COPY with Timeout cleared leaves the request's

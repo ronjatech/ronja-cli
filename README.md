@@ -1403,13 +1403,19 @@ request whose deadline exceeds the ceiling a shallow copy of the client with
 `Timeout` cleared (the Transport is shared, so the connection pool is not
 duplicated), and `do` skips `context.WithTimeout` entirely for a non-positive
 timeout — passing `0` there would produce an already-expired context, which is
-the exact opposite of "no deadline". This matters because a large query is
-routed to Batch compute server-side and is minutes by design.
+the exact opposite of "no deadline". This matters because a heavy query can
+take minutes.
 
 The CLI always sends `format: "csv_meta"` — it is not a flag. CSV is the one
 shape that is both legible at a terminal and consumable by every data tool, and
 the "meta" half is what makes truncation and a failure distinguishable from an
 empty result.
+
+The CSV is printed (or written to `--out`) exactly as the server's DuckDB
+writer produced it — nothing re-encodes it client-side: a NULL is an empty
+field (a one-column NULL row is `""`, so it survives any CSV reader it is
+piped into), a boolean is `true`/`false`, a DECIMAL keeps its scale. The full
+per-type list is in `claude/AGENT-TOOLS.md` → "queryRonja's CSV".
 
 **The trap this command exists to close: a failed query is HTTP 200 with a
 non-empty `error` field.** Nothing in the transport layer flags it, so
@@ -3679,14 +3685,14 @@ upstream, which is the commonest pipeline edit there is. Sending the exact list
 also *removes* stale entries that would otherwise linger as phantom lineage
 edges and trigger cascade rebuilds nobody asked for.
 
-**Stored code comes back in two forms, and the second one is not legacy.** The
-write API stores id-form verbatim, but the AI build path — `POST /:id/build`,
-`/fix`, and the agent's `editDerivedTable` — persists **positional**
-`{{ ref('0') }}`, an index into the row's `input_models`. Any table a colleague
-has touched through chat holds positional refs. `internal/tablerefs` is a
+**Stored code comes back in two forms, and the second one is not rare.** The
+write API stores id-form verbatim, but the retired AI build — `POST /:id/build`
+and `/fix` used to rewrite a table's SQL — persisted **positional**
+`{{ ref('0') }}`, an index into the row's `input_models`. `/build` no longer
+rewrites code, but every table it wrote still holds positional refs. `internal/tablerefs` is a
 byte-for-byte mirror of `esql.IndexToTableIDRefs` (with that function's own test
 cases as fixtures), and **every remote code read is canonicalized to id-form
-before it is hashed or written to disk** — without which every chat-edited table
+before it is hashed or written to disk** — without which every such table
 would read as permanently drifted.
 
 Two refusals fall out of that, and both are hard rather than warnings:
@@ -3895,8 +3901,8 @@ change, from `GET /api/v2/table/draft/:id/review` plus one sample read:
   Above it the read is skipped with a note naming the row count: five rows of
   garnish are not worth a scan of a table that size, and the user can query it
   directly. Skipped entirely under `--json`, where the field is `json:"-"` and
-  the read would buy an LLM routing call — and possibly a Batch job — for output
-  the run does not print.
+  the read would buy a query that can take minutes for output the run does not
+  print.
 
 All of it degrades to a stderr note and never fails the push — the build
 succeeded and the work is safe; the report is how you decide whether to publish

@@ -148,8 +148,8 @@ func TestRewriteRefusesAQuotedReplacement(t *testing.T) {
 }
 
 // TestPositionalRefsAreClassified: `{{ ref('0') }}` is an INDEX into
-// input_models, which is what the AI build path persists, so it is the steady
-// state of any table a colleague has touched through chat. A resolver that read
+// input_models, which is what the retired AI build persisted, so every table
+// it touched still holds it. A resolver that read
 // it as a name would repoint the SQL at whatever table happened to be declared
 // under that alias.
 func TestPositionalRefsAreClassified(t *testing.T) {

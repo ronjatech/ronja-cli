@@ -264,8 +264,8 @@ func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 	}
 }
 
-// TestPipelineCloneCanonicalizesPositionalRefs: the AI build path persists
-// POSITIONAL refs, so any table a colleague has touched through chat holds them.
+// TestPipelineCloneCanonicalizesPositionalRefs: the retired AI build persisted
+// POSITIONAL refs, so any table it touched still holds them.
 // A folder-sync loop hashes remote code, so without canonicalization the same
 // SQL would hash two ways and every such table would read as permanently
 // drifted.
@@ -274,7 +274,7 @@ func TestPipelineCloneCanonicalizesPositionalRefs(t *testing.T) {
 	signInPipeline(t, f)
 	f.AddFeature("collection-1", "Sales", "private")
 	f.AddTable(&api.Table{ID: "table-orders", Name: "Orders", FeatureID: "collection-1", Code: "SELECT 1"})
-	// Exactly what POST /:id/build leaves behind.
+	// Exactly what the retired AI build (POST /:id/build) left behind.
 	f.AddTable(&api.Table{ID: "table-revenue", Name: "Revenue", FeatureID: "collection-1",
 		Code:        "SELECT o.* FROM {{ ref('0') }} o JOIN {{ ref('0') }} b ON TRUE",
 		InputModels: []string{"table-orders"}})

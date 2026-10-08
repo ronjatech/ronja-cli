@@ -1450,13 +1450,13 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	// checked out and never synced has no partitions of its own. And only when
 	// the row count the report just fetched says the table is small enough to be
 	// worth it — see maxSampledRowCount for why five rows of garnish are not
-	// worth an LLM routing call and a Batch job.
+	// worth a query that can take minutes.
 	switch {
 	case flagJSON:
 		// The sample is rendered by the human report alone — the field is
-		// json:"-" — and reading it costs a duckdb query, which means LLM routing
-		// and, on a big table, a Batch job. Nothing should pay that for output
-		// this run will not print.
+		// json:"-" — and reading it costs a duckdb query, which on a big table
+		// can take minutes. Nothing should pay that for output this run will
+		// not print.
 	case out.Review != nil && out.Review.DraftRowCount > maxSampledRowCount:
 		fmt.Fprintf(os.Stderr, "  Note: no sample rows for %s — %s rows is large enough that the read costs real compute; query it directly if you want a look.\n",
 			path, describeRowCount(out.Review.DraftRowCount))

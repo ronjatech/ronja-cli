@@ -110,9 +110,10 @@ func TestCanonicalizeGrammarTolerance(t *testing.T) {
 	}
 }
 
-// aiBuiltCode is the shape a table last edited through chat actually holds:
-// positional refs throughout, because POST /:id/build, /fix and the agent's
-// editDerivedTable all normalize to them before they store the SQL.
+// aiBuiltCode is the shape a table the retired AI build wrote still holds:
+// positional refs throughout, because POST /:id/build and /fix normalized to
+// them before they stored the SQL. /build no longer rewrites code, but those
+// rows keep it.
 //
 // This is the case the whole canonicalization component exists for — not the
 // single-line cases above. Without it, this table's local file would hash

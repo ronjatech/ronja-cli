@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,6 +31,9 @@ type queryServer struct {
 	status int
 
 	inputs []api.QueryInput
+	// raws are the same bodies as JSON objects, for what the struct cannot
+	// say: whether a key was sent at all.
+	raws []map[string]any
 }
 
 func newQueryServer(t *testing.T) *queryServer {
@@ -41,11 +45,20 @@ func newQueryServer(t *testing.T) *queryServer {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 			return
 		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read query body: %v", err)
+		}
 		var in api.QueryInput
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		if err := json.Unmarshal(raw, &in); err != nil {
+			t.Fatalf("decode query body: %v", err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
 			t.Fatalf("decode query body: %v", err)
 		}
 		q.inputs = append(q.inputs, in)
+		q.raws = append(q.raws, m)
 		if q.status != 0 {
 			http.Error(w, `{"error":"boom"}`, q.status)
 			return
@@ -316,10 +329,9 @@ func TestQueryOutTightensAnExistingFilesMode(t *testing.T) {
 
 // --- the deadline -----------------------------------------------------------
 
-// A heavy query is routed to bigger compute server-side and takes minutes, so
-// the deadline has to be movable. The plumbing that makes a value past the
-// client's own ceiling actually apply is pinned in internal/api; this is the
-// flag reaching it.
+// A heavy query can take minutes server-side, so the deadline has to be
+// movable. The plumbing that makes a value past the client's own ceiling
+// actually apply is pinned in internal/api; this is the flag reaching it.
 func TestQueryTimeoutFlagIsAccepted(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -517,5 +529,73 @@ func TestQueryAcceptsJQWithTheFlagAfterIt(t *testing.T) {
 	}
 	if out != "2\n" {
 		t.Errorf("stdout = %q", out)
+	}
+}
+
+// --- the hidden --attach flag ---------------------------------------------------
+
+// A database join: each --attach alias=secret lands in the body's attach map,
+// split on the FIRST = only.
+func TestQueryAttachSendsEachDatabase(t *testing.T) {
+	q := newQueryServer(t)
+	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
+	signInTo(t, q.URL())
+
+	if _, err := runCLI(t, t.TempDir(), "query", "--attach", "crm=secret-a", "--attach", "erp=secret=e", "SELECT 1"); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	q.only()
+	got, _ := q.raws[0]["attach"].(map[string]any)
+	if len(got) != 2 || got["crm"] != "secret-a" || got["erp"] != "secret=e" {
+		t.Fatalf("attach = %v, want both databases", q.raws[0]["attach"])
+	}
+}
+
+// A malformed value or an alias given twice is a usage error naming the flag,
+// before any request.
+func TestQueryAttachRefusesABadValue(t *testing.T) {
+	q := newQueryServer(t)
+	signInTo(t, q.URL())
+	for _, args := range [][]string{
+		{"--attach", "crm"},
+		{"--attach", "=secret-a"},
+		{"--attach", "crm="},
+		{"--attach", "crm=secret-a", "--attach", "crm=secret-b"},
+	} {
+		_, err := runCLI(t, t.TempDir(), append(append([]string{"query"}, args...), "SELECT 1")...)
+		if err == nil || !strings.Contains(err.Error(), "--attach") || !(strings.Contains(err.Error(), "alias=secret") || strings.Contains(err.Error(), "more than once")) {
+			t.Errorf("%v: want a usage error naming --attach, got %v", args, err)
+		}
+	}
+	if len(q.inputs) != 0 {
+		t.Fatalf("a refused --attach still sent %d request(s)", len(q.inputs))
+	}
+}
+
+// No --attach is no attach key at all: the body is the one the CLI always
+// sent.
+func TestQueryWithoutAttachSendsNoAttachKey(t *testing.T) {
+	q := newQueryServer(t)
+	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
+	signInTo(t, q.URL())
+
+	if _, err := runCLI(t, t.TempDir(), "query", "SELECT 1"); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	q.only()
+	if _, ok := q.raws[0]["attach"]; ok {
+		t.Fatalf("a query without --attach sent an attach key: %v", q.raws[0])
+	}
+}
+
+// Hidden while joins run only where Laminar does (not in production): the
+// flag works but is in no --help.
+func TestQueryAttachFlagIsHidden(t *testing.T) {
+	f := newQueryCmd().Flags().Lookup("attach")
+	if f == nil {
+		t.Fatal("ronja query has no --attach flag")
+	}
+	if !f.Hidden {
+		t.Fatal("--attach is visible in --help; it stays hidden until joins reach production")
 	}
 }

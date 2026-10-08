@@ -44,6 +44,7 @@ func newQueryCmd() *cobra.Command {
 		timeout   time.Duration
 		jqExpr    string
 		rawOutput bool
+		attach    []string
 	)
 
 	cmd := &cobra.Command{
@@ -99,9 +100,9 @@ Authoring advice about the SQL — a backslash escape that reads differently
 under raw and legacy escape handling, say — is printed on stderr too, and
 carried as .advice. It is never a failure: a query with advice on it ran.
 
-A large query can be routed to bigger compute server-side and take minutes.
-Raise --timeout for those; the default is generous for an interactive query and
-too short for a heavy one.
+A heavy query can take several minutes; raise --timeout for those (the default
+is generous for an interactive query and too short for a heavy one). One that
+runs out of memory or time fails with an error that says so; narrow the query.
 
 A query that fails comes back as HTTP 200 with an error in the envelope. This
 command treats that as a failure: the message goes to stderr and the exit code
@@ -135,6 +136,10 @@ is non-zero.`,
 			if timeout < 0 {
 				return fmt.Errorf("--timeout cannot be negative (got %s) — pass 0 to wait for as long as the query takes", timeout)
 			}
+			attached, err := parseQueryAttach(attach)
+			if err != nil {
+				return err
+			}
 			if rawOutput && jqExpr == "" {
 				return errors.New("--raw only means something with --jq: it unquotes the STRINGS a filter produces")
 			}
@@ -148,7 +153,7 @@ is non-zero.`,
 				return errors.New("--json prints the whole envelope and --jq prints part of it — pass one or the other")
 			}
 			// Compiled before the query runs. A typo in the filter should not
-			// cost a round trip to a Batch-compute query that takes minutes.
+			// cost a round trip to a query that can take minutes.
 			var filter *jqf.Filter
 			if jqExpr != "" {
 				var compileErr error
@@ -166,6 +171,7 @@ is non-zero.`,
 				SQL:     sql,
 				MaxRows: maxRows,
 				Format:  api.QueryFormatCSVMeta,
+				Attach:  attached,
 			}, timeout)
 			if err != nil {
 				return err
@@ -251,7 +257,36 @@ is non-zero.`,
 		"filter the response envelope through a jq expression")
 	cmd.Flags().BoolVarP(&rawOutput, "raw", "r", false,
 		"with --jq, print string results unquoted")
+	// A database join: the alias the SQL reads it as (crm.customers) and the
+	// secret id of a login for it, repeatable. HIDDEN while joins run only
+	// where Ronja's query tier does, which is not production: a flag that is
+	// refused everywhere a customer runs it is not one to advertise. It comes
+	// out of hiding with the server field (DATABASE.md's checklist).
+	cmd.Flags().StringArrayVar(&attach, "attach", nil,
+		"join a database into the query as alias=secret-id (repeatable)")
+	_ = cmd.Flags().MarkHidden("attach")
 	return cmd
+}
+
+// parseQueryAttach turns the --attach values into the request's map, nil for
+// none. Split on the FIRST = only, like --param; an empty half or an alias
+// given twice is a usage error rather than a silently dropped database.
+func parseQueryAttach(specs []string) (map[string]string, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(specs))
+	for _, spec := range specs {
+		alias, secret, ok := strings.Cut(spec, "=")
+		if !ok || strings.TrimSpace(alias) == "" || strings.TrimSpace(secret) == "" {
+			return nil, fmt.Errorf("--attach takes alias=secret, got %q", spec)
+		}
+		if _, dup := out[alias]; dup {
+			return nil, fmt.Errorf("--attach %s was given more than once; give each database its own alias", alias)
+		}
+		out[alias] = secret
+	}
+	return out, nil
 }
 
 // printQueryAdvice writes the server's non-fatal notes about the SQL, ONE LINE
