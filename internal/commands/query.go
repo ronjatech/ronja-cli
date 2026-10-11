@@ -258,10 +258,10 @@ is non-zero.`,
 	cmd.Flags().BoolVarP(&rawOutput, "raw", "r", false,
 		"with --jq, print string results unquoted")
 	// A database join: the alias the SQL reads it as (crm.customers) and the
-	// secret id of a login for it, repeatable. HIDDEN while joins run only
-	// where Ronja's query tier does, which is not production: a flag that is
-	// refused everywhere a customer runs it is not one to advertise. It comes
-	// out of hiding with the server field (DATABASE.md's checklist).
+	// secret id of a login for it, repeatable. HIDDEN while the HTTP join
+	// stays unpublished outside chat: the server field it sends is not
+	// advertised either. It comes out of hiding with the server field
+	// (DATABASE.md's checklist).
 	cmd.Flags().StringArrayVar(&attach, "attach", nil,
 		"join a database into the query as alias=secret-id (repeatable)")
 	_ = cmd.Flags().MarkHidden("attach")
