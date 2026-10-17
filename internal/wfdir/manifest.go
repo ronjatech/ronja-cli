@@ -173,40 +173,44 @@ type Manifest struct {
 	// journals nothing and cannot resume — 2, the DURABLE runtime, whose
 	// @tools.step results are journaled so a failed run can be resumed instead
 	// of re-run from the top, or 3, which is Durable plus a container that holds
-	// no table credential and reads tables only through tools.query. 3 is what a
-	// workflow is CREATED on, and the only runtime it can be: 1 and 2 are
-	// retired, so a push refuses to create on them or to raise 1 to 2 (see
-	// wfdir.RetiredRuntime) — a folder cloned from a legacy workflow still
-	// declares its true 1 or 2. See the warning below on what an absent key means.
+	// no table credential and reads tables only through tools.query, or 4, the
+	// next generation (RuntimeMain), whose meaning is the instance's to say. A
+	// new workflow is created on 3 or 4 — whichever the instance's defaults
+	// name, or --runtime picks: 1 and 2 are retired, so a push refuses to create
+	// on them or to raise 1 to 2 (see wfdir.RetiredRuntime) — a folder cloned
+	// from a legacy workflow still declares its true 1 or 2. See the warning
+	// below on what an absent key means.
 	//
 	// A plain int with omitempty rather than the three-state pointer Parameters
 	// and Access carry, because the third state has nothing to describe: the
-	// runtime only ever moves UP (1 -> 3, 2 -> 3; every downgrade is refused),
+	// runtime only ever moves UP (every downgrade is refused),
 	// so a pointer would publish a distinction no code could act on.
 	//
 	// It rides the create body of a first push, and after that a push RAISES a
-	// row still on a lower runtime to 3 (its own PUT, after the files land, on
+	// row still on a lower runtime to the declared one (its own PUT, after the files land, on
 	// the draft; publish commits the flip). Declaring a LOWER runtime than the row already
 	// has is a REFUSAL, not a silent skip: the runtime cannot be lowered, and
 	// pushing code written for one runtime at a row running another is the
 	// outcome worth an error.
 	//
-	// ⚠️ ABSENT is NOT "the default runtime" any more — it is "let the SERVER
-	// choose", and the server's create default is 3. RuntimeVersion() still answers RuntimeDefault for an absent
-	// key, because that is what an absent key means to a workflow this CLI has
-	// already created (every such row predates the flip, or had the key written
-	// back onto it by the push that created it — see resolvePushTarget).
+	// ⚠️ ABSENT is NOT "the default runtime" any more — on a folder with no
+	// workflow yet it is "the instance's default", which the instance names
+	// (GET /workflow/defaults). RuntimeVersion() still answers RuntimeDefault
+	// for an absent key, because that is what an absent key means to a workflow
+	// this CLI has already created (every such row predates the flip, or had
+	// the key pinned by the push that created it — see runPush).
 	//
-	// So it is written down wherever an answer is actually known: `wf init` writes
-	// it whenever --runtime names one (only 3 is accepted), `wf clone` writes the runtime
-	// the cloned row reports (1 included), and the first push of a folder that
-	// declared nothing writes back whatever the server stamped.
+	// So it is written down wherever an answer is actually known: `wf init`
+	// ALWAYS writes it (the runtime --runtime names, else the instance's
+	// default), `wf clone` writes the runtime the cloned row reports (1
+	// included), and the first push of a folder that declared nothing pins the
+	// instance's default before it validates, and sends it on the create.
 	//
 	// ⚠️ A value this build does not know is refused at LOAD (wfdir.ValidRuntime,
 	// applied in LoadManifest), not here. Nothing used to validate it on push, so
 	// a hand-edited `"runtime": 3` pushed and was then modelled as v2 by
 	// IsDurable's `>= RuntimeDurable` — which happens to be the right answer for
-	// 3 and would have been the wrong one for 4.
+	// 3 and 4 and need not be for the next one.
 	Runtime int `json:"runtime,omitempty"`
 	// ReportingTimezone is the IANA calendar the workflow's DuckDB session runs
 	// at on every run — what date_trunc and date casts bucket against.
@@ -523,27 +527,25 @@ func (m *Manifest) RuntimeVersion() int {
 	return m.Runtime
 }
 
-// RuntimeForValidate answers which runtime a CANDIDATE should be checked
-// against, which is not always the one the folder declares.
+// RuntimeForValidate answers which runtime a candidate for an EXISTING row is
+// checked against, which is not always the one the folder declares.
 //
-// A folder that declares one is checked against it, on a push to an existing row
-// included: that is both what the metadata patch may raise the row to and, either
-// way, the runtime this code's author wrote for.
+// A folder that declares one is checked against it: that is both what the
+// metadata patch may raise the row to and, either way, the runtime this code's
+// author wrote for. A folder that declares none is checked against the row's —
+// and against nothing runtime-scoped (0) when the instance did not report one,
+// or when there is no row to read, which is exactly what every caller written
+// before runtimes existed asks for.
 //
-// An absent key means "let the instance choose", and validate is a PRE-CREATION
-// endpoint with no row to read it from — it reads 0 as "check nothing
-// runtime-scoped". So the answer depends on what the push is about to do. A
-// CREATE (live == nil) is rehearsed against RuntimeCreateDefault, because that is
-// the runtime the workflow will exist on and a 0 would rehearse a different save
-// from the one about to happen. A push to an existing row is checked against THAT
-// row — and against nothing runtime-scoped when the instance did not report one,
-// which is exactly what every caller written before runtimes existed asks for.
+// A CREATE is not this function's question: the runtime a new workflow is
+// created on is the instance's to name, and the commands ask it (see
+// createRuntimeFor in internal/commands) rather than guess here.
 func (m *Manifest) RuntimeForValidate(live *api.Workflow) int {
 	if m.Runtime != 0 {
 		return m.Runtime
 	}
 	if live == nil {
-		return RuntimeCreateDefault
+		return 0
 	}
 	return live.RuntimeVersion
 }
@@ -883,7 +885,7 @@ func LoadManifest(root string, kind Kind) (*Manifest, error) {
 	// naming the versions this build understands is the whole message.
 	if !ValidRuntime(m.Runtime) {
 		return nil, fmt.Errorf("%s declares \"runtime\": %d, which this CLI does not know — the runtimes it understands are %s. Upgrade the CLI — run: ronja update — or set a runtime from that list",
-			path, m.Runtime, joinInts(Runtimes))
+			path, m.Runtime, JoinInts(Runtimes))
 	}
 	if err := m.checkStacks(path); err != nil {
 		return nil, err

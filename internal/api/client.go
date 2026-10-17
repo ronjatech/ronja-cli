@@ -17,10 +17,21 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/ronjatech/ronja-cli/internal/useragent"
 )
 
-// UserAgent identifies the CLI in server logs.
-const UserAgent = "ronja-cli"
+// UserAgent identifies the CLI, and its version, in server logs:
+// "ronja-cli/<version>" (useragent.For), set once at startup by commands' init.
+// Every request this package builds — Do, DoRaw, GetText — sends it.
+var UserAgent = useragent.Product
+
+// RawUserAgent is what `ronja api` sends instead of UserAgent:
+// "ronja-cli-api/<version>" (useragent.ForAPI), so an instance can tell a
+// request a CLI command built from one somebody wrote by hand. Set once at
+// startup beside UserAgent; the command puts it on its request, and a -H
+// User-Agent still wins.
+var RawUserAgent = useragent.APIProduct
 
 // maxErrorBody bounds how much of an error response we read before giving up.
 // A misconfigured URL pointed at something that is not Ronja can otherwise

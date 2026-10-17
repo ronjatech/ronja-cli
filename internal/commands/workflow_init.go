@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +10,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
 )
@@ -23,7 +26,9 @@ import (
 // the first push is the first thing that exists.
 //
 // It does READ: one GET confirming --feature names a feature this credential can
-// reach, before anything is written. See confirmFeatureIn.
+// reach, before anything is written (see confirmFeatureIn), and one GET of the
+// instance's defaults for a new workflow — on the runtime --runtime names, or
+// on its default (see initRuntime).
 func newWorkflowInitCmd() *cobra.Command {
 	var fromPath string
 	var featureID string
@@ -52,42 +57,38 @@ Without --from you get an empty folder to write main.py into yourself:
 GET /api/v2/feature/query. The binding is recorded per instance, so run this
 against the instance you intend to push to (--url, or your last login).
 
-A new workflow is runtime 3: DURABLE — every @tools.step result is journaled,
-and so is every SEND (email, event, upload, tools.http call), so a failed run can
-be resumed (` + "`ronja wf test --resume`" + `) instead of re-run from the top, without
-repeating what already went out — and run in a container that holds no
+The folder is pinned to a runtime in ronja.json, and its first push creates the
+workflow on exactly that runtime. Without --runtime it is the one the instance
+creates new workflows on (it asks GET /api/v2/workflow/defaults); --runtime
+picks another the instance offers. Runtime 1 and 2 are retired: a new workflow
+cannot be created on them, so --runtime 1 and --runtime 2 are refused.
+
+Runtime 3 is DURABLE — every @tools.step result is journaled, and so is every
+SEND (email, event, upload, tools.http call), so a failed run can be resumed
+(` + "`ronja wf test --resume`" + `) instead of re-run from the top, without
+repeating what already went out — and runs in a container that holds no
 credential for Ronja's table storage: its code reads a table only through
 ` + "`tools.query(\"SELECT ... FROM {{ ref('tbl::...') }}\")`" + `, never by reading a
 parquet file itself.
 
-Without --runtime the folder declares none and the instance chooses, which is
-runtime 3. --runtime 3 pins it in the manifest. Runtime 1 and 2 are retired: a
-new workflow cannot be created on them, so --runtime 1 and --runtime 2 are
-refused.
-
-Without --from you also get a durable main.py to start from.`,
+Without --from you also get a main.py to start from, written for that runtime.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// 3 is the only runtime a new workflow can be created on. Runtime 1
-			// and 2 are retired, so naming one is refused here, in the words the
+			// Only a runtime a new workflow can be created on. Runtime 1 and 2
+			// are retired, so naming one is refused here, in the words the
 			// instance would use at the first push — before a byte is written,
-			// rather than a folder that can never be created. The flag's own
-			// default is 3, so a plain init never meets this.
-			if wfdir.RetiredRuntime(runtime) {
-				return fmt.Errorf("--runtime %d: runtime 1 and 2 are retired — a new workflow cannot be created on them. Omit --runtime (new workflows are runtime %d) and read tables with tools.query (the {{ ref }} marker goes inside the SQL string)",
-					runtime, wfdir.RuntimeQuery)
-			}
-			if runtime != wfdir.RuntimeQuery {
-				return fmt.Errorf("--runtime must be %d (got %d) — runtime %d is durable and reads tables only through tools.query",
-					wfdir.RuntimeQuery, runtime, wfdir.RuntimeQuery)
-			}
-
-			// runtime is 3 from here on: the flag's default, and the only value
-			// the checks above accept. runtimeNamed still matters — it decides
-			// whether the manifest pins the runtime (see below); an unnamed one
-			// leaves the key ABSENT, so the first push can write back whatever
-			// the server stamped.
+			// rather than a folder that can never be created.
 			runtimeNamed := cmd.Flags().Changed("runtime")
+			if runtimeNamed {
+				if wfdir.RetiredRuntime(runtime) {
+					return fmt.Errorf("--runtime %d: runtime 1 and 2 are retired — a new workflow cannot be created on them. Omit --runtime (the folder then takes the instance's default) and read tables with tools.query (the {{ ref }} marker goes inside the SQL string)",
+						runtime)
+				}
+				if !wfdir.CreatableRuntime(runtime) {
+					return fmt.Errorf("--runtime must name a runtime the instance creates new workflows on (got %d); omit it for the instance's default",
+						runtime)
+				}
+			}
 
 			// MarkFlagRequired only asserts the flag was PASSED, so `--feature
 			// ""` sails through it and writes a binding with no feature — which
@@ -130,6 +131,13 @@ Without --from you also get a durable main.py to start from.`,
 				return err
 			}
 
+			// The runtime the folder is pinned to, and the starter written for
+			// it. Settled before anything is written too, for the same reason.
+			runtime, starter, err := initRuntime(cmd.Context(), resolved, runtime, runtimeNamed)
+			if err != nil {
+				return err
+			}
+
 			entrypoint := wfdir.DefaultEntrypoint
 			copied := false
 			var warnings []string
@@ -154,18 +162,22 @@ Without --from you also get a durable main.py to start from.`,
 				}
 			}
 
-			// A durable folder starts from code that is durable — the four
-			// structuring rules (journal the discovery step, derive keys rather
-			// than write them, return handles, return something from a
+			// A folder starts from code written for its runtime — on 3 the four
+			// durable structuring rules (journal the discovery step, derive keys
+			// rather than write them, return handles, return something from a
 			// side-effecting step) are not things anyone infers from an empty
-			// file, and a v2 workflow written in v1 shapes journals nothing.
+			// file.
 			//
 			// Only when there is nothing to overwrite: --from means the author
 			// brought their own code, and an existing entrypoint is somebody's
 			// work.
 			scaffolded := false
 			if fromPath == "" {
-				scaffolded, err = writeDurableScaffold(root, entrypoint)
+				scaffolded, err = writeStarter(root, entrypoint, starter)
+				if errors.Is(err, errEmptyStarter) {
+					return fmt.Errorf("%s named runtime %d for a new workflow but sent no starter %s — write %s yourself, or pass --from with the code to start from",
+						describeTarget(resolved), runtime, entrypoint, entrypoint)
+				}
 				if err != nil {
 					return err
 				}
@@ -180,15 +192,16 @@ Without --from you also get a durable main.py to start from.`,
 				Title:      title,
 				Entrypoint: entrypoint,
 			}
-			// Written whenever the author NAMED a runtime (3, the only one
-			// accepted above), so the folder pins it whatever an instance's
-			// default becomes.
-			//
-			// Absent when the flag was not passed at all, which keeps that
-			// folder's manifest byte-identical to one written before runtimes
-			// existed and leaves the choice where the author left it.
-			if runtimeNamed {
-				manifest.Runtime = runtime
+			// ALWAYS pinned, named or not: the first push sends it, so the
+			// workflow is created on the runtime init settled — not on whatever
+			// the instance's default has become by then. Code from --from or an
+			// adopted entrypoint was not written from that runtime's starter,
+			// and the note below says so.
+			manifest.Runtime = runtime
+			if !scaffolded && !runtimeNamed {
+				warnings = append(warnings, fmt.Sprintf(
+					"this folder is pinned to runtime %d, the one %s creates new workflows on, and %s was not written from its starter — make sure the code is written for runtime %d before the first push, or pick another with `wf init --runtime`",
+					runtime, describeTarget(resolved), entrypoint, runtime))
 			}
 			// No workflowID: nothing exists server-side yet. The first push
 			// creates the workflow and fills it in.
@@ -248,10 +261,8 @@ Without --from you also get a durable main.py to start from.`,
 					"bound":      true,
 					"created":    false,
 					"copiedFrom": fromPath,
-					// The EFFECTIVE runtime, always, rather than the manifest key
-					// — which is absent when nobody named one. A caller asking
-					// what this folder will create wants the answer, not the
-					// spelling.
+					// The runtime the manifest pins, which the first push
+					// creates the workflow on.
 					"runtime":    runtime,
 					"scaffolded": scaffolded,
 				}
@@ -274,8 +285,8 @@ Without --from you also get a durable main.py to start from.`,
 		"feature the workflow will be created in (required)")
 	cmd.Flags().StringVar(&title, "title", "",
 		"workflow title (default: derived from --from, or the directory name)")
-	cmd.Flags().IntVar(&runtime, "runtime", wfdir.RuntimeQuery,
-		"workflow runtime to pin in the manifest; 3 is the only one a new workflow can be created on — durable, reading tables only through tools.query (runtime 1 and 2 are retired). Unset, the folder declares none and the instance creates on 3")
+	cmd.Flags().IntVar(&runtime, "runtime", 0,
+		"workflow runtime to pin in the manifest (default: the one the instance creates new workflows on); runtime 1 and 2 are retired")
 	_ = cmd.MarkFlagRequired("feature")
 	return cmd
 }
@@ -375,115 +386,69 @@ func deriveTitle(fromPath, root string) string {
 	return string(unicode.ToUpper(first)) + base[size:]
 }
 
-// durableScaffoldHeader opens the starter main.py: it names the runtime and
-// states the rule that a Ronja table is read through tools.query and nothing
-// else, which is the one thing an author cannot infer from the body below.
+// initRuntime decides the runtime a new folder is pinned to and the starter
+// written for it, by asking the instance: GET /workflow/defaults for the
+// runtime --runtime names, else for the instance's default. The instance is the
+// one place both are true — a runtime it offers, and an entrypoint written for
+// it — so the CLI keeps no copy of either to go stale.
 //
-// The rule is stated, not demonstrated: a commented-out tools.query call would
-// have to name a table id, and a fake id is a line nobody can run.
-//
-// ⚠️ The placeholder is `table-…` and MUST stay id-SHAPED. markers.Scan reads
-// source as text and cannot see that this line is a comment, so the ref in it is
-// scanned like any other — and a placeholder that is not id-shaped and not a
-// declared alias is refused by unresolvedTableNames, which would make this
-// scaffold a file `ronja wf init` writes and `ronja wf push` then refuses. That
-// is the failure checkStacks forbids one file over.
-func durableScaffoldHeader() string {
-	return fmt.Sprintf(`# Durable workflow (runtime %d). Every @tools.step result is journaled, so
-# `+"`ronja wf test --resume`"+` replays the steps that already finished and re-runs
-# only the work that never did.
-#
-# Read a Ronja table ONLY with tools.query("… FROM {{ ref('table-…') }} …") — the
-# marker goes inside the SQL string, and the container holds no credential for
-# the table's files.
-`, wfdir.RuntimeQuery)
+// Every failure is init's, before a byte is written (see workflowDefaults): an
+// instance that predates the route, a runtime the instance does not create on
+// (its 400 names the ones it does, and is shown as it is), a failed read, and
+// an answer this build cannot pin — LoadManifest refuses a runtime it does not
+// know, so pinning one would write a folder no later command could open.
+func initRuntime(ctx context.Context, resolved *config.Resolved, named int, isNamed bool) (int, string, error) {
+	ask := 0
+	if isNamed {
+		ask = named
+	}
+	defaults, err := workflowDefaults(ctx, newClient(resolved.URL, resolved.Token), resolved, ask)
+	if err != nil {
+		return 0, "", err
+	}
+	switch {
+	case len(defaults.EntrypointStarter) > maxStarterBytes:
+		return 0, "", fmt.Errorf("%s sent a %d-byte starter %s, over the %d KiB this CLI writes — refusing it; pass --from with the code to start from, or report the instance",
+			describeTarget(resolved), len(defaults.EntrypointStarter), wfdir.DefaultEntrypoint, maxStarterBytes/1024)
+	case isNamed && defaults.RuntimeVersion != named:
+		// An instance that ignored the parameter answers its default, and
+		// pinning that would pin a runtime the author did not ask for.
+		return 0, "", fmt.Errorf("asked %s for runtime %d and it answered runtime %d — update the instance, or omit --runtime to take its default",
+			describeTarget(resolved), named, defaults.RuntimeVersion)
+	case !wfdir.CreatableRuntime(defaults.RuntimeVersion):
+		return 0, "", unknownDefaultRuntime(resolved, defaults.RuntimeVersion, "pass --runtime with one it knows")
+	}
+	return defaults.RuntimeVersion, defaults.EntrypointStarter, nil
 }
 
-// durableScaffoldBody is the rest of the starting main.py — everything below
-// the header.
-//
-// It is not a tutorial: every line is a shape a durable workflow has to be
-// written in for a resume to work at all, and the comments state the constraint
-// rather than narrate the code. The server seeds its own one-line placeholder
-// into every new workflow, so this is what the first push overwrites it with.
-//
-// It makes no table access at all, which is exactly what keeps it pushable as
-// written under runtime 3's marker rules.
-const durableScaffoldBody = `
+// maxStarterBytes caps the starter an instance may have `wf init` write: a
+// starter is a page of code, and the instance's answer is written to disk as is.
+const maxStarterBytes = 256 << 10
 
-@tools.step
-def load_orders():
-    # Journal the step that DISCOVERS the iteration set. A resume that recomputed
-    # this list could iterate a different one and re-key every step below it.
-    return ["A-1", "A-2", "A-3"]
+// errEmptyStarter is writeStarter's refusal to write an empty entrypoint; the
+// caller words it.
+var errEmptyStarter = errors.New("empty starter")
 
-
-@tools.step
-def process(order_id):
-    # Keys are derived from the function and its arguments, so each iteration of
-    # the loop below is its own journal entry. A durable loop needs no key
-    # strings, and a hand-written one would have to stay unique forever.
-    #
-    # Return a HANDLE — a table name, a file key, an id — never a DataFrame: step
-    # results cross the journal as JSON, and the codec refuses a DataFrame as a
-    # step argument. The step that needs the rows re-reads them from the handle.
-    return "order-" + order_id
-
-
-@tools.step
-def publish(handles):
-    # A side effect belongs inside a step, and that step must return a value: a
-    # step returning None is not journaled, so a resume would do it a second time.
-    return len(handles)
-
-
-# tools.http is the journaled, requests-compatible client: tools.http.get(url)
-# instead of requests.get(url). A raw requests call is NOT journaled and re-runs
-# on every resume, side effects included.
-
-# A SEND journals itself too — sendEmail, emitEvent, uploadFile and friends record
-# their answer, so a resume replays it rather than sending again. Two identical
-# sends in one scope are ONE send; differ an argument to send twice.
-
-# tools.now(), never datetime.now(): the first execution journals the timestamp
-# and a resume replays it, so a resumed run computes what the original would have.
-# It is an ISO-8601 UTC STRING, not a datetime.
-started = tools.now()
-
-handles = []
-for order_id in load_orders():
-    handles.append(process(order_id))
-
-count = publish(handles)
-
-# END ON A BARE NAME, never on a call. The runtime reads the run body by
-# evaluating the last line and refuses to evaluate a call, so a file ending in
-# print(...) returns null however well the run went.
-summary = f"{count} orders, started {started}"
-summary
-`
-
-// durableScaffold is the starter main.py: the header and the body.
-func durableScaffold() string {
-	return durableScaffoldHeader() + durableScaffoldBody
-}
-
-// writeDurableScaffold writes the durable starter into the folder, reporting
-// whether it wrote anything.
+// writeStarter writes the starter into the folder, reporting whether it wrote
+// anything. An empty starter is refused (errEmptyStarter) — but only when it
+// would be written: a folder adopting an existing entrypoint never needed one.
 //
 // An existing entrypoint is left ALONE rather than refused: `wf init` in a
 // directory that already holds main.py is the documented way to adopt a script
 // you have, and the one thing worse than an init that scaffolds nothing is one
 // that ate the file it found. Nothing else in init depends on the scaffold, so
 // there is no failure to report — only a note.
-func writeDurableScaffold(root, entrypoint string) (bool, error) {
+func writeStarter(root, entrypoint, starter string) (bool, error) {
 	dest := filepath.Join(root, entrypoint)
 	if _, err := os.Stat(dest); err == nil {
 		return false, nil
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("read %s: %w", dest, err)
 	}
-	if err := wfdir.WriteFile(root, entrypoint, durableScaffold()); err != nil {
+	if strings.TrimSpace(starter) == "" {
+		return false, errEmptyStarter
+	}
+	if err := wfdir.WriteFile(root, entrypoint, starter); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -502,7 +467,7 @@ func printInitReport(root, target, title, entrypoint, featureID, fromPath string
 	if copied {
 		fmt.Fprintf(out, "\n  Copied %s -> %s\n", fromPath, entrypoint)
 	} else if scaffolded {
-		fmt.Fprintf(out, "\n  Wrote a durable %s to start from.\n", entrypoint)
+		fmt.Fprintf(out, "\n  Wrote a runtime-%d %s to start from.\n", runtime, entrypoint)
 	} else if fromPath == "" {
 		fmt.Fprintf(out, "\n  Write your code in %s.\n", entrypoint)
 	}

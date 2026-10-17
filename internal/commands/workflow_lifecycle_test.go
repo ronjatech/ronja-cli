@@ -106,12 +106,15 @@ func TestValidateWorksBeforeTheWorkflowExists(t *testing.T) {
 	if _, err := runCLI(t, root, "wf", "validate", "--json"); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	// Two requests, and only two: the organization lookup an environment token
-	// owes before this folder's binding may be trusted (it supplies the featureID
-	// validate posts), and the validate itself. Nothing about the WORKFLOW is
-	// read, which is what makes validate work before one exists.
+	// Three requests, and only three: the organization lookup an environment
+	// token owes before this folder's binding may be trusted (it supplies the
+	// featureID validate posts), the instance's defaults (the folder names no
+	// runtime, and a create would be made on the instance's), and the validate
+	// itself. Nothing about the WORKFLOW is read, which is what makes validate
+	// work before one exists.
 	for _, req := range f.Requests {
-		if !strings.HasSuffix(req, "/validate") && req != "GET /api/v2/authentication/me" {
+		if !strings.HasSuffix(req, "/validate") && req != "GET /api/v2/authentication/me" &&
+			req != "GET /api/v2/workflow/defaults" {
 			t.Errorf("validate made an extra request: %v", f.Requests)
 		}
 	}

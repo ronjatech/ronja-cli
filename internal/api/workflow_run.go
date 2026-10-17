@@ -84,6 +84,12 @@ type WorkflowRun struct {
 	Status       string                   `json:"status"`
 	Outputs      []WorkflowRunOutput      `json:"outputs"`
 	TableOutputs []WorkflowRunTableOutput `json:"tableOutputs"`
+	// TableOutputCount is the run's full count of table outputs. The run LIST
+	// (ListWorkflowRuns) carries only the first 20 entries in TableOutputs;
+	// GET /workflow/run/:runID carries them all. Read the count as
+	// max(TableOutputCount, len(TableOutputs)) — RunTableOutputCount does — so
+	// an instance that predates the field still reads right.
+	TableOutputCount int `json:"tableOutputCount"`
 	// Logs is the run's FULL captured output, on the row itself. There is no
 	// streaming endpoint, which is why the CLI tails this at the end rather
 	// than following it live.
@@ -135,6 +141,12 @@ type WorkflowRun struct {
 	TokensUsed  int64 `json:"tokensUsed"`
 	AICallCount int64 `json:"aiCallCount"`
 	QueryCount  int64 `json:"queryCount"`
+}
+
+// RunTableOutputCount is how many tables the run wrote, whichever read it came
+// from: a run from the list carries only the first 20 entries plus the count.
+func (r *WorkflowRun) RunTableOutputCount() int {
+	return max(r.TableOutputCount, len(r.TableOutputs))
 }
 
 // WorkflowRunOutput mirrors rdb.WorkflowRunOutput — one file a run produced.
@@ -331,16 +343,22 @@ func (c *Client) ResumeWorkflowRun(ctx context.Context, workflowID, resumeOfRunI
 
 // ListWorkflowRuns reads a workflow's most recent runs, newest first.
 //
+// limit <= 0 sends none and gets the server's default page, 100 runs; the
+// server lowers anything above 500. Each run carries at most its first 20
+// table outputs (TableOutputCount is the full count). Its two callers ask for
+// a handful, adoptTimedOutRun 5 and lastFailedRun 20, so neither bound reaches
+// them.
+//
 // The ordering is REQUESTED, not assumed: rworkflow.QueryRuns applies no
 // default ORDER BY, so a limited query without one returns whatever rows
 // Postgres happened to reach first — which for a "find the last failed run"
 // caller is not a sort problem but a wrong answer. `executed_at desc` is
 // validated server-side against the table's columns.
 //
-// Runs belong to a workflow ROW, and a draft is its own row, so this is asked
-// of the draft `wf test` runs rather than of the live workflow. That matches
-// the server's own resume rule: the run being resumed must belong to the same
-// workflow the resume is posted to.
+// Runs belong to a workflow ROW, and a draft is its own row, so lastFailedRun
+// asks it of the draft `wf test` runs rather than of the live workflow. That
+// matches the server's own resume rule: the run being resumed must belong to
+// the same workflow the resume is posted to.
 func (c *Client) ListWorkflowRuns(ctx context.Context, workflowID string, limit int) ([]WorkflowRun, error) {
 	query := url.Values{}
 	query.Set("orderBy", "executed_at desc")

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -298,11 +299,25 @@ type fakeInstance struct {
 	// the behaviour worth pinning, not an edge case.
 	noFrontendOrigin bool
 
-	// createRuntime is the runtime this instance stamps when a create body names
-	// none — the server's own default, which is a real number and not 1 any more.
-	// Zero keeps the fake on the older shape, where a create that said nothing
-	// produced a row reporting nothing.
-	createRuntime int
+	// defaults is what GET /workflow/defaults answers with no ?runtime: the
+	// instance's create default, runtime 3 with fakeStarter unless a test stages
+	// another. Nil models an instance older than the route: the path falls
+	// through to GET /workflow/:id with the id "defaults", which 404s.
+	// otherStarters are the other runtimes a workflow can be created on, by
+	// runtime; ?runtime=N answers N's when N is the default or listed here, and
+	// the server's 400 otherwise. failDefaults answers the route with a status
+	// instead, and failDefaultsMessage as its error ("boom" when empty); 0 is
+	// off. defaultsAsked records each request's raw query, and
+	// defaultsUserAgent the User-Agent of the last.
+	defaults            *api.WorkflowDefaults
+	otherStarters       map[int]string
+	failDefaults        int
+	failDefaultsMessage string
+	// ignoreRuntimeParam answers ?runtime=N with the default, as an instance
+	// that does not read the parameter would.
+	ignoreRuntimeParam bool
+	defaultsAsked      []string
+	defaultsUserAgent  string
 
 	// What the fake was asked to do, for assertions.
 	created      []api.CreateWorkflowInput
@@ -401,6 +416,10 @@ func (f *fakeInstance) writesFor(path string) []recordedFileWrite {
 	return out
 }
 
+// fakeStarter is the entrypoint the fake instance starts a new workflow from.
+// Pushable as written: it holds no marker and no table read.
+const fakeStarter = "# the instance's runtime-3 starter\nresult = 1\nresult\n"
+
 func newFakeInstance(t *testing.T) *fakeInstance {
 	t.Helper()
 	f := &fakeInstance{
@@ -428,6 +447,7 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 		featureNotFoundBody: "feature not found",
 		missStatus:          http.StatusNotFound,
 		privilegeLevel:      50,
+		defaults:            &api.WorkflowDefaults{RuntimeVersion: wfdir.RuntimeQuery, EntrypointStarter: fakeStarter},
 
 		versions:             map[string][]api.Workflow{},
 		enforcePreconditions: true,
@@ -674,6 +694,38 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"id": secretID, "name": secretID})
 		return
 	}
+	// GET /workflow/defaults — what `wf init` asks, and every door that creates
+	// or rehearses the create of an unpinned folder. Matched before the read
+	// switch, whose default arm reads "defaults" as a workflow id; with nothing
+	// staged it falls through to exactly that, as on an instance without it.
+	if r.Method == http.MethodGet && r.URL.Path == "/api/v2/workflow/defaults" && f.defaults != nil {
+		f.defaultsAsked = append(f.defaultsAsked, r.URL.RawQuery)
+		f.defaultsUserAgent = r.UserAgent()
+		if f.failDefaults != 0 {
+			message := f.failDefaultsMessage
+			if message == "" {
+				message = "boom"
+			}
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, message), f.failDefaults)
+			return
+		}
+		if !r.URL.Query().Has("runtime") || f.ignoreRuntimeParam {
+			writeJSON(w, f.defaults)
+			return
+		}
+		n, _ := strconv.Atoi(r.URL.Query().Get("runtime"))
+		starter, ok := f.otherStarters[n]
+		if n == f.defaults.RuntimeVersion {
+			starter, ok = f.defaults.EntrypointStarter, true
+		}
+		if !ok || n == 0 {
+			http.Error(w, fmt.Sprintf(`{"error":"a new workflow cannot be created on runtime %s; it can be created on runtime %d"}`,
+				r.URL.Query().Get("runtime"), f.defaults.RuntimeVersion), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, api.WorkflowDefaults{RuntimeVersion: n, EntrypointStarter: starter})
+		return
+	}
 	// The module surface, whose paths share no prefix with the workflow one —
 	// matched before serveWrites so a module path can never fall through to the
 	// workflow read switch's default branch and 404 as a missing workflow.
@@ -834,19 +886,13 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// answer with — not even the organization default.
 			zone = ""
 		}
-		// Echoed rather than dropped: the server stamps the runtime it was sent,
-		// and falls back to its OWN default when the body named none. A fake that
-		// answered 0 either way would let a test asserting on the created ROW
-		// pass against a create that never carried it.
-		runtimeVersion := in.RuntimeVersion
-		if runtimeVersion == 0 {
-			runtimeVersion = f.createRuntime
-		}
+		// Echoed rather than dropped, so a test asserting on the created ROW
+		// fails against a create that never carried the runtime.
 		created := f.AddWorkflow(&api.Workflow{
 			ID:                id,
 			Lifecycle:         api.LifecycleDraft,
 			Title:             in.Title,
-			RuntimeVersion:    runtimeVersion,
+			RuntimeVersion:    in.RuntimeVersion,
 			Entrypoint:        entrypoint,
 			FeatureID:         in.FeatureID,
 			Parameters:        in.Parameters,

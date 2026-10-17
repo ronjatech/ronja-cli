@@ -588,14 +588,14 @@ func TestQueryWithoutAttachSendsNoAttachKey(t *testing.T) {
 	}
 }
 
-// Hidden while joins run only where Laminar does (not in production): the
-// flag works but is in no --help.
+// Hidden while the server's `attach` field is unpublished (no HTTP guide
+// documents joins yet): the flag works but is in no --help.
 func TestQueryAttachFlagIsHidden(t *testing.T) {
 	f := newQueryCmd().Flags().Lookup("attach")
 	if f == nil {
 		t.Fatal("ronja query has no --attach flag")
 	}
 	if !f.Hidden {
-		t.Fatal("--attach is visible in --help; it stays hidden until joins reach production")
+		t.Fatal("--attach is visible in --help; it stays hidden until the HTTP guides document joins")
 	}
 }

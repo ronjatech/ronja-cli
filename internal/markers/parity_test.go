@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -26,6 +27,16 @@ var serverFiles = []string{
 	// own comment says the two must stay identical, and listing the file here is
 	// what makes something enforce that — see TestServerRefPatternCopiesAgree.
 	"backend/engine/pymarkers/malformed.go",
+	// Not a marker family: the module file-path rule, mirrored for the module
+	// commands. Its pattern does not start with `\{\{`, so the family
+	// enumeration below skips it.
+	"backend/engine/pymarkers/run_modules.go",
+}
+
+// mirroredNonFamilyPatterns is every pattern in this package copied from the
+// server that is not a marker family, server var name → the copy.
+var mirroredNonFamilyPatterns = map[string]*regexp.Regexp{
+	"runModulePathPattern": runModulePathPattern,
 }
 
 // serverPatterns is every package-level `<name> = regexp.MustCompile("…")` in
@@ -151,6 +162,16 @@ func TestPatternParity(t *testing.T) {
 				fam.Family, fam.serverVar, got, want)
 		}
 	}
+	for serverVar, re := range mirroredNonFamilyPatterns {
+		want, ok := server[serverVar]
+		if !ok {
+			t.Errorf("server no longer declares %s, which this package mirrors", serverVar)
+			continue
+		}
+		if got := re.String(); got != want {
+			t.Errorf("%s has drifted\n  cli:    %s\n  server: %s", serverVar, got, want)
+		}
+	}
 }
 
 // excludedServerPatterns is every marker-shaped pattern on the server that this
@@ -168,6 +189,60 @@ var excludedServerPatterns = map[string]string{
 	"genericMarkerPattern": "the verb-agnostic scanner behind RejectMarkersInsideStrings, not a family",
 	"refPattern":           "the POSITIONAL narrowing of tableIDRefPattern — Occurrence.Positional is this",
 	"refMarkerPattern":     "pymarkers' own leaf-safe copy of tableIDRefPattern, which `ref` above already mirrors; TestServerRefPatternCopiesAgree pins the two server copies to each other",
+}
+
+// serverStringConst is the literal value of the package-level string constant
+// name in one server file, or "" when there is none.
+func serverStringConst(t *testing.T, path, name string) string {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, n := range value.Names {
+				if n.Name != name || i >= len(value.Values) {
+					continue
+				}
+				lit, ok := value.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return ""
+				}
+				body, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					return ""
+				}
+				return body
+			}
+		}
+	}
+	return ""
+}
+
+// TestRunModulePathRuleParity keeps the module file-name rule's wording word for
+// word the server's, because `module validate` and `module push` claim to print
+// the server's refusal.
+func TestRunModulePathRuleParity(t *testing.T) {
+	root := repoRoot(t)
+	if root == "" {
+		t.Skip("backend tree not present — nothing to check parity against")
+	}
+	want := serverStringConst(t, filepath.Join(root, "backend/engine/pymarkers/run_modules.go"), "RunModulePathRule")
+	if want == "" {
+		t.Fatal("server no longer declares pymarkers.RunModulePathRule as a string literal")
+	}
+	if RunModulePathRule != want {
+		t.Errorf("RunModulePathRule has drifted\n  cli:    %s\n  server: %s", RunModulePathRule, want)
+	}
 }
 
 // TestEveryServerMarkerFamilyIsMirroredOrExcluded is the direction

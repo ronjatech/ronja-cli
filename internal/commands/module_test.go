@@ -1028,6 +1028,77 @@ func TestModulePushRefusesMarkersBeforeWriting(t *testing.T) {
 	}
 }
 
+// TestModuleValidateRefusesUnimportableFileNames pins the local mirror of the
+// server's file-name refusal: a module file whose dotted in-package path Python
+// cannot import is reported with the name that works, every such file at once,
+// while `__init__.py` at any depth and an ordinary identifier stay clean.
+func TestModuleValidateRefusesUnimportableFileNames(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+
+	root := moduleTestFolder(t, f.Key(), wfdir.Binding{FeatureID: "collection-1"}, map[string]string{
+		"__init__.py":     "",
+		"pkg/__init__.py": "",
+		"my_helpers.py":   "x = 1",
+	})
+	if out, err := runCLI(t, root, "module", "validate", "--json"); err != nil {
+		t.Fatalf("__init__.py, pkg/__init__.py and my_helpers.py must validate: %v (%s)", err, out)
+	}
+
+	for path, body := range map[string]string{"my-helpers.py": "y = 2", "pkg/2fast.py": "z = 3", "calc.v2.py": "w = 4"} {
+		if err := wfdir.WriteFile(root, path, body); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	out, err := runCLI(t, root, "module", "validate", "--json")
+	if err == nil {
+		t.Fatal("a module file Python cannot import must be refused")
+	}
+	payload := decodeJSON(t, out)
+	problems, _ := payload["problems"].([]any)
+	if len(problems) != 3 {
+		t.Fatalf("problems = %v, want one per unimportable file", problems)
+	}
+	joined := problems[0].(string) + "\n" + problems[1].(string) + "\n" + problems[2].(string)
+	for _, want := range []string{`"my-helpers.py"`, `"my_helpers.py"`, `"pkg/2fast.py"`, `"pkg/_2fast.py"`, `"calc.v2.py"`, `"calc_v2.py"`, "letters, digits and underscores"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the refusals must mention %s, got %q", want, joined)
+		}
+	}
+}
+
+// TestModulePushRefusesUnimportableFileNameBeforeWriting pins the push-side
+// half: the server refuses the file mid-push, so the CLI has to refuse it with
+// the network untouched or the push leaves a half-written draft behind.
+func TestModulePushRefusesUnimportableFileNameBeforeWriting(t *testing.T) {
+	f := newFakeInstance(t)
+	signInAsModuleUser(t, f)
+
+	root := t.TempDir()
+	if _, err := runCLI(t, root, "module", "init", "emab_tracker",
+		"--feature", "collection-1", "--title", "EMAB tracker"); err != nil {
+		t.Fatalf("module init: %v", err)
+	}
+	if err := wfdir.WriteFile(root, "my-helpers.py", "x = 1\n"); err != nil {
+		t.Fatalf("write my-helpers.py: %v", err)
+	}
+
+	f.mu.Lock()
+	f.Requests = nil
+	f.mu.Unlock()
+	_, err := runCLI(t, root, "module", "push", "--json")
+	if err == nil {
+		t.Fatal("a module file Python cannot import must be refused")
+	}
+	if !strings.Contains(err.Error(), `"my-helpers.py"`) || !strings.Contains(err.Error(), `"my_helpers.py"`) {
+		t.Fatalf("the refusal must name the file and the name that works, got: %v", err)
+	}
+	if len(f.Requests) != 0 || len(f.mod.created) != 0 || len(f.fileWrites) != 0 {
+		t.Fatalf("the refusal must precede every request, got requests=%v created=%v writes=%v",
+			f.Requests, f.mod.created, f.fileWrites)
+	}
+}
+
 // setModuleManifestTitle edits the folder's manifest the way a person would,
 // leaving the bindings and the lock file alone.
 func setModuleManifestTitle(t *testing.T, root, title string) {
@@ -1098,5 +1169,76 @@ func TestModuleStatusFlagsAnInertDependenciesBlock(t *testing.T) {
 	}
 	if _, ok := decodeJSON(t, out)["inertDependencies"]; ok {
 		t.Error("a folder declaring no dependencies grew an inertDependencies key")
+	}
+}
+
+// TestModulePushChecksFileNamesOnlyOnFilesItWrites pins that the push-side
+// name check covers exactly what the server would check: the files the push
+// writes. A module already holding `calc.v2.py` (accepted before the rule) must
+// still take an edit to another file, while changing that file is refused
+// before anything is written.
+func TestModulePushChecksFileNamesOnlyOnFilesItWrites(t *testing.T) {
+	f := newFakeInstance(t)
+	signInAsModuleUser(t, f)
+
+	root := t.TempDir()
+	if _, err := runCLI(t, root, "module", "init", "emab_tracker",
+		"--feature", "collection-1", "--title", "EMAB tracker"); err != nil {
+		t.Fatalf("module init: %v", err)
+	}
+	if err := wfdir.WriteFile(root, "tracker.py", "x = 1\n"); err != nil {
+		t.Fatalf("write tracker.py: %v", err)
+	}
+	out, err := runCLI(t, root, "module", "push", "--json")
+	if err != nil {
+		t.Fatalf("first push: %v (%s)", err, out)
+	}
+	draftID, _ := decodeJSON(t, out)["draftID"].(string)
+
+	// The row already holds a dotted file, and this folder's baseline knows it.
+	const dotted = "w = 4\n"
+	f.mu.Lock()
+	f.putModuleFile(f.mod.rows[draftID], "calc.v2.py", dotted)
+	f.mu.Unlock()
+	if err := wfdir.WriteFile(root, "calc.v2.py", dotted); err != nil {
+		t.Fatalf("write calc.v2.py: %v", err)
+	}
+	state, err := wfdir.LoadState(root)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	state.For(f.Key()).Files["calc.v2.py"] = wfdir.FileState{SHA256: wfdir.HashString(dotted)}
+	if err := wfdir.SaveState(root, state); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	if err := wfdir.WriteFile(root, "tracker.py", "x = 2\n"); err != nil {
+		t.Fatalf("edit tracker.py: %v", err)
+	}
+	f.mu.Lock()
+	f.fileWrites = nil
+	f.mu.Unlock()
+	if out, err := runCLI(t, root, "module", "push", "--json"); err != nil {
+		t.Fatalf("an unchanged calc.v2.py is not written, so it must not refuse the push: %v (%s)", err, out)
+	}
+	if len(f.fileWrites) != 1 || f.fileWrites[0].Path != "tracker.py" {
+		t.Fatalf("only tracker.py may be written, got %+v", f.fileWrites)
+	}
+
+	if err := wfdir.WriteFile(root, "calc.v2.py", "w = 5\n"); err != nil {
+		t.Fatalf("edit calc.v2.py: %v", err)
+	}
+	f.mu.Lock()
+	f.fileWrites = nil
+	f.mu.Unlock()
+	_, err = runCLI(t, root, "module", "push", "--json")
+	if err == nil {
+		t.Fatal("a changed calc.v2.py is written, so the push must refuse it")
+	}
+	if !strings.Contains(err.Error(), `"calc.v2.py"`) || !strings.Contains(err.Error(), `"calc_v2.py"`) {
+		t.Fatalf("the refusal must name the file and the name that works, got: %v", err)
+	}
+	if len(f.fileWrites) != 0 {
+		t.Fatalf("the refusal must precede every write, got %+v", f.fileWrites)
 	}
 }

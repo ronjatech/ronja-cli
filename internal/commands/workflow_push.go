@@ -116,6 +116,11 @@ type pushResult struct {
 	// Set only on an upgrade, so RuntimeVersion alone cannot tell a create from a
 	// conversion and this is what says which happened.
 	RuntimeUpgradedFrom int `json:"runtimeUpgradedFrom,omitempty"`
+	// RuntimePinned reports that the folder named no runtime and this push, which
+	// created its workflow, pinned RuntimeVersion — the instance's default — into
+	// ronja.json. The folder now says something its author never wrote, so the
+	// report says so.
+	RuntimePinned bool `json:"runtimePinned,omitempty"`
 	// WorkflowID is the STABLE identity (what ronja.json records); DraftID is
 	// the row the files were actually written to. For a parentless draft they
 	// are the same id.
@@ -292,13 +297,31 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return nil, err
 	}
 
-	// 2b. The runtime, which moves ONE WAY and only to 3. A folder declaring a
-	// lower runtime than the row, a CREATE on retired runtime 1 or 2, or a raise
-	// of a runtime-1 row to 2 is refused HERE — still in the pure-read phase,
-	// before a workflow is created, a draft is checked out or a file is written.
-	// The upgrade to 3 needs no decision: it is its own request, step 8b.
+	// 2b. The runtime, which moves ONE WAY and never onto retired 1 or 2. A
+	// folder declaring a lower runtime than the row, a CREATE on retired runtime
+	// 1 or 2, or a raise of a runtime-1 row to 2 is refused HERE — still in the
+	// pure-read phase, before a workflow is created, a draft is checked out or a
+	// file is written. An upgrade needs no decision: it is its own request, step
+	// 8b.
 	if err := checkRuntimeDrift(f, existing.Workflow); err != nil {
 		return nil, err
+	}
+	// 2c. A CREATE names its runtime, always. A folder that names none (written
+	// by hand, or by a `wf init` older than the pin) is pinned to the runtime the
+	// instance creates on — asked, never assumed — BEFORE validate, so the
+	// candidate is checked against the runtime it is then created on, and the
+	// create sends it.
+	//
+	// IN MEMORY ONLY until the create lands: the manifest is saved by
+	// resolvePushTarget once the workflow exists, so a push refused before then
+	// (validation, a failed create) leaves ronja.json byte-identical.
+	pinned := false
+	if f.Binding.WorkflowID == "" && f.Manifest.Runtime == 0 {
+		runtime, err := createRuntimeFor(ctx, client, f)
+		if err != nil {
+			return nil, err
+		}
+		f.Manifest.Runtime, pinned = runtime, true
 	}
 
 	// 3. Validate, so a binding error names the file that contains it rather
@@ -323,8 +346,9 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 			// that already exists — where it is both what the metadata patch may
 			// RAISE the row to (never lowered) and, either way, the runtime this
 			// candidate's author wrote for. Validating against the row's instead
-			// would check the code about to be upgraded past. A folder that
-			// declares none names the runtime this push will actually produce; see
+			// would check the code about to be upgraded past. On a create the
+			// folder always declares one by now (step 2c); an unpinned folder
+			// pushed to an existing row is checked against the row's. See
 			// Manifest.RuntimeForValidate.
 			RuntimeVersion: f.Manifest.RuntimeForValidate(existing.Workflow),
 		})
@@ -381,6 +405,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	if err != nil {
 		return nil, err
 	}
+	result.RuntimePinned = pinned && result.Created
 	result.DraftID = target.ID
 	// Recorded here rather than at the end, so every success path reports the
 	// same link — including the up-to-date one, which returns before the
@@ -870,14 +895,12 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 			Parameters: f.Manifest.DeclaredParameters(),
 			// The runtime, stamped at create. This is the only request that can
 			// pick it FREELY: afterwards it moves one way only, so a push to a
-			// workflow that already exists sends runtimeVersion 3 as a metadata
-			// patch when the folder declares 3 against a lower row (reported as
-			// an upgrade), and refuses the reverse before writing anything —
-			// there is no downgrade, on the server or here.
+			// workflow that already exists sends the declared runtime as a
+			// metadata patch when it is above the row's (reported as an upgrade),
+			// and refuses the reverse before writing anything.
 			//
-			// Zero when the folder declares nothing, and omitempty drops the key:
-			// the SERVER then picks, and its default is no longer 1. What it
-			// picked is read back off the created row below.
+			// Never zero here: a folder that declared nothing was pinned to the
+			// instance's default before validate (runPush, step 2c).
 			RuntimeVersion: f.Manifest.Runtime,
 			// Same round-trip saving for the declared calendar, but the value is
 			// the EFFECTIVE one: create refuses an explicit "" outright (unlike
@@ -907,31 +930,10 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 		// records the binding it describes: they are one fact and a folder
 		// holding half of it is a folder with an anchor pointing at nothing.
 		f.setHeadVersion(created.ID)
-		// The runtime the SERVER stamped, recorded in the committed manifest the
-		// same way and for the same reason as the binding above: this folder said
-		// nothing, the server picked, and the folder now has to remember what was
-		// picked. Its create default is no longer 1, so an absent key leaves the
-		// committed folder silent about the runtime its code is written for, and
-		// a folder later re-pushed into a NEW workflow elsewhere would create
-		// whatever that instance's default happens to be — the same reason
-		// `wf clone` records the runtime it cloned. Only above the default, and
-		// only when the folder had no opinion: an instance too old to report a
-		// runtime answers 0 and leaves the manifest exactly as it was.
-		//
-		// And only a runtime THIS BUILD KNOWS. The day a server's create default
-		// becomes 4, an older CLI's SUCCESSFUL push would otherwise write
-		// "runtime": 4 into the committed manifest, and LoadManifest — which
-		// refuses an unknown runtime, for good reasons of its own — would then
-		// hard-fail every later command on that folder, recoverable only by
-		// upgrading the CLI or re-cloning. A push that worked must not brick the
-		// folder it just created, so an unknown runtime degrades to the behaviour
-		// this CLI had before the write-back existed: record nothing. The folder
-		// is then unpinned, which checkRuntimeDrift, RuntimeForValidate and
-		// `wf status` all read as "no opinion" and defer to the row for.
-		if f.Manifest.Runtime == 0 && created.RuntimeVersion > wfdir.RuntimeDefault &&
-			wfdir.ValidRuntime(created.RuntimeVersion) {
-			f.Manifest.Runtime = created.RuntimeVersion
-		}
+		// The runtime is saved with the binding: it is the one the create sent
+		// — the folder's own, or the instance's default runPush pinned in memory
+		// — so the committed folder states the runtime its workflow was created
+		// on, whatever that instance's default becomes later.
 		if err := f.saveFolder(); err != nil {
 			return nil, fmt.Errorf("record the new workflow %s in %s: %w",
 				created.ID, f.bindingFiles(), err)
@@ -1510,6 +1512,9 @@ func printPushReport(r *pushResult) {
 		// never heard of — see runtimeInfo.
 		if _, sentence := runtimeInfo(r.RuntimeVersion); sentence != "" {
 			fmt.Fprintf(out, "    runtime  %d — %s\n", r.RuntimeVersion, sentence)
+		}
+		if r.RuntimePinned {
+			fmt.Fprintf(out, "    note     %s\n", runtimePinnedNote(r.RuntimeVersion))
 		}
 	}
 	// The conversion of an EXISTING workflow, which lands on the draft and takes

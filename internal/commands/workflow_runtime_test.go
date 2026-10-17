@@ -181,7 +181,7 @@ func TestStatusReportsRuntimeDrift(t *testing.T) {
 		if err != nil {
 			t.Fatalf("status: %v", err)
 		}
-		if !strings.Contains(text, "refused   runtime: 2 here, 1 there — runtime 1 and 2 are retired, so the only upgrade is to 3; a push is refused") {
+		if !strings.Contains(text, "refused   runtime: 2 here, 1 there — runtime 1 and 2 are retired, so the only upgrade is to a runtime the instance creates on; a push is refused") {
 			t.Errorf("status does not say why the raise is refused:\n%s", text)
 		}
 	})
@@ -289,32 +289,6 @@ func TestInitReportNamesTheRuntimeItStamped(t *testing.T) {
 	}
 }
 
-// The runtime-3 starter states v3's one added rule. The body is the shared
-// durable template and makes no table access at all, which is what keeps it
-// pushable exactly as written under the v3 marker rules.
-func TestQueryRuntimeScaffoldStatesTheTableRule(t *testing.T) {
-	f := newFakeInstance(t)
-	signIn(t, f)
-	dir := t.TempDir()
-
-	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "3"); err != nil {
-		t.Fatalf("init --runtime 3: %v", err)
-	}
-	scaffold := readFile(t, dir, "main.py")
-	if want := "# Durable workflow (runtime 3). Every @tools.step result is journaled, so\n"; !strings.HasPrefix(scaffold, want) {
-		t.Errorf("the runtime-3 scaffold does not open with %q:\n%s", want, scaffold)
-	}
-	const rule = "#\n# Read a Ronja table ONLY with tools.query(\"… FROM {{ ref('table-…') }} …\") — the\n" +
-		"# marker goes inside the SQL string, and the container holds no credential for\n" +
-		"# the table's files.\n"
-	if !strings.Contains(scaffold, rule) {
-		t.Errorf("the runtime-3 scaffold does not state the table rule:\n%s", scaffold)
-	}
-	if !strings.Contains(scaffold, "for order_id in load_orders():") {
-		t.Errorf("the runtime-3 scaffold is not the durable template:\n%s", scaffold)
-	}
-}
-
 // The upgrade line names the runtime being moved TO, and 2 → 3 is a real upgrade
 // the server takes. It used to print "(Durable)" whatever the target was.
 func TestUpgradeLineNamesRuntimeThree(t *testing.T) {
@@ -366,87 +340,52 @@ func TestPushRefusesADowngradeFromRuntimeThree(t *testing.T) {
 	}
 }
 
-// ── The create default is the SERVER's, and it is no longer 1 ───────────────
+// ── A create names the instance's runtime, and the folder keeps it ──────────
 
-// A folder that declares no runtime lets the server choose, and the server now
-// chooses 3. The folder records what was chosen, because `runtime` is a
-// COMMITTED key and the folder is the only lasting statement of the runtime its
-// code is written for — a folder later pushed into a NEW workflow elsewhere
-// would otherwise create whatever that instance's default happens to be.
-// (An absent key is no longer a second-push brick: checkRuntimeDrift reads it
-// as declaring nothing. The write-back is about identity, not about that.)
-func TestCreateRecordsTheRuntimeTheServerStamped(t *testing.T) {
+// A folder that declares no runtime is pinned, on its first push, to the
+// runtime the instance creates on (GET /workflow/defaults) — validated and
+// created on it, and recorded, because `runtime` is a COMMITTED key and the
+// folder is the only lasting statement of the runtime its code is written for.
+func TestCreateRecordsTheRuntimeItWasCreatedOn(t *testing.T) {
 	f := newFakeInstance(t)
-	f.createRuntime = wfdir.RuntimeQuery
 	signIn(t, f)
 	dir := t.TempDir()
 
-	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1"); err != nil {
-		t.Fatalf("init: %v", err)
-	}
-	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, "runtime") {
-		t.Fatalf("init wrote a runtime key without being asked for one: %s", raw)
-	}
-	// `wf init` with no --runtime scaffolds for the runtime the create will
-	// produce; this pins the push, not the scaffold, so the entrypoint is
-	// overwritten with a body of the test's own.
+	initUnpinnedFolder(t, dir)
 	writeLocal(t, dir, "main.py", "print('one')\n")
 
 	out, err := runCLI(t, dir, "wf", "push")
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
-	if len(f.created) != 1 || f.created[0].RuntimeVersion != 0 {
-		t.Fatalf("create declared a runtime the folder never did: %+v", f.created)
+	if len(f.created) != 1 || f.created[0].RuntimeVersion != wfdir.RuntimeQuery {
+		t.Fatalf("create did not name the instance's runtime: %+v", f.created)
 	}
-	// A create rehearsed against runtime 0 would rehearse a save that checks
-	// nothing runtime-scoped — a different save from the one about to happen.
-	if len(f.validated) == 0 || f.validated[len(f.validated)-1].RuntimeVersion != wfdir.RuntimeCreateDefault {
+	if len(f.validated) == 0 || f.validated[len(f.validated)-1].RuntimeVersion != wfdir.RuntimeQuery {
 		t.Errorf("the validate before a create did not name the runtime it will be created on: %+v", f.validated)
 	}
-	// The summary names what the SERVER stamped, not what the folder guessed.
 	const want = "    runtime  3 — steps are journaled; tables are read only through `tools.query` — the container holds no table credential\n"
 	if !strings.Contains(out, want) {
-		t.Errorf("the create summary does not name the runtime the server stamped:\n%s", out)
+		t.Errorf("the create summary does not name the runtime:\n%s", out)
 	}
 	m, err := wfdir.LoadManifest(dir, wfdir.WorkflowKind)
 	if err != nil {
 		t.Fatalf("load manifest: %v", err)
 	}
 	if m.Runtime != wfdir.RuntimeQuery {
-		t.Errorf("manifest runtime = %d, want %d recorded from the created row", m.Runtime, wfdir.RuntimeQuery)
+		t.Errorf("manifest runtime = %d, want %d recorded", m.Runtime, wfdir.RuntimeQuery)
 	}
 
-	// The point of recording it: the SECOND push is an ordinary no-op, not a
-	// refusal about a runtime nobody chose to lower.
+	// The SECOND push is an ordinary one, not a refusal about a runtime nobody
+	// chose to lower.
 	writeLocal(t, dir, "main.py", "print('two')\n")
 	if _, err := runCLI(t, dir, "wf", "push"); err != nil {
 		t.Fatalf("the second push of a folder that never declared a runtime: %v", err)
 	}
 }
 
-// An instance too old to report a runtime at create leaves the manifest exactly
-// as it was — the write-back records a real answer, never a guess.
-func TestCreateLeavesTheManifestAloneWhenTheServerReportsNoRuntime(t *testing.T) {
-	f := newFakeInstance(t)
-	signIn(t, f)
-	dir := t.TempDir()
-
-	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1"); err != nil {
-		t.Fatalf("init: %v", err)
-	}
-	writeLocal(t, dir, "main.py", "print('one')\n")
-	if _, err := runCLI(t, dir, "wf", "push"); err != nil {
-		t.Fatalf("push: %v", err)
-	}
-	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, "runtime") {
-		t.Errorf("a push invented a runtime key against an instance that reported none: %s", raw)
-	}
-}
-
 // Runtime 1 and 2 are retired, so `wf init` refuses to set up a folder that
-// could never be created — in the instance's words, before a byte is written —
-// while its own default is 3, so a plain init never meets the refusal.
+// could never be created — in the instance's words, before a byte is written.
 func TestInitRefusesARetiredRuntime(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -457,7 +396,7 @@ func TestInitRefusesARetiredRuntime(t *testing.T) {
 		if err == nil {
 			t.Fatalf("init accepted --runtime %s", value)
 		}
-		for _, want := range []string{"runtime 1 and 2 are retired", "Omit --runtime (new workflows are runtime 3)", "tools.query"} {
+		for _, want := range []string{"runtime 1 and 2 are retired", "Omit --runtime (the folder then takes the instance's default)", "tools.query"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("--runtime %s refusal does not say %q: %v", value, want, err)
 			}
@@ -471,11 +410,10 @@ func TestInitRefusesARetiredRuntime(t *testing.T) {
 	}
 }
 
-// The flag's own default is 3 (B2): a check that ran on the flag's VALUE
-// whether or not it was passed refused a plain `wf init` when the default was
-// 1. A plain init still writes no runtime key — the instance chooses, and its
-// choice is 3 — and the help says 3.
-func TestInitDefaultsToRuntimeThree(t *testing.T) {
+// A plain `wf init` pins the runtime the instance answers. --runtime's own
+// default is 0, "ask the instance", so --help shows no number that could go
+// stale.
+func TestInitWithoutRuntimeFlagPinsTheInstancesAnswer(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	dir := t.TempDir()
@@ -487,12 +425,25 @@ func TestInitDefaultsToRuntimeThree(t *testing.T) {
 	if got := decodeJSON(t, out)["runtime"]; got != float64(wfdir.RuntimeQuery) {
 		t.Errorf("a plain init reports runtime %v, want 3", got)
 	}
-	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, `"runtime"`) {
-		t.Errorf("a plain init pinned a runtime the author never named: %s", raw)
+	if raw := readFile(t, dir, wfdir.ManifestName); !strings.Contains(raw, `"runtime": 3`) {
+		t.Errorf("a plain init did not pin the instance's runtime: %s", raw)
 	}
-	// What --help prints as "(default N)" is the flag's DefValue.
-	if def := newWorkflowInitCmd().Flags().Lookup("runtime").DefValue; def != "3" {
-		t.Errorf("--runtime's default is %s, want 3 — --help would show it", def)
+	if def := newWorkflowInitCmd().Flags().Lookup("runtime").DefValue; def != "0" {
+		t.Errorf("--runtime's default is %s, want 0 (ask the instance)", def)
+	}
+}
+
+// initUnpinnedFolder is a workflow folder that declares no runtime: what `wf
+// init` wrote before it pinned one, and what a hand-written ronja.json still
+// is. The create-pin tests are about that folder, so they build it explicitly.
+func initUnpinnedFolder(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	setManifestRuntime(t, dir, 0)
+	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, "runtime") {
+		t.Fatalf("could not unpin the folder: %s", raw)
 	}
 }
 
@@ -531,8 +482,8 @@ func TestPushFromAFolderDeclaringNoRuntime(t *testing.T) {
 	signIn(t, f)
 	root := cloneFolder(t, f, "wf-1")
 	// `wf clone` writes the key, so the state under test has to be made: this is
-	// the folder somebody committed before the write-back existed, or wrote by
-	// hand, or produced with an older CLI.
+	// the folder somebody committed before the create pinned a runtime, or wrote
+	// by hand, or produced with an older CLI.
 	setManifestRuntime(t, root, 0)
 	writeLocal(t, root, "main.py", "M2\n")
 
@@ -574,39 +525,12 @@ func TestStatusReportsNoRuntimeDriftForAnUnpinnedFolder(t *testing.T) {
 	}
 }
 
-// ── A write-back must never brick the folder it just wrote ──────────────────
-
-// The day an instance's create default becomes a runtime this build has never
-// heard of, a SUCCESSFUL push must not commit that number into ronja.json:
-// LoadManifest refuses an unknown runtime, so the next command on the folder
-// would hard-fail with nothing to do about it but upgrade the CLI or re-clone.
-// An unknown runtime degrades to the behaviour that predates the write-back —
-// record nothing — which leaves the folder unpinned and therefore workable.
-func TestCreateDoesNotRecordARuntimeThisBuildCannotOpen(t *testing.T) {
-	f := newFakeInstance(t)
-	f.createRuntime = 99
-	signIn(t, f)
-	dir := t.TempDir()
-
-	if _, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1"); err != nil {
-		t.Fatalf("init: %v", err)
-	}
-	writeLocal(t, dir, "main.py", "print('one')\n")
-	if _, err := runCLI(t, dir, "wf", "push"); err != nil {
-		t.Fatalf("push: %v", err)
-	}
-
-	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, "runtime") {
-		t.Fatalf("the create wrote back a runtime this build cannot open: %s", raw)
-	}
-	// The point of not writing it: the folder still opens.
-	if _, err := wfdir.LoadManifest(dir, wfdir.WorkflowKind); err != nil {
-		t.Fatalf("the folder the push created cannot be opened again: %v", err)
-	}
-	if _, err := runCLI(t, dir, "wf", "status", "--json"); err != nil {
-		t.Fatalf("status on the folder the push created: %v", err)
-	}
-}
+// ── A runtime this build cannot open is never written ──────────────────────
+//
+// LoadManifest refuses an unknown runtime, so recording one would hard-fail
+// every later command on the folder. A push never pins one: an instance default
+// this build does not know is refused before anything is sent (see
+// TestAnUnpinnedCreateIsLoudWhenTheDefaultsCannotBeRead).
 
 // `wf clone` records the source's runtime for a different reason — identity, so
 // the folder recreates the same runtime elsewhere — and the same bricking
@@ -777,7 +701,7 @@ func TestPushRefusesARaiseToARetiredRuntime(t *testing.T) {
 	if err == nil {
 		t.Fatal("push accepted a raise from runtime 1 to retired runtime 2")
 	}
-	for _, want := range []string{"runtime 1 and 2 are retired", `Set "runtime": 3`, "tools.query"} {
+	for _, want := range []string{"runtime 1 and 2 are retired", `Set "runtime" in`, "to a runtime the instance creates on", "tools.query"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal missing %q: %v", want, err)
 		}
@@ -805,7 +729,7 @@ func TestPushRefusesToCreateOnARetiredRuntime(t *testing.T) {
 		if err == nil {
 			t.Fatalf("push created a workflow on retired runtime %d", runtime)
 		}
-		for _, want := range []string{"runtime 1 and 2 are retired", "cannot be created", `Set "runtime": 3`} {
+		for _, want := range []string{"runtime 1 and 2 are retired", "cannot be created", `Set "runtime" in`, "GET /api/v2/workflow/defaults names the default"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("runtime %d refusal missing %q: %v", runtime, want, err)
 			}

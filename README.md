@@ -359,6 +359,16 @@ ronja update           # install the newest release
 ronja update --check   # report what it would do, and change nothing
 ```
 
+Every request the CLI makes carries `User-Agent: ronja-cli/<version>` (the
+version `ronja --version` prints; `dev` for an unstamped build), from one place
+(`internal/useragent`, set at startup; the release fetch uses the same format).
+An instance counts CLI versions by it before it changes a default an older CLI
+cannot follow, and reads a bare `ronja-cli` — what every release before the
+version was added sends — as older than all of them. A request `ronja api`
+passes through carries `ronja-cli-api/<version>` instead (a `-H User-Agent`
+still wins), so an instance never counts a hand-written request as one a CLI
+command built. Keep both formats.
+
 A binary that rewrites itself as a side effect of a command somebody asked for
 is a binary whose bytes change under a CI job that pinned a version.
 
@@ -1764,6 +1774,16 @@ A **durable** workflow — which is what a first push creates unless the folder
 declares otherwise — adds one verb to that loop: `ronja wf test --resume`
 continues a failed run instead of starting over. See "Durable workflows" below.
 
+**`push` syncs every file in the folder** except dot-files and dot-directories,
+`ronja.json`, `ronja.lock.json` and `.ronja/` (each dot-file and dot-directory,
+a symlink, and a path the server would refuse are reported as skipped): a README, notes or a data file is stored
+with the workflow like the code. A run loads only the entrypoint and
+the other `.py` files whose file and folder names are letters, digits and
+underscores (none starting with a digit), so `validate` and `push` (unless
+`--no-validate`) name every other file: a note for a file that is not `.py` (kept, but the code cannot read
+it) and a warning for a `.py` file whose name breaks that rule
+(`lib/my-helpers.py`, `main.old.py`; rename it `lib/my_helpers.py`). Neither stops the push.
+
 Two or three files describe the folder — see **Stacks** below for which, and
 why the third one exists:
 
@@ -1889,9 +1909,9 @@ why the third one exists:
 
   `runtime` is the workflow's runtime version: `3`, a **durable** workflow whose
   container holds no credential for Ronja's table storage (its code reads a
-  table only through `tools.query`), is the only runtime a workflow is created
-  on. `1` (the original runtime) and `2` (durable, reading tables in the
-  container) are **retired**: a folder cloned from such a workflow records its
+  table only through `tools.query`), or `4`; which of them an instance creates
+  new workflows on is the instance's to say. `1` (the original runtime) and `2`
+  (durable, reading tables in the container) are **retired**: a folder cloned from such a workflow records its
   true `1` or `2` and keeps pushing files to its draft, but its code can be
   test-run or published only once the folder says `"runtime": 3` — the folder's
   spelling of the server's `runtimeVersion 3`. "Code" is more than the files:
@@ -1899,27 +1919,46 @@ why the third one exists:
   packages it installs and the tables, secrets, Agents and modules its files
   use. What still publishes on such a workflow is its title, its description and
   how it runs (reporting timezone, concurrency, dedicated compute, approval
-  defaults). **Absent means "let the instance
-  choose", and a new workflow is created on `3`.** Unlike `parameters` it is a
+  defaults). **Absent means "the instance's default", and the push that creates
+  the workflow asks the instance which that is and pins it.** Unlike `parameters` it is a
   plain int with no three-state pointer, because the third state has nothing to
   describe: the runtime moves **one way**, so a pointer would publish a
-  distinction no code could act on. `wf init` writes the key whenever
-  `--runtime` names one (a release with the freeze accepts only `3`; an older
-  one writes what it is given, and the server then refuses to create a workflow
-  on `1` or `2`), `wf clone` writes the runtime the
-  cloned workflow is on (`1` included — the folder is committed, and is the only
-  lasting statement of the runtime its code is written for), and the push that
-  CREATES a workflow records whatever
-  runtime the instance stamped — but only a runtime this CLI knows, since
-  recording a `4` it cannot open would brick the folder the push just created.
+  distinction no code could act on. `wf init` **always** writes the key, and the
+  starter `main.py` with it, both read from the instance: `GET
+  /api/v2/workflow/defaults?runtime=N` for the runtime `--runtime` names, else
+  `GET /api/v2/workflow/defaults` for the one it creates new workflows on. The
+  CLI carries no starter and no default of its own, so every failure fails
+  `init` before it writes anything: a runtime the instance does not create on
+  (its refusal names the ones it does), an instance too old to serve the route
+  (update the instance, or use an older `ronja`), an expired credential, a
+  `5xx`, a default runtime this release does not know (run `ronja update`),
+  and a starter over 256 KiB. With `--from`, or over a `main.py` already in the
+  folder, and no `--runtime`, the folder is still pinned to the instance's
+  default, and the report (a `Note:`, or `warnings` under `--json` beside
+  `scaffolded: false`) says the code was not written from its starter. Pinning
+  is the point: the first push sends the pinned runtime on
+  the create, so the workflow is created on the runtime its starter was written
+  for even after the instance's default has moved. (`--runtime 1` and
+  `--runtime 2` are refused: those runtimes are retired.) `wf clone` writes the
+  runtime the cloned workflow is on (`1` included — the folder is committed, and
+  is the only lasting statement of the runtime its code is written for). A
+  folder that names none and has no workflow yet — written by hand, or by an
+  older `wf init` — is pinned by the push that creates it: the push reads the
+  instance's default, validates against it, sends it on the create and records
+  it once the workflow exists (the report says `pinned to the instance's
+  default`); a push refused before the create leaves `ronja.json` exactly as it
+  was, and a failed read of the default stops the push before it sends anything.
   The key is committed, and the folder is the only lasting statement of the
   runtime its code is written for. An absent key **declares nothing**, and every
   reader treats it that way: an unpinned folder bound to a workflow on any
   runtime pushes without complaint, and `wf status` reports no drift for it.
-  `validate` — the standalone command and the
-  pass inside `push` — rehearses against that same runtime, so a folder declaring
-  none is checked against the one it is about to be created on rather than
-  against no runtime rules at all. A push raises a workflow on runtime 1 or 2 to
+  `validate` — the standalone command, the pass inside `push`, and `sync check`
+  — rehearses against that same runtime, so a folder declaring none is checked
+  against the one it is about to be created on (the instance's default, read
+  once per run and never written) rather than against no runtime rules at all.
+  A folder declaring none that is bound to a workflow `validate` cannot read is
+  checked against no runtime rules, and its `could not read` note says so. A
+  push raises a workflow on runtime 1 or 2 to
   a folder's `3` (`runtime  1 → 3 (Durable, tables via tools.query)` in the
   report; the raise lands on your draft as its own request, after the files,
   and `wf publish` commits the flip).
@@ -1927,8 +1966,14 @@ why the third one exists:
   runtime cannot be lowered — and so, before anything is written, is a folder
   declaring `2` against a runtime-1 workflow (3 is the only upgrade) and a folder
   declaring `1` or `2` that would CREATE a workflow. A value this CLI does not
-  know (`"runtime": 4`) is refused when the folder is opened, so it fails at the
-  push rather than at the first unattended run.
+  know (`"runtime": 5` on this release) is refused when the folder is opened, so
+  it fails at the push rather than at the first unattended run, with
+  `run: ronja update` in the message. When the instance refuses a runtime
+  instead — it does not take the one sent, or the workflow has moved past the
+  folder's — the error ends with the runtimes this CLI knows and the way out
+  either way: `ronja update` when the instance names a newer one, the
+  `"runtime"` key when it names an older one. `sync apply` puts that hint in the
+  folder's `notes`.
 
   `reportingTimezone` is the **calendar the workflow's runs execute on** — the
   IANA zone its DuckDB session is set to, so it is what `date_trunc`,
@@ -2467,9 +2512,10 @@ it takes away nothing that ever worked.
 All three scan source as TEXT — so a commented-out marker trips them. Accepted
 rather than mirroring `stripLineComments` and `stripTripleQuotedBlocks`, whose
 drift would be silent in both directions; deleting a dead line is a real fix, and
-the messages say so. (`ronja wf init`'s runtime-3 scaffold writes its example ref
-as `{{ ref('table-…') }}` for exactly this reason: an id-shaped placeholder, so
-the CLI never writes a file it would then refuse to push.)
+the messages say so. (The instance's runtime-3 starter, which `wf init` writes,
+names its example ref as `{{ ref('table-…') }}` for exactly this reason: an
+id-shaped placeholder, so `wf init` never writes a file `push` would then
+refuse.)
 
 **`wf validate` and `app validate` fail on an alias refusal** — non-zero, `ok:
 false`, and the refusals in the `--json` payload under `aliasRefusals`. They are
@@ -2738,9 +2784,10 @@ finished executes again.
 durable **and** withholds every Ronja table credential from the container: its
 code reads a table only through
 `tools.query("SELECT ... FROM {{ ref('tbl::...') }}")`, never by reading a
-parquet file itself. A folder that declares no `runtime` creates a workflow on
-3, and the create summary names the runtime it was given; `wf init` scaffolds a
-durable `main.py` with a header stating the table rule. Runtime 1 and 2 are
+parquet file itself. `wf init` pins the runtime the instance creates on and
+writes the instance's starter `main.py` for it; a folder that declares no
+`runtime` is pinned to the instance's default by the push that creates its
+workflow, and the create summary names the runtime it was given. Runtime 1 and 2 are
 retired: a new workflow on either is refused. The server refuses the create on
 every CLI release; a release with the freeze refuses earlier — `wf init
 --runtime 1` and `--runtime 2`, and a push that would create a workflow from a
@@ -2753,8 +2800,8 @@ has to write a key — so a loop journals per item, and forgetting one stops bei
 possible.
 
 ```bash
-ronja wf init --feature collection-abc        # a durable main.py on runtime 3
-ronja wf push                                 # the create stamps the runtime
+ronja wf init --feature collection-abc        # pins the instance's runtime, writes its starter main.py
+ronja wf push                                 # the create sends the pinned runtime
 ronja wf test                                 # it fails somewhere in the middle
 $EDITOR main.py && ronja wf push              # fix the bug
 ronja wf test --resume                        # continue from where it stopped
@@ -2944,11 +2991,11 @@ workflow this folder did not create. The manifest is the fallback for one case
 only — an instance predating durable workflows sends no `runtimeVersion`, and a
 0 means "the instance did not say", not "runtime 1".
 
-`wf init` (runtime 3, which is durable) also writes a `main.py` in
-the shapes a resume depends on (decorated steps, keys derived rather than
-written, `tools.now()`, handles across step boundaries). A durable workflow scaffolded from v1 code journals
-nothing and fails silently: the run works, and the resume that was the point of
-it does not.
+`wf init` writes the instance's starter `main.py` for the runtime it pins (on 3,
+in the shapes a resume depends on: decorated steps, keys derived rather than
+written, `tools.now()`, handles across step boundaries). A durable workflow
+scaffolded from v1 code journals nothing and fails silently: the run works, and
+the resume that was the point of it does not.
 
 ### Two editors, one workflow
 
@@ -3234,6 +3281,26 @@ reports that component's warnings (with a CLI built after app icons shipped;
 an older binary prints no `Warnings:` block in that case). A `components/icon.svg`, or any icon not at
 the root, is an ordinary file.
 
+**`api/` holds the app's server functions.** Each `.ts` / `.js` file directly
+in `api/` is a server function: backend code that runs on Ronja's servers and
+that the app calls with `functions.call("<name>")`. Deeper files (`api/lib/…`)
+are its helpers. To the CLI they are ordinary files: `push` sends them, `clone`
+brings them down, `status` diffs them, and nothing here parses them. The server
+builds and checks every function on every code write, so a bad one comes back as
+`Compiles: NO` naming the file. That check reads each function's literal
+`{{ ref('table-…') }}` refs, `env.db('secret-…')` ids and `{{secret::secret-….<field>}}`
+placeholders against the allowlists the push has just sent, which is one more
+reason `access` goes first (see the push order below). `env.db` is also held
+to the app's `query_external` / `write_external` capabilities (which call needs
+which is *Ids, and what the app declares* in the skill), and those are checked when the
+function runs, not on push. `app test` exercises functions only
+through the app, whose `ops` list each call as `/fn/<name>`. There is no verb
+that calls a function directly, and `ronja api` cannot either, because the route
+takes only the app's own token. The runtime and the limits of one call are in
+the `creating-data-apps` skill (*Server functions*, *Limits and errors*), and
+the `/service-api/v1/fn/:name` wire contract in the `dataapp-dev` guide (*Server
+functions*).
+
 ### Four things that are not like a workflow
 
 These are not arbitrary; each falls out of how data apps work server-side.
@@ -3452,8 +3519,9 @@ Push does things in an order that is the reverse of `wf` in one place and
 different in another, both deliberately:
 
 1. **Allowlists before files.** The compiler validates a secret reference
-   against `allowedSecretIDs`, so a file that arrives before its grant fails to
-   compile for a reason that is nowhere in the file.
+   against `allowedSecretIDs` (and a server function's table refs and
+   `env.db` ids against both lists), so a file that arrives before its grant
+   fails to compile for a reason that is nowhere in the file.
 2. **Entrypoint LAST**, where a workflow writes it first. A workflow leads with
    it because renaming one needs the new file to exist before the row can name
    it — which cannot happen here. What entrypoint-last buys instead is cost: a
@@ -4950,6 +5018,17 @@ The restriction is the server's (V1): the runtime's module-name grammar mangles 
 non-`.py` path, writing `data.csv` as `data/csv.py`. It is threaded through
 `wfdir.Kind.SyncExt`, so `Enumerate` and `CheckLocalPaths` answer identically —
 the rule that stops a baseline claiming a path no later walk returns.
+A `.py` file whose file or folder names are not letters, digits and underscores,
+or start with a digit (`my-helpers.py`, `calc.v2.py`, a digit-led folder), is
+refused, naming the file and a spelling that loads (`my_helpers.py`): the runtime
+stops on a hyphen or a leading digit before any code runs, so one would break
+every workflow importing the module. `validate` reports every such
+file and `push` refuses the first one it would write, before anything is written —
+the server refuses one per file write, so leaving it to the server would stop a
+push part-way. A file already on the server with the same content is not
+written, so a module committed before the rule still takes edits to its other files. The
+rule is `markers.IsRunModulePath`, a copy of the server's
+`pymarkers.IsRunModulePath` that `cli/internal/markers`' parity test pins.
 
 **`__init__.py` is not optional.** The server seeds one inside the create
 transaction, and `module init` seeds one locally, and the two are not redundant:
@@ -4995,8 +5074,9 @@ markers against the author's access, which genuinely requires the server. **A
 module refuses every Ronja marker at save** — it receives its database handles,
 data and configuration as function arguments — so there is nothing to resolve and
 no server-side pass to run. What is checkable is checked here: the path grammar,
-the `.py` rule, the size and NUL limits, the case-collision rule, the package
-name's identifier shape, the presence of `__init__.py`, and **the marker rule
+the `.py` rule, the file-name rule, the size and NUL
+limits, the case-collision rule, the package name's identifier shape, the
+presence of `__init__.py`, and **the marker rule
 itself**, which needs no server precisely because it resolves nothing — a lexical
 scan naming the file and the marker family, ported from the server's own gate
 (`pymarkers.FirstRonjaMarkerVerb`) with the same dead-text rule: a marker in a

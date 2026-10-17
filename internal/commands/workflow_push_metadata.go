@@ -147,7 +147,7 @@ func checkRuntimeDrift(f *folder, live *api.Workflow) error {
 		return nil
 	}
 	if declared > live.RuntimeVersion && wfdir.RetiredRuntime(declared) {
-		return fmt.Errorf("this folder declares runtime %d, but %s is on runtime %d, and runtime 1 and 2 are retired — a push can only upgrade it to runtime 3.\n  %s, or set it back to %d to leave the runtime as it is",
+		return fmt.Errorf("this folder declares runtime %d, but %s is on runtime %d, and runtime 1 and 2 are retired — a push can only upgrade it to a runtime the instance creates on (GET /api/v2/workflow/defaults names the default).\n  %s, or set it back to %d to leave the runtime as it is",
 			declared, live.ID, live.RuntimeVersion, retiredRuntimeAdvice(f), live.RuntimeVersion)
 	}
 	if declared >= live.RuntimeVersion {
@@ -166,11 +166,12 @@ func checkRuntimeDrift(f *folder, live *api.Workflow) error {
 }
 
 // retiredRuntimeAdvice is the way out of a retired-runtime refusal in a
-// folder's own words: the instance says "set runtimeVersion 3", and in a folder
-// that is the manifest key.
+// folder's own words: in a folder, the runtime is the manifest key. It names no
+// number: which runtimes a workflow can be created on is the instance's to say,
+// and a number here goes stale the day its default moves.
 func retiredRuntimeAdvice(f *folder) string {
-	return fmt.Sprintf("Set \"runtime\": %d in %s and read tables with tools.query (the {{ ref }} marker goes inside the SQL string)",
-		wfdir.RuntimeQuery, wfdir.ManifestPath(f.Root))
+	return fmt.Sprintf("Set \"runtime\" in %s to a runtime the instance creates on (GET /api/v2/workflow/defaults names the default) and read tables with tools.query (the {{ ref }} marker goes inside the SQL string)",
+		wfdir.ManifestPath(f.Root))
 }
 
 // sameParameters compares two declarations for sync purposes. Order is

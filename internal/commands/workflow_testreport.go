@@ -69,6 +69,11 @@ func printTestReport(o *testOutcome, logsMode string) {
 			fmt.Fprintf(out, "    %s  %s, %d %s\n", table.DisplayName, table.WriteMode,
 				table.FileCount, plural(table.FileCount, "file"))
 		}
+		// A run adopted from the run LIST (adoptTimedOutRun, when the follow never
+		// replaced it) carries only its first 20 tables; say how many it wrote.
+		if more := run.RunTableOutputCount() - len(run.TableOutputs); more > 0 {
+			fmt.Fprintf(out, "    and %d more (ronja api /api/v2/workflow/run/%s/table-outputs)\n", more, run.ID)
+		}
 	}
 
 	printRunLogs(out, run.Logs, logsMode)

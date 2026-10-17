@@ -30,6 +30,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ronjatech/ronja-cli/internal/useragent"
 )
 
 const (
@@ -86,7 +88,7 @@ func Latest(ctx context.Context, base, version string) (Release, error) {
 		return Release{}, fmt.Errorf("build release request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "ronja-cli/"+version)
+	req.Header.Set("User-Agent", useragent.For(version))
 	// Deliberately no Authorization header. See the package doc.
 
 	resp, err := releaseHTTPClient().Do(req)

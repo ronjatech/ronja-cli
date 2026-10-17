@@ -76,14 +76,12 @@ type ValidateInput struct {
 	Parameters  []WorkflowParameter `json:"parameters,omitempty"`
 	Files       []ValidateFile      `json:"files"`
 	PipPackages []string            `json:"pipPackages,omitempty"`
-	// RuntimeVersion is 1, 2 or 3 — the runtime the candidate is checked against.
+	// RuntimeVersion is the runtime the candidate is checked against.
 	//
-	// ⚠️ 0 is NOT the create default here. This endpoint reads it as "run no
-	// runtime-scoped rules", which is what every caller written before runtimes
-	// existed is asking for — deliberately unlike CreateWorkflowInput, where an
-	// absent key means "give me the current default". So a rehearsal of a CREATE
-	// has to NAME the runtime the create will produce, or it rehearses a
-	// different save. wfdir.Manifest.RuntimeForValidate is where that is decided.
+	// ⚠️ 0 is NOT the create default here: this endpoint reads it as "run no
+	// runtime-scoped rules". So a rehearsal of a CREATE has to NAME the runtime
+	// the create will be made on, or it rehearses a different save (see
+	// createRuntimeFor in internal/commands).
 	RuntimeVersion int `json:"runtimeVersion,omitempty"`
 }
 

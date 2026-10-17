@@ -191,10 +191,9 @@ at the right flow.`,
 			//
 			// Zero is the one value not recorded: an instance too old to report
 			// a runtime has told us nothing, and a folder must not declare a
-			// guess. A runtime this build does not KNOW is not recorded either,
-			// for the reason spelled out at the create write-back in
-			// workflow_push.go: recording it would write a manifest this CLI
-			// refuses to open again.
+			// guess. A runtime this build does not KNOW is not recorded either:
+			// LoadManifest refuses an unknown runtime, so recording it would
+			// write a manifest this CLI refuses to open again.
 			if source.RuntimeVersion != 0 && wfdir.ValidRuntime(source.RuntimeVersion) {
 				manifest.Runtime = source.RuntimeVersion
 			}

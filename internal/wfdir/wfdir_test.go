@@ -1015,10 +1015,11 @@ func TestEnumerateReportsNonRegularFiles(t *testing.T) {
 	}
 }
 
-// A candidate is checked against the runtime it will actually run on, which is
-// not always the one the folder declares. Validate is a pre-creation endpoint
-// with no row to read: it takes 0 as "check nothing runtime-scoped", so a create
-// rehearsed with 0 would rehearse a different save from the one about to happen.
+// A candidate for an existing row is checked against the runtime it will
+// actually run on, which is not always the one the folder declares. A create is
+// not this function's question — the instance names that runtime — so an
+// undeclared folder with no row reads 0, "check nothing runtime-scoped", rather
+// than a compiled-in guess at the instance's default.
 func TestRuntimeForValidate(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -1028,7 +1029,7 @@ func TestRuntimeForValidate(t *testing.T) {
 	}{
 		{"a declared runtime wins, unbound", 2, nil, 2},
 		{"a declared runtime wins over the row it will raise", 3, &api.Workflow{RuntimeVersion: 1}, 3},
-		{"undeclared, creating: the runtime the create will produce", 0, nil, RuntimeCreateDefault},
+		{"undeclared, no row: nothing runtime-scoped, never a guess", 0, nil, 0},
 		{"undeclared, bound: the row's own runtime", 0, &api.Workflow{RuntimeVersion: 2}, 2},
 		{"undeclared, bound to a row that reports none: nothing runtime-scoped", 0, &api.Workflow{}, 0},
 	} {

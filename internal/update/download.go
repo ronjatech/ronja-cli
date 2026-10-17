@@ -14,6 +14,8 @@ import (
 	"path"
 	"sync"
 	"time"
+
+	"github.com/ronjatech/ronja-cli/internal/useragent"
 )
 
 const (
@@ -302,7 +304,7 @@ func get(ctx context.Context, base, url string) (io.ReadCloser, error) {
 		cancel()
 		return nil, fmt.Errorf("build request for %s: %w", Safe(url), err)
 	}
-	req.Header.Set("User-Agent", "ronja-cli")
+	req.Header.Set("User-Agent", useragent.Product)
 	// Deliberately no Authorization header — see the package doc.
 	resp, err := releaseHTTPClient().Do(req)
 	if err != nil {

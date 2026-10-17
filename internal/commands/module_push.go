@@ -193,6 +193,17 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 	if err != nil {
 		return nil, err
 	}
+	// The server refuses a file that breaks the file-name rule one write at a
+	// time, which would likewise stop the push part-way. It checks only what it
+	// writes, so this checks only the files this push will write: a file
+	// committed before the rule and left unchanged must not block the push.
+	before, err := moduleFilesBeforePush(ctx, client, existing)
+	if err != nil {
+		return nil, err
+	}
+	if err := refuseModuleFileNames(moduleFilesToWrite(local, before)); err != nil {
+		return nil, err
+	}
 	featureID, err := moduleFeatureIDFor(f, existing.Module)
 	if err != nil {
 		return nil, err
@@ -853,7 +864,7 @@ func putModuleFiles(ctx context.Context, client *api.Client, target *api.Module,
 	}
 
 	for _, path := range order {
-		if remoteContent, ok := remote[path]; ok && remoteContent == local[path] {
+		if moduleFileUnchanged(local, remote, path) {
 			result.Unchanged++
 			continue
 		}
@@ -891,6 +902,42 @@ func putModuleFiles(ctx context.Context, client *api.Client, target *api.Module,
 		result.Pushed = append(result.Pushed, path)
 	}
 	return nil
+}
+
+// moduleFileUnchanged reports that the row already holds path with the local
+// content, so a push skips it.
+func moduleFileUnchanged(local, remote map[string]string, path string) bool {
+	remoteContent, ok := remote[path]
+	return ok && remoteContent == local[path]
+}
+
+// moduleFilesToWrite is the subset of local a push writes against remote.
+func moduleFilesToWrite(local, remote map[string]string) map[string]string {
+	out := make(map[string]string, len(local))
+	for path, content := range local {
+		if !moduleFileUnchanged(local, remote, path) {
+			out[path] = content
+		}
+	}
+	return out
+}
+
+// moduleFilesBeforePush is what the row a push writes to holds before any
+// write: the open draft or unpublished row itself, or the live row a checkout
+// will copy. Nil for a module the push creates.
+func moduleFilesBeforePush(ctx context.Context, client *api.Client, existing existingModuleTarget) (map[string]string, error) {
+	row := existing.Row()
+	if row == nil {
+		row = existing.Module
+	}
+	if row == nil {
+		return nil, nil
+	}
+	files, err := client.ListModuleFiles(ctx, row.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read files of %s: %w", row.ID, err)
+	}
+	return moduleContentByPath(files), nil
 }
 
 // reconcileTimedOutModulePut asks what the server actually holds for one file

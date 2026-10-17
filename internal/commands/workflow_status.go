@@ -560,7 +560,7 @@ func printStatus(r *statusReport) {
 					label = "refused"
 					suffix = " — the runtime cannot be lowered; a push is refused"
 					if rt.Local > rt.Remote {
-						suffix = " — runtime 1 and 2 are retired, so the only upgrade is to 3; a push is refused"
+						suffix = " — runtime 1 and 2 are retired, so the only upgrade is to a runtime the instance creates on; a push is refused"
 					}
 				}
 				fmt.Fprintf(out, "    %-9s runtime: %d here, %d there%s\n", label, rt.Local, rt.Remote, suffix)

@@ -51,6 +51,11 @@ agents and workflows the app is allowed to reach, and which app it maps to on
 each instance. The sync baseline lives in .ronja/, which is local-only and
 git-ignored for you.
 
+Files directly in api/ (api/<name>.ts or .js) are server functions: the app's backend,
+run on Ronja's servers and called from the app with functions.call("<name>").
+They push like any other file, and every push builds and checks them; what goes
+inside one is in /docs/api/skills/creating-data-apps.md.
+
 Two ways in:
 
   ronja app clone <data-app-id>    copy an existing app down to a folder

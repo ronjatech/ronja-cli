@@ -146,8 +146,14 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 	// is advisory, so a row we cannot read costs the parameters, not the command.
 	existing, err := inspectTarget(ctx, client, f)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Note: could not read %s on %s (%v) — validating the files alone, without its saved parameters.\n",
-			f.Binding.WorkflowID, f.Resolved.URL, err)
+		// A folder that names no runtime is checked against its row's, so
+		// without the row it is checked against none (RuntimeForValidate).
+		unchecked := ""
+		if f.Manifest.Runtime == 0 {
+			unchecked = " and without runtime-scoped rules (this folder names no runtime, and the workflow's could not be read), so they were not checked"
+		}
+		fmt.Fprintf(os.Stderr, "  Note: could not read %s on %s (%v) — validating the files alone, without its saved parameters%s.\n",
+			f.Binding.WorkflowID, f.Resolved.URL, err, unchecked)
 	}
 
 	featureID, err := featureIDFor(ctx, client, f, existing.Workflow)
@@ -200,16 +206,24 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 	if f.Manifest.ManagesParameters() {
 		params = f.Manifest.DeclaredParameters()
 	}
+	// The runtime the FOLDER declares, so a candidate is checked against the
+	// rules its author wrote for — and, when it declares none, the runtime the
+	// workflow it would push to runs on, or (a folder with no workflow yet) the
+	// one the instance would create it on, which is what `wf push` pins. Read,
+	// never written: this door saves nothing. See createRuntimeFor and
+	// Manifest.RuntimeForValidate.
+	runtime := f.Manifest.RuntimeForValidate(existing.Workflow)
+	if f.Binding.WorkflowID == "" {
+		if runtime, err = createRuntimeFor(ctx, client, f); err != nil {
+			return out, err
+		}
+	}
 	result, err := client.ValidateWorkflowFiles(ctx, api.ValidateInput{
-		FeatureID:  featureID,
-		Entrypoint: f.Manifest.Entrypoint,
-		Parameters: params,
-		Files:      validateFilesOf(f.Codec, files),
-		// The runtime the FOLDER declares, so a candidate is checked against the
-		// rules its author wrote for — and, when it declares none, the runtime
-		// the workflow this folder would create or push to actually runs on. See
-		// Manifest.RuntimeForValidate.
-		RuntimeVersion: f.Manifest.RuntimeForValidate(existing.Workflow),
+		FeatureID:      featureID,
+		Entrypoint:     f.Manifest.Entrypoint,
+		Parameters:     params,
+		Files:          validateFilesOf(f.Codec, files),
+		RuntimeVersion: runtime,
 	})
 	if err != nil {
 		if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {

@@ -255,8 +255,8 @@ var (
 //
 // RuntimeDefault is the runtime a folder may still DECLARE, and its behaviour is
 // frozen: v1 runs stay bit-identical. It is NOT what a workflow gets when the
-// create body says nothing — the server's create default is RuntimeQuery, so a
-// folder that wants v1 has to keep saying so. It stays the value an ABSENT
+// create body says nothing — that is the instance's create default, which GET
+// /workflow/defaults names. It stays the value an ABSENT
 // `runtime` key means to THIS CLI (see Manifest.RuntimeVersion), which is a
 // separate question from what the server stamps. RuntimeDurable journals
 // every @tools.step result, which is what makes a failed run resumable.
@@ -265,7 +265,7 @@ var (
 // reads a Ronja table only through tools.query.
 //
 // Runtime 1 and 2 are RETIRED on the instance: nothing new is created on them
-// and 1 → 2 is refused, so 3 is the only runtime a push may create or raise to
+// and 1 → 2 is refused, so a push creates or raises only to a runtime above them
 // (see RetiredRuntime). A folder still DECLARING 1 or 2 stays loadable all the
 // same — `wf clone` of a legacy workflow records its true runtime, and that
 // folder keeps pushing files to the workflow's draft. RuntimeDefault keeps its
@@ -277,50 +277,50 @@ var (
 // instance has never heard of would create a workflow whose runtime nobody can
 // name — discovered at the first run, not at the push. That refusal is
 // ValidRuntime, and LoadManifest applies it to every folder it opens.
+//
+// RuntimeMain (4) is a runtime whose meaning is the instance's to say; the CLI
+// models it as Durable, like 3.
 const (
 	RuntimeDefault = 1
 	RuntimeDurable = 2
 	RuntimeQuery   = 3
+	RuntimeMain    = 4
 )
-
-// RuntimeCreateDefault mirrors the runtime an instance stamps on a workflow
-// created with no runtime in the body. It is NOT what an absent `runtime` key
-// means to this CLI (that is RuntimeDefault) — it is the CLI's copy of somebody
-// else's decision, kept only so a rehearsal can name the runtime a create is
-// about to happen on. See Manifest.RuntimeForValidate, its one caller.
-const RuntimeCreateDefault = RuntimeQuery
 
 // ValidRuntime reports whether n is a runtime this CLI knows how to declare.
 //
-// Zero is valid: a manifest may simply not mention a runtime, which is what a
-// folder written before runtimes existed looks like and what a folder that
-// leaves the choice to the instance looks like. (The two are not the same
-// folder any more: a create's write-back records what the server stamped, so
-// an unpinned folder does not stay unpinned past its first push.) Everything
-// else is refused at load, so a hand-edited `"runtime": 4` fails at the push
-// that would have created it rather than at the first unattended run.
+// Zero is valid: a manifest may simply not mention a runtime, and the push that
+// creates its workflow pins the instance's default. Everything else is refused
+// at load, so a hand-edited `"runtime": 5` fails at the push that would have
+// created it rather than at the first unattended run.
 func ValidRuntime(n int) bool {
-	return n == 0 || n == RuntimeDefault || n == RuntimeDurable || n == RuntimeQuery
+	return n == 0 || n == RuntimeDefault || n == RuntimeDurable || n == RuntimeQuery || n == RuntimeMain
+}
+
+// CreatableRuntime reports whether a new workflow may be created on n: a runtime
+// this CLI knows that is not retired. Zero is not creatable — it names nothing.
+func CreatableRuntime(n int) bool {
+	return n != 0 && ValidRuntime(n) && !RetiredRuntime(n)
 }
 
 // RetiredRuntime reports whether n is runtime 1 or 2, which an instance no
 // longer creates a workflow on or raises one to. Zero is not retired: it is a
 // folder that declares nothing, and the instance then creates on its default,
-// which is 3.
+// which `wf init` and the first push pin.
 func RetiredRuntime(n int) bool {
 	return n == RuntimeDefault || n == RuntimeDurable
 }
 
 // Runtimes is every runtime a folder may declare, for the messages that have to
-// list them. Derived from the constants so a fourth cannot be added to one
+// list them. Derived from the constants so another cannot be added to one
 // without the other.
-var Runtimes = []int{RuntimeDefault, RuntimeDurable, RuntimeQuery}
+var Runtimes = []int{RuntimeDefault, RuntimeDurable, RuntimeQuery, RuntimeMain}
 
-// joinInts renders a list of runtimes for a message — "1, 2 or 3". Here rather
-// than at each call site so the refusal at load and the refusal at `wf init`
-// read identically; a reader who sees both should not have to wonder whether
-// they are the same list.
-func joinInts(ns []int) string {
+// JoinInts renders a list of runtimes for a message — "1, 2, 3 or 4". The one
+// rendering every message listing runtimes uses (the refusal at load, the hint
+// under an instance's runtime refusal), so a reader who sees two of them never
+// has to wonder whether they are the same list.
+func JoinInts(ns []int) string {
 	parts := make([]string, 0, len(ns))
 	for _, n := range ns {
 		parts = append(parts, strconv.Itoa(n))

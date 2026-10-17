@@ -398,8 +398,9 @@ func TestInitRejectsAnUnknownRuntime(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 
-	// 3 is a real runtime now; 4 is the next one this build has not heard of.
-	for _, value := range []string{"0", "4", "-1"} {
+	// 3 and 4 are real runtimes; 5 is the next one this build has not heard of,
+	// and 0 names nothing (it is what an unnamed flag means, never a choice).
+	for _, value := range []string{"0", "5", "-1"} {
 		dir := t.TempDir()
 		_, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", value)
 		if err == nil {
@@ -414,9 +415,8 @@ func TestInitRejectsAnUnknownRuntime(t *testing.T) {
 	}
 }
 
-// A runtime the CLI DOES know is accepted, writes the key, and scaffolds — the
-// positive half of the refusal above. Runtime 3 is durable (a superset of 2), so
-// it gets the same starter rather than an empty file.
+// A runtime the CLI DOES know is accepted, writes the key, and writes the
+// instance's starter for it — the positive half of the refusal above.
 func TestInitAcceptsTheQueryRuntime(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -443,8 +443,8 @@ func TestInitAcceptsTheQueryRuntime(t *testing.T) {
 	if !m.IsDurable() {
 		t.Error("runtime 3 must read as durable — it journals every step exactly like runtime 2")
 	}
-	if body := readFile(t, dir, "main.py"); !strings.Contains(body, "@tools.step") {
-		t.Errorf("a durable runtime with no --from must scaffold a durable main.py, got %q", body)
+	if body := readFile(t, dir, "main.py"); body != fakeStarter {
+		t.Errorf("init with no --from must write the instance's starter, got %q", body)
 	}
 }
 
@@ -461,7 +461,8 @@ func TestLoadManifestRejectsAnUnknownRuntime(t *testing.T) {
 		t.Fatalf("init: %v", err)
 	}
 	raw := readFile(t, dir, wfdir.ManifestName)
-	edited := strings.Replace(raw, "{", "{\n  \"runtime\": 4,", 1)
+	// The init pinned a runtime; replace it with one this build does not know.
+	edited := strings.Replace(raw, `"runtime": 3`, `"runtime": 5`, 1)
 	if edited == raw {
 		t.Fatal("could not hand-edit the manifest — this test needs re-aiming, not deleting")
 	}
@@ -476,72 +477,16 @@ func TestLoadManifestRejectsAnUnknownRuntime(t *testing.T) {
 	}
 }
 
-// A plain `wf init` — no --runtime at all — has to scaffold and report for the
-// runtime it is ABOUT TO CREATE, which is RuntimeCreateDefault and not the
-// flag's own default of 1. Reading the flag there gave the author an empty
-// main.py and a report that named no runtime, while the first push created the
-// workflow on 3: they then wrote a v1-shaped `con.execute("... {{ ref }} ...")`
-// table read into a runtime that refuses it, and found out at the first run —
-// on an automation, at 03:00.
-//
-// The manifest key stays ABSENT, and that half is load-bearing rather than
-// incidental: it is what lets the first push write back whatever the server
-// actually stamped, which is the fix for the second-push brick. Scaffolding for
-// 3 must not pin the folder to 3.
-func TestInitWithNoRuntimeFlagScaffoldsForTheCreateDefault(t *testing.T) {
+// A plain `wf init` — no --runtime at all — writes and reports for the runtime
+// the first push creates on: the instance's default, with the instance's
+// starter for it. What the starter SAYS is the instance's to test; here it is
+// only carried.
+func TestInitWithNoRuntimeFlagWritesTheInstancesDefault(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	dir := t.TempDir()
 
 	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--json")
-	if err != nil {
-		t.Fatalf("init: %v", err)
-	}
-	payload := decodeJSON(t, out)
-	if payload["runtime"] != float64(wfdir.RuntimeCreateDefault) {
-		t.Errorf("runtime = %v, want %d", payload["runtime"], wfdir.RuntimeCreateDefault)
-	}
-	if payload["scaffolded"] != true {
-		t.Errorf("scaffolded = %v, want true", payload["scaffolded"])
-	}
-	if raw := readFile(t, dir, wfdir.ManifestName); strings.Contains(raw, "runtime") {
-		t.Errorf("init pinned a runtime nobody asked for — the first push can no longer write back what the server stamped: %s", raw)
-	}
-	// The scaffold is the create default's, not merely "a durable one": under
-	// runtime 3 the table rule is the one thing an author cannot infer from an
-	// empty file, and it is exactly what the failure above turned on.
-	scaffold := readFile(t, dir, "main.py")
-	if !strings.Contains(scaffold, "@tools.step") {
-		t.Errorf("a plain init wrote no durable scaffold:\n%s", scaffold)
-	}
-	if !strings.Contains(scaffold, "Read a Ronja table ONLY with tools.query") {
-		t.Errorf("the scaffold does not state the table rule of the runtime it will be created on:\n%s", scaffold)
-	}
-
-	// And the human report says which runtime that is, in the same words the
-	// --runtime 3 report uses.
-	reportDir := t.TempDir()
-	report, err := runCLI(t, reportDir, "wf", "init", "--feature", "feat-1")
-	if err != nil {
-		t.Fatalf("init (report): %v", err)
-	}
-	_, sentence := runtimeInfo(wfdir.RuntimeCreateDefault)
-	want := fmt.Sprintf("  Runtime:    %d — %s\n", wfdir.RuntimeCreateDefault, sentence)
-	if !strings.Contains(report, want) {
-		t.Errorf("the init report does not name the runtime it will create (%q):\n%s", want, report)
-	}
-}
-
-// --runtime 3 has to produce both halves: the manifest key the first push sends
-// as runtimeVersion, and code written in the shapes a resume depends on. A
-// durable workflow scaffolded from v1 code journals nothing, which is a silent
-// failure — the run works, and the resume that was the point of it does not.
-func TestInitDurableRuntimeWritesTheKeyAndAScaffold(t *testing.T) {
-	f := newFakeInstance(t)
-	signIn(t, f)
-	dir := t.TempDir()
-
-	out, err := runCLI(t, dir, "wf", "init", "--feature", "feat-1", "--runtime", "3", "--json")
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -552,45 +497,28 @@ func TestInitDurableRuntimeWritesTheKeyAndAScaffold(t *testing.T) {
 	if payload["scaffolded"] != true {
 		t.Errorf("scaffolded = %v, want true", payload["scaffolded"])
 	}
-
-	manifest, err := wfdir.LoadManifest(dir, wfdir.WorkflowKind)
+	m, err := wfdir.LoadManifest(dir, wfdir.WorkflowKind)
 	if err != nil {
 		t.Fatalf("load manifest: %v", err)
 	}
-	if !manifest.IsDurable() {
-		t.Fatalf("manifest runtime = %d, want %d", manifest.RuntimeVersion(), wfdir.RuntimeQuery)
+	if m.Runtime != wfdir.RuntimeQuery {
+		t.Errorf("manifest runtime = %d, want %d pinned", m.Runtime, wfdir.RuntimeQuery)
+	}
+	if got := readFile(t, dir, "main.py"); got != fakeStarter {
+		t.Errorf("main.py = %q, want the instance's starter", got)
 	}
 
-	// The scaffold is checked by the PROPERTIES that make a resume work, not by
-	// its prose: decorated steps, a keyless loop, and a journaled clock.
-	scaffold := readFile(t, dir, "main.py")
-	// The HEADER is the exception, and it is pinned rather than sampled: it is
-	// the one part of the template that varies by runtime, and every property
-	// checked below lives in the shared body — so a header that named the wrong
-	// runtime would pass every other assertion here.
-	if want := "# Durable workflow (runtime 3). Every @tools.step result is journaled, so\n"; !strings.HasPrefix(scaffold, want) {
-		t.Errorf("the durable scaffold does not open with %q:\n%s", want, scaffold)
+	// And the human report says which runtime that is, in the same words the
+	// --runtime 3 report uses.
+	reportDir := t.TempDir()
+	report, err := runCLI(t, reportDir, "wf", "init", "--feature", "feat-1")
+	if err != nil {
+		t.Fatalf("init (report): %v", err)
 	}
-	for _, want := range []string{"@tools.step", "for order_id in load_orders():", "tools.now()"} {
-		if !strings.Contains(scaffold, want) {
-			t.Errorf("the durable scaffold is missing %q:\n%s", want, scaffold)
-		}
-	}
-	// CODE lines only: the comment naming datetime.now() is the constraint being
-	// stated, and a substring check over the whole file would flag it.
-	for _, line := range strings.Split(scaffold, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
-			continue
-		}
-		if strings.Contains(line, "datetime.now()") {
-			t.Errorf("the durable scaffold reaches for the wall clock, which a resume cannot replay: %s", line)
-		}
-	}
-	// Keys are DERIVED in the durable runtime. A scaffold carrying a hand-written
-	// key would teach the one habit that breaks a loop's resume: two iterations
-	// on one key.
-	if strings.Contains(scaffold, `tools.step("`) {
-		t.Errorf("the durable scaffold writes a key string:\n%s", scaffold)
+	_, sentence := runtimeInfo(wfdir.RuntimeQuery)
+	want := fmt.Sprintf("  Runtime:    %d — %s\n", wfdir.RuntimeQuery, sentence)
+	if !strings.Contains(report, want) {
+		t.Errorf("the init report does not name the runtime it will create (%q):\n%s", want, report)
 	}
 }
 

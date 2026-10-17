@@ -225,16 +225,11 @@ func TestPushSendsTheDeclaredRuntimeAtCreate(t *testing.T) {
 	}
 }
 
-// A folder that declares no runtime sends no runtimeVersion on the CREATE: the
-// key is absent because the folder has no opinion, and the instance stamps its
-// own default — which is also what keeps the request byte-identical to the one
-// an instance predating durable workflows saw.
-//
-// VALIDATE is the deliberate asymmetry. It is a pre-creation endpoint with no
-// row to read the runtime from, and it takes 0 as "check nothing runtime-scoped"
-// — so a create rehearsed with 0 would rehearse a different save from the one
-// about to happen. See Manifest.RuntimeForValidate.
-func TestPushOfADefaultRuntimeFolderSendsNoRuntimeVersionOnTheCreate(t *testing.T) {
+// A folder that declares no runtime still NAMES one on the create: the one the
+// instance creates on, asked for before the validate so the candidate is
+// checked against the runtime it is then created on. Sending none would leave
+// the runtime to whatever the instance's default is by then — which moves.
+func TestPushOfAnUnpinnedFolderNamesTheInstancesRuntimeOnTheCreate(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	root := initFolder(t, f, map[string]string{"main.py": "print('hi')\n"})
@@ -245,11 +240,11 @@ func TestPushOfADefaultRuntimeFolderSendsNoRuntimeVersionOnTheCreate(t *testing.
 	if len(f.created) != 1 {
 		t.Fatalf("created %d workflows, want 1", len(f.created))
 	}
-	if got := f.created[0].RuntimeVersion; got != 0 {
-		t.Errorf("create sent runtimeVersion %d, want it absent", got)
+	if got := f.created[0].RuntimeVersion; got != wfdir.RuntimeQuery {
+		t.Errorf("create sent runtimeVersion %d, want the instance's %d", got, wfdir.RuntimeQuery)
 	}
-	if got := f.validated[0].RuntimeVersion; got != wfdir.RuntimeCreateDefault {
-		t.Errorf("validate sent runtimeVersion %d, want %d — the runtime the create will produce", got, wfdir.RuntimeCreateDefault)
+	if got := f.validated[0].RuntimeVersion; got != wfdir.RuntimeQuery {
+		t.Errorf("validate sent runtimeVersion %d, want %d — the runtime the create is made on", got, wfdir.RuntimeQuery)
 	}
 }
 

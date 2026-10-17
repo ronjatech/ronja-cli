@@ -21,6 +21,7 @@ import (
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
+	"github.com/ronjatech/ronja-cli/internal/useragent"
 )
 
 // `ronja api` has no endpoint knowledge to test, which is the point of it. What
@@ -1435,5 +1436,32 @@ func TestCheckFilesUnchangedSpotsASameSizeRewrite(t *testing.T) {
 	// claim nothing: "not known" is not "changed".
 	if err := checkFilesUnchanged(fileBody{path: path, size: fi.Size()}); err != nil {
 		t.Errorf("a body with no recorded modification time claimed a change it cannot know about: %v", err)
+	}
+}
+
+// --- user agent ---------------------------------------------------------------
+
+// A request `ronja api` passes through says it was written by hand:
+// ronja-cli-api/<version>, never the ronja-cli/<version> every command sends —
+// an instance counting what CLI commands create must not count a hand-written
+// POST /api/v2/workflow among them. A -H User-Agent still wins.
+func TestAPISendsItsOwnUserAgent(t *testing.T) {
+	e := newEchoServer(t)
+	signInTo(t, e.URL())
+
+	if _, err := runCLI(t, t.TempDir(), "api", "-X", "POST", "/api/v2/workflow", "-d", `{}`); err != nil {
+		t.Fatalf("api: %v", err)
+	}
+	want := useragent.ForAPI(resolveVersion())
+	if got := e.only().Header.Get("User-Agent"); got != want || !strings.HasPrefix(got, "ronja-cli-api/") {
+		t.Errorf("User-Agent = %q, want %q (ronja-cli-api/<version>)", got, want)
+	}
+
+	e.requests = nil
+	if _, err := runCLI(t, t.TempDir(), "api", "-H", "User-Agent: mine/1", "/api/v2/authentication/me"); err != nil {
+		t.Fatalf("api -H: %v", err)
+	}
+	if got := e.only().Header.Get("User-Agent"); got != "mine/1" {
+		t.Errorf("User-Agent = %q, want the -H one", got)
 	}
 }

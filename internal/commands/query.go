@@ -261,7 +261,7 @@ is non-zero.`,
 	// secret id of a login for it, repeatable. HIDDEN while the HTTP join
 	// stays unpublished outside chat: the server field it sends is not
 	// advertised either. It comes out of hiding with the server field
-	// (DATABASE.md's checklist).
+	// (DATABASE.md → "What is documented, and what is not").
 	cmd.Flags().StringArrayVar(&attach, "attach", nil,
 		"join a database into the query as alias=secret-id (repeatable)")
 	_ = cmd.Flags().MarkHidden("attach")

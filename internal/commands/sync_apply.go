@@ -645,6 +645,12 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 	// warning describes files that landed, which is true whether or not the
 	// publish after them did.
 	line.Notes = append(line.Notes, notes...)
+	// An instance's refusal of a workflow runtime gets the way out that `wf push`
+	// prints under it (runtimeRefusalHint) — as a NOTE, so Detail stays the
+	// one-line refusal a --json reader keys on.
+	if hint := runtimeHintFor(err); hint != "" {
+		line.Notes = append(line.Notes, hint)
+	}
 	var checksErr *checksNotAppliedError
 	var tagsErr *tagsNotAppliedError
 	switch {
@@ -1088,6 +1094,9 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		push, pushErr := runPush(ctx, f, pushOptions{Validate: true})
 		if push != nil && push.Created {
 			created = 1
+		}
+		if push != nil && push.RuntimePinned {
+			notes = append(notes, runtimePinnedNote(push.RuntimeVersion))
 		}
 		if pushErr != nil {
 			return "", created, false, notes, pushErr

@@ -19,6 +19,8 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/useragent"
 	"github.com/spf13/cobra"
 )
 
@@ -70,6 +72,16 @@ func withExitCode(code int, err error) error {
 // It stays "dev" for a plain `go build` from a checkout, and resolveVersion
 // recovers the real one for `go install ...@version`.
 var Version = "dev"
+
+// The User-Agent carries the version every request is made by, resolved once
+// before any command runs. In init rather than in run so it is set before the
+// first request of any entry point, test binaries included, and never written
+// while a request might be reading it.
+func init() {
+	version := resolveVersion()
+	api.UserAgent = useragent.For(version)
+	api.RawUserAgent = useragent.ForAPI(version)
+}
 
 // resolveVersion reports the version to display.
 //
@@ -180,6 +192,7 @@ func run(args []string) int {
 	defer stop()
 	code := 0
 	if err := root.ExecuteContext(ctx); err != nil {
+		err = runtimeRefusalHint(err)
 		// Cobra has already printed the error for usage problems; this covers
 		// the RunE path. Keep it on stderr so --json output stays parseable.
 		if !errors.Is(err, errAlreadyReported) {
@@ -202,6 +215,9 @@ func run(args []string) int {
 }
 
 func newRootCmd() *cobra.Command {
+	// One command tree is one invocation, and what an instance said about its
+	// workflow defaults is cached for exactly that long. See defaultsCache.
+	forgetWorkflowDefaults()
 	root := &cobra.Command{
 		Use:   "ronja",
 		Short: "Build and explore in Ronja from the command line",

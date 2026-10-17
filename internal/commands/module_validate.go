@@ -40,7 +40,9 @@ func newModuleValidateCmd() *cobra.Command {
 Reports what a save would reject: a path the server's grammar refuses, a file
 that is not .py, a file too large or holding binary content, two paths differing
 only by capitalisation, a missing ` + "`__init__.py`" + ` (the file that makes the package
-importable), and a file carrying a Ronja marker.
+importable), a file or folder name that is not letters, digits and underscores, or starts
+with a digit (` + "`my-helpers.py`" + `, ` + "`calc.v2.py`" + `, ` + "`2fast.py`" + `; the message suggests
+one that works), and a file carrying a Ronja marker.
 
 Modules are marker-free: ` + "`{{ ref }}`" + `, ` + "`{{ secret }}`" + `, ` + "`{{ workflow }}`" + ` and the rest
 are refused at save, in any file. A module runs inside the calling workflow's
@@ -108,6 +110,11 @@ Exits non-zero when there are errors. With --json, one object listing them.`,
 					continue
 				}
 				report.Problems = append(report.Problems, moduleMarkerProblem(path, verb))
+			}
+			for _, path := range sortedPaths(files) {
+				if problem := moduleFileNameProblem(path); problem != "" {
+					report.Problems = append(report.Problems, problem)
+				}
 			}
 			if f.Manifest.Name == "" {
 				report.Problems = append(report.Problems, fmt.Sprintf(

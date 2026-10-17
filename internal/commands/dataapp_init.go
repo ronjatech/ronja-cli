@@ -64,7 +64,10 @@ by its manifest name:
 
   ai              completeAI — ask the AI for a completion
   query_external  queryExternal — read an external or managed database
+                  (and env.db(...).query in a server function)
   write_external  executeExternal — write rows to a managed database
+                  (and env.db(...).execute in a server function, and
+                  .query too when the login is a write login)
   upload_file     uploadFile — store a file in Ronja
 
 Nothing else ever goes in "capabilities": reading Ronja tables, running an

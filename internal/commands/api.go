@@ -215,6 +215,12 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 			if err != nil {
 				return err
 			}
+			// A hand-written request says so: ronja-cli-api, not the ronja-cli
+			// every command sends, so an instance counting what CLI commands
+			// create never counts this. A -H User-Agent still wins.
+			if header.Get("User-Agent") == "" {
+				header.Set("User-Agent", api.RawUserAgent)
+			}
 			body, err := requestBody(data)
 			if err != nil {
 				return err
