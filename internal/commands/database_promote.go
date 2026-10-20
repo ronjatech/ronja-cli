@@ -9,19 +9,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja db promote` is the second half of the dev-copy loop `db migrate --env
-// dev` opens: it moves the migrations the copy's ledger has and production's
-// does not onto production.
-//
-// It sends no migrations. What promotes is the TAIL the server computes from the
-// two ledgers, and that is not a convenience — a client choosing which
-// migrations to move would be a second opinion about what the copy actually has,
-// and the first time the two disagreed the ledgers would stop being comparable
-// at all. Same reason `db migrate` computes no hashes.
-//
-// It prints through reportMigrations, the same reporter `migrate status` and
-// `migrate push` use, because it is the same answer: a list of migrations and
-// what happened to each. The outcomes are the existing four.
+// It sends no migrations: the server computes the tail from the two ledgers,
+// because a client choosing what to move would be a second opinion about what
+// the copy has (the same reason `db migrate` computes no hashes).
 func newDatabasePromoteCmd() *cobra.Command {
 	var (
 		dryRun  bool
@@ -76,9 +66,8 @@ without parsing its output.`,
 				return fmt.Errorf("--timeout cannot be negative (got %s) — pass 0 to wait for as long as it takes", timeout)
 			}
 
-			// Asked BEFORE the instance is resolved: nothing should be sent
-			// anywhere on the strength of a command the operator has not
-			// confirmed yet.
+			// Asked BEFORE the instance is resolved: nothing is sent on the
+			// strength of an unconfirmed command.
 			ok, err := confirmPromote(databaseID, dryRun, yes)
 			if err != nil {
 				return err
@@ -93,12 +82,9 @@ without parsing its output.`,
 			}
 			client := api.New(resolved.URL, resolved.Token)
 
-			// Every refusal this command has — a diverged history, no dev copy, a
-			// copy that is not ready, an id that is itself a copy — arrives as an
-			// HTTP 400 carrying a written instruction. That is already a non-zero
-			// exit with the server's own message on stderr, so there is deliberately
-			// no second mechanism here: a local re-classification of those cases
-			// would be a second, staler description of when a promote is impossible.
+			// Every refusal (diverged history, no dev copy, copy not ready, id is a
+			// copy) arrives as a 400 with the server's instruction; deliberately not
+			// re-classified locally, which would be a second, staler definition.
 			result, err := client.Promote(cmd.Context(), databaseID, api.PromoteInput{
 				DryRun: dryRun,
 			}, timeout)
@@ -106,18 +92,14 @@ without parsing its output.`,
 				return err
 			}
 
-			// Promote always targets production — it refuses in a dev session
-			// server-side — so this prints nothing today. It is called anyway so
-			// that "which database answered" comes from ONE place for all three
-			// `db` commands, and a promote that ever did land elsewhere would say
-			// so rather than being the one report that stays silent.
+			// Prints nothing while promote only targets production; called anyway
+			// so a promote that ever landed elsewhere would say so.
 			reportEnvironment(api.EnvironmentProd, result.Environment, result.DatabaseID, result.ParentDatabaseID)
 
 			if flagJSON {
 				return emitJSON(result)
 			}
-			// Drift reaches the reporter rather than an error return, and the
-			// reporter turns it into one. Same rule as `migrate status`.
+			// Drift reaches the reporter, which turns it into the error return.
 			return reportMigrations(result)
 		},
 	}
@@ -131,17 +113,9 @@ without parsing its output.`,
 	return cmd
 }
 
-// confirmPromote is the gate in front of the one `db` verb that changes
-// production's schema.
-//
-// It reuses `confirm` — the same "prompt, or --yes" rule the discard commands
-// keep — rather than growing a second idiom: no terminal (or --json, which says
-// a program is reading) means nobody is there to ask, so --yes is required
-// instead of assumed.
-//
-// A DRY RUN is exempt because it changes nothing. Making it ask would train the
-// operator to answer the question without reading it, which is the opposite of
-// what the gate is for.
+// confirmPromote gates the one `db` verb that changes production's schema; with
+// no terminal (or --json) --yes is required, not assumed. A dry run is exempt:
+// asking there would train the operator to answer without reading.
 func confirmPromote(databaseID string, dryRun, yes bool) (bool, error) {
 	if dryRun {
 		return true, nil

@@ -10,10 +10,8 @@ import (
 	"time"
 )
 
-// Same discipline as workflow_test.go: the fixtures are TAG VERIFICATION
-// against the server structs (rworkflow.ValidateResult, the workflow handler's
-// FileSaveResponse / FileDeleteResponse), because a name that does not match
-// decodes to the zero value in silence — and here that silence means "no
+// The fixtures verify tags against rworkflow.ValidateResult and the handler's
+// FileSaveResponse / FileDeleteResponse: a drifted name decodes silently to "no
 // findings" on a broken folder, or a lost warning.
 
 const validateFixture = `{
@@ -74,8 +72,6 @@ func TestValidateWorkflowFilesDecodesFindings(t *testing.T) {
 	}
 }
 
-// Warnings alone are not a failure — a save succeeds through them, and so does
-// a push.
 func TestValidateOKWithWarningsOnly(t *testing.T) {
 	result := &ValidateResult{Findings: []ValidateFinding{
 		{Severity: "warning", Code: "secret_dropped"},
@@ -109,7 +105,6 @@ func TestPutWorkflowFileSendsContentAndReadsWarnings(t *testing.T) {
 	if sent.Content != "X = 1" {
 		t.Errorf("sent content = %q", sent.Content)
 	}
-	// The embedded file is at the response ROOT, not under a key.
 	if saved.Path != "lib/helpers.py" || saved.Content != "X = 1" || saved.WorkflowID != "wf-1" {
 		t.Errorf("saved = %+v", saved.WorkflowFile)
 	}
@@ -118,10 +113,7 @@ func TestPutWorkflowFileSendsContentAndReadsWarnings(t *testing.T) {
 	}
 }
 
-// GetWorkflowFile exists for one caller — the push, reconciling a write whose
-// outcome it does not know — so what is worth pinning is that it asks the
-// single-file route rather than the collection, and that a path the row does not
-// hold comes back as an error rather than as an empty file.
+// A path the row does not hold must be an error, not an empty file.
 func TestGetWorkflowFileReadsOneFile(t *testing.T) {
 	var gotMethod, gotPath string
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -149,12 +141,9 @@ func TestGetWorkflowFileReadsOneFile(t *testing.T) {
 	}
 }
 
-// The two halves of the timeout model, on the call that needs both.
-//
-// A per-request deadline may only ever SHORTEN the caller's — the client's own
-// timeout is the ceiling, not the policy — and what came back has to be
-// distinguishable from a refusal, because the push treats them differently: a
-// rejected write certainly did not land, while a timed-out one may have.
+// A per-request deadline may only SHORTEN the caller's, and a timeout must be
+// distinguishable from a refusal: a rejected write did not land, a timed-out one
+// may have.
 func TestPutHonoursAShorterCallerDeadlineAndReportsItAsATimeout(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(300 * time.Millisecond)
@@ -174,8 +163,6 @@ func TestPutHonoursAShorterCallerDeadlineAndReportsItAsATimeout(t *testing.T) {
 	}
 }
 
-// And a refusal is not a timeout: the server considered the write and said no,
-// so the file certainly kept its previous content.
 func TestIsTimeoutIgnoresAServerRefusal(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"nope"}`, http.StatusBadRequest)
@@ -207,9 +194,7 @@ func TestDeleteWorkflowFileReadsWarnings(t *testing.T) {
 	}
 }
 
-// The four lifecycle verbs share a shape: empty body in, nothing out. What is
-// worth pinning is that each hits its own route — and that request-review lives
-// under the GOVERNANCE prefix, not beside the others.
+// request-review lives under the GOVERNANCE prefix, not beside the others.
 func TestLifecycleVerbsHitTheirRoutes(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -279,8 +264,6 @@ func TestCreateAndUpdateWorkflow(t *testing.T) {
 	if wf.ID != "wf-new" || wf.Lifecycle != LifecycleDraft {
 		t.Errorf("created = %+v", wf)
 	}
-	// Normalized: a created row carries no bindings at all, and callers should
-	// not have to nil-check each one.
 	if wf.InputTableIDs == nil || wf.OutputTableIDs == nil {
 		t.Error("binding slices were not normalized")
 	}
@@ -294,9 +277,8 @@ func TestCreateAndUpdateWorkflow(t *testing.T) {
 	if _, err := client.UpdateWorkflow(context.Background(), "wf-new", WorkflowPatch{}); err != nil {
 		t.Fatalf("empty patch: %v", err)
 	}
-	// Each field OMITTED when there is none: every field of the server's Patch
-	// is an optional, so an explicit "" would CLEAR the value rather than leave
-	// it alone.
+	// Every field of the server's Patch is optional, so an explicit "" would
+	// CLEAR the value.
 	want := []string{`{"title":"New name"}`, `{"entrypoint":"run.py"}`, `{}`}
 	if len(patches) != 3 || patches[0] != want[0] || patches[1] != want[1] || patches[2] != want[2] {
 		t.Errorf("patch bodies = %q, want %q", patches, want)
@@ -308,11 +290,8 @@ func TestCreateAndUpdateWorkflow(t *testing.T) {
 
 // --- optimistic concurrency --------------------------------------------------
 
-// The precondition's THREE states have to survive the encoder distinctly, and
-// the raw body is what is asserted rather than a decoded struct: the whole
-// hazard is that a *string collapsing to a string makes "no precondition" and
-// "must not exist" the same bytes, and no decode of the sender's own type can
-// see that.
+// The raw body is asserted, not a decode: a *string collapsing to a string would
+// make "no precondition" and "must not exist" the same bytes.
 func TestPutWorkflowFileEncodesThePreconditionsThreeStates(t *testing.T) {
 	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	empty := ""
@@ -342,10 +321,8 @@ func TestPutWorkflowFileEncodesThePreconditionsThreeStates(t *testing.T) {
 	}
 }
 
-// The two routes whose body is OPTIONAL send genuinely nothing when they have
-// nothing to say. That is not cosmetic: the previous shape of both was bodyless,
-// and `{}` is a different request for a server that distinguishes an absent
-// field from a zero one.
+// `{}` is a different request from no body for a server that distinguishes an
+// absent field from a zero one.
 func TestOptionalBodiesAreOmittedEntirely(t *testing.T) {
 	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	for _, tc := range []struct {
@@ -385,11 +362,9 @@ func TestOptionalBodiesAreOmittedEntirely(t *testing.T) {
 	}
 }
 
-// The head is element ZERO of the versions listing, and an EMPTY listing means
-// the workflow has never been versioned — in which case the live row itself is
-// the anchor rworkflow.resolveHeadVersionID falls back to. Getting the second
-// half wrong sends "" as a confirmation, which the server reads as "no
-// override" and refuses all over again.
+// The head is element ZERO of the versions listing; an EMPTY listing means the
+// live row itself is the anchor (as rworkflow.resolveHeadVersionID falls back),
+// since "" as a confirmation reads as "no override".
 func TestHeadVersionIDReadsElementZeroAndFallsBackToTheWorkflowID(t *testing.T) {
 	var gotPath string
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -420,9 +395,8 @@ func TestHeadVersionIDReadsElementZeroAndFallsBackToTheWorkflowID(t *testing.T) 
 	}
 }
 
-// StatusConflict is a wire contract in the same sense the lifecycle strings
-// are: two commands branch on it, and one of them must keep it out of a
-// fallback keyed on 400.
+// Commands branch on StatusConflict, and one must keep it out of a fallback
+// keyed on 400.
 func TestConflictIsReportedAsItsOwnStatus(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"main.py changed since you last read it"}`, StatusConflict)
@@ -434,8 +408,7 @@ func TestConflictIsReportedAsItsOwnStatus(t *testing.T) {
 	if StatusOf(err) != StatusConflict || StatusOf(err) == 400 {
 		t.Errorf("status = %d, want %d", StatusOf(err), StatusConflict)
 	}
-	// The server's prose is the only detail a 409 carries — there is no
-	// structured payload — so it has to survive into the error.
+	// The server's prose is the only detail this 409 carries.
 	if !strings.Contains(err.Error(), "changed since you last read it") {
 		t.Errorf("error = %v, want the server's own message", err)
 	}

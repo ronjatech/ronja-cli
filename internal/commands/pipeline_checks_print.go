@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-// Rendering a checks pass for a person: the per-file block push and publish print.
-
 func quoteNames(names []string) string {
 	quoted := make([]string, 0, len(names))
 	for _, n := range names {
@@ -16,7 +14,6 @@ func quoteNames(names []string) string {
 	return strings.Join(quoted, ", ")
 }
 
-// printPipelineChecksResult renders one checks file's outcome.
 func printPipelineChecksResult(out *os.File, r pipelineChecksResult) {
 	switch r.Outcome {
 	case checksOutcomePendingPublish:

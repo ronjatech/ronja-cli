@@ -5,10 +5,6 @@ import (
 	"testing"
 )
 
-// A folder bound to two organizations on ONE instance is the case this key
-// exists for. Keyed by URL alone, both would share an entry — and a push made
-// while signed in to the second would send the FIRST one's workflow id under
-// the second's token.
 func TestBindingSeparatesOrganizationsOnOneInstance(t *testing.T) {
 	const url = "https://app.ronja.tech"
 	m := &Manifest{Kind: KindWorkflow, Title: "x"}
@@ -31,15 +27,11 @@ func TestBindingSeparatesOrganizationsOnOneInstance(t *testing.T) {
 		}
 	}
 
-	// A third organization on the same instance is unbound, not "bound to
-	// whichever entry sorted first".
 	if _, ok, _ := m.Binding(InstanceKey{URL: url, TenantID: "ten-third"}); ok {
 		t.Error("an organization with no entry reported as bound")
 	}
 }
 
-// Re-pushing under the same organization updates its entry rather than adding a
-// second one beside it.
 func TestSetBindingReplacesSameOrganization(t *testing.T) {
 	key := InstanceKey{URL: "https://app.ronja.tech", TenantID: "ten-acme"}
 	m := &Manifest{Kind: KindWorkflow, Title: "x"}
@@ -54,9 +46,8 @@ func TestSetBindingReplacesSameOrganization(t *testing.T) {
 	}
 }
 
-// A signed-out `wf status` has no organization to match on. It is a read-only
-// command that worked fine before bindings were organization-keyed, so an
-// unambiguous folder must keep answering.
+// A signed-out `wf status` has no organization to match on, so an unambiguous
+// folder must still answer.
 func TestUnknownOrganizationMatchesOnURLAlone(t *testing.T) {
 	const url = "https://app.ronja.tech"
 	m := &Manifest{Kind: KindWorkflow, Title: "x"}
@@ -77,8 +68,6 @@ func TestUnknownOrganizationMatchesOnURLAlone(t *testing.T) {
 	}
 }
 
-// ...but two organizations on that URL is a genuine coin flip, and picking one
-// would show another organization's workflow as if it were this folder's.
 func TestUnknownOrganizationRefusesToPickAmongSeveral(t *testing.T) {
 	const url = "https://app.ronja.tech"
 	m := &Manifest{Kind: KindWorkflow, Title: "x"}
@@ -98,9 +87,7 @@ func TestUnknownOrganizationRefusesToPickAmongSeveral(t *testing.T) {
 	}
 }
 
-// A key that names an organization must never adopt an entry that names a
-// different one, or none at all — a hand-written entry with no organization
-// could belong to anybody.
+// A hand-written entry with no organization could belong to anybody.
 func TestKnownOrganizationNeverAdoptsAnotherEntry(t *testing.T) {
 	const url = "https://app.ronja.tech"
 	m := &Manifest{
@@ -115,9 +102,6 @@ func TestKnownOrganizationNeverAdoptsAnotherEntry(t *testing.T) {
 	}
 }
 
-// The baseline is keyed the same way, so one organization's sync state cannot
-// be read as another's — which would report every file as drifted, or worse, as
-// unchanged when it is not.
 func TestStateSeparatesOrganizations(t *testing.T) {
 	const url = "https://app.ronja.tech"
 	acme := InstanceKey{URL: url, TenantID: "ten-acme"}
@@ -138,8 +122,8 @@ func TestStateSeparatesOrganizations(t *testing.T) {
 	}
 }
 
-// ronja.json is committed and hand-edited, so the two spellings people reach
-// for must still match — and must not accumulate a second entry on write.
+// ronja.json is hand-edited, so a trailing slash or uppercase host must still
+// match and must not accumulate a second entry on write.
 func TestKeyMatchingToleratesURLSpelling(t *testing.T) {
 	m := &Manifest{
 		Kind: KindWorkflow, Title: "x",
@@ -160,12 +144,8 @@ func TestKeyMatchingToleratesURLSpelling(t *testing.T) {
 	}
 }
 
-// KeysOn answers two questions whose disagreement is invisible: "which
-// organizations does this folder name here" (what a refusal enumerates) and "is
-// there anything here to adopt" (what decides whether the caller pays for an
-// organization lookup). Both have to see exactly what Find sees, spelling
-// included — a rawer comparison would leave a folder that Find matches looking
-// empty, and the lookup would go unguarded.
+// KeysOn feeds the ambiguity refusal and the decision to look up the caller's
+// organization, so it must see exactly what Find sees, spelling included.
 func TestKeysOnSeesWhatFindSees(t *testing.T) {
 	instances := []Instance{
 		{URL: "https://APP.ronja.tech/", TenantID: "ten-acme"},
@@ -179,8 +159,6 @@ func TestKeysOnSeesWhatFindSees(t *testing.T) {
 	if got[0].TenantID != "ten-acme" || got[1].TenantID != "ten-northwind" {
 		t.Errorf("KeysOn = %+v, want slice order preserved", got)
 	}
-	// The pairing that matters: an unknown organization on this URL is ambiguous
-	// exactly when KeysOn reports more than one.
 	if _, err := Find(instances, Instance.Key, InstanceKey{URL: "https://app.ronja.tech"}); err != ErrAmbiguousInstance {
 		t.Errorf("Find err = %v, want the ambiguity KeysOn just enumerated", err)
 	}

@@ -9,27 +9,13 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// Parameter handling for `ronja wf test`: turning repeated --param key=value
-// flags into the values a run POST carries, and refusing the ones the workflow
-// never declared.
-//
-// Its own file because it is the one part of the command that is pure — no
-// client, no folder, no terminal — which makes these checks worth reading on
-// their own rather than in the middle of a poll loop.
+// Parameter handling for `ronja wf test`: --param key=value flags checked
+// against what the workflow declares.
 
-// parseParams turns repeated --param key=value flags into the run's parameter
-// values, checked against what the workflow declares.
-//
-// This mirrors rworkflow.CoerceWorkflowParameterValues, which the v2 run
-// endpoint DOES now apply (it did not when this was written, which is why these
-// checks exist at all). They stay because a --param typo caught here costs no
-// round trip, and because a shell hands over strings: a "number" parameter
-// arriving as "12" would otherwise travel as text.
-//
-// The server's pass is the authority and is strictly wider — it folds select
-// casing and canonicalizes dates to YYYY-MM-DD, neither of which happens here —
-// so a value this accepts may still be rewritten server-side. Keep this the
-// SUBSET; never let it accept something the server refuses.
+// parseParams mirrors rworkflow.CoerceWorkflowParameterValues so a typo costs no
+// round trip and a "number" does not travel as text. The server's pass is the
+// authority and strictly wider: keep this the SUBSET, never accepting something
+// the server refuses.
 func parseParams(specs []string, declared []api.WorkflowParameter) (map[string]any, error) {
 	byName := make(map[string]api.WorkflowParameter, len(declared))
 	for _, p := range declared {
@@ -38,15 +24,12 @@ func parseParams(specs []string, declared []api.WorkflowParameter) (map[string]a
 
 	values := map[string]any{}
 	for _, spec := range specs {
-		// FIRST = only: a value may perfectly well contain one (a SQL fragment,
-		// a base64 blob, a date range), and splitting on all of them would
-		// corrupt it silently.
+		// First = only: a value may itself contain one.
 		name, raw, ok := strings.Cut(spec, "=")
 		if !ok || name == "" {
 			return nil, fmt.Errorf("--param takes key=value, got %q", spec)
 		}
 		if _, dup := values[name]; dup {
-			// Last-wins would be a coin flip nobody can see in the output.
 			return nil, fmt.Errorf("--param %s was given more than once", name)
 		}
 		p, known := byName[name]
@@ -60,25 +43,16 @@ func parseParams(specs []string, declared []api.WorkflowParameter) (map[string]a
 		values[name] = value
 	}
 
-	// A defaulted parameter is not missing: the server fills in its declared
-	// default at dispatch, which is the whole point of having one. That is
-	// rworkflow.ApplyParameterDefaults, called from the one run funnel every
-	// entry point converges on — so the value the script sees is the declared
-	// default, coerced exactly as a value passed here would have been.
+	// A defaulted parameter is not missing: the server applies it at dispatch
+	// (rworkflow.ApplyParameterDefaults).
 	var missing, blank []string
 	for _, p := range declared {
 		if !p.Required || p.DefaultValue != nil {
 			continue
 		}
-		// A blank value is refused too, as the server rules: `required` means a
-		// value with content. Every parameter except a select with static
-		// options — that select's blank never reaches here unless "" is a
-		// declared option (coerceParam refuses any non-option first), which is
-		// the author saying an empty choice is meaningful. Options on any other
-		// type are ignored (coerceParam and the server check them only on a
-		// select), so they exempt nothing: exempting them would accept a blank
-		// the server refuses. Kept apart from missing so `--param body=` is not
-		// told it has no value.
+		// A blank required value is refused as the server does, except a select with
+		// static options, where coerceParam has already required "" to be a declared
+		// option. Options on other types exempt nothing, since only a select checks them.
 		v, ok := values[p.Name]
 		if !ok {
 			missing = append(missing, p.Name)
@@ -102,20 +76,12 @@ func parseParams(specs []string, declared []api.WorkflowParameter) (map[string]a
 	return values, nil
 }
 
-// coerceParam converts one command-line string to the type the parameter
-// declares, or explains why it cannot.
-//
-// An unknown or empty type is passed through as a string rather than refused:
-// the server treats it as unconstrained, and a CLI that rejected a parameter
-// kind added after it shipped would be wrong in the direction that blocks work.
+// coerceParam passes an unknown or empty type through as a string: the server
+// treats it as unconstrained, and refusing a newer kind would block work.
 func coerceParam(p api.WorkflowParameter, raw string) (any, error) {
 	switch p.Type {
 	case "number":
-		// Integers first, and not only for tidiness: a float64 holds 53 bits of
-		// mantissa, so an id or an epoch-nanosecond timestamp passed as a
-		// "number" would arrive at the script quietly rounded. Anything that is
-		// not an integer falls through to the float, which is what "number"
-		// mostly means.
+		// Integers first: a float64 would quietly round an id or a nanosecond epoch.
 		if i, err := strconv.ParseInt(raw, 10, 64); err == nil {
 			return i, nil
 		}
@@ -125,18 +91,14 @@ func coerceParam(p api.WorkflowParameter, raw string) (any, error) {
 		}
 		return n, nil
 	case "select":
-		// Only when the options are declared statically. A select whose options
-		// come from an OptionsQuery has no list to check against here — the
-		// server does not check it either.
+		// Only static options: the server does not check an OptionsQuery select either.
 		if len(p.Options) > 0 && !contains(p.Options, raw) {
 			return nil, fmt.Errorf("workflow parameter %q value %q is not one of its options: %s",
 				p.Name, raw, strings.Join(p.Options, ", "))
 		}
 		return raw, nil
 	default:
-		// string, date, and anything added later. Dates cross the wire as
-		// strings server-side, so there is nothing to parse — and parsing them
-		// here would only invent a format the server never asked for.
+		// string, date, and anything added later; the server takes dates as strings.
 		return raw, nil
 	}
 }
@@ -158,8 +120,6 @@ func quoteAll(names []string) []string {
 	return out
 }
 
-// declaredNames renders the "here is what you could have said" tail of the
-// unknown-parameter error.
 func declaredNames(declared []api.WorkflowParameter) string {
 	if len(declared) == 0 {
 		return " (it declares no parameters at all)"

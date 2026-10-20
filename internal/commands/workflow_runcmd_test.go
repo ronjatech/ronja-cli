@@ -10,22 +10,13 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// `wf run`'s REFUSALS, in the order the command makes them: which row, is there
-// a draft in the way, is the folder what is live, is there a gate, are the
-// parameters right — and then the three the server makes, which this command
-// renders rather than passing through as a status code.
-//
-// Every test here asserts ZERO run requests, for the reason the `wf test` ones
-// do: this command runs the LIVE workflow, so a refusal that arrives after the
-// POST has already written to production tables is not a refusal. What happens
-// once a run DOES start — the notes, the report, the terminal statuses — is
-// workflow_runcmd_report_test.go.
+// Every refusal here asserts zero run requests: `wf run` runs the live
+// workflow, and a refusal after the POST comes after production writes.
 
 // --- helpers ----------------------------------------------------------------
 
-// liveFolder is the state `wf run` is FOR: a live workflow, no draft of it, and
-// a folder cloned from live (so the baseline describes the live row, which is
-// exactly what publish leaves behind).
+// liveFolder is a live workflow with no draft and a folder cloned from live,
+// the state publish leaves behind.
 func liveFolder(t *testing.T, f *fakeInstance, shape func(*api.Workflow)) string {
 	t.Helper()
 	live := f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive},
@@ -52,9 +43,8 @@ func TestRunRefusesAnUnboundFolder(t *testing.T) {
 	}
 }
 
-// The doctrine, made testable. `wf run` is a sync-loop verb because it runs THIS
-// FOLDER's workflow; the moment it accepts an id it is a wrapper around one
-// endpoint, and the refusal is what keeps that argument honest.
+// `wf run` is a sync-loop verb because it runs this folder's workflow; taking an
+// id would make it a wrapper around one endpoint.
 func TestRunTakesNoWorkflowID(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -74,8 +64,6 @@ func TestRunTakesNoWorkflowID(t *testing.T) {
 	}
 }
 
-// A workflow that has never been published has no live row at all, and the
-// remedy is publish rather than anything about the folder.
 func TestRunRefusesAWorkflowThatWasNeverPublished(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft},
@@ -99,10 +87,8 @@ func TestRunRefusesAWorkflowThatWasNeverPublished(t *testing.T) {
 
 // --- a draft in the way -------------------------------------------------------
 
-// The refusal the staleness check below CANNOT make. A folder with an open draft
-// is clean against that draft, so nothing about its files says the live version
-// is somebody else's code — which is precisely the publish → edit → push state
-// where a live run would run something the author stopped looking at.
+// The staleness check cannot catch this: a folder is clean against its open
+// draft, so the live version may be code the author stopped looking at.
 func TestRunRefusesWhenADraftIsOpen(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -144,9 +130,8 @@ func TestRunRefusesAFolderWithChangesThatAreNotLive(t *testing.T) {
 	}
 }
 
-// A copy cloned from git has no baseline (.ronja/ is local-only), so there is
-// nothing to compare live against — and "I cannot tell" has to refuse, because
-// the whole claim this command makes is that it ran the code in front of you.
+// A git clone has no baseline (.ronja/ is local-only), and "cannot tell" must
+// refuse: the command's claim is that it ran the code in front of you.
 func TestRunRefusesAFolderWithNoBaseline(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -167,19 +152,15 @@ func TestRunRefusesAFolderWithNoBaseline(t *testing.T) {
 	}
 }
 
-// The other half of that refusal, and a DIFFERENT message: the baseline exists
-// and names some other row. Reachable on the ordinary non-admin path — `wf
-// publish` on a shared workflow submits the draft for review and returns
-// without re-anchoring the baseline, so once an admin commits it the folder
-// names a draft that is gone. The files are usually exactly what went live, so
-// a message about a copy taken from git would send somebody to re-clone a
-// perfectly good folder.
+// Reachable on the non-admin path: publishing a shared workflow submits the
+// draft for review without re-anchoring the baseline, so after an admin commits
+// it the folder names a gone draft; a "copy from git" message would send
+// somebody to re-clone a good folder.
 func TestRunTellsAMismatchedBaselineApartFromNoBaselineAtAll(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
 	root := liveFolder(t, f, nil)
 
-	// push opens a draft and anchors the baseline on it.
 	if _, err := runCLI(t, root, "wf", "push"); err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -187,8 +168,7 @@ func TestRunTellsAMismatchedBaselineApartFromNoBaselineAtAll(t *testing.T) {
 	if draftID == "" {
 		t.Fatal("push opened no draft")
 	}
-	// ...and an admin commits it, which is the server-side half the author's
-	// folder never hears about.
+	// An admin commits it server-side.
 	delete(f.draftOf, "wf-1")
 	delete(f.workflows, draftID)
 
@@ -201,7 +181,6 @@ func TestRunTellsAMismatchedBaselineApartFromNoBaselineAtAll(t *testing.T) {
 			t.Errorf("refusal missing %q: %v", want, err)
 		}
 	}
-	// The two states share a check and must not share a sentence.
 	if strings.Contains(err.Error(), "has no sync baseline") {
 		t.Errorf("a mismatched baseline was reported as a missing one: %v", err)
 	}
@@ -212,9 +191,8 @@ func TestRunTellsAMismatchedBaselineApartFromNoBaselineAtAll(t *testing.T) {
 
 // --- the approval gate ------------------------------------------------------
 
-// Same locked decision as `wf test`: refused before any POST, and the message
-// never names the off-switch — turning the gate off is a governance change, and
-// nobody should learn it from a CLI hint.
+// The message never names the off-switch: turning the gate off is a governance
+// change nobody should learn from a CLI hint.
 func TestRunRefusesAnApprovalGatedWorkflow(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -243,9 +221,8 @@ func TestRunRefusesAnApprovalGatedWorkflow(t *testing.T) {
 
 // --- parameters -------------------------------------------------------------
 
-// The full matrix is pinned against `wf test` (TestTestParameterValidation);
-// what matters here is that `wf run` goes through the same chokepoint, against
-// the LIVE row's declaration.
+// The full matrix is TestTestParameterValidation; this pins that `wf run` uses
+// the same chokepoint against the live row's declaration.
 func TestRunChecksParametersAgainstTheLiveDeclaration(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -270,7 +247,6 @@ func TestRunChecksParametersAgainstTheLiveDeclaration(t *testing.T) {
 		t.Fatalf("runs = %+v, want one", f.runRequests)
 	}
 	got := f.runRequests[0].ParameterValues
-	// Coerced, not passed through as the text a shell handed over.
 	if got["month"] != "2026-07" || got["limit"] != float64(12) {
 		t.Errorf("parameterValues = %#v, want the coerced values", got)
 	}
@@ -278,11 +254,9 @@ func TestRunChecksParametersAgainstTheLiveDeclaration(t *testing.T) {
 
 // --- the two refusals only the server can make --------------------------------
 
-// Running a workflow needs only READ access to it, so a 403 is the role (a
-// read-only member) or a token's scopes — never the feature's scope. A bare
-// 403 tells somebody nothing; naming both causes and the way forward does,
-// and the message must NOT send them hunting for admin access or a Feature
-// owner, which were the rules while the run route borrowed the write gate.
+// Running needs only read access, so a 403 is the role or the token's scopes,
+// never the feature's scope; the message must not send anyone hunting for admin
+// access or a Feature owner.
 func TestRunExplainsRoleOrScopeOn403(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failRun = http.StatusForbidden
@@ -310,10 +284,8 @@ func TestRunExplainsRoleOrScopeOn403(t *testing.T) {
 	}
 }
 
-// A 404 on the run of a workflow the command has just read is the gate's
-// oracle-safe answer for a row the credential can no longer SEE — a race with
-// an access change, not absence and not a rule about who may run. Bare, it
-// reads "not found" straight after a successful push.
+// A 404 on a workflow just read is the gate's oracle-safe answer for a row the
+// credential can no longer see: a race with an access change, not absence.
 func TestRunExplainsLostVisibilityOn404(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failRun = http.StatusNotFound
@@ -336,9 +308,8 @@ func TestRunExplainsLostVisibilityOn404(t *testing.T) {
 	}
 }
 
-// The concurrency-skip 409. Two properties: NOTHING RAN — this is not a failed
-// run — and the blocking run is named from the response's own `blockingRunId`
-// rather than scraped out of the message.
+// The concurrency-skip 409: nothing ran, and the blocking run comes from the
+// response's `blockingRunId`, not scraped from the message.
 func TestRunReportsTheBlockingRunOn409(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failRun = http.StatusConflict
@@ -367,10 +338,8 @@ func TestRunReportsTheBlockingRunOn409(t *testing.T) {
 	}
 }
 
-// The same 409 with nobody to name. The server omits the details entirely when
-// the run that lost the race is anonymous — the partial unique index refuses
-// without a read — so the clause about the run holding the slot has to go with
-// it rather than print an empty id.
+// The server omits the details when the partial unique index refused without a
+// read, so the slot-holder clause must go rather than print an empty id.
 func TestRunReportsAnAnonymousBlockingRunOn409(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failRun = http.StatusConflict
@@ -391,7 +360,6 @@ func TestRunReportsAnAnonymousBlockingRunOn409(t *testing.T) {
 			t.Errorf("409 message missing %q: %v", want, err)
 		}
 	}
-	// No half-written sentence about a run nobody named.
 	for _, forbidden := range []string{"holds the slot", "ronja api /api/v2/workflow/run/"} {
 		if strings.Contains(err.Error(), forbidden) {
 			t.Errorf("an anonymous 409 still rendered %q: %v", forbidden, err)
@@ -402,8 +370,6 @@ func TestRunReportsAnAnonymousBlockingRunOn409(t *testing.T) {
 	}
 }
 
-// Everything else arrives in the server's own words — the credit kill-stop above
-// all, whose one sentence says what to do about it.
 func TestRunPassesThroughTheServersOtherRefusals(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failRun = http.StatusBadRequest

@@ -10,10 +10,7 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The read-only half: what `pipeline status` reports for each checks file.
-
-// pipelineChecksStatus is one checks file's remote state, the read-only twin
-// of what applyTableChecks would do.
+// pipelineChecksStatus is the read-only twin of what applyTableChecks would do.
 type pipelineChecksStatus struct {
 	Path    string `json:"path"`
 	TableID string `json:"tableID,omitempty"`
@@ -39,16 +36,14 @@ type pipelineChecksStatus struct {
 	// file does not manage `enabled` — they guard nothing.
 	Silenced []string `json:"silenced,omitempty"`
 	// KindChange names declared checks whose body is the other kind from the
-	// live check's (an expression against a watchdog, or the reverse). A push
-	// REFUSES these — a check's kind is fixed — so they are not Pending, which
-	// would promise a write the push can only fail on.
+	// live check's. A push refuses these (a check's kind is fixed), so they are
+	// not Pending.
 	KindChange []string `json:"kindChange,omitempty"`
 	// Unmanaged counts the checks on the table the folder neither declares nor
 	// owns.
 	Unmanaged int `json:"unmanaged,omitempty"`
 }
 
-// pipelineChecksStatuses judges every checks file, concurrently.
 func pipelineChecksStatuses(ctx context.Context, client *api.Client, f *folder, codec pipelineCodec,
 	local map[string]string, store liveHashes) []pipelineChecksStatus {
 
@@ -164,7 +159,6 @@ func oneChecksStatus(ctx context.Context, client *api.Client, f *folder, codec p
 	return out
 }
 
-// printPipelineChecksStatus renders one checks file's remote state.
 func printPipelineChecksStatus(out *os.File, s pipelineChecksStatus) {
 	if s.FileDeleted {
 		fmt.Fprintf(out, "    %s (deleted — the checks it created are still on the table)\n", s.Path)

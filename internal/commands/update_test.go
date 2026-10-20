@@ -64,13 +64,10 @@ func TestUpdateCheckJSON(t *testing.T) {
 func TestUpdateSwapsTheBinary(t *testing.T) {
 	dir := t.TempDir()
 	binary := installedBinary(t, dir)
-	// A setuid bit somebody once put on the installed binary must NOT be
-	// carried onto freshly downloaded code.
 	if err := os.Chmod(binary, 0o755|os.ModeSetuid); err != nil {
 		t.Fatalf("chmod setuid: %v", err)
 	}
-	// A probe left behind by an earlier run that was SIGKILLed, aged past the
-	// sweep's threshold so it is a leftover rather than a live run's file.
+	// Aged past the sweep's threshold: a SIGKILLed run's leftover, not a live probe.
 	stale := filepath.Join(dir, ".ronja-update-999")
 	if err := os.WriteFile(stale, []byte("leftover"), 0o600); err != nil {
 		t.Fatalf("plant a stale probe: %v", err)
@@ -120,8 +117,6 @@ func TestUpdateSwapsTheBinary(t *testing.T) {
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Error("the stale probe was not swept")
 	}
-	// The download itself must never put the archive beside the binary: only
-	// the verified, extracted executable is allowed in that directory.
 	seen := mirror.sawInBinaryDir()
 	if len(seen) == 0 {
 		t.Fatal("the mid-download directory listing never ran, so the assertion below proves nothing")
@@ -150,7 +145,6 @@ func TestUpdateRefusesABadChecksum(t *testing.T) {
 	archive := releaseTarball(t)
 	mirror := newFakeMirror(t, testLatestVersion, archive)
 	asset := update.AssetName(testLatestVersion, runtime.GOOS, runtime.GOARCH)
-	// The manifest disagrees with the bytes: a corrupt or tampered download.
 	mirror.assets[update.ChecksumsName] = []byte(fmt.Sprintf("%s  %s\n", strings.Repeat("0", 64), asset))
 	useMirror(t, mirror, testCurrentVersion)
 
@@ -204,13 +198,9 @@ func TestUpdateRefusesARonjaDirectoryEntry(t *testing.T) {
 	assertNoResidue(t, dir)
 }
 
-// An archive whose `ronja` entry is a stub passes every other check: the name
-// is right, the type is right, and the checksum matches, because the manifest
-// is generated from whatever the release pipeline built. Installing it would
-// replace a working CLI with an unrunnable file AND take `ronja update` away in
-// the same rename, leaving the user with nothing to repair it with — so it is
-// refused, end to end, with the original binary and both directories as they
-// were.
+// A stub `ronja` entry passes the checksum (the manifest is generated from
+// whatever the pipeline built), and installing it would also take away
+// `ronja update` itself.
 func TestUpdateRefusesABinaryTooSmallToBeOne(t *testing.T) {
 	tmp := isolateTempDir(t)
 	dir := t.TempDir()
@@ -235,10 +225,8 @@ func TestUpdateRefusesABinaryTooSmallToBeOne(t *testing.T) {
 	assertNoArchiveResidue(t, tmp)
 }
 
-// The sweep deletes what it matches, so it must not be reading the binary's
-// directory as a PATTERN: `[` in a path is a metacharacter to filepath.Glob,
-// and a user whose binary lives under ~/bin[old]/ would get either no sweep at
-// all or one aimed somewhere else.
+// `[` in a path is a metacharacter to filepath.Glob, and the sweep deletes what
+// it matches.
 func TestSweepStaleProbesInADirectoryWithAGlobCharacter(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "bin[old]")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -311,7 +299,6 @@ func TestUpdateRefusesAnUnwritableDirectory(t *testing.T) {
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatalf("chmod dir: %v", err)
 	}
-	// Restore the mode so the temp dir can be cleaned up.
 	t.Cleanup(func() { os.Chmod(dir, 0o755) })
 
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
@@ -324,8 +311,6 @@ func TestUpdateRefusesAnUnwritableDirectory(t *testing.T) {
 	if !strings.Contains(err.Error(), dir) || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("error = %q, want it to name %s and say permission denied", err, dir)
 	}
-	// The probe comes before the download for exactly this reason: nobody
-	// should wait for eight megabytes to be told the directory is read-only.
 	if n := mirror.assetRequests(); n != 0 {
 		t.Errorf("the refusal made %d asset requests, want 0", n)
 	}
@@ -362,9 +347,8 @@ func TestUpdateOnTheNewestReleaseSaysSo(t *testing.T) {
 	}
 }
 
-// The up-to-date path is the one that carries upToDate as a real false's
-// opposite: it has to appear, and appear as true, or a script reading the
-// object cannot tell "nothing to do" from "this field is missing on this path".
+// upToDate must appear as true, or a script cannot tell "nothing to do" from a
+// missing field.
 func TestUpdateJSONOnTheNewestRelease(t *testing.T) {
 	dir := t.TempDir()
 	binary := installedBinary(t, dir)
@@ -390,8 +374,6 @@ func TestUpdateJSONOnTheNewestRelease(t *testing.T) {
 	}
 }
 
-// A binary built from a checkout has no release to update to, and guessing one
-// would rewrite a developer's own build with a published one.
 func TestUpdateRefusesADevelopmentBuild(t *testing.T) {
 	dir := t.TempDir()
 	installedBinary(t, dir)
@@ -410,10 +392,8 @@ func TestUpdateRefusesADevelopmentBuild(t *testing.T) {
 	}
 }
 
-// An entry named `ronja` that is not a plain file is a claim on the name, not
-// a binary — and two entries claiming it are ambiguous rather than a race the
-// updater gets to resolve by picking one. Every shape is refused end to end,
-// with the installed binary and both directories untouched.
+// Two entries claiming `ronja` are ambiguous, not a race the updater resolves by
+// picking one.
 func TestUpdateRefusesAmbiguousArchiveShapes(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -452,9 +432,6 @@ func TestUpdateRefusesAmbiguousArchiveShapes(t *testing.T) {
 	}
 }
 
-// A second `ronja update` running right now owns its probe, and sweeping it
-// would make that run fail on a file it created itself — with a message naming
-// a dotfile and nothing to connect it back to this process.
 func TestUpdateLeavesAFreshForeignProbeAlone(t *testing.T) {
 	dir := t.TempDir()
 	binary := installedBinary(t, dir)
@@ -475,11 +452,7 @@ func TestUpdateLeavesAFreshForeignProbeAlone(t *testing.T) {
 	}
 }
 
-// The probe's name carries this process's pid and the sweep leaves fresh files
-// alone, so a collision means a live run under a reused pid or a leftover
-// younger than an hour. The reader cannot tell those apart without looking, so
-// the refusal names the file and says what makes it safe to remove — rather
-// than adopting it, which would let two runs write the same file.
+// Refused rather than adopted, which would let two runs write the same file.
 func TestUpdateRefusesAProbeItDidNotCreate(t *testing.T) {
 	dir := t.TempDir()
 	binary := installedBinary(t, dir)
@@ -509,10 +482,6 @@ func TestUpdateRefusesAProbeItDidNotCreate(t *testing.T) {
 	}
 }
 
-// A download slower than staleProbeAge would otherwise age its own probe into a
-// leftover, and the next `ronja update` to start would delete a file this run
-// is about to write. The probe is touched at each step, so a concurrent sweep
-// leaves it alone.
 func TestUpdateKeepsItsProbeAliveThroughALongDownload(t *testing.T) {
 	dir := t.TempDir()
 	binary := installedBinary(t, dir)
@@ -523,13 +492,11 @@ func TestUpdateKeepsItsProbeAliveThroughALongDownload(t *testing.T) {
 	mirror.hook = func(path string) {
 		switch {
 		case strings.HasSuffix(path, update.ChecksumsName):
-			// Stand in for the hour the archive takes on a slow link.
 			old := time.Now().Add(-2 * staleProbeAge)
 			if err := os.Chtimes(probe, old, old); err == nil {
 				aged.Store(true)
 			}
 		case strings.HasSuffix(path, ".tar.gz"):
-			// A second `ronja update` starts while this one downloads.
 			sweepStaleProbes(dir)
 			if _, err := os.Stat(probe); err == nil {
 				survived.Store(true)
@@ -551,9 +518,6 @@ func TestUpdateKeepsItsProbeAliveThroughALongDownload(t *testing.T) {
 	assertNoResidue(t, dir)
 }
 
-// The state file is shared with the daily notice. Writing a whole struct here
-// would zero NotifiedAt, and the notice would then treat a user it told
-// yesterday as one it has never told — nagging on the very next command.
 func TestUpdateCheckKeepsNotifiedAt(t *testing.T) {
 	dir := t.TempDir()
 	installedBinary(t, dir)
@@ -583,10 +547,6 @@ func TestUpdateCheckKeepsNotifiedAt(t *testing.T) {
 	}
 }
 
-// A cache that cannot be READ is not written over either. The read is what
-// carries NotifiedAt forward, so writing after a failed one would put a zeroed
-// NotifiedAt on disk and the daily notice would then tell a user it told this
-// morning all over again — a cache failure turned into user-visible nagging.
 func TestUpdateLeavesAnUnreadableStateAlone(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can read a 0000 file")
@@ -621,8 +581,6 @@ func TestUpdateLeavesAnUnreadableStateAlone(t *testing.T) {
 	}
 }
 
-// A release that does not carry what this platform needs is a refusal, not a
-// half-done update: neither piece is optional and neither can be reconstructed.
 func TestUpdateRefusesAnIncompleteRelease(t *testing.T) {
 	asset := update.AssetName(testLatestVersion, runtime.GOOS, runtime.GOARCH)
 	for _, missing := range []string{asset, update.ChecksumsName} {
@@ -672,16 +630,12 @@ func TestUpdateJSONOnTheSwapPath(t *testing.T) {
 		"updated":  true,
 	}
 	assertJSONFields(t, payload, want)
-	// The human report is what --json replaces, not something it accompanies.
 	if strings.Contains(stderr, "Updated ronja") {
 		t.Errorf("stderr = %q, want the narration suppressed under --json", stderr)
 	}
 	assertBinaryReplaced(t, binary)
 }
 
-// The Homebrew payload is deliberately smaller: the command answers from the
-// binary's own location and asks the mirror nothing, so there is no latest
-// version it could honestly report.
 func TestUpdateJSONOnTheHomebrewPath(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Caskroom", "ronja", "0.28.4")
@@ -711,8 +665,6 @@ func TestUpdateJSONOnTheHomebrewPath(t *testing.T) {
 	}
 }
 
-// A mirror that is down is reported as one: the command says what it could not
-// read, and changes nothing.
 func TestUpdateSurfacesAReleaseLookupFailure(t *testing.T) {
 	dir := t.TempDir()
 	binary := installedBinary(t, dir)
@@ -733,8 +685,6 @@ func TestUpdateSurfacesAReleaseLookupFailure(t *testing.T) {
 	assertNoResidue(t, dir)
 }
 
-// A tag the mirror publishes that is not a version is the mirror's problem, and
-// the message says so rather than blaming the read that worked.
 func TestUpdateRefusesAnUnparseableTag(t *testing.T) {
 	dir := t.TempDir()
 	installedBinary(t, dir)
@@ -753,9 +703,6 @@ func TestUpdateRefusesAnUnparseableTag(t *testing.T) {
 	}
 }
 
-// A download that stops halfway hashes to something else, which is exactly the
-// case the checksum exists for. Nothing is installed and nothing is left in
-// either directory — the binary's, or the one the archive streamed into.
 func TestUpdateRefusesATruncatedDownload(t *testing.T) {
 	tmp := isolateTempDir(t)
 	dir := t.TempDir()
@@ -778,8 +725,6 @@ func TestUpdateRefusesATruncatedDownload(t *testing.T) {
 	assertNoArchiveResidue(t, tmp)
 }
 
-// assertNoResidue checks that a failed update left nothing behind in the
-// binary's directory beyond the binary itself.
 func assertNoResidue(t *testing.T, dir string) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -793,8 +738,6 @@ func assertNoResidue(t *testing.T, dir string) {
 	}
 }
 
-// isolateTempDir points os.TempDir() at a directory of this test's own, so the
-// archive the download streams into can be asserted about.
 func isolateTempDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -813,10 +756,8 @@ func assertNoArchiveResidue(t *testing.T, dir string) {
 	}
 }
 
-// assertJSONFields compares a --json payload against the EXACT field set it
-// should carry: an extra field is a failure too, because these payloads are
-// what a script reads and a field that appears on one path and not another is
-// the bug this pins.
+// assertJSONFields fails on an extra field too: a field that appears on one
+// path and not another is the bug this pins.
 func assertJSONFields(t *testing.T, payload, want map[string]any) {
 	t.Helper()
 	for field, value := range want {

@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-// isolate points the credential store at a temp dir and clears the overrides,
-// so tests never read or write the developer's real profile.
 func isolate(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -33,31 +31,21 @@ func TestNormalizeURL(t *testing.T) {
 		{name: "plain https", in: "https://app.ronja.tech", want: "https://app.ronja.tech"},
 		{name: "trailing slash dropped", in: "https://app.ronja.tech/", want: "https://app.ronja.tech"},
 		{name: "http preserved", in: "http://localhost:8080", want: "http://localhost:8080"},
-		// A bare host is what people actually type.
 		{name: "bare loopback assumes http", in: "localhost:8080", want: "http://localhost:8080"},
 		{name: "bare 127.0.0.1 assumes http", in: "127.0.0.1:8080", want: "http://127.0.0.1:8080"},
 		{name: "bare remote assumes https", in: "app.ronja.tech", want: "https://app.ronja.tech"},
 		{name: "whitespace trimmed", in: "  https://app.ronja.tech  ", want: "https://app.ronja.tech"},
-		// Query and fragment are not part of an instance's identity; keeping
-		// them would fragment the credential store across equivalent URLs.
 		{name: "query dropped", in: "https://app.ronja.tech?x=1", want: "https://app.ronja.tech"},
 		{name: "fragment dropped", in: "https://app.ronja.tech#top", want: "https://app.ronja.tech"},
-		// An API URL pasted as the instance root would otherwise produce
-		// doubled paths (".../api/api/v2/...") that 404 with no clue why.
 		{name: "api suffix stripped", in: "https://app.ronja.tech/api", want: "https://app.ronja.tech"},
 		{name: "api/v2 suffix stripped", in: "https://app.ronja.tech/api/v2", want: "https://app.ronja.tech"},
 		{name: "api suffix with trailing slash", in: "https://app.ronja.tech/api/", want: "https://app.ronja.tech"},
-		// A genuine subpath deployment must survive.
 		{name: "subpath preserved", in: "https://corp.example/ronja", want: "https://corp.example/ronja"},
 		{name: "subpath with api suffix", in: "https://corp.example/ronja/api", want: "https://corp.example/ronja"},
-		// Hostnames are case-insensitive, so an uppercase spelling must not
-		// become a second credential-store key.
 		{name: "host lowercased", in: "https://APP.Ronja.Tech", want: "https://app.ronja.tech"},
 		{name: "bare uppercase loopback", in: "LOCALHOST:8080", want: "http://localhost:8080"},
-		// Paths genuinely are case-sensitive.
 		{name: "path case preserved", in: "https://corp.example/Ronja", want: "https://corp.example/Ronja"},
-		// The loopback sniff is an EXACT host match: "localhost.evil.com" is a
-		// registerable domain, and must not be talked to in cleartext.
+		// "localhost.evil.com" is registerable and must not get a token in cleartext.
 		{name: "loopback lookalike is https", in: "localhost.evil.com", want: "https://localhost.evil.com"},
 		{name: "loopback lookalike with port", in: "localhost.evil.com:8080", want: "https://localhost.evil.com:8080"},
 		{name: "127.0.0.1 lookalike is https", in: "127.0.0.1.evil.com", want: "https://127.0.0.1.evil.com"},
@@ -87,9 +75,8 @@ func TestNormalizeURL(t *testing.T) {
 	}
 }
 
-// login stores one credential the way `ronja login` does — claim the
-// identity and fill it in, inside a single Update. Tests go through this rather
-// than writing the map directly so they exercise the real allocation path.
+// login stores one credential the way `ronja login` does, through the real
+// allocation path rather than writing the map directly.
 func login(t *testing.T, url, tenantID, tenantName, token, loggedIn string) string {
 	t.Helper()
 	normalized, err := NormalizeURL(url)
@@ -102,8 +89,7 @@ func login(t *testing.T, url, tenantID, tenantName, token, loggedIn string) stri
 		var created bool
 		name, p, created = f.ClaimProfile(normalized, tenantID, "")
 		p.Token, p.TenantName, p.LoggedIn = token, tenantName, loggedIn
-		// Only a freshly created profile carries a provisional name. Renaming
-		// on every login would rename the profile the user deliberately chose.
+		// Only a created profile's name is provisional.
 		if created && tenantName != "" {
 			if better := f.AutoName(normalized, tenantName, name); better != name {
 				if err := f.Rename(name, better); err != nil {
@@ -139,7 +125,7 @@ func TestSaveRoundTripAndPermissions(t *testing.T) {
 	dir := isolate(t)
 	login(t, "localhost:8080", "ten-1", "", "tok-1", "2026-01-01T00:00:00Z")
 
-	// The file holds a bearer token; it must not be readable by other users.
+	// The file holds a bearer token.
 	info, err := os.Stat(filepath.Join(dir, FileName))
 	if err != nil {
 		t.Fatalf("stat: %v", err)
@@ -152,7 +138,6 @@ func TestSaveRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	// The bare host must resolve to the same key it was stored under.
 	if resolved.URL != "http://localhost:8080" {
 		t.Errorf("URL = %q, want http://localhost:8080", resolved.URL)
 	}
@@ -172,7 +157,6 @@ func TestResolvePrecedence(t *testing.T) {
 	login(t, "http://localhost:8080", "ten-dev", "", "stored", "2026-01-01T00:00:00Z")
 	prod := login(t, "https://app.ronja.tech", "ten-prod", "Acme", "prod", "2026-02-01T00:00:00Z")
 
-	// The most recent login becomes current.
 	resolved, err := Resolve("", "")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -181,7 +165,6 @@ func TestResolvePrecedence(t *testing.T) {
 		t.Errorf("current = %q/%q, want %s/prod", resolved.Profile, resolved.Token, prod)
 	}
 
-	// RONJA_URL selects by URL...
 	t.Setenv(EnvURL, "http://localhost:8080")
 	resolved, err = Resolve("", "")
 	if err != nil {
@@ -191,7 +174,6 @@ func TestResolvePrecedence(t *testing.T) {
 		t.Errorf("with RONJA_URL, token = %q, want stored", resolved.Token)
 	}
 
-	// ...and an explicit flag beats RONJA_URL.
 	resolved, err = Resolve("https://app.ronja.tech", "")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -200,7 +182,7 @@ func TestResolvePrecedence(t *testing.T) {
 		t.Errorf("with --url, token = %q, want prod", resolved.Token)
 	}
 
-	// --profile selects by name, ignoring RONJA_URL entirely.
+	// --profile beats RONJA_URL.
 	resolved, err = Resolve("", prod)
 	if err != nil {
 		t.Fatalf("Resolve --profile: %v", err)
@@ -209,8 +191,7 @@ func TestResolvePrecedence(t *testing.T) {
 		t.Errorf("--profile %s resolved to %q/%q", prod, resolved.URL, resolved.Token)
 	}
 
-	// RONJA_TOKEN outranks anything on disk, so a CI job never inherits
-	// whoever last logged in on the machine.
+	// RONJA_TOKEN outranks anything on disk.
 	t.Setenv(EnvToken, "from-env")
 	resolved, err = Resolve("http://localhost:8080", "")
 	if err != nil {
@@ -224,17 +205,9 @@ func TestResolvePrecedence(t *testing.T) {
 	}
 }
 
-// An explicitly named URL is a FILTER, never a fallback.
-//
-// The failure this guards is a credential leak, not an inconvenience: falling
-// through to the current profile sends a PRODUCTION token to whatever host the
-// user just named on the command line.
-//
-// Negative control: the second half asserts a case the pre-profile, URL-keyed
-// store would also have passed, and the FIRST half is the one that distinguishes
-// them — a current profile that exists, holds a token, and is on a different
-// URL. A test that only checked "no profiles at all" would pass against an
-// implementation that falls back, and prove nothing.
+// Falling back would send the current profile's token to the host the user
+// named. The first half is the distinguishing case: a current profile with a
+// token on a different URL; "no profiles at all" would pass a fallback too.
 func TestExplicitURLNeverFallsBackToCurrent(t *testing.T) {
 	isolate(t)
 	login(t, "https://app.ronja.tech", "ten-prod", "Acme", "prod-token", "2026-02-01T00:00:00Z")
@@ -253,7 +226,6 @@ func TestExplicitURLNeverFallsBackToCurrent(t *testing.T) {
 		t.Errorf("URL = %q, want the URL that was asked for", resolved.URL)
 	}
 
-	// Same via the environment variable, which takes the identical path.
 	t.Setenv(EnvURL, "https://staging.ronja.tech")
 	resolved, err = Resolve("", "")
 	if err != nil {
@@ -264,15 +236,11 @@ func TestExplicitURLNeverFallsBackToCurrent(t *testing.T) {
 	}
 }
 
-// Two organizations on ONE instance is the case profiles exist for. A URL alone
-// cannot choose between them, and choosing anyway is the difference between
-// reading test data and writing to a customer's organization.
 func TestAmbiguousURLRefusesToPick(t *testing.T) {
 	isolate(t)
 	acme := login(t, "https://app.ronja.tech", "ten-acme", "Acme Retail", "acme-token", "2026-01-01T00:00:00Z")
 	north := login(t, "https://app.ronja.tech", "ten-north", "Northwind AB", "north-token", "2026-02-01T00:00:00Z")
 
-	// Both logins survived — neither evicted the other.
 	f, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -281,8 +249,7 @@ func TestAmbiguousURLRefusesToPick(t *testing.T) {
 		t.Fatalf("stored %d profiles, want 2 — a second organization on one instance evicted the first", len(f.Profiles))
 	}
 
-	// `north` is current (logged in last), so the URL resolves to it rather
-	// than erroring: an existing choice is a real signal, not a coin flip.
+	// `north` is current (logged in last), which counts as a choice.
 	resolved, err := Resolve("https://app.ronja.tech", "")
 	if err != nil {
 		t.Fatalf("Resolve with current among candidates: %v", err)
@@ -291,7 +258,6 @@ func TestAmbiguousURLRefusesToPick(t *testing.T) {
 		t.Errorf("profile = %q, want the current profile %q", resolved.Profile, north)
 	}
 
-	// With current pointing elsewhere, the URL is genuinely ambiguous.
 	if err := Update(func(f *File) error { f.Current = ""; return nil }); err != nil {
 		t.Fatalf("clear current: %v", err)
 	}
@@ -303,14 +269,11 @@ func TestAmbiguousURLRefusesToPick(t *testing.T) {
 	if len(ambiguous.Candidates) != 2 {
 		t.Errorf("candidates = %v, want both profiles named so the user can choose", ambiguous.Candidates)
 	}
-	// Sorted, or the message reads differently on every run.
 	if ambiguous.Candidates[0] != acme || ambiguous.Candidates[1] != north {
 		t.Errorf("candidates = %v, want them sorted", ambiguous.Candidates)
 	}
 }
 
-// Naming both a profile and a conflicting URL is refused, rather than one half
-// of the command silently winning.
 func TestProfileAndURLConflictIsRefused(t *testing.T) {
 	isolate(t)
 	prod := login(t, "https://app.ronja.tech", "ten-prod", "Acme", "prod-token", "2026-01-01T00:00:00Z")
@@ -321,20 +284,17 @@ func TestProfileAndURLConflictIsRefused(t *testing.T) {
 		t.Fatalf("Resolve = %v, want a ProfileURLMismatchError", err)
 	}
 
-	// Agreeing is fine — people do pass both.
 	if _, err := Resolve("https://app.ronja.tech", prod); err != nil {
 		t.Errorf("Resolve with a matching --url and --profile: %v", err)
 	}
 
-	// An unknown name is an error, not a silent fallback to current.
 	if _, err := Resolve("", "nope"); !errors.Is(err, ErrNoProfile) {
 		t.Errorf("Resolve with an unknown profile = %v, want ErrNoProfile", err)
 	}
 }
 
-// An environment token and a stored profile are independent. Adopting the
-// profile's organization would make `wf push` match one organization's binding
-// and send its workflow id under the other's token.
+// Adopting the profile's organization under an environment token would let
+// `wf push` send one organization's workflow id under another's token.
 func TestEnvTokenNeverAdoptsProfileTenant(t *testing.T) {
 	isolate(t)
 	login(t, "https://app.ronja.tech", "ten-acme", "Acme", "acme-token", "2026-01-01T00:00:00Z")
@@ -350,20 +310,13 @@ func TestEnvTokenNeverAdoptsProfileTenant(t *testing.T) {
 	if !resolved.FromEnv || resolved.Token != "some-other-orgs-token" {
 		t.Errorf("FromEnv=%v token=%q, want the environment credential", resolved.FromEnv, resolved.Token)
 	}
-	// The profile is still what chose the URL, and saying so is useful.
 	if resolved.URL != "https://app.ronja.tech" {
 		t.Errorf("URL = %q, want the profile's", resolved.URL)
 	}
 }
 
-// On a fresh install, with nothing stored and nothing exported, the CLI points
-// at the hosted instance.
-//
 // The literal is pinned rather than compared against the constant, which would
-// be tautological and pass whatever the constant said. What this guards is a
-// default quietly moving back to a local backend for someone's convenience:
-// almost nobody running this has one, and pointing at it fails as "connection
-// refused" — a message that says nothing about what to do instead.
+// pass whatever the constant said.
 func TestResolveDefaultsToTheHostedInstance(t *testing.T) {
 	isolate(t)
 
@@ -371,8 +324,7 @@ func TestResolveDefaultsToTheHostedInstance(t *testing.T) {
 	if DefaultURL != hosted {
 		t.Errorf("DefaultURL = %q, want the hosted instance %q", DefaultURL, hosted)
 	}
-	// And it must already be canonical, or the default disagrees with the key
-	// every stored profile is written under.
+	// Non-canonical, the default would disagree with every stored profile's key.
 	if normalized, err := NormalizeURL(DefaultURL); err != nil || normalized != DefaultURL {
 		t.Errorf("NormalizeURL(DefaultURL) = %q, %v — the default is not in canonical form", normalized, err)
 	}
@@ -387,7 +339,6 @@ func TestResolveDefaultsToTheHostedInstance(t *testing.T) {
 	if resolved.Token != "" {
 		t.Errorf("Token = %q, want empty on a fresh install", resolved.Token)
 	}
-	// A default is not a login. Nothing is stored until someone authenticates.
 	if resolved.Profile != "" {
 		t.Errorf("Profile = %q, want none — the default is a destination, not a credential", resolved.Profile)
 	}
@@ -406,8 +357,6 @@ func TestRemoveProfile(t *testing.T) {
 		t.Error("Remove should report that it removed a stored profile")
 	}
 
-	// Removing the current profile must fall back to a remaining one rather
-	// than leaving the CLI with nothing selected.
 	resolved, err := Resolve("", "")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -416,8 +365,6 @@ func TestRemoveProfile(t *testing.T) {
 		t.Errorf("after removing current, resolved to %q/%q", resolved.Profile, resolved.Token)
 	}
 
-	// Removing something that was never stored is not an error, but must be
-	// reported honestly so logout does not claim a success that did not happen.
 	if err := Update(func(f *File) error { removed = f.Remove("nowhere"); return nil }); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -426,23 +373,18 @@ func TestRemoveProfile(t *testing.T) {
 	}
 }
 
-// With two or more profiles left, the promoted current must be the most recent
-// login rather than whatever Go's randomised map iteration happened to yield —
-// otherwise one logout can silently point the next command at production.
 func TestRemovePromotesMostRecentLogin(t *testing.T) {
 	isolate(t)
 	login(t, "http://localhost:8080", "t1", "", "local", "2026-01-01T00:00:00Z")
 	staging := login(t, "https://staging.ronja.tech", "t2", "Acme", "staging", "2026-03-01T00:00:00Z")
 	prod := login(t, "https://app.ronja.tech", "t3", "Acme", "prod", "2026-02-01T00:00:00Z")
 
-	// prod is current (written last), so removing it forces the fallback
-	// choice among the two remaining.
+	// prod is current (written last).
 	if err := Update(func(f *File) error { f.Remove(prod); return nil }); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
-	// Run it repeatedly: a nondeterministic implementation passes a single
-	// check by luck roughly half the time.
+	// Repeated: a nondeterministic pick passes one check half the time.
 	for i := 0; i < 20; i++ {
 		resolved, err := Resolve("", "")
 		if err != nil {
@@ -454,8 +396,6 @@ func TestRemovePromotesMostRecentLogin(t *testing.T) {
 	}
 }
 
-// Ties (and profiles the user hand-edited to have no login stamp) still have to
-// resolve to one answer, not a coin flip.
 func TestPickCurrentBreaksTiesByName(t *testing.T) {
 	f := &File{Profiles: map[string]*Profile{
 		"b-org": {LoggedIn: "2026-01-01T00:00:00Z"},
@@ -472,20 +412,13 @@ func TestPickCurrentBreaksTiesByName(t *testing.T) {
 	}
 }
 
-// Concurrent logins must all survive — including the hard case: several
-// organizations on ONE instance, which all derive the SAME provisional name.
-//
-// Two separate failures are covered. Unlocked, the later Save writes a snapshot
-// that predates the earlier one and drops a token outright. Correctly locked but
-// with name allocation OUTSIDE the lock, every racer picks the same free name
-// and the last writer overwrites the rest — the same lost credential, one layer
-// up, and the exact bug profiles exist to fix.
+// Several organizations on one instance derive the same provisional name, so
+// this catches name allocation outside the lock as well as an unlocked Save.
 func TestConcurrentLoginsKeepEveryCredential(t *testing.T) {
 	isolate(t)
 
 	const url = "https://app.ronja.tech"
 	tenants := []string{"ten-a", "ten-b", "ten-c", "ten-d"}
-	// A second instance in the mix, so the test covers both axes at once.
 	other := "https://staging.ronja.tech"
 
 	errs := make(chan error, len(tenants)+1)
@@ -534,8 +467,6 @@ func TestConcurrentLoginsKeepEveryCredential(t *testing.T) {
 	}
 }
 
-// Re-authenticating updates the profile you already have. It must not mint a
-// second one beside it, and must not rename the one scripts refer to.
 func TestReLoginKeepsProfileNameAndIdentity(t *testing.T) {
 	isolate(t)
 	first := login(t, "https://app.ronja.tech", "ten-acme", "Acme Retail", "tok-1", "2026-01-01T00:00:00Z")
@@ -559,9 +490,6 @@ func TestReLoginKeepsProfileNameAndIdentity(t *testing.T) {
 	}
 }
 
-// A --profile name held by a DIFFERENT organization must not be taken. The new
-// credential still has to land somewhere: the server has already minted it and
-// shown it to nobody else, so discarding it strands a live token.
 func TestClaimProfileNeverOverwritesAnotherIdentity(t *testing.T) {
 	isolate(t)
 	login(t, "https://app.ronja.tech", "ten-acme", "Acme Retail", "acme-token", "2026-01-01T00:00:00Z")
@@ -601,8 +529,6 @@ func TestLoadRejectsCorruptFileClearly(t *testing.T) {
 	}
 }
 
-// A hostname whose label happens to end in "api" must not be mangled — the
-// suffix strip is a PATH rule, not a substring rule.
 func TestNormalizeURLDoesNotEatHostnames(t *testing.T) {
 	for _, in := range []string{"https://api.ronja.tech", "https://myapi.example"} {
 		got, err := NormalizeURL(in)
@@ -615,17 +541,9 @@ func TestNormalizeURLDoesNotEatHostnames(t *testing.T) {
 	}
 }
 
-// A STALE lock must admit exactly one writer, not everybody who saw it.
-//
-// This reproduces the two-writer ordering EXACTLY rather than hoping the
-// scheduler produces it: both waiters observe the same stale content, the first
-// evicts it and re-acquires, and only then does the second act on its stale
-// observation. With an unconditional Stat-then-Remove takeover the second
-// waiter's Remove deletes the FIRST waiter's brand-new lock, after which both
-// O_EXCL creates succeed and both run the critical section — which is a
-// read-modify-write of the whole credential file, so "both ran" means one
-// login's token is silently dropped: it exists on the server, was displayed
-// nowhere, and cannot be recovered.
+// Reproduces the two-writer ordering deterministically: both waiters observe
+// the same stale content, and the second acts only after the first evicted and
+// re-acquired.
 func TestStaleTakeoverAdmitsOneEvictor(t *testing.T) {
 	dir := isolate(t)
 	lockPath := filepath.Join(dir, FileName+".lock")
@@ -634,10 +552,7 @@ func TestStaleTakeoverAdmitsOneEvictor(t *testing.T) {
 		t.Fatalf("seed stale lock: %v", err)
 	}
 
-	// Waiter A and waiter B both read the stale lock and judge it abandoned.
-	// (Both observations are the same string; that is the premise.)
-
-	// A evicts and acquires.
+	// Waiters A and B both observed `stale`; A evicts and acquires.
 	if !evictObservedLock(lockPath, stale) {
 		t.Fatal("the first evictor should have taken over the abandoned lock")
 	}
@@ -647,7 +562,7 @@ func TestStaleTakeoverAdmitsOneEvictor(t *testing.T) {
 		t.Fatalf("first evictor could not acquire after eviction: acquired=%v err=%v", acquired, err)
 	}
 
-	// B now acts on its (now obsolete) observation. It must NOT remove A's lock.
+	// B acts on its obsolete observation.
 	if evictObservedLock(lockPath, stale) {
 		t.Error("a second evictor took over a lock that had already been re-acquired — two writers")
 	}
@@ -660,17 +575,12 @@ func TestStaleTakeoverAdmitsOneEvictor(t *testing.T) {
 	}
 }
 
-// The end-to-end shape: concurrent withLock callers racing a pre-existing stale
-// lock must serialize. Complements the deterministic test above by exercising
-// the real acquire/evict/release loop.
 func TestWithLockStaleTakeoverSerializes(t *testing.T) {
 	dir := isolate(t)
 	lockPath := filepath.Join(dir, FileName+".lock")
 	if err := os.WriteFile(lockPath, []byte(lockBody("deadbeefdeadbeefdeadbeef")), 0o600); err != nil {
 		t.Fatalf("seed stale lock: %v", err)
 	}
-	// Older than the staleness threshold by a wide margin, so every racer
-	// certainly sees it as abandoned.
 	old := time.Now().Add(-10 * lockStale)
 	if err := os.Chtimes(lockPath, old, old); err != nil {
 		t.Fatalf("age the lock: %v", err)
@@ -692,9 +602,8 @@ func TestWithLockStaleTakeoverSerializes(t *testing.T) {
 				if inside.Add(1) > 1 {
 					overlapped.Store(true)
 				}
-				// Long enough that a genuine overlap cannot be missed by
-				// scheduling luck, short enough that every racer still fits
-				// inside lockWait rather than timing out.
+				// Long enough to catch any overlap, short enough that every
+				// racer fits inside lockWait.
 				time.Sleep(50 * time.Millisecond)
 				inside.Add(-1)
 				return nil
@@ -712,8 +621,6 @@ func TestWithLockStaleTakeoverSerializes(t *testing.T) {
 			t.Errorf("racer %d: %v", i, err)
 		}
 	}
-	// And nothing is left behind for the next command to trip over — neither
-	// the lock nor an eviction claim.
 	if _, err := os.Stat(lockPath); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("lock file survived every holder: stat err = %v", err)
 	}
@@ -723,9 +630,6 @@ func TestWithLockStaleTakeoverSerializes(t *testing.T) {
 	}
 }
 
-// A process that has been taken over must NOT delete its successor's lock on
-// the way out. The unconditional `defer os.Remove(lockPath)` this replaces did
-// exactly that, admitting a third writer behind the second.
 func TestReleaseLockLeavesAnotherHoldersLock(t *testing.T) {
 	dir := isolate(t)
 	lockPath := filepath.Join(dir, FileName+".lock")
@@ -734,7 +638,7 @@ func TestReleaseLockLeavesAnotherHoldersLock(t *testing.T) {
 		t.Fatalf("seed successor lock: %v", err)
 	}
 
-	// The evicted process releases with ITS OWN body, which no longer matches.
+	// The evicted process releases with its own body.
 	releaseLock(lockPath, lockBody("ffff0000ffff0000ffff0000"))
 
 	current, err := os.ReadFile(lockPath)
@@ -745,16 +649,12 @@ func TestReleaseLockLeavesAnotherHoldersLock(t *testing.T) {
 		t.Errorf("lock body = %q, want %q", current, successor)
 	}
 
-	// And the real holder can still release it.
 	releaseLock(lockPath, successor)
 	if _, err := os.Stat(lockPath); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("holder could not release its own lock: stat err = %v", err)
 	}
 }
 
-// The wait bound and the staleness threshold are separate knobs on purpose: a
-// holder whose read-modify-write outlasts the wait (a network home directory, a
-// laptop resuming from sleep) must not be evicted while it is still running.
 func TestLockStaleIsWellClearOfLockWait(t *testing.T) {
 	if lockStale <= 10*lockWait {
 		t.Errorf("lockStale (%s) must be an order of magnitude beyond lockWait (%s), else a slow holder is evicted mid-write",
@@ -771,8 +671,7 @@ func TestEvictionKey(t *testing.T) {
 		{"nonce extracted", "pid=123 nonce=abcdef012345\n", "abcdef012345"},
 		{"legacy empty lock", "", "unidentified"},
 		{"truncated write", "pid=123 non", "unidentified"},
-		// Never let attacker-ish content become a path traversal in the claim
-		// filename; anything that is not plain hex collapses to the shared key.
+		// Non-hex content must never become a path in the claim filename.
 		{"non-hex rejected", "nonce=../../etc/passwd", "unidentified"},
 		{"uppercase rejected", "nonce=ABCDEF", "unidentified"},
 	}

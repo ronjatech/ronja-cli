@@ -14,22 +14,14 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// `wf test` tests, in the order the command refuses things: which row, is the
-// folder pushed, is there a gate, are the parameters right, would this write to
-// live tables — and only then the run and its poll loop.
-//
-// The refusal tests all assert ZERO run requests, not just a non-zero exit.
-// That is the property that matters: a refusal that happens after the POST has
-// already replaced a production table is not a refusal.
+// The refusal tests assert zero run requests, not just a non-zero exit: a
+// refusal after the POST may already have replaced a production table.
 
 // --- helpers ----------------------------------------------------------------
 
-// withFastPolling collapses the poll cadence so a test can drive the whole loop
-// without sleeping through it.
-//
-// The backoff CEILING is collapsed as well, not just the starting interval: a
-// test that polls its way past pollsAtStartInterval would otherwise start
-// growing its waits towards the real 10s cap and take the suite with it.
+// withFastPolling collapses the poll cadence, including the backoff ceiling: a
+// test polling past pollsAtStartInterval would otherwise grow towards the real
+// cap.
 func withFastPolling(t *testing.T) {
 	t.Helper()
 	savedInterval, savedMax := runPollInterval, maxPollInterval
@@ -40,10 +32,8 @@ func withFastPolling(t *testing.T) {
 	})
 }
 
-// draftFolder is the state every test here starts from: a live workflow, the
-// caller's own draft of it, and a folder cloned from that draft (so it is
-// clean, which is what `wf test` requires). shape adjusts the draft row —
-// output tables, an approval gate, declared parameters — before the clone.
+// draftFolder is a live workflow, the caller's draft of it, and a clean folder
+// cloned from that draft; shape adjusts the draft row before the clone.
 func draftFolder(t *testing.T, f *fakeInstance, shape func(*api.Workflow)) string {
 	t.Helper()
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive},
@@ -55,7 +45,7 @@ func draftFolder(t *testing.T, f *fakeInstance, shape func(*api.Workflow)) strin
 	return cloneFolder(t, f, "wf-1")
 }
 
-// finishedRun is a terminal poll answer. The fake stamps the run id.
+// finishedRun is a terminal poll answer; the fake stamps the run id.
 func finishedRun(status, health string) api.RunResponse {
 	return api.RunResponse{
 		WorkflowRun: api.WorkflowRun{Status: status, Logs: "line one\nline two\n"},
@@ -76,9 +66,6 @@ func ptr[T any](v T) *T { return &v }
 
 // --- which row --------------------------------------------------------------
 
-// `wf test` runs the DRAFT. A folder bound to a live workflow the caller has no
-// draft of has nothing to test, and running live instead would be the opposite
-// of what was asked.
 func TestTestRefusesWhenThereIsNoDraft(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive},
@@ -148,7 +135,6 @@ func TestTestStaleOKRunsTheDraftAsItStands(t *testing.T) {
 	if len(f.runRequests) != 1 {
 		t.Fatalf("runs = %+v, want exactly one", f.runRequests)
 	}
-	// The DRAFT, not the live row.
 	if f.runRequests[0].WorkflowID != "draft-1" {
 		t.Errorf("ran %s, want the draft", f.runRequests[0].WorkflowID)
 	}
@@ -156,18 +142,14 @@ func TestTestStaleOKRunsTheDraftAsItStands(t *testing.T) {
 
 // --- drift on the draft -----------------------------------------------------
 
-// The web builder edits the SAME per-user draft, so the code `wf test` is about
-// to run can carry an edit that never came from this folder. That is a note,
-// not a refusal — the draft is what this command runs by definition — but it
-// must be said, because a clean folder otherwise reads as "you are testing
-// exactly what you are looking at".
+// The web builder edits the same per-user draft, so the code about to run can
+// carry an edit this folder never made. A note, not a refusal.
 func TestTestNotesDraftChangesThatDidNotComeFromThisFolder(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
 	signIn(t, f)
 	withFastPolling(t)
 	root := draftFolder(t, f, nil)
-	// Somebody edits the draft in a browser tab.
 	f.putFile("draft-1", "main.py", "print(99)\n")
 
 	var err error
@@ -183,8 +165,6 @@ func TestTestNotesDraftChangesThatDidNotComeFromThisFolder(t *testing.T) {
 	}
 }
 
-// ...and silence when there is nothing to say. A note on every run is a note
-// nobody reads.
 func TestTestSaysNothingWhenTheDraftMatchesTheFolder(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -204,9 +184,8 @@ func TestTestSaysNothingWhenTheDraftMatchesTheFolder(t *testing.T) {
 
 // --- the approval gate ------------------------------------------------------
 
-// The locked decision: a gated workflow fail-fasts before any run POST, and the
-// message never suggests turning the gate off — that edit would ride the draft
-// onto the live workflow at publish.
+// The message never suggests turning the gate off: that edit would ride the
+// draft onto the live workflow at publish.
 func TestTestRefusesAnApprovalGatedDraftBeforeRunning(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -226,7 +205,6 @@ func TestTestRefusesAnApprovalGatedDraftBeforeRunning(t *testing.T) {
 			t.Errorf("refusal missing %q: %v", want, err)
 		}
 	}
-	// The workaround must not be advertised, in any spelling.
 	for _, forbidden := range []string{"disable", "turn off", "approvalGate"} {
 		if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(forbidden)) {
 			t.Errorf("refusal suggests the gate-off workaround (%q): %v", forbidden, err)
@@ -234,7 +212,6 @@ func TestTestRefusesAnApprovalGatedDraftBeforeRunning(t *testing.T) {
 	}
 }
 
-// A gate that exists but is switched off is not a gate.
 func TestTestRunsWithADisabledGate(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -295,7 +272,6 @@ func TestTestParameterValidation(t *testing.T) {
 		args: []string{"--param", "month=2026-07", "--param", "anywhere=whatever"},
 		want: map[string]any{"month": "2026-07", "anywhere": "whatever"},
 	}, {
-		// The value may perfectly well contain an '='; only the first splits.
 		name: "only the first equals splits",
 		args: []string{"--param", "month=2026-07", "--param", "note=a=b=c"},
 		want: map[string]any{"month": "2026-07", "note": "a=b=c"},
@@ -350,7 +326,6 @@ func TestTestParameterValidation(t *testing.T) {
 	}
 }
 
-// A workflow with no parameters sends no parameterValues at all.
 func TestTestSendsNoParameterValuesWhenThereAreNone(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -368,7 +343,6 @@ func TestTestSendsNoParameterValuesWhenThereAreNone(t *testing.T) {
 
 // --- output safety ----------------------------------------------------------
 
-// The bootstrap case, and the common one: no bound output tables, no friction.
 func TestTestRunsFreelyWithNoOutputTables(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -428,8 +402,8 @@ func TestTestRunsBoundOutputTablesWithWriteLive(t *testing.T) {
 	}
 }
 
-// The names are decoration; the ids are the warning. A token that cannot reach
-// the table surface must still get told which tables would be overwritten.
+// A token that cannot read the table names must still be told which ids would
+// be overwritten.
 func TestTestWriteLiveRefusalSurvivesNameLookupFailure(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failTableLookup = 403
@@ -449,9 +423,8 @@ func TestTestWriteLiveRefusalSurvivesNameLookupFailure(t *testing.T) {
 
 // --- resume -----------------------------------------------------------------
 
-// durableFolder is draftFolder with the ROW declaring the durable runtime,
-// which is where the CLI reads it from: the row is what the run funnel reads,
-// and it is right about a workflow this folder did not create.
+// durableFolder is draftFolder with the row declaring the durable runtime; the
+// CLI reads the runtime from the row, as the run funnel does.
 func durableFolder(t *testing.T, f *fakeInstance, shape func(*api.Workflow)) string {
 	t.Helper()
 	return draftFolder(t, f, func(draft *api.Workflow) {
@@ -462,10 +435,8 @@ func durableFolder(t *testing.T, f *fakeInstance, shape func(*api.Workflow)) str
 	})
 }
 
-// declareDurableInManifest is the FALLBACK path: an instance that predates
-// durable workflows sends no runtimeVersion, so the row decodes as 0 and the
-// folder's own declaration is all there is to go on. A 0 means "the instance
-// did not say", not "runtime 1".
+// declareDurableInManifest is the fallback for an instance that sends no
+// runtimeVersion: a 0 means "not said", not runtime 1.
 func declareDurableInManifest(t *testing.T, root string) {
 	t.Helper()
 	manifest, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
@@ -478,19 +449,13 @@ func declareDurableInManifest(t *testing.T, root string) {
 	}
 }
 
-// historicRun is one entry of a workflow's run history.
 func historicRun(id, status string, executedAt time.Time) api.WorkflowRun {
 	return api.WorkflowRun{ID: id, WorkflowID: "draft-1", Status: status, ExecutedAt: executedAt}
 }
 
-// The two halves of a resume's contract, in one test: it names the most recent
-// FAILED run, and it sends no parameter values at all — the server refuses a
-// resume that carries any, because a changed parameter invalidates every step
-// result computed under the old ones.
-//
-// The history is staged newest-LAST and out of order, because the endpoint has
-// no default ordering: a CLI that took the first row would pick a done run here
-// and a random one in production.
+// The server refuses a resume carrying parameter values, since a changed
+// parameter invalidates every journaled step. The history is staged out of
+// order because the endpoint has no default ordering.
 func TestTestResumeSendsTheLastFailedRunAndNoParameters(t *testing.T) {
 	f := newFakeInstance(t)
 	resumed := finishedRun(api.RunStatusDone, api.RunHealthDone)
@@ -513,8 +478,7 @@ func TestTestResumeSendsTheLastFailedRunAndNoParameters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("test --resume: %v", err)
 	}
-	// A replayed step reads as replayed rather than as "skipped", which is what
-	// a continue_on_error step that never ran also says.
+	// A never-run continue_on_error step also says "skipped".
 	if !strings.Contains(out, "replayed  Load orders") {
 		t.Errorf("the report does not distinguish a journal hit from a skip:\n%s", out)
 	}
@@ -528,16 +492,12 @@ func TestTestResumeSendsTheLastFailedRunAndNoParameters(t *testing.T) {
 	if len(got.ParameterValues) != 0 {
 		t.Errorf("a resume sent parameterValues %+v", got.ParameterValues)
 	}
-	// The ordering is REQUESTED, not hoped for. Without it the limit above
-	// returns an arbitrary window of the history.
+	// Without a requested order the limit returns an arbitrary window.
 	if len(f.runQueries) != 1 || !strings.Contains(f.runQueries[0], "orderBy=executed_at+desc") {
 		t.Errorf("run history query = %v, want an explicit newest-first ordering", f.runQueries)
 	}
 }
 
-// A resume with nothing to resume must say so. Starting a fresh run instead
-// would be the one outcome the flag exists to avoid — a full re-run of work
-// somebody asked to continue.
 func TestTestResumeWithNoFailedRunRefusesRatherThanStartingOne(t *testing.T) {
 	f := newFakeInstance(t)
 	base := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
@@ -558,11 +518,8 @@ func TestTestResumeWithNoFailedRunRefusesRatherThanStartingOne(t *testing.T) {
 	}
 }
 
-// A standard-runtime folder is NOT refused for being standard-runtime. Resume
-// works on both runtimes — on the standard one a step is journaled when the
-// author writes an explicit key — so the only thing that can be missing is a
-// failed run, and that is what the refusal must say. Refusing on the runtime
-// would tell an author who did write keys that their resume is impossible.
+// Resume works on both runtimes (the standard one journals explicitly keyed
+// steps), so the only thing missing can be a failed run.
 func TestTestResumeOnADefaultRuntimeFolderRefusesOnlyForWantOfAFailedRun(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -584,9 +541,8 @@ func TestTestResumeOnADefaultRuntimeFolderRefusesOnlyForWantOfAFailedRun(t *test
 	}
 }
 
-// --param with --resume is refused rather than dropped: the server rejects
-// parameter values on a resume, and a CLI that silently discarded them would
-// hide exactly the mistake that rule exists to catch.
+// Refused rather than dropped: discarding them would hide the mistake the
+// server's rule exists to catch.
 func TestTestResumeRefusesParameters(t *testing.T) {
 	f := newFakeInstance(t)
 	base := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
@@ -609,13 +565,8 @@ func TestTestResumeRefusesParameters(t *testing.T) {
 	}
 }
 
-// A failed run of a durable workflow ends with the invocation that continues it
-// and the size of what a resume would skip.
-//
-// The count is the response's journalEntries — the LINEAGE's journal — and NOT
-// len(steps): the run below has one observable step and three journaled ones,
-// so a report that counted steps would print a confident wrong number in the
-// one place somebody is deciding whether to trust the skip.
+// The count is the lineage's journalEntries, not len(steps): the run below has
+// one observable step and three journaled ones.
 func TestTestFailedDurableRunPrintsTheResumeInvocationAndTheJournalSize(t *testing.T) {
 	f := newFakeInstance(t)
 	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
@@ -638,26 +589,12 @@ func TestTestFailedDurableRunPrintsTheResumeInvocationAndTheJournalSize(t *testi
 	}
 }
 
-// TestTestSaysNothingRanWhenTheFailureWasSetup is the other half of the resume
-// hint: it must NOT be offered when the workflow's code never ran.
-//
-// "Fix the code and push first if the failure was a bug" is advice about the
-// author's files. A run that died fetching S3 credentials failed before the
-// container had them — the Python harness stamps processing_started_at
-// immediately before it execs the code, and compiles the entrypoint inside that
-// exec — so nothing the author wrote was ever evaluated, and telling them to fix
-// their code is an outage rendered as bad authorship.
-//
-// Accepted edge, pinned here rather than left to be rediscovered: a durable run
-// from before migration 000389 has no exec_run (steps [], NULL stamp) and no
-// journal, so it prints this message too. That is the cost of reading the only
-// signal that exists, and it errs toward "re-run it" rather than toward blaming
-// files nobody looked at.
+// The resume hint's "fix the code" advice must not follow a run whose code
+// never ran. Accepted edge: a durable run from before migration 000389 has no
+// exec_run and no journal, so it prints this notice too.
 func TestTestSaysNothingRanWhenTheFailureWasSetup(t *testing.T) {
 	f := newFakeInstance(t)
 	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
-	// No stamp, no steps, no journal, no captured output: the container never
-	// got as far as producing any of them.
 	failed.Logs = ""
 	failed.Error = ptr("get S3 credentials: assume role: AccessDenied\n  at the presign step")
 	f.runScript = []api.RunResponse{failed}
@@ -675,13 +612,11 @@ func TestTestSaysNothingRanWhenTheFailureWasSetup(t *testing.T) {
 	if !strings.Contains(out, "Nothing in your code ran") {
 		t.Errorf("expected the report to say the code never ran:\n%s", out)
 	}
-	// It reports where the run died, not whose fault that is — see
-	// printNothingRanNotice. Some pre-execution failures really are the author's.
+	// Where, never whose fault: see printNothingRanNotice.
 	if strings.Contains(out, "not a bug in your files") {
 		t.Errorf("the notice claimed the author's files are innocent, which it cannot know:\n%s", out)
 	}
-	// The first line only, in the notice — the Error: line above already carries
-	// the whole message, and repeating it would bury the sentence that matters.
+	// The first line only; the Error: line carries the whole message.
 	if !strings.Contains(out, "(get S3 credentials: assume role: AccessDenied).") {
 		t.Errorf("expected the first line of the error in the notice:\n%s", out)
 	}
@@ -690,16 +625,8 @@ func TestTestSaysNothingRanWhenTheFailureWasSetup(t *testing.T) {
 	}
 }
 
-// The pre-execution failure that IS the author's, and the reason the notice no
-// longer says "that is not a bug in your files".
-//
-// A package list the folder's ronja.json declares is validated before ExecV2 is
-// ever called (manalysis fails the run with "invalid pip packages: …"), so the
-// run arrives here with nothing executed and every signal userCodeRan reads
-// absent — indistinguishable, to this report, from a container that could not
-// get its credentials. The generic "re-run it" is useless advice for a list that
-// will be refused identically every time, so this one failure gets a line naming
-// the file that holds it.
+// The pre-execution failure that is the author's: a refused package list looks
+// like any setup failure to userCodeRan, and a re-run fails identically.
 func TestTestNamesPipPackagesWhenTheSetupFailureWasTheFolder(t *testing.T) {
 	f := newFakeInstance(t)
 	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
@@ -725,12 +652,7 @@ func TestTestNamesPipPackagesWhenTheSetupFailureWasTheFolder(t *testing.T) {
 	}
 }
 
-// The three signals that outvote a missing stamp. The check-in is best-effort —
-// a background worker that gives up on a network failure — so a run that really
-// did execute can arrive unstamped, and concluding "nothing ran" there would
-// hide a genuine bug from its author.
-//
-// A journal count is NOT among them — see the test below this one.
+// The check-in is best-effort, so a run that executed can arrive unstamped.
 func TestTestStillOffersTheResumeWhenSomethingProvesTheCodeRan(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -770,24 +692,14 @@ func TestTestStillOffersTheResumeWhenSomethingProvesTheCodeRan(t *testing.T) {
 	}
 }
 
-// A journal count alone does NOT prove that THIS run executed the author's
-// code, and must not suppress the notice.
-//
-// journalEntries counts what the resume LINEAGE has journaled and is derived on
-// read, so a `wf test --resume` inherits a non-zero count from the runs before
-// it. The failure this notice exists for — the container dying before it
-// starts, on an S3 credential or a launch error — then arrives with no stamp,
-// no steps and no logs, and treating the inherited count as evidence handed the
-// author a bare infrastructure error on the one run that needed the notice
-// most. Every other signal here is a fact about the run in hand; this one is a
-// fact about its ancestors.
+// journalEntries counts the resume lineage, so a resumed run inherits it; it
+// says nothing about whether this run executed.
 func TestTestSaysNothingRanWhenOnlyTheLineageHasAJournal(t *testing.T) {
 	f := newFakeInstance(t)
 	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
 	failed.Logs = ""
 	failed.ProcessingStartedAt = nil
 	failed.Steps = nil
-	// Inherited from earlier runs of the same lineage, not produced by this one.
 	failed.JournalEntries = 2
 	failed.Error = ptr("failed to assume role for object storage")
 	f.runScript = []api.RunResponse{failed}
@@ -804,8 +716,6 @@ func TestTestSaysNothingRanWhenOnlyTheLineageHasAJournal(t *testing.T) {
 	}
 }
 
-// The same hint on a folder whose INSTANCE never sends a runtimeVersion: the
-// row decodes as 0, and the folder's own declaration is the fallback.
 func TestTestFailedRunUsesTheManifestWhenTheRowSaysNothing(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusError, api.RunHealthFailed)}
@@ -821,15 +731,13 @@ func TestTestFailedRunUsesTheManifestWhenTheRowSaysNothing(t *testing.T) {
 	if !strings.Contains(out, "ronja wf test --resume") {
 		t.Errorf("the manifest's declaration was ignored:\n%s", out)
 	}
-	// No count: the instance sent none, and "0 steps journaled" would read as a
-	// fact about the journal rather than as an absent field.
+	// "0 steps journaled" would read as a fact rather than an absent field.
 	if strings.Contains(out, "journaled") {
 		t.Errorf("a count was printed with no journalEntries on the response:\n%s", out)
 	}
 }
 
-// The same failure on a v1 folder offers nothing, because there is nothing to
-// offer: a v1 run journals no steps, and a resume of it would re-run all of them.
+// A v1 run journals no steps, so a resume would re-run all of them.
 func TestTestFailedDefaultRuntimeRunOffersNoResume(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusError, api.RunHealthFailed)}
@@ -846,11 +754,7 @@ func TestTestFailedDefaultRuntimeRunOffersNoResume(t *testing.T) {
 	}
 }
 
-// A v1 run that never reached the interpreter says so too. The notice is about
-// the RUN, not about what a resume could skip, so the runtime it ran on has
-// nothing to do with whether it is true — and a v1 author reading a bare
-// "AccessDenied" has exactly the same reason to go looking through their own
-// files for a bug that is not there.
+// The notice is about the run, so the runtime does not matter.
 func TestTestSaysNothingRanOnADefaultRuntimeRunToo(t *testing.T) {
 	f := newFakeInstance(t)
 	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
@@ -871,7 +775,6 @@ func TestTestSaysNothingRanOnADefaultRuntimeRunToo(t *testing.T) {
 	if !strings.Contains(out, "Run `ronja wf test` again") {
 		t.Errorf("the notice did not name the command that produced this run:\n%s", out)
 	}
-	// Still no resume: v1 journals nothing, so there is nothing to skip.
 	if strings.Contains(out, "--resume") {
 		t.Errorf("a v1 failure offered a resume:\n%s", out)
 	}
@@ -879,10 +782,8 @@ func TestTestSaysNothingRanOnADefaultRuntimeRunToo(t *testing.T) {
 
 // --- a refused run POST -----------------------------------------------------
 
-// Some refusals only the server can make: the credit kill-stop is the one that
-// matters, and it arrives as a 400 on the run POST. Its words are the server's
-// and must reach the caller unparaphrased — a CLI that answered "run failed"
-// would hide the one sentence that says what to do about it.
+// The credit kill-stop arrives as a 400 on the run POST, and its sentence must
+// reach the caller unparaphrased.
 func TestTestPassesThroughTheServersRefusalOfTheRunPost(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failRun = http.StatusBadRequest
@@ -898,7 +799,6 @@ func TestTestPassesThroughTheServersRefusalOfTheRunPost(t *testing.T) {
 	if !strings.Contains(err.Error(), f.failRunMessage) {
 		t.Errorf("the server's own words did not survive:\n  got:  %v\n  want: %s", err, f.failRunMessage)
 	}
-	// The POST was made and refused; nothing was polled, because no run exists.
 	if len(f.runRequests) != 1 {
 		t.Errorf("runRequests = %+v, want the single refused POST", f.runRequests)
 	}
@@ -956,17 +856,13 @@ func TestTestExitsNonZeroOnAFailedRun(t *testing.T) {
 	if err == nil {
 		t.Fatal("a failed run exited zero")
 	}
-	// The report is still printed: a failed run IS the answer.
 	if !strings.Contains(out, "ZeroDivisionError") {
 		t.Errorf("report did not carry the run's error:\n%s", out)
 	}
 }
 
-// A durable run that PARKS is not a failure: the burst finished cleanly, its
-// outputs are persisted, and it resumes on its own. So the poll ends there (a
-// park lasts until an agent answers or a timer fires — days, possibly) and the
-// command exits ZERO, because a non-zero exit would stop a nightly pipeline
-// over a workflow doing exactly what it was written to do.
+// A waiting run is not a failure and may wait for days, so the poll ends there
+// and exits zero; non-zero would stop a nightly pipeline over a healthy run.
 func TestTestParkedRunExitsZeroAndReportsTheWait(t *testing.T) {
 	f := newFakeInstance(t)
 	parked := finishedRun(api.RunStatusWaiting, api.RunHealthWaiting)
@@ -980,36 +876,26 @@ func TestTestParkedRunExitsZeroAndReportsTheWait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a parked run exited non-zero: %v", err)
 	}
-	// The status is named as a park rather than left as a bare "waiting", which
-	// reads as stuck...
 	for _, want := range []string{"waiting — nothing failed, and it resumes on its own", "It resumes on its own", "run-1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report missing %q:\n%s", want, out)
 		}
 	}
-	// ...and what DID run is still reported: a park is a partial answer, not no
-	// answer.
 	if !strings.Contains(out, "Ask the agent") {
 		t.Errorf("report dropped the steps that ran before the park:\n%s", out)
 	}
-	// Neither hint applies. Publish would take code live on a run that has not
-	// finished; resume would offer to continue a run nothing has stopped.
 	for _, forbidden := range []string{"wf publish", "--resume"} {
 		if strings.Contains(out, forbidden) {
 			t.Errorf("a parked run was offered %q:\n%s", forbidden, out)
 		}
 	}
-	// The poll ENDED on it rather than sitting the park out.
 	if f.runPolls != 1 {
 		t.Errorf("polls = %d, want exactly one — the park was waited out", f.runPolls)
 	}
 }
 
-// The wake latch: a poll can land on `resuming` between "a wake decided to
-// resume this run" and "the resume run exists". Terminal for the row we polled
-// and not a failure — the work is continuing — so it exits zero and says where
-// the work went, because the run id in the report is no longer the one to
-// follow.
+// The wake latch: `resuming` is terminal for the polled row but not a failure,
+// and the run id in the report is no longer the one to follow.
 func TestTestResumingRunExitsZeroAndSaysItContinuedElsewhere(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusResuming, api.RunHealthDone)}
@@ -1031,10 +917,8 @@ func TestTestResumingRunExitsZeroAndSaysItContinuedElsewhere(t *testing.T) {
 	}
 }
 
-// Exit zero means the run did not FAIL, and nothing wider. A status this CLI
-// does not know — one added server-side after it shipped — ends the poll (see
-// api.RunResponse.Running) and must NOT be reported as a pass: a green exit for
-// "cancelled" is the kind of thing a nightly pipeline believes.
+// An unknown status ends the poll (api.RunResponse.Running) but must not exit
+// zero: a nightly pipeline would believe a green "cancelled".
 func TestTestExitsNonZeroOnAStatusItDoesNotRecognise(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun("cancelled", api.RunHealthDone)}
@@ -1046,27 +930,21 @@ func TestTestExitsNonZeroOnAStatusItDoesNotRecognise(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unrecognised terminal status exited zero")
 	}
-	// The status is NAMED — the whole value of not hanging on it is that the
-	// caller learns something the CLI does not know.
 	if !strings.Contains(err.Error(), "cancelled") {
 		t.Errorf("error does not name the status: %v", err)
 	}
 	if !strings.Contains(out, "cancelled") {
 		t.Errorf("report did not carry the status:\n%s", out)
 	}
-	// Ended the poll rather than waiting the status out.
 	if f.runPolls != 1 {
 		t.Errorf("polls = %d, want exactly one", f.runPolls)
 	}
 }
 
-// Ctrl-C stops the WAITING. The run is somebody else's process on somebody
-// else's machine and keeps going, which is the one thing a person needs told at
-// that moment — and it only gets said because the ROOT installs an interrupt
-// handler (signalContext) and hands every command a context that carries it.
+// Ctrl-C stops the waiting, not the server-side run; the message depends on the
+// root's interrupt handler (signalContext).
 func TestTestCtrlCStopsWaitingAndSaysTheRunSurvives(t *testing.T) {
 	f := newFakeInstance(t)
-	// Never terminates: the only way out of the poll loop is the interrupt.
 	f.runScript = []api.RunResponse{runningRun()}
 	var once sync.Once
 	polled := make(chan struct{})
@@ -1076,8 +954,7 @@ func TestTestCtrlCStopsWaitingAndSaysTheRunSurvives(t *testing.T) {
 	root := draftFolder(t, f, nil)
 
 	go func() {
-		// A served poll proves the handler is installed: the root registers it
-		// before the command makes any request at all.
+		// The root registers the handler before any request.
 		<-polled
 		self, err := os.FindProcess(os.Getpid())
 		if err != nil {
@@ -1097,8 +974,6 @@ func TestTestCtrlCStopsWaitingAndSaysTheRunSurvives(t *testing.T) {
 	}
 }
 
-// A run that outlives --timeout is reported as still going, with its id, and a
-// non-zero exit. The run itself is untouched.
 func TestTestTimesOutWithoutKillingTheRun(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{runningRun()}
@@ -1121,9 +996,7 @@ func TestTestTimesOutWithoutKillingTheRun(t *testing.T) {
 	}
 }
 
-// 0 means "wait for as long as it takes" — a documented value a negative
-// duration has no claim to. Refused rather than treated as another spelling of
-// forever, which is what it used to be.
+// 0 means "wait forever"; a negative duration is refused, not another spelling.
 func TestTestRejectsANegativeTimeout(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -1141,7 +1014,6 @@ func TestTestRejectsANegativeTimeout(t *testing.T) {
 	}
 }
 
-// A pod restarting mid-deploy is not a reason to abandon a run.
 func TestTestToleratesTransientPollFailures(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failRunGets = maxConsecutivePollFailures - 1
@@ -1174,8 +1046,7 @@ func TestTestGivesUpAfterAnUnbrokenRunOfPollFailures(t *testing.T) {
 
 // --- output shape -----------------------------------------------------------
 
-// --json is ONE object: the run row FLATTENED at the root (mirroring the
-// server's embedded *rdb.WorkflowRun) plus steps and health.
+// --json mirrors the server's embedded *rdb.WorkflowRun, flattened at the root.
 func TestTestJSONIsTheFlattenedRunResponse(t *testing.T) {
 	f := newFakeInstance(t)
 	done := finishedRun(api.RunStatusDone, api.RunHealthDegraded)
@@ -1253,10 +1124,8 @@ func TestTestRejectsAnUnknownLogsMode(t *testing.T) {
 
 // --- no prompts anywhere ----------------------------------------------------
 
-// The locked decision: --write-live is a flag, never a y/N fallback. These
-// tests run without a terminal, so a prompt would either hang or be answered by
-// accident — pinning its ABSENCE is what keeps a later "just ask on a TTY"
-// change honest.
+// --write-live is a flag, never a y/N fallback; this pins the absence of a
+// prompt against a later "just ask on a TTY".
 func TestTestNeverPrompts(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -1267,7 +1136,6 @@ func TestTestNeverPrompts(t *testing.T) {
 		draft.OutputTableIDs = []string{"tbl-1"}
 	})
 
-	// Refused without the flag...
 	out, err := runCLI(t, root, "wf", "test")
 	if err == nil {
 		t.Fatal("ran without --write-live")
@@ -1277,7 +1145,6 @@ func TestTestNeverPrompts(t *testing.T) {
 			t.Errorf("a prompt appeared:\n%s", text)
 		}
 	}
-	// ...and runs with it, still without asking anything.
 	out, err = runCLI(t, root, "wf", "test", "--write-live")
 	if err != nil {
 		t.Fatalf("test: %v", err)
@@ -1289,13 +1156,9 @@ func TestTestNeverPrompts(t *testing.T) {
 
 // --- unit: number coercion --------------------------------------------------
 
-// A "number" parameter that is a whole number crosses the wire as an INTEGER.
-//
-// float64 carries 53 bits of mantissa, so a row id or an epoch-nanosecond
-// timestamp routed through one arrives at the Python script silently rounded —
-// and a value that is wrong by one is worse than a value that was refused. The
-// marshalled form is asserted too, because the integer only survives if it is
-// still an integer when it is encoded.
+// A whole number crosses the wire as an integer: through a float64 a row id or
+// epoch-nanosecond timestamp would arrive silently rounded. The marshalled form
+// is asserted too.
 func TestCoerceParamKeepsWholeNumbersExact(t *testing.T) {
 	p := api.WorkflowParameter{Name: "id", Type: "number"}
 
@@ -1315,15 +1178,12 @@ func TestCoerceParamKeepsWholeNumbersExact(t *testing.T) {
 		t.Errorf("wire form = %s, want the integer unrounded", encoded)
 	}
 
-	// Fractions still work, and are still float64.
 	if got, err := coerceParam(p, "12.5"); err != nil || got != 12.5 {
 		t.Errorf("coerce 12.5 = %#v, %v", got, err)
 	}
-	// As do negatives, which ParseInt handles and a naive digit check would not.
 	if got, err := coerceParam(p, "-7"); err != nil || got != int64(-7) {
 		t.Errorf("coerce -7 = %#v, %v", got, err)
 	}
-	// And a non-number is still refused rather than passed through as text.
 	if _, err := coerceParam(p, "lots"); err == nil {
 		t.Error("coerced a non-number")
 	}
@@ -1331,17 +1191,11 @@ func TestCoerceParamKeepsWholeNumbersExact(t *testing.T) {
 
 // --- unit: the poll schedule --------------------------------------------------
 
-// Each poll re-reads the whole run, log and all, so a long run's polling gets
-// progressively more expensive at a fixed cadence. The backoff is the cheap
-// mitigation, and both halves of it matter: the FIRST polls stay at the
-// starting interval (a run that finishes in four seconds must still be
-// reported in four seconds) and the growth STOPS (nobody should wait minutes
-// to be told a run ended).
+// Each poll re-reads the whole run, log and all, hence the backoff; the first
+// polls stay prompt and the growth stops at a cap.
 func TestPollIntervalBacksOffButStartsPrompt(t *testing.T) {
 	interval := runPollInterval
 	var elapsed time.Duration
-	// The first waits are unchanged — this is the whole reason for the
-	// pollsAtStartInterval hold.
 	for poll := 1; poll <= pollsAtStartInterval; poll++ {
 		if interval != runPollInterval {
 			t.Fatalf("wait %d = %s, want the starting %s", poll, interval, runPollInterval)
@@ -1349,7 +1203,6 @@ func TestPollIntervalBacksOffButStartsPrompt(t *testing.T) {
 		elapsed += interval
 		interval = nextPollInterval(interval, poll)
 	}
-	// ...and then it grows to the cap, and stops there.
 	polls := pollsAtStartInterval
 	for interval < maxPollInterval && polls < 1000 {
 		polls++
@@ -1362,8 +1215,7 @@ func TestPollIntervalBacksOffButStartsPrompt(t *testing.T) {
 	if nextPollInterval(interval, polls+1) != maxPollInterval {
 		t.Errorf("the cap is not a cap: %s", nextPollInterval(interval, polls+1))
 	}
-	// "Roughly a minute of polling" — the number nobody should have to
-	// re-derive from the constants when one of them is retuned.
+	// Roughly a minute, so a retune of one constant cannot drift it unnoticed.
 	if elapsed < 30*time.Second || elapsed > 90*time.Second {
 		t.Errorf("reached the cap after %s of polling, want roughly a minute", elapsed)
 	}
@@ -1371,17 +1223,10 @@ func TestPollIntervalBacksOffButStartsPrompt(t *testing.T) {
 
 // --- --follow ---------------------------------------------------------------
 
-// The whole point of the flag: a Durable run parks, a successor run picks the
-// work up, and the follow reports the SUCCESSOR's terminal status rather than
-// stopping at the park. The named run's own route is never consulted — it would
-// sit at `resuming` forever.
-//
-// The script walks the whole wake path rather than jumping park → successor,
-// because two of its states are only reachable there. `resuming` must not be
-// terminal — a follow that treated it as one would stop one poll before the
-// work resumed — and the server's wake is allowed to OSCILLATE: ReleaseWakeClaim
-// rolls a run from `resuming` back to `waiting` under the same id when the wake
-// has to be retried, so the second park has to narrate too.
+// The named run's own route is never consulted: it would sit at `resuming`
+// forever. The script walks the whole wake path because `resuming` must not be
+// terminal here, and ReleaseWakeClaim can roll a run back to `waiting` under
+// the same id, so a second park must narrate too.
 func TestTestFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
 	f := newFakeInstance(t)
 	f.headScript = []api.RunResponse{
@@ -1391,8 +1236,7 @@ func TestTestFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
 			Steps: []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "done", DurationMs: ptr(int64(900))}}},
 		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusResuming}, Health: api.RunHealthWaiting,
 			Steps: []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "done", DurationMs: ptr(int64(900))}}},
-		// The rollback: the wake claim was released, and the run is parked again
-		// under the same id waiting for the next attempt.
+		// The wake claim was released: waiting again under the same id.
 		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusWaiting}, Health: api.RunHealthWaiting,
 			Steps: []api.StepDTO{{ID: "s1", Name: "Ask the agent", Status: "done", DurationMs: ptr(int64(900))}}},
 		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusResuming}, Health: api.RunHealthWaiting,
@@ -1420,10 +1264,7 @@ func TestTestFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a followed run that finished exited non-zero: %v", err)
 	}
-	// The park was narrated with the two things a reader needs at that moment:
-	// what it is waiting on, and that Ctrl-C does not stop the run. The wake and
-	// the SECOND park are narrated too: sticky per-run flags would have printed
-	// each of those once and then gone silent through the retry.
+	// Sticky per-run flags would go silent through the retry's second park.
 	for _, want := range []string{
 		"parked — waiting on an agent",
 		"Ctrl-C stops watching, not the run",
@@ -1435,26 +1276,19 @@ func TestTestFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
 			t.Errorf("narration missing %q:\n%s", want, stderr)
 		}
 	}
-	// The long advice is once per FOLLOW; the park line itself is once per park.
 	if got := strings.Count(stderr, "Ctrl-C stops watching, not the run"); got != 1 {
 		t.Errorf("how-to-wait advice printed %d times, want once per follow:\n%s", got, stderr)
 	}
-	// The other half of the seeded head: the run we STARTED is not a hop, so the
-	// first poll — which names it — announces nothing.
+	// The run we started is not a hop.
 	if strings.Contains(stderr, "Resumed as run run-1") {
 		t.Errorf("the run we started was announced as a resume of itself:\n%s", stderr)
 	}
-	// A replayed step reads as replayed rather than as "skipped" — the same
-	// word the report uses — so a resume's re-narration does not look like a
-	// run that did nothing.
 	if !strings.Contains(stderr, "replayed  Ask the agent") {
 		t.Errorf("a journaled step was narrated as a bare skip:\n%s", stderr)
 	}
-	// The REPORT is the head run, not the run that was started.
 	if !strings.Contains(out, "run-2") {
 		t.Errorf("report named the parked run rather than the head:\n%s", out)
 	}
-	// And the plain run route was never polled: the follow asks only the head.
 	if f.runPolls != 0 {
 		t.Errorf("polled the named run %d times under --follow", f.runPolls)
 	}
@@ -1463,10 +1297,8 @@ func TestTestFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
 	}
 }
 
-// A park and its resume can both happen inside one poll interval, and then the
-// FIRST head response already names the successor. The hop is still news, so it
-// is still narrated — which is why the follow seeds its head with the run it
-// started rather than learning it from the first response.
+// Park and resume can both fall inside one poll interval, which is why the
+// follow seeds its head with the run it started.
 func TestTestFollowNarratesAResumeItLearnsOnTheFirstPoll(t *testing.T) {
 	f := newFakeInstance(t)
 	f.headScript = []api.RunResponse{
@@ -1488,7 +1320,6 @@ func TestTestFollowNarratesAResumeItLearnsOnTheFirstPoll(t *testing.T) {
 	}
 }
 
-// The negative control: a lineage that ends in failure is still a failure.
 func TestTestFollowExitsNonZeroWhenTheHeadFails(t *testing.T) {
 	f := newFakeInstance(t)
 	f.headScript = []api.RunResponse{
@@ -1513,15 +1344,9 @@ func TestTestFollowExitsNonZeroWhenTheHeadFails(t *testing.T) {
 	}
 }
 
-// A fleet where NOTHING has the route falls back, and never refuses. The run
-// has already started by the time a follow gets here, so an error whose remedy
-// is "run it again" would invite a second live run — which is the failure
-// adoptTimedOutRun exists to prevent. What the fallback reports is today's
-// documented non-follow answer: the first park, reported as a park.
-//
-// Three polls rather than one, so "the note is printed once per follow" is a
-// claim this script can falsify — the fallback is decided per poll now, and a
-// note attached to the decision would print on every one of them.
+// Falls back, never refuses: the run has already started, and "run it again"
+// would invite a second live run. Three polls so "the note prints once per
+// follow" is falsifiable, since the fallback is decided per poll.
 func TestTestFollowFallsBackOnAFleetWithoutTheHeadRoute(t *testing.T) {
 	f := newFakeInstance(t)
 	f.noHeadRoute = true
@@ -1541,13 +1366,11 @@ func TestTestFollowFallsBackOnAFleetWithoutTheHeadRoute(t *testing.T) {
 	if got := strings.Count(stderr, "answered 404 for the run-lineage route"); got != 1 {
 		t.Errorf("fallback note printed %d times, want once per follow:\n%s", got, stderr)
 	}
-	// The answer came from the plain route, and the follow stopped where a plain
-	// poll stops: the park.
 	if f.runPolls != 3 {
 		t.Errorf("plain polls = %d, want 3 (one per poll, stopping at the park)", f.runPolls)
 	}
-	// Every poll still TRIED the head route first, which is what makes a
-	// rollout that completes mid-follow pick itself up.
+	// Trying the head route every poll picks up a rollout that completes
+	// mid-follow.
 	if f.headRequests != 3 {
 		t.Errorf("head requests = %d, want 3 — the fallback latched instead of retrying the route", f.headRequests)
 	}
@@ -1556,11 +1379,8 @@ func TestTestFollowFallsBackOnAFleetWithoutTheHeadRoute(t *testing.T) {
 	}
 }
 
-// Ronja runs many instances behind one load balancer, so a follow that starts
-// mid-rollout can have its FIRST poll answered by an old pod and every later
-// one by a new pod. A one-shot "this fleet is old" decision taken on that first
-// 404 would report the first park of a fleet that follows perfectly well — and
-// the park is exactly where the plain route's answer stops.
+// Mid-rollout, the first poll can hit an old pod and later ones new pods; a
+// one-shot "this fleet is old" decision would stop at the first park.
 func TestTestFollowUpgradesWhenTheHeadRouteAnswersAfterAMiss(t *testing.T) {
 	f := newFakeInstance(t)
 	f.headScript = []api.RunResponse{
@@ -1568,8 +1388,6 @@ func TestTestFollowUpgradesWhenTheHeadRouteAnswersAfterAMiss(t *testing.T) {
 		{WorkflowRun: api.WorkflowRun{ID: "run-1", Status: api.RunStatusWaiting}, Health: api.RunHealthWaiting},
 		{WorkflowRun: api.WorkflowRun{ID: "run-2", Status: api.RunStatusDone, ResumeOfRunID: ptr("run-1")}, Health: api.RunHealthDone},
 	}
-	// What the old pod answers on the fallback poll, and then the park a latched
-	// follow would have called the end of the run.
 	f.runScript = []api.RunResponse{runningRun(), finishedRun(api.RunStatusWaiting, api.RunHealthWaiting)}
 	signIn(t, f)
 	withFastPolling(t)
@@ -1589,7 +1407,6 @@ func TestTestFollowUpgradesWhenTheHeadRouteAnswersAfterAMiss(t *testing.T) {
 	if !strings.Contains(stderr, "Resumed as run run-2") {
 		t.Errorf("narration missing the resume hop:\n%s", stderr)
 	}
-	// Only the missed poll fell back; the rest were answered by the route.
 	if f.runPolls != 1 {
 		t.Errorf("plain polls = %d, want 1 (only the poll that missed the route)", f.runPolls)
 	}
@@ -1598,15 +1415,9 @@ func TestTestFollowUpgradesWhenTheHeadRouteAnswersAfterAMiss(t *testing.T) {
 	}
 }
 
-// The other half of the same fleet fact: a 404 mid-follow is an OLDER POD, not
-// a failed poll. A follow that never concluded anything from a 404 would spend
-// its failure budget on pods that merely predate the route and abort with "lost
-// contact" on a run that is perfectly healthy — so the misses staged here
-// outnumber the budget on purpose, and consecutively.
-//
-// Meanwhile the plain route reports the run we started, parked: proof that
-// FOLLOW semantics survive the fallback on a fleet that has answered the head
-// route once, since a park read off the plain route must not end the wait.
+// A 404 mid-follow is an older pod, not a failed poll, so the staged misses
+// outnumber the failure budget on purpose. A park read off the plain route must
+// not end the wait once the fleet has answered the head route.
 func TestTestFollowSurvivesHeadRouteMissesMidFollow(t *testing.T) {
 	f := newFakeInstance(t)
 	misses := maxConsecutivePollFailures + 1
@@ -1644,9 +1455,8 @@ func TestTestFollowSurvivesHeadRouteMissesMidFollow(t *testing.T) {
 	}
 }
 
-// The other 404-shaped thing that is not one: a run id matching nothing is a
-// 400 from a new instance, and must fall through the ordinary failure budget
-// rather than be read as an old instance and degrade.
+// A run id matching nothing is a 400 from a new instance, not an old-instance
+// signal.
 func TestTestFollowTreatsAMissingRunAsAFailedPollNotAnOldInstance(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failHeadGets = http.StatusBadRequest
@@ -1672,9 +1482,7 @@ func TestTestFollowTreatsAMissingRunAsAFailedPollNotAnOldInstance(t *testing.T) 
 	}
 }
 
-// --follow riding the DEFAULT timeout says so up front, because by the deadline
-// the advice costs another whole run — and says nothing when the caller has
-// already chosen a timeout.
+// Said up front, because by the deadline the advice costs another whole run.
 func TestTestFollowNotesTheDefaultTimeoutOnlyWhenItWasNotChosen(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1708,7 +1516,6 @@ func TestTestFollowNotesTheDefaultTimeoutOnlyWhenItWasNotChosen(t *testing.T) {
 	}
 }
 
-// Without the flag, nothing changed: the head route is not touched at all.
 func TestTestWithoutFollowNeverAsksForTheLineageHead(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -1724,8 +1531,6 @@ func TestTestWithoutFollowNeverAsksForTheLineageHead(t *testing.T) {
 	}
 }
 
-// `wf run` carries the same flag, and it is the verb --follow was asked for: a
-// live run that parks is the one somebody is about to call verified.
 func TestRunFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
 	f := newFakeInstance(t)
 	f.headScript = []api.RunResponse{
@@ -1754,8 +1559,6 @@ func TestRunFollowCrossesAParkAndReportsTheSuccessor(t *testing.T) {
 
 // --- unit: the step narrator ------------------------------------------------
 
-// The live timeline goes to stderr, so it is exercised directly: the property
-// is that a step prints on each TRANSITION and not on every poll.
 func TestNarrateStepsPrintsEachTransitionOnce(t *testing.T) {
 	seen := map[string]string{}
 	first := []api.StepDTO{{ID: "s1", Name: "Fetch data", Status: "running"}}
@@ -1775,8 +1578,7 @@ func TestNarrateStepsPrintsEachTransitionOnce(t *testing.T) {
 	}
 }
 
-// captureStderr collects what fn writes to os.Stderr. A temp file rather than a
-// pipe, for the same reason captureStdout uses one.
+// captureStderr uses a temp file rather than a pipe, as captureStdout does.
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	tmp, err := os.CreateTemp(t.TempDir(), "stderr-*")

@@ -15,27 +15,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja query` is the one read that earns a verb of its own.
-//
-// It is a single endpoint, so on the face of it `ronja api -X POST
-// /api/v2/duckdb/query -d '{"sql":"..."}'` covers it — and the doctrine says a
-// wrapped call does not earn a command. Three things make this the exception,
-// and all three are about what plain HTTP does BADLY rather than about
-// convenience:
-//
-//   - Quoting. Real SQL is multi-line and full of quotes; embedding it in a
-//     JSON string inside a shell string is a two-level escaping problem people
-//     get wrong, and the failure is a syntax error attributed to the wrong
-//     layer. Here the SQL is an argument, a file, or a pipe.
-//   - Shape. The answer is a table, and the useful forms of it are "print it",
-//     "write it to a file" and "hand me the envelope". A generic runner can only
-//     ever give the third.
-//   - The 200-with-an-error trap. A failed query is HTTP 200 with `error` set,
-//     so a generic runner exits ZERO on a query that did not run. A pipeline
-//     built on that continues over a failure it never saw.
-//
-// It stays a read. There is no `ronja list`, no `ronja delete`: discovery and
-// mutation are still plain HTTP.
+// `ronja query` is the one read that earns a verb despite the doctrine, for
+// what `ronja api` does badly: two-level quoting of SQL inside JSON inside a
+// shell string, a table-shaped answer, and a failed query that is HTTP 200 with
+// `error` set (a generic runner exits zero on it).
 func newQueryCmd() *cobra.Command {
 	var (
 		file      string
@@ -107,15 +90,10 @@ runs out of memory or time fails with an error that says so; narrow the query.
 A query that fails comes back as HTTP 200 with an error in the envelope. This
 command treats that as a failure: the message goes to stderr and the exit code
 is non-zero.`,
-		// One optional positional. Two would be somebody who forgot to quote
-		// their SQL, and cobra's own error says so better than a merged string
-		// that half-runs.
-		//
-		// The --jq guard runs here rather than in RunE because this is where the
-		// mistake lands: `--jq -r '.rowCount'` binds "-r" as the expression and
-		// leaves '.rowCount' as the SQL, which is worse than the arity error
-		// `ronja api` gives — it is a round trip that fails server-side with a
-		// syntax error nobody typed.
+		// The --jq guard runs in Args, before the arity check: `--jq -r
+		// '.rowCount'` binds "-r" as the expression and leaves '.rowCount' as
+		// the SQL, a round trip that fails server-side with a syntax error
+		// nobody typed.
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := refuseFlagAsJQExpr(cmd, jqExpr); err != nil {
 				return err
@@ -130,9 +108,6 @@ is non-zero.`,
 			if maxRows < 0 {
 				return fmt.Errorf("--max-rows cannot be negative (got %d)", maxRows)
 			}
-			// Mirrors `wf test`: a negative duration has no meaning, and zero
-			// already means "no deadline", so a negative one is a typo rather
-			// than an intent worth guessing at.
 			if timeout < 0 {
 				return fmt.Errorf("--timeout cannot be negative (got %s) — pass 0 to wait for as long as the query takes", timeout)
 			}
@@ -143,17 +118,12 @@ is non-zero.`,
 			if rawOutput && jqExpr == "" {
 				return errors.New("--raw only means something with --jq: it unquotes the STRINGS a filter produces")
 			}
-			// Two contradictory descriptions of stdout. Refused rather than
-			// resolved by precedence, because either choice would silently
-			// discard a flag the caller typed on purpose, and the fix is one
-			// word either way. Checked here rather than with cobra's
-			// MarkFlagsMutuallyExclusive because --json is a PERSISTENT flag on
-			// the root, which that helper cannot see from a subcommand.
+			// Not MarkFlagsMutuallyExclusive: --json is a PERSISTENT root flag,
+			// which that helper cannot see from a subcommand.
 			if flagJSON && jqExpr != "" {
 				return errors.New("--json prints the whole envelope and --jq prints part of it — pass one or the other")
 			}
-			// Compiled before the query runs. A typo in the filter should not
-			// cost a round trip to a query that can take minutes.
+			// Compiled before the query, so a filter typo costs no round trip.
 			var filter *jqf.Filter
 			if jqExpr != "" {
 				var compileErr error
@@ -177,21 +147,14 @@ is non-zero.`,
 				return err
 			}
 
-			// Authoring advice, printed BEFORE the failure branch rather than
-			// after it: a backslash escape that means one thing under the old
-			// embed and another under raw semantics is a very good candidate
-			// for why the query that just failed did. It is stderr in every
-			// mode, so it never lands inside piped CSV or a --json envelope —
-			// and it is carried in that envelope too, for a caller that would
-			// rather branch on `.advice` than read prose.
+			// Before the failure branch: the advice is often why the query
+			// failed.
 			printQueryAdvice(os.Stderr, result.Advice)
 
-			// The trap, handled once. Everything below this point is a query
-			// that actually ran.
+			// A failed query is HTTP 200 with `error` set; below here it ran.
 			if result.Failed() {
-				// In --json (or --jq) the envelope is still the answer to what
-				// was asked, and a caller left with only an exit code has to
-				// run the query again to find out why it failed.
+				// The envelope still says why it failed; an exit code alone
+				// would force a re-run.
 				switch {
 				case filter != nil:
 					if emitErr := emitFiltered(cmd.Context(), filter, result, rawOutput); emitErr != nil {
@@ -205,15 +168,9 @@ is non-zero.`,
 				return fmt.Errorf("query failed: %s", strings.TrimSpace(result.Error))
 			}
 
-			// Always stderr, in every mode: narration on stdout would land in
-			// the middle of the CSV a pipeline is parsing.
-			//
-			// The zone is worth saying out loud on every successful run, not
-			// only when something looks wrong: the CLI sends no client
-			// timezone, so it reads at UTC while the app reads at the user's
-			// zone, and a monthly rollup can legitimately differ between them.
-			// Printed before the truncation note so the calendar is stated
-			// before any caveat about the rows.
+			// Narration is always stderr: on stdout it would land inside the
+			// CSV. The zone prints on every run because the CLI sends no client
+			// timezone (UTC) while the app reads at the user's zone.
 			if result.ZoneUsed != "" {
 				fmt.Fprintf(os.Stderr, "  Reporting timezone: %s\n", result.ZoneUsed)
 			}
@@ -237,8 +194,8 @@ is non-zero.`,
 				return emitJSON(result)
 			}
 			if out == "" {
-				// Verbatim, with no added newline: this is data, and a byte the
-				// server did not send is a byte a diff will find.
+				// Verbatim, no added newline: a byte the server did not send is
+				// a byte a diff will find.
 				fmt.Print(result.Result)
 			}
 			return nil
@@ -257,20 +214,16 @@ is non-zero.`,
 		"filter the response envelope through a jq expression")
 	cmd.Flags().BoolVarP(&rawOutput, "raw", "r", false,
 		"with --jq, print string results unquoted")
-	// A database join: the alias the SQL reads it as (crm.customers) and the
-	// secret id of a login for it, repeatable. HIDDEN while the HTTP join
-	// stays unpublished outside chat: the server field it sends is not
-	// advertised either. It comes out of hiding with the server field
-	// (DATABASE.md → "What is documented, and what is not").
+	// HIDDEN while the HTTP join stays unpublished; it unhides with the
+	// server field (DATABASE.md → "What is documented, and what is not").
 	cmd.Flags().StringArrayVar(&attach, "attach", nil,
 		"join a database into the query as alias=secret-id (repeatable)")
 	_ = cmd.Flags().MarkHidden("attach")
 	return cmd
 }
 
-// parseQueryAttach turns the --attach values into the request's map, nil for
-// none. Split on the FIRST = only, like --param; an empty half or an alias
-// given twice is a usage error rather than a silently dropped database.
+// parseQueryAttach splits on the FIRST = only, like --param; an empty half or
+// an alias given twice is a usage error rather than a silently dropped database.
 func parseQueryAttach(specs []string) (map[string]string, error) {
 	if len(specs) == 0 {
 		return nil, nil
@@ -289,33 +242,11 @@ func parseQueryAttach(specs []string) (map[string]string, error) {
 	return out, nil
 }
 
-// printQueryAdvice writes the server's non-fatal notes about the SQL, ONE LINE
-// PER KIND, and nothing at all for the ordinary query that earns none.
-//
-// Per kind, not per entry. The server sends one entry per occurrence and their
-// messages are identical within a kind by construction, so a statement with
-// twenty doubled backslashes printed twenty copies of one sentence above the
-// answer the person actually asked for — which is how narration becomes
-// something a reader learns to skip. The snippets are what differ, so they are
-// gathered onto the one line, deduplicated and bounded by
-// queryAdviceSnippetsPerLine.
-//
-// GROUPED ON (kind, message), not on kind alone. An instance older than the
-// `kind` field, or one that grows a kind this build has never seen, sends
-// entries whose kind is empty or unknown; grouping on kind alone would merge
-// two unrelated sentences into one line and print only the first. The pair is
-// the exact test for "these two entries say the same thing".
-//
-// TOLERANT BY CONSTRUCTION, because the field is newer than the instances this
-// CLI talks to and newer than the advice kinds it will grow. An instance that
-// sends no `advice` at all, an entry with no snippet, an entry that is empty
-// but for its message: all of them print what there is and say nothing about
-// what is missing. The one entry that is dropped is the one with NO message,
-// which has nothing a person could read.
-//
-// STDERR, always. Advice is narration about a query whose ANSWER is on stdout,
-// and a line of prose in the middle of a CSV a pipeline is parsing is a bug in
-// the pipeline that this command caused.
+// printQueryAdvice prints one line per (kind, message), not per entry: the
+// server sends one entry per occurrence, so the differing snippets are gathered
+// onto that line. Grouped on the pair, not kind alone, because an older or newer
+// instance sends empty or unknown kinds that would merge unrelated sentences.
+// Tolerant of any missing field; only an entry with no message is dropped.
 func printQueryAdvice(w io.Writer, advice []api.QueryAdvice) {
 	type group struct {
 		message  string
@@ -362,25 +293,15 @@ func printQueryAdvice(w io.Writer, advice []api.QueryAdvice) {
 	}
 }
 
-// queryAdviceSnippetsPerLine bounds how many distinct literals one advice line
-// names. The server already caps what it sends per kind, so this is the floor
-// under an older or a newer instance rather than the primary bound — enough to
-// find the literals in the SQL, few enough that the line stays a line. Whatever
-// it drops is counted on the line, because a bounded list read as a complete
-// one is how somebody fixes five of twenty and calls it done.
+// queryAdviceSnippetsPerLine is a floor under the server's own per-kind cap.
+// What it drops is counted on the line: a bounded list read as complete is how
+// somebody fixes five of twenty and calls it done.
 const queryAdviceSnippetsPerLine = 5
 
-// emitFiltered runs a jq filter over the query envelope.
-//
-// The envelope is re-encoded rather than filtered from the raw response,
-// because by this point it has already been decoded into a struct. That is not
-// a lossy round trip — QueryResult carries no omitempty and mirrors the wire
-// shape field for field, which is exactly the property `--json` already
-// depends on.
-//
-// It goes through runFilter for the deadline: --timeout bounds the QUERY, and
-// cmd.Context() carries no deadline at all, so a filter that never terminates
-// had nothing to stop it here.
+// emitFiltered re-encodes the decoded envelope, which is lossless only while
+// QueryResult carries no omitempty and mirrors the wire shape (as `--json`
+// relies on too). It goes through runFilter for a deadline: --timeout bounds
+// the query, and cmd.Context() carries none.
 func emitFiltered(ctx context.Context, filter *jqf.Filter, result *api.QueryResult, raw bool) error {
 	encoded, err := json.Marshal(result)
 	if err != nil {
@@ -393,13 +314,6 @@ func emitFiltered(ctx context.Context, filter *jqf.Filter, result *api.QueryResu
 	return jqf.Render(os.Stdout, results, raw)
 }
 
-// querySQL resolves the SQL from exactly one source.
-//
-// The precedence is argument, then --file, then a pipe — and the two states
-// that must not silently become each other are "nothing was given" and "an
-// empty thing was given". Both are errors here, because a query nobody wrote
-// cannot have a meaningful answer, and running one anyway would spend a round
-// trip to be told so less clearly.
 func querySQL(args []string, file string) (string, error) {
 	var sql string
 	switch {
@@ -424,8 +338,6 @@ func querySQL(args []string, file string) (string, error) {
 		sql = string(body)
 
 	case !isTerminal(os.Stdin):
-		// Piped in with no flag at all — the shape `cat report.sql | ronja
-		// query` takes.
 		body, err := readStdin("query")
 		if err != nil {
 			return "", err
@@ -433,7 +345,7 @@ func querySQL(args []string, file string) (string, error) {
 		sql = string(body)
 
 	default:
-		// A terminal, and no SQL. Prompting is the one thing this must not do.
+		// A terminal and no SQL: never prompt.
 		return "", errors.New("no SQL given — pass it as an argument, with --file <path>, or pipe it in")
 	}
 

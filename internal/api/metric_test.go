@@ -10,15 +10,10 @@ import (
 	"testing"
 )
 
-// metricRowFixture is a realistic single-row GET response for a METRIC, in the
-// shape feature.TableView actually serves — including the fields this mirror
-// deliberately does not carry, so the test proves the tags MATCH rather than
-// that a stripped-down fixture happens to decode.
-//
-// The recipe's keys are spelled OUT of alphabetical order on purpose. The whole
-// compare-and-swap depends on the client hashing the bytes it received rather
-// than a re-marshal of them, and a fixture whose keys were already sorted would
-// let a client that re-marshalled pass this test and be refused in production.
+// metricRowFixture is a metric GET response in feature.TableView's full shape,
+// including fields this mirror does not carry. The recipe's keys are out of
+// alphabetical order on purpose: the compare-and-swap hashes the bytes received,
+// and sorted keys would let a client that re-marshalled pass.
 const metricRowFixture = `{
   "id": "table-aov",
   "featureID": "collection-1",
@@ -58,8 +53,6 @@ const metricRowFixture = `{
   "buildVerdict": "ok"
 }`
 
-// TestGetTableDecodesTheMetricAxis: the two metric fields this mirror carries,
-// and the exact bytes of the one that matters.
 func TestGetTableDecodesTheMetricAxis(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		writeString(w, metricRowFixture)
@@ -74,20 +67,16 @@ func TestGetTableDecodesTheMetricAxis(t *testing.T) {
 	if row.MetricStatus != MetricStatusVerified {
 		t.Errorf("metricStatus = %q", row.MetricStatus)
 	}
-	// VERBATIM, including the key order. This is the byte string the compare-and-
-	// swap digest is taken over, and a decoder that normalised it would break the
-	// precondition against an edit nobody made.
+	// Verbatim, key order included: the compare-and-swap digest is taken over
+	// these bytes.
 	const want = `{"value":"revenue / orders","source":"table-orders","version":1}`
 	if string(row.MetricRecipe) != want {
 		t.Errorf("metricRecipe = %s\nwant %s", row.MetricRecipe, want)
 	}
 }
 
-// TestNormalizeFoldsANullRecipe: `metricRecipe` carries no omitempty
-// server-side, so EVERY row answers with the key and a non-metric one answers
-// `null` — which decodes into a four-byte RawMessage that is neither empty nor
-// valid to send anywhere. One spelling of "no recipe" keeps the fingerprint
-// helpers from having to know two.
+// A non-metric row answers `"metricRecipe": null`, which decodes into a
+// four-byte RawMessage that is neither empty nor valid to send.
 func TestNormalizeFoldsANullRecipe(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		writeString(w, `{"id":"table-orders","kind":"derived","metricRecipe":null,"metricStatus":null,"inputModels":null}`)
@@ -99,8 +88,6 @@ func TestNormalizeFoldsANullRecipe(t *testing.T) {
 	if row.MetricRecipe != nil {
 		t.Errorf("metricRecipe = %q, want nil", row.MetricRecipe)
 	}
-	// A null optional decodes into a plain string as a no-op, which is exactly
-	// what "unset" means for this field.
 	if row.MetricStatus != "" {
 		t.Errorf("metricStatus = %q", row.MetricStatus)
 	}
@@ -109,18 +96,9 @@ func TestNormalizeFoldsANullRecipe(t *testing.T) {
 	}
 }
 
-// TestCreateMetricSendsOnlyWhatTheBodyPublishes.
-//
-// The two assertions are about the same rule from both sides. What is SENT must
-// not carry a verification field or a derived metric column — a body that could
-// would let a caller mint a row asserting it is a verified metric attributed to
-// someone else, which is the hole the server's create body was narrowed to
-// close. And a field left empty must be OMITTED rather than sent as "" — not
-// because the two mean different things to the server (they do not: the handler
-// collapses an absent description onto "" and stamps prose only when the
-// trimmed value is non-empty), but because a body that publishes a field it is
-// not claiming invites a reader to think it is claiming one. See
-// CreateMetricInput.Description.
+// A create body carrying a verification field or derived metric column would
+// let a caller mint a "verified" metric attributed to someone else; empty fields
+// are omitted so the body never appears to claim them.
 func TestCreateMetricSendsOnlyWhatTheBodyPublishes(t *testing.T) {
 	var sent map[string]any
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -164,16 +142,9 @@ func TestCreateMetricSendsOnlyWhatTheBodyPublishes(t *testing.T) {
 	}
 }
 
-// TestWriteMetricRecipeOmitsAnAbsentPrecondition is the tag that is load-bearing
-// in the OTHER direction, and it is the one that 400s every ordinary push if it
-// is dropped: the server reads an empty baseRecipeSha256 as a client bug rather
-// than as "no check", deliberately, so a caller who thought they were asserting
-// something is told they were not.
-//
-// The reporting timezone is asserted alongside it because it is the same trap
-// with the opposite polarity: absent LEAVES the declaration alone, an explicit
-// empty RESETS it, so a pointer that collapsed to "" would silently move every
-// metric's calendar to UTC on every push.
+// The server 400s an empty baseRecipeSha256 rather than reading it as "no
+// check". reportingTimezone is the same trap reversed: absent leaves the
+// declaration alone, an explicit empty resets it to UTC.
 func TestWriteMetricRecipeOmitsAnAbsentPrecondition(t *testing.T) {
 	var sent map[string]any
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -200,10 +171,8 @@ func TestWriteMetricRecipeOmitsAnAbsentPrecondition(t *testing.T) {
 		t.Error("an absent reportingTimezone was sent, which would reset the metric's calendar")
 	}
 
-	// THE THREE NIL SLICES. Only sourceClosure is normalised server-side, so the
-	// other two can arrive as JSON null on a perfectly healthy write — and a nil
-	// that reached a report as "no dimensions" is indistinguishable from a metric
-	// that really declares none.
+	// Only sourceClosure is normalised server-side; the other two can arrive as
+	// JSON null on a healthy write.
 	if out.Dimensions == nil || out.InputModels == nil || out.SourceClosure == nil {
 		t.Errorf("Normalize left a nil slice: %+v", out)
 	}
@@ -212,9 +181,6 @@ func TestWriteMetricRecipeOmitsAnAbsentPrecondition(t *testing.T) {
 	}
 }
 
-// TestWriteMetricRecipeSendsAnExplicitTimezoneReset: the third state, which only
-// a pointer can express — send an explicit empty string and the server resets the
-// declaration.
 func TestWriteMetricRecipeSendsAnExplicitTimezoneReset(t *testing.T) {
 	var sent map[string]any
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -242,8 +208,6 @@ func TestWriteMetricRecipeSendsAnExplicitTimezoneReset(t *testing.T) {
 	}
 }
 
-// writeString answers a canned body, so each fixture above reads as the response
-// a real instance sends rather than as a builder.
 func writeString(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	if _, err := io.WriteString(w, body); err != nil {

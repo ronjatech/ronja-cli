@@ -9,9 +9,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// TestParseSQLParams covers the --params decode. It is decoded locally so a
-// malformed value fails naming the flag, rather than arriving at the server as a
-// type error about a field the user never typed.
 func TestParseSQLParams(t *testing.T) {
 	t.Run("empty means none", func(t *testing.T) {
 		got, err := parseSQLParams("")
@@ -50,17 +47,13 @@ func TestParseSQLParams(t *testing.T) {
 		}
 	})
 	t.Run("a bare scalar is refused", func(t *testing.T) {
-		// Someone will type --params 'a@b.c' expecting one parameter. Sending it
-		// as a non-array would be a confusing server-side error, so it fails here.
 		if _, err := parseSQLParams(`"a@b.c"`); err == nil {
 			t.Fatal("want an error for a scalar — params is an array")
 		}
 	})
 }
 
-// TestReportMigrationsFailsOnDrift is the CI-gate guarantee: `db migrate status`
-// exits non-zero when something has drifted, so a pipeline does not have to
-// parse its output to notice.
+// A CI gate relies on drift exiting non-zero rather than parsing output.
 func TestReportMigrationsFailsOnDrift(t *testing.T) {
 	err := reportMigrations(&api.MigrationSetResult{
 		DatabaseID: "mdb-abc",
@@ -81,7 +74,6 @@ func TestReportMigrationsFailsOnDrift(t *testing.T) {
 	}
 }
 
-// TestReportMigrationsCleanRuns confirms the ordinary paths exit zero.
 func TestReportMigrationsCleanRuns(t *testing.T) {
 	t.Run("dry run with pending work", func(t *testing.T) {
 		err := reportMigrations(&api.MigrationSetResult{
@@ -113,9 +105,6 @@ func TestReportMigrationsCleanRuns(t *testing.T) {
 	})
 }
 
-// TestParseEnvFlag covers --env validation. It is local so a typo fails naming
-// the flag the person typed, rather than arriving as a server 400 about a query
-// parameter they never saw — and it fails BEFORE a migration set is sent.
 func TestParseEnvFlag(t *testing.T) {
 	t.Run("accepted values", func(t *testing.T) {
 		cases := map[string]api.Environment{
@@ -138,9 +127,7 @@ func TestParseEnvFlag(t *testing.T) {
 	})
 
 	t.Run("a typo names the flag", func(t *testing.T) {
-		// "development" is the plausible typo, and the one most likely to be
-		// typed by someone who has met another tool. It must not run against
-		// production because it was not spelled "dev".
+		// "development" must not run against production for not being "dev".
 		for _, in := range []string{"prd", "development", "staging"} {
 			err := func() error { _, err := parseEnvFlag(in); return err }()
 			if err == nil {
@@ -156,10 +143,6 @@ func TestParseEnvFlag(t *testing.T) {
 	})
 }
 
-// TestReportEnvironmentNamesTheDevCopy is the misreading this line exists to
-// prevent: a set applied to the dev copy that reads exactly like one applied to
-// production. Its callers print it BEFORE the verdicts, because by the time the
-// counts are on screen the reader has decided what they mean.
 func TestReportEnvironmentNamesTheDevCopy(t *testing.T) {
 	stderr := captureStderr(t, func() {
 		reportEnvironment(api.EnvironmentDev, "dev", "mdb-dev-1", "mdb-abc")
@@ -171,8 +154,6 @@ func TestReportEnvironmentNamesTheDevCopy(t *testing.T) {
 		t.Errorf("the copy's own id is one the caller has never seen: %q", stderr)
 	}
 
-	// And a production run says nothing extra — the note is the exception, not
-	// a banner on every report.
 	quiet := captureStderr(t, func() {
 		reportEnvironment(api.EnvironmentProd, "prod", "mdb-abc", "")
 	})
@@ -181,10 +162,8 @@ func TestReportEnvironmentNamesTheDevCopy(t *testing.T) {
 	}
 }
 
-// TestReportEnvironmentWarnsWhenProductionAnswered covers the one case the
-// server-side gate cannot cover: an instance old enough not to know
-// ?environment=dev answers from production without complaint, and the command
-// otherwise looks like it did exactly what was asked.
+// An instance that predates ?environment=dev answers from production without
+// complaint; the server-side gate cannot catch that.
 func TestReportEnvironmentWarnsWhenProductionAnswered(t *testing.T) {
 	for _, answered := range []string{"prod", ""} {
 		stderr := captureStderr(t, func() {
@@ -196,9 +175,8 @@ func TestReportEnvironmentWarnsWhenProductionAnswered(t *testing.T) {
 	}
 }
 
-// TestReportMigrationsSaysNothingAboutTheEnvironment pins the split: the
-// environment line has exactly one writer, so it cannot be printed twice (once
-// per report and once per command) or omitted in --json mode.
+// The environment line has exactly one writer (reportEnvironment), so it is
+// never printed twice or dropped in --json mode.
 func TestReportMigrationsSaysNothingAboutTheEnvironment(t *testing.T) {
 	stderr := captureStderr(t, func() {
 		_ = reportMigrations(&api.MigrationSetResult{
@@ -213,9 +191,8 @@ func TestReportMigrationsSaysNothingAboutTheEnvironment(t *testing.T) {
 	}
 }
 
-// TestReportMigrationsPrintsNotes covers promote's advisory half: the note is
-// printed, and it does NOT become a failure. Only the operator can tell a
-// deliberate backfill from a surprise, so this is text rather than a refusal.
+// A note is advisory, never a failure: only the operator can tell a deliberate
+// backfill from a surprise.
 func TestReportMigrationsPrintsNotes(t *testing.T) {
 	const note = "migration 2 (0003_seed) contains DML; rows seeded from dev-copy data replay differently on production"
 	var err error
@@ -234,9 +211,8 @@ func TestReportMigrationsPrintsNotes(t *testing.T) {
 	}
 }
 
-// TestReportMigrationsEmptyTail: an already-promoted database is a clean,
-// repeatable no-op, not a failure. Only promote reaches this — an empty
-// migrations folder is refused before any request goes out.
+// Only promote reaches an empty result: an empty migrations folder is refused
+// before any request.
 func TestReportMigrationsEmptyTail(t *testing.T) {
 	var err error
 	stderr := captureStderr(t, func() {
@@ -253,7 +229,6 @@ func TestReportMigrationsEmptyTail(t *testing.T) {
 	}
 }
 
-// TestMigrationSetResultFilters pins the two helpers the command branches on.
 func TestMigrationSetResultFilters(t *testing.T) {
 	r := &api.MigrationSetResult{Results: []api.MigrationResult{
 		{Name: "a", Outcome: api.MigrationSkipped},
@@ -269,9 +244,6 @@ func TestMigrationSetResultFilters(t *testing.T) {
 	}
 }
 
-// TestDatabaseCommandWiring is the wiring half of the two tests above: a
-// validator no flag reaches is dead code, and a promote command nobody
-// registered is a help page that never renders.
 func TestDatabaseCommandWiring(t *testing.T) {
 	db := newDatabaseCmd()
 
@@ -294,8 +266,6 @@ func TestDatabaseCommandWiring(t *testing.T) {
 		return cur
 	}
 
-	// --env has to exist on all three, defaulting to production. A default of
-	// "dev" on any one of them would be a statement silently run somewhere else.
 	for _, path := range [][]string{{"sql"}, {"migrate", "status"}, {"migrate", "push"}} {
 		cmd := find(path...)
 		flag := cmd.Flags().Lookup("env")
@@ -309,8 +279,8 @@ func TestDatabaseCommandWiring(t *testing.T) {
 		}
 	}
 
-	// promote deliberately has NO --env: it names production explicitly, and a
-	// dev-redirected promote would apply the copy into itself and report success.
+	// A dev-redirected promote would apply the copy into itself and report
+	// success.
 	promote := find("promote")
 	if promote.Flags().Lookup("env") != nil {
 		t.Error("`db promote` must not take --env")
@@ -326,15 +296,11 @@ func TestDatabaseCommandWiring(t *testing.T) {
 	}
 }
 
-// TestConfirmPromoteGate pins the three answers the gate gives. The middle one
-// is the one that matters: a promote from CI or an agent, where there is no
-// terminal to prompt on, must refuse rather than run unasked.
 func TestConfirmPromoteGate(t *testing.T) {
-	// A dry run changes nothing, so it never asks.
 	if ok, err := confirmPromote("mdb-abc", true, false); !ok || err != nil {
 		t.Errorf("--dry-run must not ask: ok=%v err=%v", ok, err)
 	}
-	// No --yes and no terminal (`go test` gives none) — refused, naming the flag.
+	// `go test` gives no terminal.
 	_, err := confirmPromote("mdb-abc", false, false)
 	if err == nil {
 		t.Fatal("a real promote with no --yes and no terminal must be refused")
@@ -342,26 +308,17 @@ func TestConfirmPromoteGate(t *testing.T) {
 	if !strings.Contains(err.Error(), "--yes") {
 		t.Errorf("the refusal must name the flag that answers it, got %q", err)
 	}
-	// --yes IS the answer.
 	if ok, err := confirmPromote("mdb-abc", false, true); !ok || err != nil {
 		t.Errorf("--yes must confirm: ok=%v err=%v", ok, err)
 	}
 }
 
-// TestParseSQLParamsKeepsPrecision is the guard for a silent data-corruption bug.
-//
-// Decoding the parameter list into []any turns every JSON number into a float64,
-// which cannot represent an integer above 2^53. A caller binding a bigint id —
-// a Snowflake id, an epoch in nanoseconds, anything from a system that does not
-// use sequential ints — would have had a DIFFERENT number written to their
-// database, with no error at any layer. Nothing downstream can detect it,
-// because by the time the value reaches the server the original digits are gone.
-//
-// Keeping the elements as raw JSON is the fix, and it has to hold on BOTH sides:
-// the server has the same guard (TestParamsKeepPrecision in api/v2/database).
+// A float64 round trip silently writes a different bigint, undetectable
+// downstream. The server holds the same guard (TestParamsKeepPrecision in
+// api/v2/database).
 func TestParseSQLParamsKeepsPrecision(t *testing.T) {
-	// 2^53+1 — the smallest integer a float64 cannot represent — and a value
-	// well past it, of the size a real bigint id reaches.
+	// 2^53+1, the smallest integer a float64 cannot represent, and a real-size
+	// bigint id.
 	const input = `[9007199254740993, 1234567890123456789]`
 
 	got, err := parseSQLParams(input)
@@ -375,8 +332,8 @@ func TestParseSQLParamsKeepsPrecision(t *testing.T) {
 		}
 	}
 
-	// And it must survive being marshalled onto the wire, which is where the
-	// second float64 round trip used to happen.
+	// Marshalling onto the wire is the second place a float64 round trip can
+	// happen.
 	body, err := json.Marshal(api.DatabaseSQLInput{SQL: "x", Params: got})
 	if err != nil {
 		t.Fatal(err)
@@ -388,13 +345,8 @@ func TestParseSQLParamsKeepsPrecision(t *testing.T) {
 	}
 }
 
-// TestReportRowsAffected pins the line that makes a write visible at all — a
-// statement with no result set prints an empty CSV, so without it a run that
-// changed 40 rows and one that changed none read identically.
-//
-// The nil case is the one that matters: nil is "the server could not honestly
-// say", and rendering it as "0 rows affected" would be a confident lie about a
-// statement that may have changed a great deal.
+// The nil case matters most: nil means the server could not say, and must not
+// render as "0 rows affected".
 func TestReportRowsAffected(t *testing.T) {
 	say := func(n *int) string {
 		return captureStderr(t, func() { reportRowsAffected(n) })
@@ -405,8 +357,7 @@ func TestReportRowsAffected(t *testing.T) {
 		t.Errorf("a write that changed rows must say so: %q", got)
 	}
 
-	// Zero is a REAL answer on this field — the statement ran and matched
-	// nothing — and it is the answer a caller most needs to see.
+	// Zero is a real answer: the statement ran and matched nothing.
 	zero := 0
 	if got := say(&zero); !strings.Contains(got, "0 rows affected") {
 		t.Errorf("a write that matched nothing must say so rather than stay silent: %q", got)
@@ -422,11 +373,8 @@ func TestReportRowsAffected(t *testing.T) {
 	}
 }
 
-// TestDatabaseSQLResultKeepsRowsAffectedNull pins the wire shape `--json`
-// emits. rowsAffected is the one field on this envelope where null and 0 are
-// different answers, so the key must always be present (no omitempty, per the
-// struct's own rule) and null must survive the round trip rather than
-// collapsing into 0.
+// rowsAffected is the one envelope field where null and 0 differ, so the key is
+// always present (no omitempty) and null survives the round trip.
 func TestDatabaseSQLResultKeepsRowsAffectedNull(t *testing.T) {
 	var res api.DatabaseSQLResult
 	if err := json.Unmarshal([]byte(`{"rowCount":3}`), &res); err != nil {

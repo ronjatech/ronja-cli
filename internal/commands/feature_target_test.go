@@ -14,26 +14,12 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// Which ORGANIZATION a folder is bound to, and whether the feature it names is
-// one this credential can reach there.
-//
-// The two questions are one defect. `init` used to answer neither — it wrote a
-// binding for whichever organization the credential happened to reach and a
-// feature id nothing had ever looked at — so the first time either was wrong
-// was several files later, at `push`, as "no rows (HTTP 400)". These tests pin
-// the answers: init says which organization it bound, refuses a feature it
-// cannot reach there, and push and validate name the organization instead of
-// reporting a fact about a query.
+// Which organization a folder binds to, and whether the credential can reach
+// the feature it names there: init reports the first and refuses on the second.
 
-// A feature this credential cannot reach is refused AT INIT, and the refusal
-// leaves the directory exactly as it found it — the negative control for the
-// whole design, since the alternative to a check here is a committed manifest
-// naming a feature that was never going to work.
-//
-// Both server spellings, because the CLI ships on its own tag: an instance
-// predating the backend half answers the raw table.ErrNoRows sentinel, a newer
-// one answers "feature not found", and the 404 is the third door onto the same
-// fact (a feature in THIS organization the caller may not read).
+// Both server spellings, because the CLI ships on its own tag: an older instance
+// answers 400 "no rows", a newer one "feature not found", and a 404 means a
+// feature in this organization the caller may not read.
 func TestInitRefusesAFeatureItCannotReach(t *testing.T) {
 	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -65,12 +51,9 @@ func TestInitRefusesAFeatureItCannotReach(t *testing.T) {
 	}
 }
 
-// The same refusal against a CURRENT backend, which retyped the lookup miss:
-// where the instance above answers `400 {"error":"no rows"}`, this one answers
-// `404 {"error":"not found"}` — the bare sentinel, not the no-enumeration
-// "feature not found" the 404 arm otherwise carries. explainFeatureUnreachable
-// gates that bare code to a 404 on purpose, so this is the arm that proves the
-// gate lets the real answer through rather than only the two named codes.
+// A current backend answers `404 {"error":"not found"}`, the bare sentinel;
+// explainFeatureUnreachable accepts that code only on a 404, and this proves
+// the gate lets it through.
 func TestInitRefusesAFeatureItCannotReachOnACurrentBackend(t *testing.T) {
 	f := newFakeInstance(t)
 	f.featureNotFoundBody = "not found"
@@ -82,9 +65,8 @@ func TestInitRefusesAFeatureItCannotReachOnACurrentBackend(t *testing.T) {
 	if err == nil {
 		t.Fatal("init accepted a feature this credential cannot reach")
 	}
-	// The discriminating assertion: an unmatched code still fails init, but as
-	// the generic "check feature … : not found (HTTP 404)" wrapper. Only the
-	// matcher produces this sentence.
+	// Discriminating: an unmatched code still fails init, but only the matcher
+	// produces this sentence.
 	if !strings.Contains(err.Error(), "has no feature") || !strings.Contains(err.Error(), "you can reach") {
 		t.Errorf("the current backend's bare sentinel reached the reader unexplained: %v", err)
 	}
@@ -99,9 +81,8 @@ func TestInitRefusesAFeatureItCannotReachOnACurrentBackend(t *testing.T) {
 	}
 }
 
-// The refusal names the CREDENTIAL as well as the organization, because "wrong
-// feature" and "right feature, wrong organization" take different fixes and the
-// reader cannot tell them apart from the id alone.
+// "Wrong feature" and "right feature, wrong organization" take different fixes,
+// so the refusal names the profile as well as the organization.
 func TestInitRefusalNamesTheProfile(t *testing.T) {
 	f := newFakeInstance(t)
 	f.featureStatus["feat-foreign"] = http.StatusBadRequest
@@ -122,9 +103,6 @@ func TestInitRefusalNamesTheProfile(t *testing.T) {
 	}
 }
 
-// `app init` is the same bootstrap with the same hazard, and `app` has no
-// delete — so a folder bound to an unreachable feature is worse there, not
-// better.
 func TestAppInitRefusesAFeatureItCannotReach(t *testing.T) {
 	f := newFakeAppInstance(t)
 	f.featureStatus["feat-foreign"] = http.StatusBadRequest
@@ -141,16 +119,11 @@ func TestAppInitRefusesAFeatureItCannotReach(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(dir, wfdir.ManifestName)); statErr == nil {
 		t.Error("a refused app init wrote a manifest")
 	}
-	// Nothing scaffolded either: the entrypoint is written after the check.
 	if _, statErr := os.Stat(filepath.Join(dir, "App.tsx")); statErr == nil {
 		t.Error("a refused app init scaffolded an entrypoint")
 	}
 }
 
-// `ronja bind --stack <name> --feature <id>` is the documented way to promote a
-// folder to a SECOND organization, which makes it the other door onto the same
-// silent bind — the same id written into the same committed file, for an
-// organization nobody checked it against.
 func TestBindWithFeatureRefusesAFeatureItCannotReach(t *testing.T) {
 	f := newFakeSearchInstance(t)
 	f.featureStatus["col-prod"] = http.StatusBadRequest
@@ -169,9 +142,8 @@ func TestBindWithFeatureRefusesAFeatureItCannotReach(t *testing.T) {
 	}
 }
 
-// An instance that does not ANSWER is not a verdict on the feature. Init needs
-// a credential; making it also need a live instance would turn an outage into
-// "cannot start a folder", which is the class of message this change removes.
+// An instance that does not answer is not a verdict on the feature: init must
+// not need a live instance.
 func TestInitContinuesWhenTheInstanceDoesNotAnswerAboutTheFeature(t *testing.T) {
 	f := newFakeInstance(t)
 	f.featureStatus["feat-1"] = http.StatusServiceUnavailable
@@ -197,9 +169,7 @@ func TestInitContinuesWhenTheInstanceDoesNotAnswerAboutTheFeature(t *testing.T) 
 	}
 }
 
-// The organization is reported at the moment the binding is written, not left
-// to be discovered by `status` later. `url` alone was never the target — a
-// folder is bound to (instance, organization).
+// A folder is bound to (instance, organization), so init reports both.
 func TestInitReportsTheOrganizationItBinds(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -230,10 +200,7 @@ func TestInitReportsTheOrganizationItBinds(t *testing.T) {
 	}
 }
 
-// The default `wf push` validates BEFORE it writes, so an unreachable feature
-// surfaces at the validate step — where the old message was "no rows (HTTP 400)
-// (use --no-validate to skip this check)", advice that would have failed
-// identically one step later at create.
+// `--no-validate` advice would fail identically one step later at create.
 func TestPushExplainsAnUnreachableFeatureAtValidate(t *testing.T) {
 	for _, code := range []string{"no rows", "feature not found"} {
 		t.Run(code, func(t *testing.T) {
@@ -260,12 +227,8 @@ func TestPushExplainsAnUnreachableFeatureAtValidate(t *testing.T) {
 	}
 }
 
-// The generation of backend in between the two named codes: POST
-// /workflow/validate answered gt.NewNotfoundError("not found") for a
-// same-organization feature the caller cannot read, so the whole refusal reached
-// the reader as "validate before pushing: not found (HTTP 404) (use
-// --no-validate to skip this check)" — a sentence with no feature in it, ending
-// in advice to skip the only check that named the problem.
+// An instance whose validate answers a bare 404 "not found" for a feature the
+// caller cannot read.
 func TestPushExplainsABareNotFoundAtValidate(t *testing.T) {
 	f, root := clonedFolder(t)
 	f.failValidate = http.StatusNotFound
@@ -285,10 +248,8 @@ func TestPushExplainsABareNotFoundAtValidate(t *testing.T) {
 	}
 }
 
-// The status gate on that arm, which is the whole reason it is safe. "not found"
-// is generic enough for any route to answer about anything, so only the 404 that
-// a feature read really produces may be told as a story about the feature; the
-// same words on a 400 keep the server's own message.
+// "not found" is generic enough for any route, so only on a 404 is it read as
+// an answer about the feature; on a 400 the server's message is kept.
 func TestPushDoesNotReadABareNotFoundOnA400AsAFeatureAnswer(t *testing.T) {
 	f, root := clonedFolder(t)
 	f.failValidate = http.StatusBadRequest
@@ -304,12 +265,8 @@ func TestPushDoesNotReadABareNotFoundOnA400AsAFeatureAnswer(t *testing.T) {
 	}
 }
 
-// The other thing that arrives at the same site: an instance that did not
-// ANSWER. "(use --no-validate to skip this check)" on a 5xx advises pushing
-// files nobody has looked at, on the strength of a check that fell over — and
-// it reads as though the folder were the problem. Nothing has been written at
-// that point, because validate runs before every write on this path, so the
-// honest report is that the push did not start.
+// On a 5xx, --no-validate advice would push unchecked files; validate runs
+// before every write, so the push did not start.
 func TestPushSaysTheInstanceDidNotAnswerTheValidate(t *testing.T) {
 	f, root := clonedFolder(t)
 	f.failValidate = http.StatusInternalServerError
@@ -334,15 +291,6 @@ func TestPushSaysTheInstanceDidNotAnswerTheValidate(t *testing.T) {
 	}
 }
 
-// The same outage on `wf validate`, which is the command most people meet it
-// on: it is what the docs tell you to run first, and it is the whole of `ronja
-// sync check`'s workflow leg.
-//
-// It used to return the bare api.Error — "Internal server error (HTTP 500)" —
-// which is a sentence about a request rendered where a reader is looking for a
-// verdict on their files. Nothing is saved by this command either way, so the
-// only thing an outage costs here is the check; saying so is the difference
-// between "try again" and "start debugging your folder".
 func TestValidateSaysTheInstanceDidNotAnswer(t *testing.T) {
 	f, root := clonedFolder(t)
 	f.failValidate = http.StatusInternalServerError
@@ -361,15 +309,11 @@ func TestValidateSaysTheInstanceDidNotAnswer(t *testing.T) {
 	if !strings.Contains(err.Error(), "not a verdict on your files") {
 		t.Errorf("validate did not disclaim a verdict: %v", err)
 	}
-	// The status is still carried — a reader debugging their own instance needs
-	// it — but it is no longer the whole message.
 	if !strings.Contains(err.Error(), "HTTP 500") {
 		t.Errorf("validate dropped the status: %v", err)
 	}
 }
 
-// `wf validate` reaches the same refusal by the same route and must say the
-// same thing: it is the command people run first.
 func TestValidateExplainsAnUnreachableFeature(t *testing.T) {
 	f, root := clonedFolder(t)
 	f.failValidate = http.StatusBadRequest
@@ -384,9 +328,8 @@ func TestValidateExplainsAnUnreachableFeature(t *testing.T) {
 	}
 }
 
-// With --no-validate nothing asks the server about the feature until the CREATE,
-// so the mapping has to exist at that site too — and it is the only site an
-// older CLI ever had.
+// With --no-validate the create is the first request about the feature, so the
+// mapping must exist there too.
 func TestPushExplainsAnUnreachableFeatureAtCreate(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failCreate = http.StatusBadRequest
@@ -410,10 +353,8 @@ func TestPushExplainsAnUnreachableFeatureAtCreate(t *testing.T) {
 	}
 }
 
-// `push --profile <other>` on a folder bound elsewhere keeps REFUSING —
-// repointing a folder on the strength of which credential was passed is exactly
-// the silent bind this change is about. What it owes the reader is BOTH
-// organizations by name, and the one command that adds the second one.
+// Repointing a folder because of which credential was passed would be a silent
+// bind, so push refuses and names both organizations and the bind command.
 func TestPushUnderAnotherProfileNamesBothOrganizations(t *testing.T) {
 	f, root := clonedFolder(t)
 	rebindFolderTo(t, root, f.Key(), wfdir.Binding{WorkflowID: "wf-1", FeatureID: "feat-1"})
@@ -439,15 +380,9 @@ func TestPushUnderAnotherProfileNamesBothOrganizations(t *testing.T) {
 	}
 }
 
-// testProfile is one stored profile for writeProfiles, including the
-// organization NAME — which is what every cross-organization refusal prints,
-// and which writeProfile's positional form has no room for.
-// A CANCELLED request is not an outage, and the difference decides whether a
-// folder gets scaffolded. root.go installs signal.NotifyContext, so Ctrl-C
-// during the probe surfaces here as a *url.Error wrapping context.Canceled —
-// the same shape a dead instance produces. Read as an outage it becomes a
-// warning and init carries on writing files the reader just asked it to stop
-// writing.
+// Ctrl-C during the probe surfaces as a *url.Error wrapping context.Canceled,
+// the same shape as a dead instance; read as an outage, init would carry on
+// writing files the reader asked it to stop.
 func TestConfirmFeatureInStopsOnACancelledContext(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -465,12 +400,9 @@ func TestConfirmFeatureInStopsOnACancelledContext(t *testing.T) {
 	}
 }
 
-// A 401/403 is an answer about the CREDENTIAL, not about the feature. GET
-// /api/v2/feature/:id is ScopeStructure while the folder loops are
-// ScopeAutomation and ScopeData, so a PAT minted with only `automation:write`
-// can push this folder perfectly well and still be refused the probe. Refusing
-// init there stops a loop that was going to work, over a question the credential
-// was never allowed to ask.
+// A 401/403 is about the credential: GET /api/v2/feature/:id is ScopeStructure
+// while the folder loops are ScopeAutomation and ScopeData, so a PAT that can
+// push may still be refused the probe.
 func TestInitContinuesWhenTheCredentialMayNotReadFeatures(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -497,12 +429,8 @@ func TestInitContinuesWhenTheCredentialMayNotReadFeatures(t *testing.T) {
 	}
 }
 
-// A probe that ran out of TIME is the same non-answer as an instance that never
-// replied, and init must survive it for the same reason: scaffolding a folder
-// cannot be made to depend on a live, prompt instance. api.Unanswered
-// deliberately excludes a deadline — it stopped at our end, and the callers that
-// ask about a write have to go and look — but this one writes nothing and wanted
-// an answer about the feature, which a request that timed out did not produce.
+// A timed-out probe is a non-answer too. Unlike a write's caller, this probe
+// writes nothing, so a deadline needs no follow-up look.
 func TestInitContinuesWhenTheFeatureProbeTimesOut(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -522,12 +450,9 @@ func TestInitContinuesWhenTheFeatureProbeTimesOut(t *testing.T) {
 	}
 }
 
-// featureFixAdvice may only name the manifest as the source of the id when the
-// manifest really is. featureIDFor falls back to the WORKFLOW's own featureID
-// for a hand-written manifest that binds a workflow and records no feature, and
-// sending that reader to a `ronja.json` key that is not in their file is the
-// same wild-goose chase the advice exists to prevent — worse, because they will
-// open the file to check.
+// featureIDFor falls back to the workflow's own featureID when the manifest
+// records none, so featureFixAdvice must not send the reader to a manifest key
+// that is not in their file.
 func TestUnreachableFeatureAdviceNamesTheWorkflowWhenTheManifestRecordsNone(t *testing.T) {
 	f, root := clonedFolder(t)
 	// The row knows its feature; the committed file does not.
@@ -549,19 +474,13 @@ func TestUnreachableFeatureAdviceNamesTheWorkflowWhenTheManifestRecordsNone(t *t
 	}
 }
 
-// `pipeline init` is the third door onto the same silent bind, and the one with
-// the least around it: a pipeline folder has no entrypoint and nothing to push
-// until a .sql file exists, so a wrong featureID sits in a committed manifest
-// until somebody writes and pushes a table.
-//
-// It also creates a DIRECTORY when given a path, which the refusal must come
-// before — the same property TestPipelineInitCreatesNoDirectoryWhenItRefuses
-// pins for a bad-shape id, now for one the instance itself refuses.
+// A pipeline folder has nothing to push until a .sql file exists, so a wrong
+// featureID would sit in the manifest unnoticed; the refusal must also precede
+// creating the directory.
 func TestPipelineInitCreatesNoDirectoryWhenItRefusesAForeignFeature(t *testing.T) {
 	f := newFakePipelineInstance(t)
-	// Deliberately NOT registered: an id in another organization and one that
-	// does not exist are one answer here, exactly as RLS makes them one answer
-	// on the instance.
+	// Deliberately not registered: under RLS a foreign id and a missing one are
+	// the same answer.
 	signInPipeline(t, f)
 	dir := t.TempDir()
 
@@ -581,9 +500,6 @@ func TestPipelineInitCreatesNoDirectoryWhenItRefusesAForeignFeature(t *testing.T
 	}
 }
 
-// The same outage rule bind gets: an instance that does not ANSWER is not a
-// verdict on the feature, and refusing the promotion over it would turn a 503
-// into "cannot declare an environment".
 func TestBindWithFeatureContinuesWhenTheInstanceDoesNotAnswer(t *testing.T) {
 	f := newFakeSearchInstance(t)
 	f.featureStatus["col-prod"] = http.StatusServiceUnavailable
@@ -603,11 +519,8 @@ func TestBindWithFeatureContinuesWhenTheInstanceDoesNotAnswer(t *testing.T) {
 	}
 }
 
-// The refusal comes BEFORE the folder is opened, and that ordering is the point.
-// openFolder runs adoptStack, which REWRITES ronja.json from the legacy
-// `instances[]` shape into `stacks` the moment a bound folder is named with
-// --stack — so a check made after the open would rewrite the customer's
-// committed file and only then refuse.
+// The refusal must come before openFolder: its adoptStack rewrites a legacy
+// `instances[]` ronja.json into `stacks` as soon as --stack names it.
 func TestBindWithFeatureRefusesBeforeItRewritesTheManifest(t *testing.T) {
 	f := newFakeSearchInstance(t)
 	f.featureStatus["col-bad"] = http.StatusBadRequest

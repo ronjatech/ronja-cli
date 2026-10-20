@@ -1,17 +1,9 @@
 package commands
 
-// The server-side half of `ronja app push`'s concurrency story: the per-file
-// compare-and-swap preconditions.
-//
-// The drift guard is a check at ONE INSTANT — the moment the file listing was
-// read — and everything between that listing and each write is a window it
-// cannot see. These cover what closes it: the hashes the push attaches to every
-// write, where it deliberately attaches none, and what happens when one is
-// refused.
-//
-// The fake ENFORCES preconditions (fakeAppInstance.refusePrecondition), so a
-// regression that sent the WRONG hash fails the push itself rather than only
-// the assertion — which is the only way a test of this kind is worth writing.
+// `ronja app push`'s per-file compare-and-swap preconditions, which close the
+// window between the drift guard's listing and each write. The fake enforces
+// them (fakeAppInstance.refusePrecondition), so a wrong hash fails the push
+// itself.
 
 import (
 	"os"
@@ -23,9 +15,8 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The ordinary push: every write asserts what the baseline records the server
-// as holding, and a path the baseline has never seen asserts "" — the file must
-// NOT exist yet, because the folder believes it is creating it.
+// Every write asserts the baseline's hash; a path the baseline has never seen
+// asserts an empty hash, meaning it must not exist yet.
 func TestAppPushArmsPreconditionsFromTheBaseline(t *testing.T) {
 	f := newFakeAppInstance(t)
 	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
@@ -40,7 +31,6 @@ func TestAppPushArmsPreconditionsFromTheBaseline(t *testing.T) {
 	})
 	writeLocal(t, root, "App.tsx", "mine\n")
 	writeLocal(t, root, "lib/chart.tsx", "export const Chart = () => <div/>;\n")
-	// Removed locally, so the push deletes it on the server.
 	if err := os.Remove(filepath.Join(root, "gone.tsx")); err != nil {
 		t.Fatal(err)
 	}
@@ -49,9 +39,7 @@ func TestAppPushArmsPreconditionsFromTheBaseline(t *testing.T) {
 		t.Fatalf("push: %v", err)
 	}
 
-	// A file the baseline knows: asserted at the hash it recorded, NOT at what
-	// the folder is about to write. Asserting the new content would pass only
-	// on a server that already had it.
+	// Asserted at the recorded hash, not the content about to be written.
 	edited := f.writesFor("App.tsx")
 	if len(edited) != 1 || edited[0].BaseSha256 == nil {
 		t.Fatalf("App.tsx writes = %+v, want one carrying a precondition", edited)
@@ -60,7 +48,6 @@ func TestAppPushArmsPreconditionsFromTheBaseline(t *testing.T) {
 		t.Errorf("App.tsx baseSha256 = %q, want the baseline's %q", *edited[0].BaseSha256, want)
 	}
 
-	// A file the baseline has never seen: must not already exist.
 	added := f.writesFor("lib/chart.tsx")
 	if len(added) != 1 || added[0].BaseSha256 == nil {
 		t.Fatalf("lib/chart.tsx writes = %+v, want one carrying a precondition", added)
@@ -69,7 +56,6 @@ func TestAppPushArmsPreconditionsFromTheBaseline(t *testing.T) {
 		t.Errorf("lib/chart.tsx baseSha256 = %q, want \"\"", *added[0].BaseSha256)
 	}
 
-	// The DELETE asserts what it is removing.
 	removed := f.writesFor("gone.tsx")
 	if len(removed) != 1 || removed[0].Method != "DELETE" || removed[0].BaseSha256 == nil {
 		t.Fatalf("gone.tsx writes = %+v, want one DELETE carrying a precondition", removed)
@@ -79,13 +65,8 @@ func TestAppPushArmsPreconditionsFromTheBaseline(t *testing.T) {
 	}
 }
 
-// The race the drift guard cannot see: the file listing was clean, and somebody
-// wrote to the draft in the window before this push's own PUT. The write is
-// refused server-side, the file keeps THEIR content, and the push stops.
-//
-// The conflicting file is deliberately not the entrypoint: an app push writes
-// the entrypoint LAST, so a conflict on a non-entrypoint file is also the case
-// where "did it carry on afterwards?" has an answer.
+// The conflicting file is deliberately not the entrypoint: the entrypoint is
+// written last, so its content shows whether the push carried on.
 func TestAppPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
 	f := newFakeAppInstance(t)
 	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
@@ -101,8 +82,7 @@ func TestAppPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
 	writeLocal(t, root, "App.tsx", "mine\n")
 	writeLocal(t, root, "lib/chart.tsx", "also mine\n")
 
-	// A colleague's web-builder save, landing between the listing this push
-	// compared against and its own first write.
+	// A colleague's save landing after the drift check's listing.
 	f.beforeFileWrite = func(method, path string) {
 		if method == "PUT" && path == "lib/chart.tsx" {
 			f.beforeFileWrite = nil
@@ -121,8 +101,7 @@ func TestAppPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
 	if !strings.Contains(err.Error(), "lib/chart.tsx") {
 		t.Errorf("error = %v, want it to name the file", err)
 	}
-	// The narration is the actionable half, and it is on stderr so a --json
-	// caller's stdout stays one parseable object.
+	// Narration on stderr, so --json stdout stays one object.
 	for _, want := range []string{"lib/chart.tsx", "app status", "--force"} {
 		if !strings.Contains(narration, want) {
 			t.Errorf("stderr did not mention %q:\n%s", want, narration)
@@ -131,19 +110,14 @@ func TestAppPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
 	if got := f.FileContents(draft.ID)["lib/chart.tsx"]; got != "theirs\n" {
 		t.Errorf("lib/chart.tsx = %q — the refused write landed anyway", got)
 	}
-	// Stopped rather than carried on: the entrypoint is written last, so it is
-	// still the server's old copy.
 	if got := f.FileContents(draft.ID)["App.tsx"]; got != "old\n" {
 		t.Errorf("App.tsx = %q — the push continued past the conflict", got)
 	}
-	// One attempt. A retry (or an automatic --force) would be a second write.
 	if writes := f.writesFor("lib/chart.tsx"); len(writes) != 1 {
 		t.Errorf("lib/chart.tsx was written %d times, want exactly one attempt: %+v", len(writes), writes)
 	}
 
-	// A structured signal, not prose. A caller that has to tell "somebody got
-	// there first" from "this file was rejected" by substring-matching the
-	// error breaks the day the server rewords it.
+	// A structured signal, so callers need not substring-match the error.
 	payload := decodeJSON(t, out)
 	if payload["conflict"] != true {
 		t.Errorf("conflict = %v, want true", payload["conflict"])
@@ -152,10 +126,8 @@ func TestAppPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
 		t.Error("payload carries no error field")
 	}
 
-	// The baseline written beside that report must not claim the colleague's
-	// content: acknowledging it would disarm the drift guard against the very
-	// change the server just refused to let us overwrite, and the next plain
-	// push would destroy it without a word.
+	// Acknowledging the colleague's content in the baseline would disarm the
+	// drift guard, and the next plain push would destroy it.
 	state, loadErr := wfdir.LoadState(root)
 	if loadErr != nil {
 		t.Fatalf("load state: %v", loadErr)
@@ -165,9 +137,8 @@ func TestAppPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
 	}
 }
 
-// A refused DELETE stops the push the same way, and says something different:
-// its 409 has two causes the CLI cannot tell apart (the content moved, or
-// somebody deleted it first), and only the first leaves anything behind.
+// A refused DELETE needs its own wording: its 409 means the content moved or
+// someone deleted it first, and the CLI cannot tell which.
 func TestAppPushStopsWhenAFileToDeleteMovesUnderIt(t *testing.T) {
 	f := newFakeAppInstance(t)
 	live := f.AddApp(&api.DataApp{ID: "data_app-1"})
@@ -210,13 +181,9 @@ func TestAppPushStopsWhenAFileToDeleteMovesUnderIt(t *testing.T) {
 	}
 }
 
-// The suppression rule. Each of these is a path where the drift guard was
-// deliberately bypassed, and in each the baseline demonstrably does not
-// describe the row — so a precondition built from it could only ever produce a
-// 409 for a difference the push was already told to proceed past.
-//
-// Not merely assertions about the wire: the fake ENFORCES preconditions, so a
-// regression that stopped suppressing them fails the push itself.
+// Where the drift guard is deliberately bypassed the baseline does not describe
+// the row, so a precondition from it could only 409 on a difference the push
+// was told to proceed past.
 func TestAppPushSuppressesPreconditionsExactlyWhereTheDriftGuardIsBypassed(t *testing.T) {
 	assertNoPreconditions := func(t *testing.T, f *fakeAppInstance) {
 		t.Helper()
@@ -230,9 +197,6 @@ func TestAppPushSuppressesPreconditionsExactlyWhereTheDriftGuardIsBypassed(t *te
 		}
 	}
 
-	// --force means "overwrite the remote with what I have". Sending the
-	// baseline's hashes would 409 in precisely the case the flag exists to
-	// override.
 	t.Run("--force over real drift", func(t *testing.T) {
 		f := newFakeAppInstance(t)
 		live := f.AddApp(&api.DataApp{ID: "data_app-1"})
@@ -254,11 +218,8 @@ func TestAppPushSuppressesPreconditionsExactlyWhereTheDriftGuardIsBypassed(t *te
 		}
 	})
 
-	// --force with a CLEAN baseline, which is the subtler half: the only
-	// difference a precondition could still catch is one that lands AFTER the
-	// drift check read the listing — the same race, arriving a little later,
-	// and answering it with a 409 whose advice is "run --force" is a flag that
-	// no longer does anything.
+	// The subtler half: a 409 here would advise "--force" to a push already
+	// forcing.
 	t.Run("--force over a clean baseline", func(t *testing.T) {
 		f := newFakeAppInstance(t)
 		live := f.AddApp(&api.DataApp{ID: "data_app-1"})
@@ -277,17 +238,8 @@ func TestAppPushSuppressesPreconditionsExactlyWhereTheDriftGuardIsBypassed(t *te
 		assertNoPreconditions(t, f)
 	})
 
-	// A push that CREATED the app. There is no baseline at all and nothing on
-	// the server is older than this push, so there is nothing anyone could have
-	// changed underneath it — the drift guard is skipped entirely and so are
-	// the preconditions.
-	//
-	// Unlike the workflow's equivalent this is a WIRE assertion rather than a
-	// safety one: rdataapp.Create returns an EMPTY row (no seeded entrypoint —
-	// see the fake's serveCreate), so a "" precondition here would happen to
-	// pass rather than 409 on the CLI's own seconds-old app. It is pinned
-	// anyway, because a first push has nothing to assert and should look
-	// exactly like the request it was before preconditions existed.
+	// A wire assertion, not a safety one: a created app has no files (see the
+	// fake's serveCreate), so an empty-hash precondition would pass anyway.
 	t.Run("a first push", func(t *testing.T) {
 		f := newFakeAppInstance(t)
 		signInApp(t, f)
@@ -307,10 +259,8 @@ func TestAppPushSuppressesPreconditionsExactlyWhereTheDriftGuardIsBypassed(t *te
 	})
 }
 
-// The fresh-checkout path — no local baseline, the committed head anchor
-// vouching — is the one place the preconditions come from the REMOTE listing
-// rather than from a baseline. It is also the one place they are ARMED where
-// the pre-anchor CLI required --force, so this is strictly a tightening.
+// On a fresh checkout (no local baseline, the head anchor vouching) the
+// preconditions come from the remote listing instead.
 func TestAppPushAnchoredByHeadArmsPreconditionsFromTheRemoteListing(t *testing.T) {
 	f := newFakeAppInstance(t)
 	f.AddApp(&api.DataApp{ID: "app-1", Lifecycle: api.LifecycleLive},
@@ -324,8 +274,8 @@ func TestAppPushAnchoredByHeadArmsPreconditionsFromTheRemoteListing(t *testing.T
 	}
 	root := decodeJSON(t, out)["root"].(string)
 	writeLocal(t, root, "App.tsx", "mine\n")
-	// What `git clone` looks like: the lock's anchor survives, the git-ignored
-	// .ronja/ baseline does not.
+	// As after `git clone`: the lock's anchor survives, the git-ignored .ronja/
+	// baseline does not.
 	freshCheckout(t, root)
 
 	captureStderr(t, func() {
@@ -338,10 +288,8 @@ func TestAppPushAnchoredByHeadArmsPreconditionsFromTheRemoteListing(t *testing.T
 	if len(writes) != 1 || writes[0].BaseSha256 == nil {
 		t.Fatalf("App.tsx writes = %+v, want one carrying a precondition", writes)
 	}
-	// The REMOTE listing's hash, which is the live row's content the anchor
-	// just vouched for — not "" (the folder is not creating this file) and not
-	// the local content. Note the listing is read from the freshly-forked
-	// DRAFT, which a checkout seeds byte-identical to live.
+	// The listing comes from the freshly forked draft, seeded byte-identical
+	// to live.
 	if want := wfdir.HashString("published\n"); *writes[0].BaseSha256 != want {
 		t.Errorf("App.tsx baseSha256 = %q, want the remote listing's %q", *writes[0].BaseSha256, want)
 	}

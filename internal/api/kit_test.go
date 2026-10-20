@@ -8,9 +8,8 @@ import (
 	"testing"
 )
 
-// TestGetKitFile_ReturnsTheSourceVerbatim: the whole value of the route is that
-// what comes back is what the compiler sees, so nothing may be trimmed or
-// re-encoded on the way through.
+// What comes back must be what the compiler sees: nothing trimmed or
+// re-encoded.
 func TestGetKitFile_ReturnsTheSourceVerbatim(t *testing.T) {
 	const source = "// Vendored from shadcn/ui.\nexport function Button() {\n\treturn null\n}\n"
 	var asked string
@@ -37,10 +36,8 @@ func TestGetKitFile_ReturnsTheSourceVerbatim(t *testing.T) {
 	}
 }
 
-// A 404 answers with the API's plain-text breadcrumb, which says nothing about
-// the kit. Passed through untranslated it reads as "wrong host"; the point of
-// the wrapper is that it reads as "no such file", carrying the breadcrumb's own
-// near-miss suggestion.
+// Untranslated, the 404 breadcrumb reads as "wrong host"; it must read as "no
+// such file", with the breadcrumb's near-miss suggestion.
 func TestGetKitFile_NotFoundNamesThePathAndTheIndex(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")

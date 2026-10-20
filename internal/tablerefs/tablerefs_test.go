@@ -6,11 +6,8 @@ import (
 	"testing"
 )
 
-// TestCanonicalizeMirrorsTheServer is the fixture suite proper: every case here
-// is copied VERBATIM from backend/engine/esql/esql_test.go's
-// TestIndexToTableIDRefs, because this function's whole contract is "agrees with
-// that one". A case that diverges is a bug here, not a difference of opinion —
-// so when the backend grows a case, copy it down.
+// Every case is copied verbatim from esql_test.go's TestIndexToTableIDRefs; when
+// the backend grows a case, copy it down.
 func TestCanonicalizeMirrorsTheServer(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -78,14 +75,8 @@ func TestCanonicalizeMirrorsTheServer(t *testing.T) {
 	}
 }
 
-// TestCanonicalizeGrammarTolerance pins the parts of the pattern that look like
-// typos and are not: the doubled braces an agent emits when it escapes a ref
-// inside a Python f-string, either quote style, and whitespace inside the call.
-//
-// Not copied from esql's table (it tests the pattern through other functions),
-// but every case here is a direct consequence of the regex this package copies —
-// so a pattern that drifted from the server's would fail here rather than
-// silently in a customer's folder.
+// Pins the parts of the copied pattern that look like typos: doubled braces,
+// either quote style, whitespace inside the call.
 func TestCanonicalizeGrammarTolerance(t *testing.T) {
 	inputs := []string{"table-orders"}
 	for _, tt := range []struct {
@@ -110,14 +101,8 @@ func TestCanonicalizeGrammarTolerance(t *testing.T) {
 	}
 }
 
-// aiBuiltCode is the shape a table the retired AI build wrote still holds:
-// positional refs throughout, because POST /:id/build and /fix normalized to
-// them before they stored the SQL. /build no longer rewrites code, but those
-// rows keep it.
-//
-// This is the case the whole canonicalization component exists for — not the
-// single-line cases above. Without it, this table's local file would hash
-// differently from its remote code on every single status, forever.
+// aiBuiltCode is the positional-ref shape older stored rows hold, the case
+// canonicalization exists for.
 const aiBuiltCode = `WITH monthly AS (
     SELECT
         date_trunc('month', o.order_date) AS month,
@@ -140,7 +125,6 @@ WHERE c.segment IS NOT NULL
 GROUP BY 1, 2
 ORDER BY 1 DESC, 4 DESC`
 
-// TestCanonicalizeRealisticAIBuiltCode.
 func TestCanonicalizeRealisticAIBuiltCode(t *testing.T) {
 	inputs := []string{"table-orders", "table-customers", "table-refunds"}
 	got, unresolved := Canonicalize(aiBuiltCode, inputs)
@@ -157,16 +141,13 @@ func TestCanonicalizeRealisticAIBuiltCode(t *testing.T) {
 	if strings.Contains(got, "ref('0')") || strings.Contains(got, "ref('1')") || strings.Contains(got, "ref('2')") {
 		t.Errorf("a positional ref survived:\n%s", got)
 	}
-	// Everything that is not a ref is untouched — this rewrites markers, not SQL.
 	if !strings.Contains(got, "SUM(m.revenue) / NULLIF(COUNT(DISTINCT m.customer_id), 0)") {
 		t.Errorf("the SQL body was disturbed:\n%s", got)
 	}
 }
 
-// TestCanonicalizeIsIdempotentAndByteExactOnIDForm: the sync baseline is a
-// sha256 of the canonical form, so "canonicalizing twice changes nothing" and
-// "canonicalizing id-form code changes nothing" are not tidiness — they are the
-// two properties that make a local hash comparable to a remote one at all.
+// The sync baseline hashes the canonical form, so these two properties are what
+// make a local hash comparable to a remote one.
 func TestCanonicalizeIsIdempotentAndByteExactOnIDForm(t *testing.T) {
 	inputs := []string{"table-orders", "table-customers", "table-refunds"}
 	once, _ := Canonicalize(aiBuiltCode, inputs)
@@ -178,9 +159,7 @@ func TestCanonicalizeIsIdempotentAndByteExactOnIDForm(t *testing.T) {
 		t.Error("id-form code has nothing unresolvable in it")
 	}
 
-	// A file written by hand, in id form, with spacing the canonical form would
-	// not have chosen: nothing may be reformatted, because a rewrite here is
-	// permanent phantom drift on a file the user never edits.
+	// Any reformat of hand-written id-form code would be permanent phantom drift.
 	handWritten := "SELECT *\nFROM {{ref(\"table-orders\")}}   -- note the spelling\nWHERE 1 = 1\n"
 	got, _ := Canonicalize(handWritten, inputs)
 	if got != handWritten {
@@ -188,7 +167,6 @@ func TestCanonicalizeIsIdempotentAndByteExactOnIDForm(t *testing.T) {
 	}
 }
 
-// TestDeriveInputModels: sorted, de-duplicated, id-shaped only.
 func TestDeriveInputModels(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -236,10 +214,8 @@ func TestDeriveInputModels(t *testing.T) {
 	}
 }
 
-// TestDeriveInputModelsAgreesWithCanonicalize: the one invariant that ties the
-// two functions together — after canonicalization, every ref the code carries is
-// an input, and every input is a ref. Push sends this list on the same write it
-// sends the code, so a disagreement is a lineage graph that does not match the
+// After canonicalization, every ref is an input and every input a ref; push
+// sends both on one write, so a disagreement is lineage that does not match the
 // SQL.
 func TestDeriveInputModelsAgreesWithCanonicalize(t *testing.T) {
 	inputs := []string{"table-orders", "table-customers", "table-refunds"}
@@ -249,14 +225,13 @@ func TestDeriveInputModelsAgreesWithCanonicalize(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v want %v", got, want)
 	}
-	// And derived from the POSITIONAL form it finds nothing, which is exactly
-	// why every remote read is canonicalized before anything else looks at it.
+	// Positional code yields nothing, which is why remote code is canonicalized
+	// first.
 	if raw := DeriveInputModels(aiBuiltCode); raw != nil {
 		t.Errorf("positional code declares no ids, got %v", raw)
 	}
 }
 
-// TestIsTableID.
 func TestIsTableID(t *testing.T) {
 	for _, id := range []string{"table-abc", "modelv2-legacy"} {
 		if !IsTableID(id) {

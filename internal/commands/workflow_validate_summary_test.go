@@ -8,13 +8,9 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// TestValidateSummaryCountsByTier pins the headline against the server's own
-// severity, not against "every finding that is not an error". Two lies it must
-// never tell: that an `info` note is a warning, and "Clean" over a warning — a
-// probe builder read "Clean, with 1 warning" and moved on, and the warning was
-// the only thing standing between it and a workflow that ran `done` having done
-// nothing. A tier this build has never heard of counts as a warning, so the CLI
-// never says "Clean" about something it does not understand.
+// The headline follows the server's severity: an `info` note is not a warning,
+// "Clean" never heads a warning, and an unknown tier counts as a warning so the
+// CLI never calls something it does not understand clean.
 func TestValidateSummaryCountsByTier(t *testing.T) {
 	finding := func(sev, code string) api.ValidateFinding {
 		return api.ValidateFinding{Severity: sev, Code: code, Path: "main.py", Message: "m"}
@@ -82,8 +78,7 @@ func TestValidateSummaryCountsByTier(t *testing.T) {
 			if !strings.Contains(out, tc.want) {
 				t.Errorf("summary lacks %q:\n%s", tc.want, out)
 			}
-			// Judged on the SUMMARY lines only — the per-finding lines above
-			// print the server's own label, which is a different claim.
+			// Summary lines only: per-finding lines print the server's label.
 			summary := out[strings.LastIndex(out, "\n\n")+1:]
 			if len(tc.findings) == 0 {
 				summary = out
@@ -97,8 +92,7 @@ func TestValidateSummaryCountsByTier(t *testing.T) {
 	}
 }
 
-// TestCountErrorsCountsByTier pins the refusal line — what `wf validate` and
-// `wf push` exit with — to the same three buckets.
+// The refusal line `wf validate` and `wf push` exit with uses the same buckets.
 func TestCountErrorsCountsByTier(t *testing.T) {
 	got := countErrors(&api.ValidateResult{Findings: []api.ValidateFinding{
 		{Severity: "error"}, {Severity: "error"}, {Severity: "warning"}, {Severity: "info"},
@@ -114,9 +108,7 @@ func TestCountErrorsCountsByTier(t *testing.T) {
 	}
 }
 
-// TestPushFindingLinesLabelByTier pins push's stderr lines to the same
-// classification: an `info` advisory is a Note, and everything else a push
-// prints (warnings, and any tier this build does not know) is a Warning.
+// An unknown tier prints as a Warning, never a Note.
 func TestPushFindingLinesLabelByTier(t *testing.T) {
 	var buf bytes.Buffer
 	printPushFindingLines(&buf, []api.ValidateFinding{

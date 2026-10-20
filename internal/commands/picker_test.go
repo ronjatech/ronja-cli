@@ -16,8 +16,6 @@ func runeIndex(haystack, needle string) int {
 	return utf8.RuneCountInString(haystack[:i])
 }
 
-// Key decoding is where the fiddly cases are, and a pty is not needed to check
-// any of them — which is the point of decodeKey being a pure function.
 func TestDecodeKey(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -27,8 +25,6 @@ func TestDecodeKey(t *testing.T) {
 	}{
 		{"up arrow", []byte{27, '[', 'A'}, keyUp, 3},
 		{"down arrow", []byte{27, '[', 'B'}, keyDown, 3},
-		// Left and right are not navigation here; they must not be mistaken for
-		// it, or a stray keypress moves the selection.
 		{"right arrow ignored", []byte{27, '[', 'C'}, keyNone, 3},
 		{"left arrow ignored", []byte{27, '[', 'D'}, keyNone, 3},
 		{"enter", []byte{'\r'}, keySelect, 1},
@@ -37,20 +33,16 @@ func TestDecodeKey(t *testing.T) {
 		{"Q", []byte{'Q'}, keyCancel, 1},
 		{"vim up", []byte{'k'}, keyUp, 1},
 		{"vim down", []byte{'j'}, keyDown, 1},
-		// Raw mode turns OFF ISIG, so Ctrl-C arrives as a byte rather than a
-		// signal. If this were not handled the picker could not be escaped at
-		// all, and the terminal would be left raw.
+		// Raw mode turns off ISIG, so Ctrl-C arrives as a byte; unhandled, the
+		// picker could not be escaped.
 		{"ctrl-c", []byte{3}, keyCancel, 1},
 		{"ctrl-d", []byte{4}, keyCancel, 1},
-		// A lone ESC is the Escape key; the three-byte form above is an arrow.
 		{"bare escape", []byte{27}, keyCancel, 1},
 		{"unknown letter", []byte{'z'}, keyNone, 1},
 		{"empty read", []byte{}, keyNone, 0},
-		// A truncated sequence must not be read as its first byte and treated
-		// as Escape-means-cancel... it IS ambiguous, and cancelling is the
-		// harmless reading, but it must not panic on a short buffer.
-		// A burst from key repeat: only the FIRST key is decoded here, and the
-		// consumed count is what lets the caller reach the rest.
+		// A burst decodes only its front; the consumed count lets the caller
+		// reach the rest. A truncated sequence is consumed whole, not read as
+		// Escape.
 		{"burst decodes the front", []byte{27, '[', 'B', 27, '[', 'B'}, keyDown, 3},
 		{"truncated sequence", []byte{27, '['}, keyNone, 2},
 	}
@@ -67,9 +59,7 @@ func TestDecodeKey(t *testing.T) {
 	}
 }
 
-// Key repeat delivers several sequences in ONE read. Decoding only the front
-// and discarding the rest means the cursor moves one row however long you hold
-// the arrow down — which is the most ordinary way to use a picker.
+// Key repeat delivers several sequences in one read.
 func TestDecodeKeyDrainsABurst(t *testing.T) {
 	burst := []byte{27, '[', 'B', 27, '[', 'B', 27, '[', 'B', '\r'}
 	var got []keyAction
@@ -92,9 +82,6 @@ func TestDecodeKeyDrainsABurst(t *testing.T) {
 	}
 }
 
-// Clamping rather than wrapping: with three profiles on screen, arrowing past
-// the end and landing back on the first is a good way to select something other
-// than what you were looking at.
 func TestClampCursor(t *testing.T) {
 	tests := []struct{ cursor, delta, n, want int }{
 		{0, 1, 3, 1},
@@ -111,9 +98,6 @@ func TestClampCursor(t *testing.T) {
 	}
 }
 
-// The rule the whole picker is bounded by: without a terminal it must REFUSE,
-// not draw itself into a pipe and then block on input nobody is typing. To an
-// agent that is indistinguishable from a hang.
 func TestPickerRefusesWithoutATerminal(t *testing.T) {
 	restore := isTerminal
 	isTerminal = func(*os.File) bool { return false }
@@ -128,9 +112,6 @@ func TestPickerRefusesWithoutATerminal(t *testing.T) {
 	}
 }
 
-// ...and the same through the command, which is the path an agent actually
-// takes. A bare `profile use` in a script must be an error with the fix in it,
-// never a wait.
 func TestProfileUseWithoutANameNeedsATerminal(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("RONJA_CONFIG_DIR", dir)
@@ -151,15 +132,13 @@ func TestProfileUseWithoutANameNeedsATerminal(t *testing.T) {
 		t.Errorf("error does not name the cause: %v", err)
 	}
 
-	// The stored current profile must be untouched by a refused pick.
 	if current := currentProfile(t); current != "acme" {
 		t.Errorf("current = %q, want it unchanged by a refused pick", current)
 	}
 }
 
-// --json means a machine is reading. It cannot answer a picker, so the refusal
-// has to come before anything is drawn — not after escape sequences have been
-// emitted into whatever is parsing the output.
+// --json means a machine is reading, so the refusal comes before anything is
+// drawn.
 func TestProfileUseRefusesToPickUnderJSON(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("RONJA_CONFIG_DIR", dir)
@@ -182,8 +161,6 @@ func TestProfileUseRefusesToPickUnderJSON(t *testing.T) {
 	}
 }
 
-// Naming a profile explicitly still works and never reaches the picker, which
-// is what every script and agent does.
 func TestProfileUseByNameNeedsNoTerminal(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("RONJA_CONFIG_DIR", dir)
@@ -204,9 +181,8 @@ func TestProfileUseByNameNeedsNoTerminal(t *testing.T) {
 	}
 }
 
-// renderItems aligns columns and marks the cursor, and on a redraw walks back
-// over exactly as many lines as it wrote — one too few or too many and the list
-// smears down the terminal on every keypress.
+// A redraw must walk back over exactly as many lines as it wrote, or the list
+// smears down the terminal.
 func TestRenderItemsRedrawsInPlace(t *testing.T) {
 	items := []pickerItem{
 		{Label: "acme-retail", Detail: "Acme Retail", Note: "app.ronja.tech"},
@@ -221,15 +197,11 @@ func TestRenderItemsRedrawsInPlace(t *testing.T) {
 	if strings.Contains(lines[0], "❯") || !strings.Contains(lines[1], "❯") {
 		t.Errorf("cursor marker is on the wrong row:\n%s", first.String())
 	}
-	// Columns line up. Compared in RUNES, not bytes: the cursor marker is a
-	// multi-byte glyph, so byte offsets differ between the marked row and the
-	// others even when the two are drawn in the same screen column.
+	// Compared in runes: the cursor marker is a multi-byte glyph.
 	if runeIndex(lines[0], "Acme Retail") != runeIndex(lines[1], "Development") {
 		t.Errorf("detail column is not aligned:\n%s", first.String())
 	}
 
-	// Non-ASCII in a column that comes from a customer's organization name is
-	// the case byte-width padding gets wrong.
 	wide := []pickerItem{
 		{Label: "a", Detail: "Ässä Oy", Note: "x"},
 		{Label: "b", Detail: "Acme", Note: "y"},

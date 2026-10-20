@@ -10,21 +10,13 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// ── The declared reporting timezone in a workflow folder (migration 000499) ──
+// ── The declared reporting timezone in a workflow folder ──
 //
-// The manifest key has the same three states `parameters` does, and the same
-// failure mode if any of them is got wrong: absent must mean "the folder does
-// not manage the calendar", because a folder created before the key existed
-// looks exactly like one declaring nothing, and reading it as a declaration
-// would re-bucket a workflow's persisted output on the next ordinary push.
-//
-// What makes the zone harder than `parameters` is that "" is not the empty
-// declaration — it is the RESET, which the server stores as the literal "UTC".
-// Every comparison here therefore runs on the EFFECTIVE value, or a folder
-// declaring the reset drifts against the row forever.
+// An absent key means the folder does not manage the calendar: a pre-key
+// folder read as a declaration would re-bucket persisted output on the next
+// push. An empty string is the reset, stored as "UTC", so every comparison runs
+// on the effective value.
 
-// setManifestZone marks a folder as MANAGING the declared zone, the way a
-// hand-edited ronja.json does.
 func setManifestZone(t *testing.T, root, zone string) {
 	t.Helper()
 	m, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
@@ -37,9 +29,6 @@ func setManifestZone(t *testing.T, root, zone string) {
 	}
 }
 
-// A clone is a faithful copy, so a folder cloned from a workflow that declares
-// a calendar manages that calendar — otherwise the first push would silently
-// not sync a field the folder can plainly see.
 func TestCloneRecordsTheWorkflowsDeclaredZone(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, ReportingTimezone: "Europe/Stockholm"},
@@ -59,10 +48,8 @@ func TestCloneRecordsTheWorkflowsDeclaredZone(t *testing.T) {
 	}
 }
 
-// A row that declares NOTHING falls back to the caller's zone at run time — a
-// permanent, legitimate state the API cannot express, since an explicit "" is the
-// reset to UTC. Writing the key for it would make the very first push stamp UTC
-// onto a workflow whose calendar nobody asked to change.
+// An undeclared row falls back to the caller's zone at run time, a state the
+// API cannot express; writing the key would make the first push stamp UTC.
 func TestCloneLeavesTheZoneUnmanagedWhenTheRowDeclaresNone(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive},
@@ -79,11 +66,8 @@ func TestCloneLeavesTheZoneUnmanagedWhenTheRowDeclaresNone(t *testing.T) {
 	}
 }
 
-// `init` deliberately does NOT write the key, and the asymmetry with
-// `SetParameters(nil)` on the line above it is the point: the only value init
-// could write without a round trip is "", which means "declare UTC" — so every
-// fresh folder would silently override its organization's default. Absent means
-// "inherit it".
+// Unlike parameters, init must not write the key: the only value it could
+// write without a round trip declares UTC, overriding the organization default.
 func TestInitDoesNotDeclareAZone(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -100,14 +84,11 @@ func TestInitDoesNotDeclareAZone(t *testing.T) {
 		t.Errorf("init declared a zone (%q); absent is what lets the create inherit the organization default",
 			m.DeclaredReportingTimezone())
 	}
-	// The contrast that makes it deliberate rather than forgotten.
 	if !m.ManagesParameters() {
 		t.Error("init stopped managing parameters — the zone's absence is only correct next to that")
 	}
 }
 
-// The create carries the declaration, so a first push does not have to create
-// the workflow and then immediately patch it onto the right calendar.
 func TestPushCreatesWithTheDeclaredZone(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -125,9 +106,8 @@ func TestPushCreatesWithTheDeclaredZone(t *testing.T) {
 	}
 }
 
-// POST /workflow refuses an explicit "" (unlike the patch, where it is the
-// reset), so a folder declaring the reset has to send the literal UTC on a
-// create — the one form the create accepts for the same intent.
+// POST /workflow refuses an explicit empty zone (the patch's reset), so a
+// create sends the literal UTC for the same intent.
 func TestPushCreatesTheResetAsAnExplicitUTC(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -145,8 +125,6 @@ func TestPushCreatesTheResetAsAnExplicitUTC(t *testing.T) {
 	}
 }
 
-// An unmanaged folder sends nothing at all, so the server stamps the
-// organization default rather than the CLI choosing one for it.
 func TestPushCreatesWithNoZoneForAnUnmanagedFolder(t *testing.T) {
 	f := newFakeInstance(t)
 	f.tenantZone = "Europe/Stockholm"
@@ -167,8 +145,6 @@ func TestPushCreatesWithNoZoneForAnUnmanagedFolder(t *testing.T) {
 	}
 }
 
-// The point of the feature on an existing workflow: the manifest declares the
-// calendar and a push makes the row match — onto the DRAFT, never the live row.
 func TestPushPatchesTheDeclaredZoneOntoTheDraft(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, ReportingTimezone: "UTC"},
@@ -194,10 +170,8 @@ func TestPushPatchesTheDeclaredZoneOntoTheDraft(t *testing.T) {
 	}
 }
 
-// The back-compat invariant, and the reason Manifest.ReportingTimezone is a
-// pointer: a folder created before the key existed does not manage the calendar,
-// so a push must leave the row's declaration completely alone rather than read
-// "no key" as "declares UTC" and re-bucket the workflow's output.
+// Why Manifest.ReportingTimezone is a pointer: reading "no key" as "declares
+// UTC" would re-bucket the workflow's output.
 func TestPushLeavesTheZoneAloneForAFolderThatDoesNotManageIt(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, ReportingTimezone: "Europe/Stockholm"},
@@ -205,7 +179,7 @@ func TestPushLeavesTheZoneAloneForAFolderThatDoesNotManageIt(t *testing.T) {
 	signIn(t, f)
 	root := cloneFolder(t, f, "wf-1")
 
-	// Drop the key the clone wrote — this is a pre-zone folder.
+	// A pre-zone folder.
 	m, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
 	if err != nil {
 		t.Fatalf("load manifest: %v", err)
@@ -227,10 +201,8 @@ func TestPushLeavesTheZoneAloneForAFolderThatDoesNotManageIt(t *testing.T) {
 	}
 }
 
-// A folder declaring the reset and a row already holding the literal UTC AGREE.
-// Comparing the raw declaration instead would patch on every single push — ""
-// never equals the "UTC" the server just wrote — and no push would ever report
-// itself up to date.
+// Comparing the raw declaration would patch on every push: the reset never
+// equals the "UTC" the server stored.
 func TestPushDoesNotRePatchAResetTheRowAlreadyHolds(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, ReportingTimezone: "UTC"},
@@ -248,8 +220,7 @@ func TestPushDoesNotRePatchAResetTheRowAlreadyHolds(t *testing.T) {
 	}
 }
 
-// status has to report the zone as drift, or the one field a push changes
-// without touching a single file is invisible until it has already happened.
+// A push changes the zone without touching a file, so status must show it.
 func TestStatusReportsZoneDrift(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, ReportingTimezone: "UTC"},
@@ -257,7 +228,6 @@ func TestStatusReportsZoneDrift(t *testing.T) {
 	signIn(t, f)
 	root := cloneFolder(t, f, "wf-1")
 
-	// Cloned as-is: the folder and the row agree, so nothing is reported.
 	out, err := runCLI(t, root, "wf", "status", "--json")
 	if err != nil {
 		t.Fatalf("status: %v", err)
@@ -289,20 +259,11 @@ func TestStatusReportsZoneDrift(t *testing.T) {
 
 // ── Version skew: a server that does not have the column at all ──────────────
 //
-// The whole reason these exist: `reportingTimezone` is an ordinary JSON key on
-// POST /workflow and PUT /workflow/:id, and gin binds request bodies WITHOUT
-// DisallowUnknownFields — so an instance predating migration 000499 accepts the
-// key, drops it, and answers 2xx. Every other field a push writes is confirmed
-// by the write itself; this one is accepted, discarded and reported as success.
-// A folder would then declare Europe/Stockholm, push clean forever, and every
-// run would keep executing on whatever calendar the caller happened to carry.
-//
-// The fix is a READ-BACK, and its two halves are tested here: the author is
-// told, and the unapplied value never reaches the local baseline — so
-// `wf status` keeps reporting it as unsynced and a later push against an
-// upgraded instance applies it.
+// An instance predating migration 000499 binds bodies without
+// DisallowUnknownFields, so it drops `reportingTimezone` and answers 2xx. Hence
+// the read-back: the author is told, and the unapplied value never reaches the
+// baseline, so a later push against an upgraded instance applies it.
 
-// pushBaseline is the folder's recorded baseline for this instance.
 func pushBaseline(t *testing.T, f *fakeInstance, root string) *wfdir.InstanceState {
 	t.Helper()
 	state, err := wfdir.LoadState(root)
@@ -334,7 +295,6 @@ func TestPushWarnsAndRecordsNothingWhenTheServerIgnoresTheZone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("push failed over a zone the server ignored: %v", err)
 	}
-	// It TRIED — the skew is on the server side, not a CLI that gave up.
 	if len(f.timezonePatches) == 0 {
 		t.Fatal("push never sent the declared zone at all")
 	}
@@ -344,8 +304,7 @@ func TestPushWarnsAndRecordsNothingWhenTheServerIgnoresTheZone(t *testing.T) {
 	if decodeJSON(t, out)["reportingTimezoneIgnored"] != true {
 		t.Errorf("reportingTimezoneIgnored not reported in --json: %s", out)
 	}
-	// The half that matters most: the baseline records the SERVER's answer, so
-	// the folder does not claim a declaration nobody holds.
+	// The baseline records the server's answer, not what was sent.
 	baseline := pushBaseline(t, f, root)
 	if baseline.ReportingTimezone == nil {
 		t.Fatal("baseline recorded no zone at all — nil is UNRECORDED, which disarms the drift guard")
@@ -354,14 +313,11 @@ func TestPushWarnsAndRecordsNothingWhenTheServerIgnoresTheZone(t *testing.T) {
 		t.Errorf("baseline recorded %q; the server holds none, and recording the pushed value would make `wf status` report clean forever",
 			*baseline.ReportingTimezone)
 	}
-	// And the report does not claim a change that did not happen.
 	if md, _ := decodeJSON(t, out)["metadata"].(string); strings.Contains(md, "timezone") {
 		t.Errorf("push reported the zone as changed: %q", md)
 	}
 }
 
-// The other side of the same read-back: a server that DOES apply it confirms,
-// the baseline records it, and the report says what changed.
 func TestPushRecordsAndReportsAZoneTheServerApplies(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, ReportingTimezone: "UTC"},
@@ -382,8 +338,6 @@ func TestPushRecordsAndReportsAZoneTheServerApplies(t *testing.T) {
 	if strings.Contains(stderr, "does not support") {
 		t.Errorf("warned about a zone the server applied:\n%s", stderr)
 	}
-	// describePatch had exactly one call site — the ERROR path — so a push that
-	// silently re-declared a workflow's calendar printed nothing at all.
 	if !strings.Contains(out, `updated  the reporting timezone to "Europe/Stockholm"`) {
 		t.Errorf("the success report does not name the metadata it changed:\n%s", out)
 	}
@@ -393,11 +347,8 @@ func TestPushRecordsAndReportsAZoneTheServerApplies(t *testing.T) {
 	}
 }
 
-// A push that stops AFTER the metadata patch writes a baseline from the
-// in-memory row, and that row must carry what the server confirmed rather than
-// what we sent. Baking the sent value in would leave a folder whose push
-// visibly FAILED nonetheless claiming the calendar landed — and no later push
-// would retry it.
+// A push that stops after the metadata patch writes its baseline from the
+// in-memory row, which must carry the confirmed zone, or no later push retries.
 func TestPartialPushDoesNotBakeAnUnappliedZoneIntoTheBaseline(t *testing.T) {
 	f := newFakeInstance(t)
 	f.zoneUnsupported = true
@@ -407,8 +358,7 @@ func TestPartialPushDoesNotBakeAnUnappliedZoneIntoTheBaseline(t *testing.T) {
 	signIn(t, f)
 	root := cloneFolder(t, f, "wf-1")
 	setManifestZone(t, root, "Europe/Stockholm")
-	// old.py is gone locally, and its deletion — the last step of the push —
-	// is refused.
+	// The deletion, the push's last step, is refused.
 	if err := os.Remove(filepath.Join(root, "old.py")); err != nil {
 		t.Fatalf("remove old.py: %v", err)
 	}
@@ -425,20 +375,10 @@ func TestPartialPushDoesNotBakeAnUnappliedZoneIntoTheBaseline(t *testing.T) {
 	}
 }
 
-// The other half of the same window: the patch landed and the READ-BACK failed,
-// so the CLI does not know what the row holds.
-//
-// `target` still carries the PRE-patch zone there (applyPatch deliberately never
-// touches the field — the zone is learned from the server, not from what we
-// sent), so recording it would leave a baseline describing the world before our
-// own successful patch. metadataDriftOf compares the row against that baseline
-// on the next push, finds a difference nobody but us caused, and REFUSES —
-// blaming a colleague who changed nothing.
-//
-// The warning already tells the author the zone "is left out of the local
-// baseline, so the next push tries again"; this is the code saying the same
-// thing. A nil zone reads as "not part of this baseline" in both readers
-// (metadataDriftOf and baselineDescribes skip it), so the retry is unarmed.
+// The patch landed but the read-back failed. `target` still carries the
+// pre-patch zone (applyPatch never touches it), so recording it would make
+// metadataDriftOf refuse the next push over our own change; a nil zone is
+// skipped by both readers, so the next push retries.
 func TestPartialPushRecordsNoZoneWhenTheReadBackFails(t *testing.T) {
 	f := newFakeInstance(t)
 	f.tenantZone = "UTC"
@@ -451,8 +391,7 @@ func TestPartialPushRecordsNoZoneWhenTheReadBackFails(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, "old.py")); err != nil {
 		t.Fatalf("remove old.py: %v", err)
 	}
-	// The patch is accepted; the confirming read is not. The deletion then fails
-	// so the push stops and writes its partial baseline.
+	// The deletion fails so the push stops and writes its partial baseline.
 	f.failRowGetAfterPatch = true
 	f.failDelete["old.py"] = 500
 

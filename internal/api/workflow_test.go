@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// serve points a client at a one-route stub. Unlike newTestClient this needs no
-// poll-timing surgery — these calls are single round trips.
+// serve points a client at a one-route stub, with none of newTestClient's
+// poll-timing setup.
 func serve(t *testing.T, handler http.HandlerFunc) *Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -16,9 +16,8 @@ func serve(t *testing.T, handler http.HandlerFunc) *Client {
 	return New(srv.URL, "test-token")
 }
 
-// A realistic full response. The point of the fixture is TAG VERIFICATION: a
-// field name that does not match backend/ronja/rdb/table_workflow.go decodes to
-// the zero value silently, and a mirror nobody checks is a mirror that drifts.
+// A field name that drifts from backend/ronja/rdb/table_workflow.go decodes to
+// the zero value silently.
 const workflowFixture = `{
   "id": "wf-abc",
   "workspaceID": null,
@@ -113,9 +112,8 @@ func TestGetWorkflowDecodesEveryMirroredField(t *testing.T) {
 		{"CodexIDs[0]", wf.CodexIDs[0], "cdx-1"},
 		{"QuerySecretIDs[0]", wf.QuerySecretIDs[0], "sec-3"},
 		{"PipPackages[0]", wf.PipPackages[0], "requests==2.31.0"},
-		// Stamped by the SERVER (WorkflowView) on a FRONTEND origin, which is
-		// not the API origin this client was pointed at — the whole reason the
-		// CLI reads it instead of templating one.
+		// Stamped by the server on the FRONTEND origin, not the API origin the
+		// client was pointed at, which is why the CLI never templates one.
 		{"URL", wf.URL, "https://app.example.test/workflows/wf-abc"},
 	}
 	for _, c := range checks {
@@ -138,8 +136,7 @@ func TestGetWorkflowDecodesEveryMirroredField(t *testing.T) {
 	if wf.UpdatedAt.IsZero() || wf.CreatedAt.IsZero() {
 		t.Errorf("timestamps did not decode: created=%v updated=%v", wf.CreatedAt, wf.UpdatedAt)
 	}
-	// optional.V[string] marshals to `null` when unset; unmarshalling null into
-	// a string is a documented no-op, and "" is exactly what unset means here.
+	// optional.V[string] marshals to `null` when unset.
 	if wf.WorkspaceID != "" {
 		t.Errorf("WorkspaceID = %q, want empty", wf.WorkspaceID)
 	}
@@ -150,8 +147,7 @@ func TestGetWorkflowDecodesEveryMirroredField(t *testing.T) {
 }
 
 func TestGetWorkflowNormalizesAbsentSlices(t *testing.T) {
-	// Empty ID slices carry omitempty server-side, so they arrive ABSENT rather
-	// than as []. Code that ranges or compares should not have to care.
+	// Empty ID slices carry omitempty server-side, so they arrive absent.
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"id":"wf-1","lifecycle":"live","approvalGate":null}`))
 	})
@@ -159,8 +155,7 @@ func TestGetWorkflowNormalizesAbsentSlices(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	// `url` is omitempty server-side: an instance with no configured frontend
-	// origin sends none, and "" is what the CLI must read that as — silently.
+	// An instance with no configured frontend origin sends no `url`.
 	if wf.URL != "" {
 		t.Errorf("URL = %q, want empty for a response carrying no url", wf.URL)
 	}
@@ -181,10 +176,8 @@ func TestGetWorkflowNormalizesAbsentSlices(t *testing.T) {
 	}
 }
 
-// The draft route answers 200 with a JSON `null` BODY when the caller has no
-// draft — not a 404. Decoding that into a struct would manufacture a
-// zero-valued draft with an empty id, and every caller would then act on a
-// draft that does not exist.
+// The draft route answers 200 with a JSON `null` body for no draft, which must
+// not decode into a zero-valued draft.
 func TestGetWorkflowDraftNullBodyIsNil(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v2/workflow/wf-1/draft" {

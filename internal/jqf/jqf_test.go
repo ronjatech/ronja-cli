@@ -11,24 +11,15 @@ import (
 	"time"
 )
 
-// ⚠️ NOTHING IN THIS FILE CALLS t.Parallel(), AND THAT IS DELIBERATE. The memory
-// budget is metered off a PROCESS-WIDE allocation counter (see heapAllocated),
-// so a test that deliberately allocates a quarter of a gigabyte inflates the
-// reading of every filter running beside it. With t.Parallel() the runaway
-// tests spent the honest tests' budget and refused them — which is the
-// production over-estimate property, reproduced as a flake.
-
-// What is worth testing here is the thin layer around gojq, not gojq: the
-// stream-to-slice collection, the raw-string rendering, and the two truth rules
-// a poll loop depends on.
+// ⚠️ Nothing in this file calls t.Parallel(), deliberately: the memory budget
+// reads a process-wide allocation counter (see heapAllocated), so a runaway test
+// would spend a parallel honest test's budget and refuse it.
 
 func TestCompileRejectsBadExpression(t *testing.T) {
 	_, err := Compile(".result[")
 	if err == nil {
 		t.Fatal("expected a parse error")
 	}
-	// The expression has to be in the message: a caller sees only their own
-	// one-line flag, and a bare position offset locates nothing.
 	if !strings.Contains(err.Error(), ".result[") {
 		t.Fatalf("error does not quote the expression: %v", err)
 	}
@@ -48,9 +39,7 @@ func TestRunCollectsEveryOutput(t *testing.T) {
 	}
 }
 
-// An expression that matches nothing is not an error — `empty` and a missing
-// key are ordinary jq results — but it must come back as zero outputs rather
-// than as a null, because Holds distinguishes the two.
+// Zero outputs, not a null: Holds distinguishes the two.
 func TestRunEmptyIsNotAnError(t *testing.T) {
 	f, err := Compile("empty")
 	if err != nil {
@@ -75,9 +64,6 @@ func TestRunReportsRuntimeError(t *testing.T) {
 	}
 }
 
-// A non-JSON body must fail as a decode problem, not as a jq problem: the fix
-// is entirely different, and blaming the expression sends the caller to rewrite
-// something that was never wrong.
 func TestRunBytesReportsDecodeFailureSeparately(t *testing.T) {
 	f, err := Compile(".")
 	if err != nil {
@@ -114,8 +100,6 @@ func TestRenderWithoutRawQuotesStrings(t *testing.T) {
 }
 
 func TestTruthyFollowsJqRules(t *testing.T) {
-	// The surprising half: 0, "" and [] are all TRUE in jq. A condition built
-	// on the C intuition would fire on the wrong response.
 	for _, v := range []any{true, 0.0, "", []any{}, map[string]any{}} {
 		if !Truthy(v) {
 			t.Errorf("Truthy(%#v) = false, want true", v)
@@ -128,9 +112,6 @@ func TestTruthyFollowsJqRules(t *testing.T) {
 	}
 }
 
-// The rule a poll loop's correctness rests on: no outputs is NOT satisfied.
-// Vacuous truth here would end the wait the moment an endpoint answered with an
-// unexpected shape.
 func TestHoldsNeedsAtLeastOneTruthyOutput(t *testing.T) {
 	cases := []struct {
 		name string
@@ -151,22 +132,15 @@ func TestHoldsNeedsAtLeastOneTruthyOutput(t *testing.T) {
 	}
 }
 
-// Cancellation, which is not expressible as a golden CASE — the failure it
-// pins is a HANG, and a case file can only describe outputs.
-//
-// `ronja api --jq 'def f: f; f'` would otherwise wedge a user's terminal with
-// no way out but Ctrl-C, and --wait-until re-runs its filter on every poll, so
-// the same expression would wedge it once per attempt.
+// Not a golden case: the failure it pins is a hang, which a case file cannot
+// describe.
 func TestRunIsCancellable(t *testing.T) {
 	f, err := Compile("def f: f; f")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	// ⚠️ ALREADY CANCELLED before Run is called. The step budget now stops this
-	// program in about 15 ms, so racing a 200 ms deadline against the work
-	// budget would pass while proving nothing about ctx — the budget would win
-	// every time. Cancelling up front leaves the caller's context as the only
-	// thing that can end the run, which is the property this test is named for.
+	// ⚠️ Cancelled before Run: the step budget stops this program in ~15 ms, so
+	// a racing deadline would pass without proving anything about ctx.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -189,18 +163,8 @@ func TestRunIsCancellable(t *testing.T) {
 	}
 }
 
-// TestRunReturnsEveryValueRatherThanAPrefix is the rule this package sells, and
-// the regression it pins was shipped.
-//
-// An earlier form capped the stream at 10,000 values and had the CLI print the
-// first 10,000 with a note on stderr and a ZERO exit. `ids=$(ronja api ... --jq
-// '.result[].id' -r 2>/dev/null)` therefore captured a silently wrong prefix,
-// and the flag added to opt out of that (--jq-strict, implied by
-// --fail-on-error) printed nothing at all instead. Neither is an answer, so the
-// cap is gone: a filter produces every value it matched, or it fails.
-//
-// Forty thousand is deliberately four times the old cap — a test at the old
-// boundary would pass on an off-by-one that reintroduced it.
+// Forty thousand is four times the 10,000-value cap this package must never
+// regain; a test at that boundary would pass on an off-by-one.
 func TestRunReturnsEveryValueRatherThanAPrefix(t *testing.T) {
 	const want = 40000
 
@@ -230,18 +194,10 @@ func TestRunReturnsEveryValueRatherThanAPrefix(t *testing.T) {
 	}
 }
 
-// TestRunRefusesAnEnormousAnswerRatherThanTruncatingIt is the other half of that
-// rule, and it is what makes removing the cap affordable.
-//
-// The cap never bounded COST — past it the loop kept pulling and discarding —
-// so the only thing it bounded was the length of the collected slice. That is
-// bounded by the MEMORY budget instead, because the slice allocates like
-// everything else and heapAllocated is process-wide and cumulative. So an answer
-// that is genuinely too large to hold comes back as a refusal naming a remedy,
-// which is a thing a script can act on, rather than as a prefix that is not.
+// The memory budget, not a cap, bounds the collected stream.
 func TestRunRefusesAnEnormousAnswerRatherThanTruncatingIt(t *testing.T) {
-	// 100,000 values of 100 KB each: no single value is large, and the array is
-	// never built — it is the COLLECTED stream that cannot fit.
+	// No single value is large and no array is built: only the collected
+	// stream cannot fit.
 	f, err := Compile(`range(100000) | "x"*100000`)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -262,13 +218,8 @@ func TestRunRefusesAnEnormousAnswerRatherThanTruncatingIt(t *testing.T) {
 	}
 }
 
-// allocatedDuring reports how much the process allocated while fn ran, and it
-// is the assertion that matters below.
-//
-// ⚠️ ASSERTING ONLY "it returned an error" IS NOT ENOUGH, and that is exactly
-// how the first version of these bounds shipped wrong: every runaway shape here
-// DID come back with an error, and some came back with it after allocating
-// gigabytes. The number is the test.
+// ⚠️ allocatedDuring is the assertion that matters below: a runaway shape can
+// return the right error after allocating gigabytes.
 func allocatedDuring(fn func()) uint64 {
 	sample := []metrics.Sample{{Name: "/gc/heap/allocs:bytes"}}
 	runtime.GC()
@@ -279,18 +230,10 @@ func allocatedDuring(fn func()) uint64 {
 	return sample[0].Value.Uint64() - before
 }
 
-// TestRunRefusesRunawayGeneratorsWithoutADeadline is the half a cancellable
-// context does NOT cover.
-//
-// Every expression here produces at most ONE top-level output, so the collected
-// stream is not what bounds them. Two budgets share the work and the SPLIT IS
-// THE POINT, which is
-// why each case names the sentinel it must trip: the step budget answers a
-// program that spins, the memory budget answers one that manufactures data, and
-// a step count cannot see the second — `[range(2000) | "x"*1000000]` is half a
-// percent of a four-million-step budget and 1.9 GB of heap. The context is
-// Background, with no deadline, because that is the point: a caller who forgets
-// one is still bounded.
+// Each case names the sentinel it must trip because a step count cannot see a
+// program that manufactures data (`[range(2000) | "x"*1000000]` is ~18,000
+// steps and 1.9 GB). No deadline: a caller who forgets one is still
+// bounded.
 func TestRunRefusesRunawayGeneratorsWithoutADeadline(t *testing.T) {
 	for _, tc := range []struct {
 		expr     string
@@ -333,13 +276,8 @@ func TestRunRefusesRunawayGeneratorsWithoutADeadline(t *testing.T) {
 	}
 }
 
-// TestRunAllowsADenseHonestListing is the other edge, and it is the case a flat
-// step budget got wrong.
-//
-// Cost tracks ELEMENTS, so the same 5 MiB body costs nine times as much when
-// its rows are thin. Measured, `[.[] | select(.id != null) | {id, name}]` costs
-// 7,200,000 steps over 194,000 thin rows against 790,000 over 21,000 fat ones,
-// and a flat four million refused the first in 44 ms.
+// Cost tracks elements: this thin-row 5 MiB body costs ~7.2M steps, past the
+// MinSteps floor, so it passes only because the budget scales with input size.
 func TestRunAllowsADenseHonestListing(t *testing.T) {
 	var b strings.Builder
 	b.WriteByte('[')
@@ -365,16 +303,8 @@ func TestRunAllowsADenseHonestListing(t *testing.T) {
 	}
 }
 
-// TestRunSurfacesAnErrorRaisedLateInTheStream is a REGRESSION test, and the
-// regression it pins was shipped.
-//
-// A jq program is a STREAM and a stream can fail LATE, so nothing may return on
-// the strength of the values it has already collected. The capped form used to
-// return the moment it held 10,000: measured on 20,000 items with a type error
-// at index 15,000, `ronja api --jq` went from `"cannot add"` and EXIT 1 on main
-// to ten thousand values, a nil error and EXIT 0 on the branch. `halt_error`
-// behaved identically. A command that prints a prefix of a stream that was going
-// to fail, and exits successfully, is worse than one that prints nothing.
+// The failure sits past 10,000 values, where a capped run would have returned
+// a clean prefix.
 func TestRunSurfacesAnErrorRaisedLateInTheStream(t *testing.T) {
 	const items = 20000
 	const failAt = 15000
@@ -414,8 +344,8 @@ func TestRunSurfacesAnErrorRaisedLateInTheStream(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("want the stream's own error (%q), got: %v", tc.want, err)
 			}
-			// Nothing partial escapes: the caller renders what it is given, so
-			// a prefix returned beside an error would be printed beside one.
+			// The caller renders what it is given, so a prefix returned beside
+			// an error would be printed.
 			if out != nil {
 				t.Errorf("a failed run returned %d values; it must return none", len(out))
 			}

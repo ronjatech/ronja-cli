@@ -13,16 +13,13 @@ import (
 	"time"
 )
 
-// The `ronja token create` tests (plan C4). The fake answers token-link once,
-// then serves a SCRIPT of token-mine answers — the first is the snapshot taken
-// before the browser opens, each later one a poll — and every token row carries
-// a `token` sentinel, so the assertion that the credential reaches neither
-// stream is made on every run.
+// The fake serves a script of token-mine answers (the first is the snapshot,
+// each later one a poll), and every token row carries a `token` sentinel, so
+// every run asserts the credential reaches no stream.
 
 const (
-	// tokenLinkURL is what the fake's token-link answers. Deliberately a
-	// different origin from the fake and from anything the CLI could build: a
-	// browser handed exactly this string got the server's link verbatim.
+	// A different origin from anything the CLI could build, so a browser handed
+	// exactly this string got the server's link verbatim.
 	tokenLinkURL   = "https://app.example.test/account?new=1&name=etl&scope=data%3Aread&org=ten-test#tokens"
 	tokenSentinel  = "TOKEN-SENTINEL-9f3c"
 	tokenOldID     = "api_token-old"
@@ -30,8 +27,7 @@ const (
 	tokenAdminOnly = "Only an Admin can create a personal access token."
 )
 
-// mineAnswer is one GET /authentication/token-mine answer: httpStatus 0 is 200
-// with tokens.
+// mineAnswer's httpStatus 0 is 200 with tokens.
 type mineAnswer struct {
 	httpStatus int
 	tokens     []map[string]any
@@ -42,8 +38,8 @@ type tokenFake struct {
 	server *httptest.Server
 
 	mu sync.Mutex
-	// events is every request, plus "OPEN <url>" when the browser is handed
-	// one, in order — so a test can see the snapshot came before the open.
+	// events interleaves requests with "OPEN <url>", so a test can see the
+	// snapshot came before the open.
 	events      []string
 	linkQueries []url.Values
 
@@ -113,8 +109,6 @@ func (f *tokenFake) eventsCopy() []string {
 	return append([]string(nil), f.events...)
 }
 
-// tokenBrowser records the URLs a browser was handed, into the fake's event
-// log as well.
 func tokenBrowser(t *testing.T, f *tokenFake) *[]string {
 	t.Helper()
 	var opened []string
@@ -151,8 +145,7 @@ func tok(id, name string, grants map[string]string, expiresAt any) map[string]an
 	}
 }
 
-// runToken runs one invocation and checks what every run keeps: neither the
-// login's token nor a minted one reaches any stream.
+// runToken asserts that neither the login's token nor a minted one reaches any stream.
 func runToken(t *testing.T, args ...string) (stdout, stderr, errText string) {
 	t.Helper()
 	stdout, stderr, errText = runSecretCLI(t, append([]string{"token", "create"}, args...)...)
@@ -169,9 +162,6 @@ func runToken(t *testing.T, args ...string) (stdout, stderr, errText string) {
 
 var oldToken = tok(tokenOldID, "ronja-cli on laptop", nil, nil)
 
-// The happy path: the server's link is opened verbatim AFTER the snapshot, and
-// the token reported is the one whose id was not in it — even though the
-// person renamed it on the form.
 func TestTokenCreateReportsTheTokenNotInTheSnapshot(t *testing.T) {
 	fastToken(t, 5*time.Second)
 	f := newTokenFake(t,
@@ -246,8 +236,6 @@ func TestTokenCreateExpiresFlag(t *testing.T) {
 	}
 }
 
-// Refused before anything is sent: no name, no scope, an --expires that is no
-// shape the server takes.
 func TestTokenCreateRefusesBadFlagsBeforeAnyRequest(t *testing.T) {
 	cases := map[string][]string{
 		"no name":      {"--scope", "data:read"},
@@ -281,7 +269,6 @@ func TestTokenCreateCommaSeparatedScopes(t *testing.T) {
 	}
 }
 
-// token-link's refusals: each named, and no browser opens for any of them.
 func TestTokenCreateLinkRefusals(t *testing.T) {
 	cases := []struct {
 		name, body string
@@ -318,7 +305,6 @@ func TestTokenCreateLinkRefusals(t *testing.T) {
 	}
 }
 
-// A scoped login without admin 403s on token-mine: told so, and no browser.
 func TestTokenCreateSnapshotForbiddenIsTheScopedLoginMessage(t *testing.T) {
 	f := newTokenFake(t, mineAnswer{httpStatus: http.StatusForbidden})
 	opened := tokenBrowser(t, f)
@@ -387,8 +373,6 @@ func TestTokenCreateCtrlCStopsWaiting(t *testing.T) {
 	}
 }
 
-// --no-wait opens and returns without reading the token list at all;
-// --no-browser never calls the browser and puts the link on stderr.
 func TestTokenCreateNoWaitAndNoBrowser(t *testing.T) {
 	f := newTokenFake(t)
 	opened := tokenBrowser(t, f)
@@ -407,10 +391,7 @@ func TestTokenCreateNoWaitAndNoBrowser(t *testing.T) {
 	}
 }
 
-// A sign-in token that lands DURING the wait (another terminal's `ronja login`,
-// an MCP client) appears alone in an earlier poll: it is named on stderr and
-// does not end the wait, and the form's token, a poll later, is the one
-// reported. A sign-in token is full access, so it never matches on scopes.
+// A sign-in token is full access, so it never matches on scopes.
 func TestTokenCreateIgnoresAnUnrelatedTokenThatAppearsFirst(t *testing.T) {
 	fastToken(t, 5*time.Second)
 	login := tok("api_token-login", "ronja-cli on desktop", nil, nil)
@@ -438,8 +419,6 @@ func TestTokenCreateIgnoresAnUnrelatedTokenThatAppearsFirst(t *testing.T) {
 	}
 }
 
-// Renamed on the form with the scopes left as asked: still this request's.
-// Changed scopes with the name left: still this request's. Both changed: not.
 func TestTokenCreateMatchesOnNameOrExactScopes(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -481,10 +460,8 @@ func TestTokenCreateMatchesOnNameOrExactScopes(t *testing.T) {
 	}
 }
 
-// The expiry is an instant with its offset, not a bare date: the form sends
-// midnight in the BROWSER's zone, and a bare date read in another zone is the
-// day before. Sets time.Local, which is safe only because no test in this
-// package calls t.Parallel.
+// Sets time.Local, which is safe only because no test in this package calls
+// t.Parallel.
 func TestTokenCreatePrintsTheExpiryAsAnInstant(t *testing.T) {
 	saved := time.Local
 	time.Local = time.FixedZone("CET", 3600)
@@ -511,9 +488,6 @@ func TestTokenCreatePrintsTheExpiryAsAnInstant(t *testing.T) {
 
 func ptrTime(t time.Time) *time.Time { return &t }
 
-// The organization the link was stamped with is named on stderr before the
-// browser opens: by its id under an environment token (the server's ?org=),
-// by the stored profile's name when the credential is that profile's.
 func TestTokenCreateNamesTheOrganization(t *testing.T) {
 	t.Run("environment token", func(t *testing.T) {
 		f := newTokenFake(t)
@@ -541,7 +515,6 @@ func TestTokenCreateNamesTheOrganization(t *testing.T) {
 	})
 }
 
-// The command's own flag set offers no way to pre-select full access.
 func TestTokenCreateHasNoFullAccessFlag(t *testing.T) {
 	cmd := newTokenCreateCmd()
 	for _, name := range []string{"full-access", "full", "access", "json", "print", "out"} {
@@ -551,8 +524,6 @@ func TestTokenCreateHasNoFullAccessFlag(t *testing.T) {
 	}
 }
 
-// Parse actual stdout, including the no-wait path: JSON is one complete object,
-// and multiple matches retain their metadata without ever decoding token values.
 func TestTokenCreateJSON(t *testing.T) {
 	for _, noWait := range []bool{false, true} {
 		t.Run(map[bool]string{false: "created", true: "pending"}[noWait], func(t *testing.T) {

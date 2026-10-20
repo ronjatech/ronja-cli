@@ -2,11 +2,8 @@ package commands
 
 import "testing"
 
-// TestFirstRonjaMarkerVerb is the port's fidelity test, and the cases are the
-// server's own (backend/engine/pymarkers/module_test.go). A CLI that answered
-// differently from the gate it predicts would be worse than one that did not
-// predict at all: the author would fix a file the server never objected to, or
-// trust a "clean" that the save refuses.
+// The port's fidelity test: the cases are the server's own
+// (backend/engine/pymarkers/module_test.go).
 func TestFirstRonjaMarkerVerb(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -26,19 +23,13 @@ func TestFirstRonjaMarkerVerb(t *testing.T) {
 		{"workflow", `tools.runWorkflow({{ workflow('workflow-x') }})`, "workflow"},
 		// Modules are LEAVES in V1 — no transitive imports.
 		{"module marker in a module file", `from {{ module('module-x') }} import y`, "module"},
-		// Dead text is skipped, matching the server's extraction. A docstring
-		// showing a consumer how to call the module is documentation.
 		{"marker inside a docstring is not a violation",
 			"\"\"\"\nCall it from a workflow that does {{ ref('table-x') }}.\n\"\"\"\ndef f():\n    pass\n", ""},
 		{"marker inside a line comment is not a violation",
 			"# the consumer passes the handle from {{ secret('secret-x', 'token') }}\ndef f():\n    pass\n", ""},
-		// A marker in a LIVE string literal is flagged: a module has no marker
-		// contract, so the author is relying on a substitution that never comes.
 		{"marker inside a live string literal is a violation", `q = "{{ ref('table-x') }}"`, "ref"},
 		{"an unknown verb is not a Ronja marker", `x = {{ format('a') }}`, ""},
-		// The boundary the server draws too: no quoted argument, no binding, no
-		// match. Refusing these would refuse ordinary Python that merely looks
-		// like a marker.
+		// No quoted argument, no binding, no match, as on the server.
 		{"a marker-shaped construct that binds nothing passes", `x = {{ ref() }}`, ""},
 		{"first violation wins",
 			"a = {{ write('table-x') }}\nb = {{ agent('agent-x') }}\n", "write"},

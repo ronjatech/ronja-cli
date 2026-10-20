@@ -1229,9 +1229,9 @@ func printLintWarnings(out io.Writer, r *appPushResult) {
 //
 // The lint carries exactly one such line today — the migration advisory, which
 // fires on a HEALTHY app to say it could be brought up to date — and the server
-// is explicit that everything else in the list is a mistake (`lint.go`:
-// "everything else here is still a defect"). The CLI was the only place that
-// distinction was lost: every line landed under `Warnings:` beneath a footer
+// marks that advisory as the one line that is not a mistake (`lint.go`, on
+// lintMsgMigrateToSpec2), so every other line is a defect. The CLI was the only
+// place that distinction was lost: every line landed under `Warnings:` beneath a footer
 // reading "These compile but fail silently in the frame", which told the author
 // of a perfectly working app that it is broken.
 //

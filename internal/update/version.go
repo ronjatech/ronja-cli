@@ -5,19 +5,9 @@ import (
 	"strings"
 )
 
-// Version comparison, hand-rolled.
-//
-// The CLI has three dependencies and this needs one shape of version string:
-// `vMAJOR.MINOR.PATCH` with an optional prerelease suffix, which is exactly
-// what the release pipeline stamps (`-X ...Version={{ .Tag }}`). Pulling in a
-// semver module to compare four integers would be a dependency added for a
-// twenty-line function.
-//
-// Everything that is NOT that shape reports ok=false, and ok=false means the
-// caller stays silent: a `dev` build from a checkout, Go's `(devel)`, and the
-// pseudo-version a `go install ...@<commit>` records all land here. None of
-// them can be meaningfully compared against a release tag, and guessing would
-// tell a developer running their own build that they are behind.
+// Version comparison is hand-rolled for the one shape the release pipeline
+// stamps, `vMAJOR.MINOR.PATCH[-pre]`. Anything else (a `dev` build, `(devel)`, a
+// pseudo-version) reports ok=false so the caller stays silent.
 
 type parsedVersion struct {
 	nums [3]int
@@ -39,9 +29,7 @@ func Compare(current, latest string) (newer, ok bool) {
 			return l.nums[i] > c.nums[i], true
 		}
 	}
-	// Same numeric core, so the prerelease decides. A prerelease sorts BELOW
-	// its own release, which is the case that matters: someone running
-	// v0.29.0-rc.1 is told about v0.29.0.
+	// A prerelease sorts below its own release.
 	switch {
 	case c.pre == l.pre:
 		return false, true
@@ -50,16 +38,14 @@ func Compare(current, latest string) (newer, ok bool) {
 	case c.pre == "" && l.pre != "":
 		return false, true
 	default:
-		// Two prereleases of the same core. A byte comparison is not the
-		// semver rule (rc.10 sorts below rc.9), and it does not need to be:
-		// the answer only decides whether to mention a release candidate to
-		// someone already running one.
+		// Byte order, not semver (rc.10 sorts below rc.9): it only decides
+		// whether to mention a release candidate to someone running one.
 		return l.pre > c.pre, true
 	}
 }
 
-// IsRelease reports whether v is a version this package can compare — i.e.
-// whether the running binary came from the release pipeline at all.
+// IsRelease reports whether v is a version this package can compare, i.e. a
+// release-pipeline build.
 func IsRelease(v string) bool {
 	_, ok := parseVersion(v)
 	return ok
@@ -71,8 +57,7 @@ func parseVersion(v string) (parsedVersion, bool) {
 		return out, false
 	}
 	body := v[1:]
-	// Build metadata is not something the pipeline produces, and comparing it
-	// is explicitly not a thing semver does. Refuse rather than half-handle it.
+	// The pipeline never produces build metadata.
 	if strings.Contains(body, "+") {
 		return out, false
 	}
@@ -92,10 +77,7 @@ func parseVersion(v string) (parsedVersion, bool) {
 		if p == "" || strings.TrimLeft(p, "0123456789") != "" {
 			return out, false
 		}
-		// Semver forbids a leading zero, and accepting one would make v0.01.0
-		// and v0.1.0 compare equal while printing as two different releases —
-		// so a tag that is not a version we could ever have published is
-		// refused rather than quietly normalised.
+		// A leading zero would make v0.01.0 and v0.1.0 compare equal.
 		if len(p) > 1 && p[0] == '0' {
 			return out, false
 		}
@@ -111,18 +93,13 @@ func parseVersion(v string) (parsedVersion, bool) {
 	return out, true
 }
 
-// validPrerelease accepts semver's prerelease grammar and nothing else:
-// dot-separated identifiers of [0-9A-Za-z-], none of them empty.
+// validPrerelease accepts semver's prerelease grammar only: dot-separated,
+// non-empty identifiers of [0-9A-Za-z-].
 //
-// It is a PRINTING rule as much as a parsing one. The tag comes from whatever
-// the mirror answered, and `ok` from Compare is the gate that admits it into
-// the notice line and into `ronja update`'s report — both of which go to a
-// terminal verbatim. Without a charset test, a tag carrying a bidirectional
-// override or a control character would be echoed there, where it can rewrite
-// the line around it: "ronja v1.0.0-rc.1<U+202E>..." is a sentence the reader
-// does not get to see honestly. The one place a tag is still printed WITHOUT
-// passing this gate is the "tagged %q, which is not a release version" refusal,
-// and %q escapes what this rejects.
+// ⚠️ It is also a printing gate: a tag that passes is echoed verbatim into the
+// notice and `ronja update`'s report, so a bidi override or control character
+// must never pass. The one unvetted print is the not-a-release refusal, which
+// uses %q.
 func validPrerelease(pre string) bool {
 	if pre == "" {
 		return false
@@ -142,19 +119,12 @@ func validPrerelease(pre string) bool {
 	return true
 }
 
-// isPseudoVersion recognises the version Go synthesises for a module resolved
-// at a commit rather than a tag: v0.0.0-20260901120000-abcdef123456, and its
-// two tagged variants, all of which end in a 14-digit UTC timestamp followed by
-// a 12-character commit prefix.
-//
-// It has to be recognised because it PARSES as vMAJOR.MINOR.PATCH-pre and
-// would otherwise be compared as an ordinary prerelease of v0.0.0 — telling
-// every `go install ...@<commit>` user that a release is available and that
-// `ronja update` will fix it, which for that install method it would not.
+// isPseudoVersion recognises a Go pseudo-version (a 14-digit timestamp then a
+// 12-character commit, e.g. v0.0.0-20260901120000-abcdef123456), which parses
+// as a prerelease and would otherwise be compared as one.
 func isPseudoVersion(pre string) bool {
-	// Split on both separators: the timestamp is preceded by a dash in the
-	// untagged form (v0.0.0-20260901120000-abcdef123456) and by a dot in the
-	// two tagged ones (v0.28.4-0.20260901120000-abcdef123456).
+	// The timestamp follows a dash untagged and a dot in the tagged forms
+	// (v0.28.4-0.20260901120000-abcdef123456).
 	parts := strings.FieldsFunc(pre, func(r rune) bool { return r == '.' || r == '-' })
 	if len(parts) < 2 {
 		return false

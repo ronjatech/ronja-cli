@@ -7,13 +7,9 @@ import (
 	"testing"
 )
 
-// A realistic GET /workflow/run/:runID body, with the run row at the ROOT
-// alongside steps and health — the flattening the server gets from embedding
-// *rdb.WorkflowRun in RunResponse.
-//
-// Same purpose as the workflow fixture: tag verification. It matters more here,
-// because `wf test --json` prints this struct verbatim, so a mistyped tag does
-// not merely go unread — it silently deletes a field from the CLI's output.
+// The run row sits at the ROOT beside steps and health, as the server embeds
+// it. `wf test --json` prints this struct verbatim, so a mistyped tag silently
+// deletes a field from the CLI's output.
 const runResponseFixture = `{
   "tenant_id": "ten-1",
   "id": "run-abc",
@@ -63,8 +59,6 @@ func TestGetWorkflowRunDecodesTheFlattenedResponse(t *testing.T) {
 		t.Fatalf("GetWorkflowRun: %v", err)
 	}
 
-	// The run row, reached through the embedded struct exactly as the server
-	// serves it: at the root, not under a "run" key.
 	if run.ID != "run-abc" || run.WorkflowID != "wf-1" || run.Status != RunStatusDone {
 		t.Errorf("run identity = %+v", run.WorkflowRun)
 	}
@@ -92,21 +86,16 @@ func TestGetWorkflowRunDecodesTheFlattenedResponse(t *testing.T) {
 	if run.TriggeringRunID != nil {
 		t.Error("a null triggeringRunID decoded to a value")
 	}
-	// Always the LINEAGE ROOT, never the run the caller asked to resume — the
-	// server normalizes it before stamping.
 	if run.ResumeOfRunID == nil || *run.ResumeOfRunID != "run-root" {
 		t.Errorf("resumeOfRunID = %v", run.ResumeOfRunID)
 	}
 	if run.Kind != "report" || run.TokensUsed != 120 || run.AICallCount != 2 || run.QueryCount != 5 {
 		t.Errorf("counters = %+v", run.WorkflowRun)
 	}
-	// The run's own runtime, denormalized at create — not re-read off the
-	// workflow row, which may since have been edited.
 	if run.RuntimeVersion != 2 {
 		t.Errorf("runtimeVersion = %d", run.RuntimeVersion)
 	}
-	// The size of the LINEAGE's journal, which is not len(Steps) and must never
-	// be printed as if it were.
+	// The lineage's journal size, which is not len(Steps).
 	if run.JournalEntries != 3 {
 		t.Errorf("journalEntries = %d", run.JournalEntries)
 	}
@@ -144,15 +133,12 @@ func TestGetWorkflowRunDecodesTheFlattenedResponse(t *testing.T) {
 	if step.QueryCount != 3 {
 		t.Errorf("step queryCount = %d", step.QueryCount)
 	}
-	// A journal hit, which is a different thing from a continue_on_error skip
-	// even though the two share a status.
+	// A journal hit, distinct from a continue_on_error skip with the same status.
 	if !step.Replayed {
 		t.Error("replayed did not decode")
 	}
 }
 
-// An unrecognised status must END the poll rather than loop until --timeout: a
-// status added server-side is not a reason for the CLI to hang.
 func TestRunningIsTrueOnlyWhileRunning(t *testing.T) {
 	for status, want := range map[string]bool{
 		RunStatusRunning: true,
@@ -168,10 +154,8 @@ func TestRunningIsTrueOnlyWhileRunning(t *testing.T) {
 	}
 }
 
-// A run of a workflow with no parameters must send parameterValues as {}, NOT
-// omit it. The server decodes a missing key to a nil map exactly as it does an
-// explicit null, and parameter_values is NOT NULL — omitting the field is the
-// null map this is meant to avoid, and used to fail the run with an opaque 400.
+// The server decodes a missing parameterValues to a nil map, and
+// parameter_values is NOT NULL.
 func TestRunWorkflowSendsEmptyParameterValues(t *testing.T) {
 	var bodies []map[string]any
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -202,10 +186,8 @@ func TestRunWorkflowSendsEmptyParameterValues(t *testing.T) {
 	}
 }
 
-// A resume names a run and says NOTHING ELSE. The parameterValues key that
-// RunWorkflow is careful to always send must be absent here: the server refuses
-// a resume that carries parameter values, because a changed parameter would
-// invalidate every step result computed under the old ones.
+// The server refuses a resume carrying parameterValues, the key RunWorkflow
+// always sends.
 func TestResumeWorkflowRunSendsOnlyTheRunID(t *testing.T) {
 	var body map[string]any
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -233,9 +215,8 @@ func TestResumeWorkflowRunSendsOnlyTheRunID(t *testing.T) {
 	}
 }
 
-// The run history is read for ONE purpose — finding the last failed run — and
-// the endpoint applies no default ordering, so the ordering has to be part of
-// the request. A listing without it is not unsorted, it is arbitrary.
+// The endpoint applies no default ordering, so a listing without one is
+// arbitrary, not merely unsorted.
 func TestListWorkflowRunsAsksForNewestFirst(t *testing.T) {
 	var query string
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -262,9 +243,7 @@ func TestListWorkflowRunsAsksForNewestFirst(t *testing.T) {
 	}
 }
 
-// The name lookup `wf test` does is best effort, and an unnamed table is a real
-// state — the server sends `null` for it, which decodes into a plain string as a
-// documented no-op. GetTable itself is exercised in table_test.go.
+// An unnamed table is a real state; the server sends `null` for it.
 func TestGetTableDecodesAnAbsentName(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v2/feature/model/tbl-1" {

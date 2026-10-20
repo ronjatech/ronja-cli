@@ -12,21 +12,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja secret create` is a CREDENTIAL HANDSHAKE, the third kind of command
-// beside the sync loops and the transport (see cli/README.md → the doctrine).
-//
-// POST /api/v2/secret already takes the value inline; what plain HTTP cannot do
-// is take it from a person without the value landing in an argument list, a
-// shell history or a transcript. That interactive half — an echo-off prompt, a
-// pipe, a file — is the whole of what this command owns. It creates one secret,
-// reports its id, and never prints a value. There is no list, show, rotate or
-// delete: those stay on `ronja api` and in Ronja.
-//
-// The rule every line here keeps: no value reaches stdout, stderr, an error
-// message or argv. A value lives in memory from where it was read until the one
-// request that carries it, and a server error is scrubbed before it is reported
-// (redactValues) — of every value of an API key, and of every sensitive field of
-// a database login (sensitiveFieldName).
+// `ronja secret create` is a credential handshake (cli/README.md → the
+// doctrine): no value reaches stdout, stderr, an error message or argv, and a
+// server error is scrubbed by redactValues before it is reported.
 
 const valuesAreNeverFlags = "values are never flags — they end up in your shell history. Run without a value to be prompted, or pipe it on stdin."
 
@@ -119,9 +107,7 @@ Prints the new secret's id, its fields and each value's length — never a value
 			name = strings.TrimSpace(name)
 			dialect = strings.TrimSpace(dialect)
 
-			// A value smuggled into a flag is refused FIRST, before anything
-			// else is looked at, so the refusal is the one message somebody
-			// who tried it sees.
+			// Refused first, so it is the one message somebody who tried it sees.
 			for _, f := range fields {
 				if strings.Contains(f, "=") {
 					return errors.New(valuesAreNeverFlags)
@@ -158,17 +144,14 @@ Prints the new secret's id, its fields and each value's length — never a value
 				return errors.New("--in-browser reads no value here — the value is entered in Ronja; drop --from-file")
 			}
 
-			// Signed in BEFORE any value is read: a value piped into a command
-			// that then refuses for want of a login is a value the person has
-			// to find and pipe again, and a prompt answered for nothing.
+			// Before any value is read, so a missing login never wastes a
+			// pipe or an answered prompt.
 			resolved, err := resolveInstance()
 			if err != nil {
 				return err
 			}
 
 			if inBrowser {
-				// No value is read from stdin, a prompt or a file on this
-				// path: the person enters it on the secret's page.
 				pending := api.CreatePendingSecretInput{
 					FeatureID:   featureID,
 					Name:        name,
@@ -208,9 +191,7 @@ Prints the new secret's id, its fields and each value's length — never a value
 			} else {
 				in.SecretType = "api_key"
 				in.AllowedURLs = hosts
-				// Every field is an agentField: a Workflow can read only the
-				// fields listed there, so a field left off is one nothing can
-				// ever use.
+				// A Workflow reads only agentFields, so every field is one.
 				in.AgentFields = fieldNames
 				in.FieldSchema = apiKeyFieldSchema(fieldNames)
 			}
@@ -240,9 +221,8 @@ Prints the new secret's id, its fields and each value's length — never a value
 	return cmd
 }
 
-// secretFieldNames validates the --field list, defaulting to one apiKey field.
-// Names are kept in the order given (that order is the prompt order and the
-// form's order in Ronja), and a repeat is refused rather than silently merged.
+// secretFieldNames keeps the order given: it is the prompt order and the
+// form's order in Ronja.
 func secretFieldNames(fields []string) ([]string, error) {
 	if len(fields) == 0 {
 		return []string{"apiKey"}, nil
@@ -263,11 +243,10 @@ func secretFieldNames(fields []string) ([]string, error) {
 	return out, nil
 }
 
-// secretHosts validates the --host list. Each one is a HOSTNAME, matched
-// against the bare hostname of the URL a request goes to — so a URL, a path, a
-// port or a user would be stored and then never match anything, and the secret
-// would be unusable with no error anywhere. `*.` is allowed as a prefix only,
-// which is the one wildcard the server matches.
+// secretHosts refuses anything but a hostname: the server matches the bare
+// hostname of a request's URL, so a stored URL, path, port or user would never
+// match and the secret would be silently unusable. `*.` is the one wildcard the
+// server matches, as a prefix only.
 func secretHosts(hosts []string) ([]string, error) {
 	out := make([]string, 0, len(hosts))
 	for _, h := range hosts {
@@ -295,8 +274,7 @@ func apiKeyFieldSchema(fieldNames []string) json.RawMessage {
 	return body
 }
 
-// reportCreatedSecret prints the one result line, or --json metadata. Field
-// names and lengths only.
+// reportCreatedSecret prints field names and lengths only.
 func reportCreatedSecret(created *api.CreatedSecret, featureID string, lengths []fieldLength) error {
 	if created.FeatureID != nil && *created.FeatureID != "" {
 		featureID = *created.FeatureID

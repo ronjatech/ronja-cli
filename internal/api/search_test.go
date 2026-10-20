@@ -8,38 +8,15 @@ import (
 	"testing"
 )
 
-// serverHitFile is where search.Hit really lives, relative to the repository
-// root. It is the type SearchHit hand-mirrors four fields of.
 const serverHitFile = "backend/lib/search/hit.go"
 
-// serverJSONTag pulls the `json:"name"` out of a struct field declaration, so
-// the comparison is against the tags the server actually serializes with rather
-// than against a copy in a comment.
 var serverJSONTag = regexp.MustCompile("`[^`]*json:\"([^\",]+)")
 
-// TestSearchHitMirrorsTheServerTags is the mechanical half of the promise
-// SearchHit's doc makes, on the pattern markers/parity_test.go established one
-// package over: cli/ is a separate Go module that deliberately does not import
-// the backend, so a hand-mirror has nothing to check itself against in the type
-// system, and the check has to read the server's SOURCE.
-//
-// It is worth the oddity because the drift is SILENT and lands somewhere that
-// looks like a data problem. `ronja bind` matches a hit on its TITLE — that
-// check is load-bearing rather than defensive, since the endpoint's tag leg
-// stamps a matching tag's score onto a resource whatever it is called — so a
-// renamed `title` tag decodes as the empty string, matches no alias, and every
-// bind reports "no match" for rows sitting right there. The decode test beside
-// this one cannot see it: its JSON body is hand-written, so it renames right
-// along with the mirror and stays green.
-//
-// Only the four tags SearchHit reads are asserted. The seven it leaves out are
-// left out deliberately (see the type's doc), and requiring them here would turn
-// every field the server adds into a failure in the CLI's test suite.
-//
-// SKIPS when the backend tree is not there — an installed module, or the CLI
-// vendored on its own — exactly as the markers parity test does, because the
-// absence of the file says nothing about whether the shapes agree. In this
-// repository, and therefore in CI, it always runs.
+// cli/ does not import the backend, so this reads the server's SOURCE (as
+// markers/parity_test.go does): a renamed `title` tag would decode as empty and
+// make every `ronja bind` report "no match", which a hand-written decode fixture
+// cannot catch. Only the tags SearchHit reads are asserted; it skips when the
+// backend tree is absent and always runs in this repository.
 func TestSearchHitMirrorsTheServerTags(t *testing.T) {
 	root := repoRoot(t)
 	if root == "" {
@@ -68,12 +45,8 @@ func TestSearchHitMirrorsTheServerTags(t *testing.T) {
 	}
 }
 
-// repoRoot walks up from the test's own directory looking for the monorepo root,
-// identified by the backend tree this test reads. Returns "" when there is none.
-//
-// A second copy of markers/parity_test.go's helper rather than a shared one:
-// cli/ has no test-support package, and inventing one so two files can agree on
-// four lines of os.Stat would be the larger change. Both are test-only.
+// repoRoot returns the monorepo root, or "" when there is none. It duplicates
+// markers/parity_test.go's helper deliberately: cli/ has no test-support package.
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	dir, err := os.Getwd()

@@ -7,26 +7,14 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// The closing link a sync loop prints, and the two rules it lives by.
-//
-// One file rather than four, because this is ONE behaviour spread across the
-// commands: the link a report ends with is whatever the SERVER put on the
-// response the command already holds, and nothing here ever templates a route
-// or picks an origin.
-//
-// The tests come in pairs on purpose. The positive half pins that the link
-// carries the FRONTEND origin (fakeFrontendOrigin), which the fake deliberately
-// serves from a different host than its API — so a CLI that rebuilt the link
-// from the profile's instance URL, the way this used to, fails here rather than
-// in production where api.* and app.* differ and local dev where the backend
-// serves no pages at all. The negative half pins that an instance which returns
-// NO url produces no link, no warning and no failure: the field is omitempty
-// server-side, an unconfigured frontend origin omits it, and that is the
-// ordinary state of the dev box this gets tested on.
+// A report's closing link is whatever url the server put on the response; the
+// CLI never templates a route or picks an origin. The fake serves its frontend
+// origin from a different host than its API, so a link rebuilt from the
+// instance URL fails here. A missing url (no frontend origin configured) prints
+// no link, no warning and no failure.
 
-// urlLine returns the value of a report's "URL:" line, or "" when it printed
-// none. Matched on the label rather than on a substring of the link, because
-// the assertion that matters most is the ABSENCE of the line.
+// urlLine matches on the label, not the link, because the assertion that
+// matters most is the line's absence.
 func urlLine(out string) string {
 	for _, line := range strings.Split(out, "\n") {
 		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "URL:"); ok {
@@ -48,8 +36,7 @@ func TestPushAndPublishReportTheServersLink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
-	// The DRAFT's page: a push writes to the draft, and that is the row whose
-	// content the reader is being invited to look at.
+	// A push links the draft: that is the row it wrote.
 	draftID := f.draftOf["wf-1"]
 	if draftID == "" {
 		t.Fatal("the push should have checked out a draft")
@@ -58,10 +45,7 @@ func TestPushAndPublishReportTheServersLink(t *testing.T) {
 		t.Errorf("push link = %q, want %q", got, want)
 	}
 
-	// status reports the WORKFLOW, whoever has a draft open — the row the
-	// binding names, and the one a reader means by "the workflow". It is a
-	// remote fact, so a status that never reached the server has none (see
-	// TestNoServerLinkPrintsNothingAndStillSucceeds).
+	// status links the workflow the binding names, whoever has a draft open.
 	status, err := runCLI(t, root, "wf", "status")
 	if err != nil {
 		t.Fatalf("status: %v", err)
@@ -70,7 +54,6 @@ func TestPushAndPublishReportTheServersLink(t *testing.T) {
 		t.Errorf("status link = %q, want %q", got, want)
 	}
 
-	// A second push has nothing to do and still says where to look.
 	upToDate, err := runCLI(t, root, "wf", "push")
 	if err != nil {
 		t.Fatalf("second push: %v", err)
@@ -82,8 +65,7 @@ func TestPushAndPublishReportTheServersLink(t *testing.T) {
 		t.Errorf("an up-to-date push should still report the link, got none:\n%s", upToDate)
 	}
 
-	// Publish reports the PARENT: the draft is gone the moment it commits, and
-	// what the reader wants to open is what went live.
+	// Publish links the parent: the draft is gone once it commits.
 	published, err := runCLI(t, root, "wf", "publish")
 	if err != nil {
 		t.Fatalf("publish: %v", err)
@@ -93,8 +75,7 @@ func TestPushAndPublishReportTheServersLink(t *testing.T) {
 	}
 }
 
-// The negative control, and the one that decides whether this is safe to ship:
-// an instance with no frontend origin configured returns no url at all.
+// The negative control: an instance with no frontend origin returns no url.
 func TestNoServerLinkPrintsNothingAndStillSucceeds(t *testing.T) {
 	f := newFakeInstance(t)
 	f.noFrontendOrigin = true
@@ -111,9 +92,8 @@ func TestNoServerLinkPrintsNothingAndStillSucceeds(t *testing.T) {
 	if got := urlLine(pushed); got != "" {
 		t.Errorf("no url from the server must print no link, got %q", got)
 	}
-	// Not a warning either. A missing link is not a problem the person running
-	// this can do anything about, and saying so on every push would train them
-	// to ignore the notes that matter.
+	// Not a warning either: the reader can do nothing about it, and a note on
+	// every push trains them to ignore notes.
 	if strings.Contains(strings.ToLower(pushed), "url") {
 		t.Errorf("the report mentions a URL it does not have:\n%s", pushed)
 	}
@@ -135,11 +115,8 @@ func TestNoServerLinkPrintsNothingAndStillSucceeds(t *testing.T) {
 	}
 }
 
-// `wf status`'s --json payload is unchanged by the link: its `url` key has
-// always meant the INSTANCE origin, and the frontend page rides the human
-// report only. A second url under another name would be a shape change to
-// something scripts parse — and one document using `url` for two different
-// origins is worse than no key at all.
+// `url` in `wf status --json` means the instance origin; the frontend link
+// rides the human report only, so scripts see no shape change.
 func TestStatusJSONKeepsURLMeaningTheInstance(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, FeatureScope: "private"},
@@ -165,9 +142,8 @@ func TestStatusJSONKeepsURLMeaningTheInstance(t *testing.T) {
 	}
 }
 
-// The --json payload is a contract for anything scripting the CLI. The link
-// rides the human report only; a caller that wants it machine-readably reads it
-// off the API response, which is where the CLI got it from.
+// The link rides the human report only; a script reads it off the API
+// response.
 func TestPushJSONCarriesNoURLKey(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, FeatureScope: "private"},
@@ -199,8 +175,7 @@ func TestAppCommandsReportTheServersLink(t *testing.T) {
 	signInApp(t, f)
 	root := appFolderBoundTo(t, f, live.ID, map[string]string{"App.tsx": "x"})
 
-	// status reports the APP, whoever has a draft open: it is the row the
-	// binding names and the one a reader means by "the app".
+	// status links the app the binding names, whoever has a draft open.
 	status, err := runCLI(t, root, "app", "status")
 	if err != nil {
 		t.Fatalf("status: %v", err)
@@ -217,8 +192,7 @@ func TestAppCommandsReportTheServersLink(t *testing.T) {
 	if got, want := urlLine(pushed), fakeFrontendOrigin+"/apps/"+draft.ID; got != want {
 		t.Errorf("push link = %q, want %q", got, want)
 	}
-	// And the LIVE link beside it: a draft is its own address, so the author
-	// needs to be told which link keeps showing the published version.
+	// A draft is its own address, so the report also names the live link.
 	if !strings.Contains(pushed, "Live URL:") || !strings.Contains(pushed, fakeFrontendOrigin+"/apps/"+live.ID+"  (unchanged") {
 		t.Errorf("push report does not name the unchanged live link:\n%s", pushed)
 	}
@@ -253,15 +227,9 @@ func TestAppCommandsWithoutAServerLinkPrintNothing(t *testing.T) {
 	}
 }
 
-// `app publish`'s link is the one that also rides the --json payload, as
-// `appURL` — the field predates this work, so it stays published. What CHANGED
-// is that it can now be absent: it used to be derived locally from the instance
-// URL and was therefore always present, and always pointing at the API host.
-//
-// Both halves are pinned here, because the absence is only meaningful against a
-// run that does emit the key: `jq -r .appURL` goes from a wrong string to
-// `null`, and a test asserting only the absence would still pass if the field
-// were dropped altogether.
+// `app publish --json` is the one payload that carries the link, as `appURL`,
+// and it may be absent. Both halves are pinned: an absence-only test would pass
+// if the field were dropped altogether.
 func TestAppPublishJSONCarriesTheServersLinkOrNoKey(t *testing.T) {
 	publishJSON := func(t *testing.T, noFrontendOrigin bool) map[string]any {
 		t.Helper()
@@ -298,10 +266,7 @@ func TestAppPublishJSONCarriesTheServersLinkOrNoKey(t *testing.T) {
 	})
 }
 
-// `app status` establishes the link from the REMOTE read, so a signed-out run —
-// which never makes one — has nothing to report. It used to answer with a link
-// assembled from the binding and the instance URL, which was a guess at both
-// the origin and the row.
+// The link comes from the remote read, which a signed-out run never makes.
 func TestAppStatusSignedOutReportsNoLink(t *testing.T) {
 	f := newFakeAppInstance(t)
 	live := f.AddApp(&api.DataApp{ID: "data_app-1"})

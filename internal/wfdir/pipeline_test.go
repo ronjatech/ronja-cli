@@ -9,14 +9,8 @@ import (
 
 // ── The kind registry ───────────────────────────────────────────────────────
 
-// TestEveryKindNamesItsOwnCommand: Kind.Command is the ONE mapping from a folder
-// kind to the CLI command that drives it, and it replaced two binary if/else
-// spellings of the same thing (wfdir.commandFor and commands.kindCommand), both
-// of which would have routed a third kind to `ronja wf`.
-//
-// The test is on the registry rather than on a list of literals because a fourth
-// kind is added by adding a kindByName entry, and that is exactly the moment the
-// question has to be answered.
+// Iterates the registry rather than a literal list, so a new kindByName entry
+// is checked the moment it is added.
 func TestEveryKindNamesItsOwnCommand(t *testing.T) {
 	seen := map[string]string{}
 	for name, kind := range kindByName {
@@ -39,19 +33,8 @@ func TestEveryKindNamesItsOwnCommand(t *testing.T) {
 	}
 }
 
-// TestLoadManifestRoutesEveryWrongKindToTheRightCommand walks the full matrix:
-// a folder of each kind, opened as each OTHER kind, must refuse AND name the
-// command that would have worked.
-//
-// The third kind is the reason this is a matrix rather than the one-direction
-// check the two-kind world got away with. Under the old binary branches a
-// pipeline folder opened as a workflow refused correctly by accident (the kinds
-// differ) while pointing at `ronja wf` — the command the caller had just run.
 func TestLoadManifestRoutesEveryWrongKindToTheRightCommand(t *testing.T) {
-	// Derived from the registry rather than listed, for the reason
-	// TestEveryKindNamesItsOwnCommand states: a kind is added by adding a
-	// kindByName entry, and a literal list is one somebody forgets to extend —
-	// which would leave the new kind's whole wrong-kind matrix unchecked.
+	// From the registry, for TestEveryKindNamesItsOwnCommand's reason.
 	var kinds []Kind
 	for _, kind := range kindByName {
 		kinds = append(kinds, kind)
@@ -77,7 +60,6 @@ func TestLoadManifestRoutesEveryWrongKindToTheRightCommand(t *testing.T) {
 				t.Errorf("a %s folder opened as %s should point at %q, got: %v",
 					onDisk.Name, openedAs.Name, onDisk.Command, err)
 			}
-			// And it must NOT point at the command that just refused it.
 			if strings.Contains(err.Error(), "use `"+openedAs.Command+"`") {
 				t.Errorf("a %s folder opened as %s points back at %q, the command that refused it: %v",
 					onDisk.Name, openedAs.Name, openedAs.Command, err)
@@ -86,9 +68,8 @@ func TestLoadManifestRoutesEveryWrongKindToTheRightCommand(t *testing.T) {
 	}
 }
 
-// TestLoadManifestNoKindNamesTheCallersOwnCommand: a manifest with no `kind` is
-// a hand-written or truncated file, so the fix-it line names the command the
-// caller ran — which for a pipeline folder must not be `ronja wf init`.
+// A manifest with no `kind` is hand-written or truncated, so the fix-it line
+// names the command the caller ran.
 func TestLoadManifestNoKindNamesTheCallersOwnCommand(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(ManifestPath(root), []byte(`{"title":"X"}`+"\n"), 0o644); err != nil {
@@ -103,9 +84,6 @@ func TestLoadManifestNoKindNamesTheCallersOwnCommand(t *testing.T) {
 	}
 }
 
-// TestPipelineManifestToleratesAnEmptyEntrypoint: a pipeline folder has no
-// entrypoint, and LoadManifest falls back to Kind.DefaultEntrypoint — itself
-// empty here. Nothing may invent "main.py" on the way through.
 func TestPipelineManifestToleratesAnEmptyEntrypoint(t *testing.T) {
 	root := t.TempDir()
 	if err := SaveManifest(root, &Manifest{Kind: KindPipeline, Title: "Sales pipeline"}); err != nil {
@@ -122,15 +100,8 @@ func TestPipelineManifestToleratesAnEmptyEntrypoint(t *testing.T) {
 
 // ── The multi-resource binding ──────────────────────────────────────────────
 
-// TestPipelineBindingRefusesTheSingleIDHelpers: ResourceID / WithResourceID are
-// how kind-agnostic code asks "which row is this folder", and a pipeline folder
-// has no answer to that question.
-//
-// The refusal is the whole point of the change: before it, both helpers were
-// `if dataapp { … } else { workflow }`, so a pipeline folder would have READ an
-// empty WorkflowID (indistinguishable from "never pushed here", which a push
-// acts on by creating everything again) and WRITTEN a table id into a field
-// nothing would ever look for.
+// A pipeline folder has no single row: an answer would be an empty WorkflowID,
+// which a push reads as "never pushed here" and acts on by creating everything again.
 func TestPipelineBindingRefusesTheSingleIDHelpers(t *testing.T) {
 	b := Binding{FeatureID: "collection-1", Tables: map[string]string{"orders.sql": "table-1"}}
 
@@ -144,15 +115,11 @@ func TestPipelineBindingRefusesTheSingleIDHelpers(t *testing.T) {
 	if got.WorkflowID != "" || got.DataAppID != "" {
 		t.Errorf("a refused WithResourceID must write nothing, got %+v", got)
 	}
-	// And the two kinds that DO have a single row still answer.
 	if id, err := (Binding{WorkflowID: "wf-1"}).ResourceID(WorkflowKind); err != nil || id != "wf-1" {
 		t.Errorf("ResourceID(WorkflowKind) = %q, %v", id, err)
 	}
 }
 
-// TestBindingTablesRoundTrip: the Tables map is what a pipeline folder is bound
-// BY, so it has to survive the committed file — and it must not appear at all
-// in a workflow or data-app manifest.
 func TestBindingTablesRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	key := InstanceKey{URL: "https://cloud.ronja.tech", TenantID: "tenant-1"}
@@ -196,8 +163,7 @@ func TestBindingTablesRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBindingTablesIsOmittedWhenEmpty: omitempty is what keeps a workflow's
-// committed manifest byte-identical to what it was before pipelines existed.
+// omitempty keeps a workflow's committed manifest free of a pipeline-only key.
 func TestBindingTablesIsOmittedWhenEmpty(t *testing.T) {
 	root := t.TempDir()
 	key := InstanceKey{URL: "https://cloud.ronja.tech"}
@@ -215,9 +181,8 @@ func TestBindingTablesIsOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
-// TestWithTableCopiesTheMap: Binding is a value type with a reference field, so
-// a WithTable that wrote through would reach into the Manifest entry the copy
-// came from — recording a binding that SaveManifest never persisted.
+// Binding is a value type with a map field, so a WithTable that wrote through
+// would reach into the Manifest entry the copy came from.
 func TestWithTableCopiesTheMap(t *testing.T) {
 	original := Binding{Tables: map[string]string{"a.sql": "table-a"}}
 	updated := original.WithTable("b.sql", "table-b")
@@ -228,7 +193,7 @@ func TestWithTableCopiesTheMap(t *testing.T) {
 	if updated.Tables["a.sql"] != "table-a" || updated.Tables["b.sql"] != "table-b" {
 		t.Errorf("WithTable lost an entry: %+v", updated.Tables)
 	}
-	// A nil map is the ordinary first-push state and must not panic.
+	// A nil map is the ordinary first-push state.
 	fresh := Binding{}.WithTable("c.sql", "table-c")
 	if fresh.Tables["c.sql"] != "table-c" {
 		t.Errorf("WithTable on a nil map: %+v", fresh.Tables)
@@ -237,9 +202,8 @@ func TestWithTableCopiesTheMap(t *testing.T) {
 
 // ── The baseline's table state ──────────────────────────────────────────────
 
-// TestTableStateRoundTrip: push resumes its own draft from this rather than
-// spending a round trip, so a state file that lost DraftID would silently make
-// every push check out a second draft (which the server refuses).
+// Push resumes its own draft from DraftID; losing it would make every push
+// check out a second draft, which the server refuses.
 func TestTableStateRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	key := InstanceKey{URL: "https://cloud.ronja.tech", TenantID: "tenant-1"}
@@ -267,17 +231,14 @@ func TestTableStateRoundTrip(t *testing.T) {
 	if got := inst.Tables["revenue.sql"]; got.TableID != "table-revenue" || got.DraftID != "table-draft-1" {
 		t.Errorf("revenue.sql did not round-trip: %+v", got)
 	}
-	// An absent DraftID is the ordinary "no open draft" state, not a decode
-	// failure — and it must come back empty rather than inheriting a neighbour's.
+	// An absent DraftID must come back empty rather than inheriting a neighbour's.
 	if got := inst.Tables["orders.sql"]; got.TableID != "table-orders" || got.DraftID != "" {
 		t.Errorf("orders.sql did not round-trip: %+v", got)
 	}
 }
 
-// TestTableStateIsAbsentWhenUnmanaged: the three-state rule. An ABSENT "tables"
-// key means "this folder does not track table state" — every workflow and
-// data-app baseline, and any pipeline baseline written before the key existed —
-// which is not the same claim as a present-but-empty map.
+// An absent "tables" key means "not tracked", a different claim from a
+// present-but-empty map.
 func TestTableStateIsAbsentWhenUnmanaged(t *testing.T) {
 	root := t.TempDir()
 	key := InstanceKey{URL: "https://cloud.ronja.tech"}
@@ -305,8 +266,6 @@ func TestTableStateIsAbsentWhenUnmanaged(t *testing.T) {
 		t.Errorf("a workflow baseline must carry no \"tables\" key:\n%s", body)
 	}
 
-	// And an unmanaged baseline reads back as nil, which is what lets a caller
-	// tell "not tracked" from "tracked, and there are none".
 	loaded, err := LoadState(root)
 	if err != nil {
 		t.Fatal(err)
@@ -318,12 +277,8 @@ func TestTableStateIsAbsentWhenUnmanaged(t *testing.T) {
 
 // ── The syncable rule ───────────────────────────────────────────────────────
 
-// TestPipelineWalkNeverReadsANonSQLFile: the .sql rule is applied INSIDE the
-// walk, not after it.
-//
-// It is a cost property with a name: a pipeline folder is an ordinary repo
-// directory, so it can hold a venv/ or a node_modules/, and hashing every file
-// in one to throw the result away is minutes of I/O for a folder of six queries.
+// The .sql rule applies inside the walk, not after it: a pipeline folder can
+// hold a venv/ or node_modules/, and hashing them to discard is minutes of I/O.
 func TestPipelineWalkNeverReadsANonSQLFile(t *testing.T) {
 	root := t.TempDir()
 	write := func(path, body string) {
@@ -341,8 +296,7 @@ func TestPipelineWalkNeverReadsANonSQLFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enumerate: %v", err)
 	}
-	// A .sql file at DEPTH is still source: the extension rule must not be
-	// implemented by pruning directories, which would hide the whole subtree.
+	// The extension rule must not prune directories, which would hide nested .sql.
 	for _, want := range []string{"orders.sql", "staging/orders_raw.sql"} {
 		if _, ok := enumeration.Files[want]; !ok {
 			t.Errorf("%s is missing from the walk: %+v", want, enumeration.Files)
@@ -354,8 +308,6 @@ func TestPipelineWalkNeverReadsANonSQLFile(t *testing.T) {
 		}
 	}
 
-	// The same folder as a WORKFLOW takes everything, which is what makes this a
-	// property of the Kind rather than of the walk.
 	all, err := Enumerate(root, WorkflowKind)
 	if err != nil {
 		t.Fatalf("enumerate as a workflow: %v", err)
@@ -365,14 +317,8 @@ func TestPipelineWalkNeverReadsANonSQLFile(t *testing.T) {
 	}
 }
 
-// TestPipelineSyncableRuleIsTheSameOnBothSides: the walk and the layout check
-// have to answer identically, or a clone writes a file the walk never returns —
-// `status` invents a deletion and the next push acts on it by deleting the file
-// server-side.
-//
-// This is the same agreement TestStructuralExclusionAndCheckLocalPathsAgree
-// pins for the structural rules, asserted for the per-kind content rule that
-// now travels beside them.
+// A clone of a file the walk never returns becomes a phantom deletion the next
+// push performs server-side.
 func TestPipelineSyncableRuleIsTheSameOnBothSides(t *testing.T) {
 	for _, path := range []string{"notes.md", "Makefile", "queries/orders.txt", "orders.sql.bak"} {
 		if err := ValidatePath(path); err != nil {
@@ -385,9 +331,6 @@ func TestPipelineSyncableRuleIsTheSameOnBothSides(t *testing.T) {
 			t.Errorf("CheckLocalPaths accepted %q, which the walk will never return", path)
 		}
 	}
-	// Case-insensitive: `.SQL` is an ordinary thing to find in a repo that has
-	// been through Windows, and refusing to sync it while listing it nowhere is
-	// the silent surprise Skipped exists to prevent.
 	for _, path := range []string{"orders.sql", "staging/orders.SQL"} {
 		if reason := NotSyncable(path, PipelineKind); reason != "" {
 			t.Errorf("NotSyncable(%q) = %q, want it syncable", path, reason)

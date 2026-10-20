@@ -15,10 +15,7 @@ func TestInstalledByHomebrew(t *testing.T) {
 	}{
 		{"/opt/homebrew/Caskroom/ronja/0.28.4/ronja", true},
 		{"/usr/local/Caskroom/ronja/0.28.4/ronja", true},
-		// The case a $HOMEBREW_PREFIX test would get wrong: on an Intel Mac
-		// the prefix IS /usr/local, and /usr/local/bin is where somebody who
-		// unpacked the release tarball puts the binary. Telling them to run
-		// `brew upgrade ronja` would send them to a cask that is not installed.
+		// The Intel-Mac prefix, where a hand-unpacked tarball also lives.
 		{"/usr/local/bin/ronja", false},
 		{"/home/adam/go/bin/ronja", false},
 		{"/usr/bin/ronja", false},
@@ -32,8 +29,6 @@ func TestInstalledByHomebrew(t *testing.T) {
 	}
 }
 
-// The path a user actually runs is the symlink in <prefix>/bin, so resolving it
-// is what makes the Caskroom marker reachable at all.
 func TestInstalledByHomebrewFollowsSymlink(t *testing.T) {
 	root := t.TempDir()
 	staged := filepath.Join(root, "Caskroom", "ronja", "0.29.0")
@@ -58,8 +53,6 @@ func TestInstalledByHomebrewFollowsSymlink(t *testing.T) {
 }
 
 func TestAssetName(t *testing.T) {
-	// The `v` is dropped: goreleaser's archive template uses .Version while
-	// the version stamp uses .Tag.
 	if got := AssetName("v0.29.0", "darwin", "arm64"); got != "ronja_0.29.0_darwin_arm64.tar.gz" {
 		t.Errorf("AssetName = %q", got)
 	}
@@ -68,8 +61,7 @@ func TestAssetName(t *testing.T) {
 	}
 }
 
-// digest is a stand-in SHA-256: the LENGTH is part of what makes a line a
-// checksum line, so a four-character marker would now be skipped as not one.
+// digest is full length because a shorter marker is skipped as not a digest.
 func digest(c string) string { return strings.Repeat(c, sha256HexLen) }
 
 func TestChecksumFor(t *testing.T) {
@@ -81,8 +73,6 @@ func TestChecksumFor(t *testing.T) {
 	if sum, err := ChecksumFor(manifest, "ronja_0.29.0_darwin_arm64.tar.gz"); err != nil || sum != digest("b") {
 		t.Errorf("ChecksumFor = (%q, %v), want (%s, nil)", sum, err, digest("b"))
 	}
-	// The binary-mode `*name` form parses too, so a manifest from another
-	// producer is not read as "this asset is not listed".
 	if sum, err := ChecksumFor(manifest, "ronja_0.29.0_linux_amd64.tar.gz"); err != nil || sum != digest("c") {
 		t.Errorf("ChecksumFor(binary form) = (%q, %v), want (%s, nil)", sum, err, digest("c"))
 	}
@@ -91,27 +81,17 @@ func TestChecksumFor(t *testing.T) {
 	}
 }
 
-// The digest field is validated, so a line that is not a checksum line cannot
-// be returned as one. Each shape here has an asset name in it somewhere and a
-// first field that is not a 64-character hex digest; answering with that field
-// would hand the caller something the archive can only mismatch, and the user
-// would read a corrupt-download refusal where the truth is "this manifest does
-// not list your platform".
+// Each shape names the asset but has a first field that is not a digest;
+// returning it would read as a corrupt download instead of not listed.
 func TestChecksumForSkipsLinesThatAreNotDigests(t *testing.T) {
 	asset := "ronja_0.29.0_darwin_arm64.tar.gz"
 	cases := map[string]string{
-		// GNU coreutils' own comment form, and the shape a human adds.
 		"a comment line": "# checksums for " + asset + "\n",
-		// A header some pipelines print above the list.
-		"a header line": "SHA256 " + asset + "\n",
-		// BSD's `shasum --tag` output: the name is in parentheses and the
-		// digest is LAST, so the first field is the algorithm.
-		"the BSD tag form": "SHA256 (" + asset + ") = " + digest("a") + "\n",
-		// A UTF-8 BOM on the first line, which is what a Windows editor
-		// leaves behind: the digest is there but the field no longer is one.
+		"a header line":  "SHA256 " + asset + "\n",
+		// `shasum --tag`: the digest is last, the first field the algorithm.
+		"the BSD tag form":        "SHA256 (" + asset + ") = " + digest("a") + "\n",
 		"a BOM before the digest": "\ufeff" + digest("a") + "  " + asset + "\n",
-		// Hex, but half a digest.
-		"a truncated digest": strings.Repeat("a", 32) + "  " + asset + "\n",
+		"a truncated digest":      strings.Repeat("a", 32) + "  " + asset + "\n",
 	}
 	for name, manifest := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -123,8 +103,6 @@ func TestChecksumForSkipsLinesThatAreNotDigests(t *testing.T) {
 	}
 }
 
-// A BOM on the first line must not hide the digest on the SECOND one: the
-// refusal above is about the line the BOM is on, not about the manifest.
 func TestChecksumForReadsPastABOMLine(t *testing.T) {
 	asset := "ronja_0.29.0_darwin_arm64.tar.gz"
 	manifest := []byte("\ufeff# ronja checksums\n" + digest("a") + "  " + asset + "\n")
@@ -133,9 +111,6 @@ func TestChecksumForReadsPastABOMLine(t *testing.T) {
 	}
 }
 
-// Hex is a number: a producer that writes the digest in upper case has not
-// said anything different, and the validation must not turn that into "not
-// listed".
 func TestChecksumForAcceptsUppercaseHex(t *testing.T) {
 	asset := "ronja_0.29.0_darwin_arm64.tar.gz"
 	upper := strings.ToUpper(digest("a"))
@@ -148,12 +123,6 @@ func TestChecksumForAcceptsUppercaseHex(t *testing.T) {
 	}
 }
 
-// One asset listed twice with two different sums has no right answer: taking
-// the first (or the last) would let a manifest carrying both the honest sum and
-// somebody else's decide by ordering alone which one the archive is verified
-// against. A duplicated line that agrees with itself is not that case, and hex
-// is a number rather than a string — the same digest in upper case is the same
-// digest.
 func TestChecksumForDuplicates(t *testing.T) {
 	asset := "ronja_0.29.0_darwin_arm64.tar.gz"
 
@@ -173,11 +142,8 @@ func TestChecksumForDuplicates(t *testing.T) {
 	}
 }
 
-// The name is the whole remainder of the line, not the second whitespace-
-// separated field. goreleaser never emits a name with a space in it, so this is
-// not a case that has to work — but splitting on whitespace would have made
-// such a name silently unfindable, which reads to a user as "this release has
-// no checksum for your platform".
+// goreleaser never emits such a name, but splitting on whitespace would make
+// one silently unfindable.
 func TestChecksumForANameWithASpace(t *testing.T) {
 	manifest := []byte(digest("d") + "  ronja 0.29.0 darwin arm64.tar.gz\n")
 	if sum, err := ChecksumFor(manifest, "ronja 0.29.0 darwin arm64.tar.gz"); err != nil || sum != digest("d") {

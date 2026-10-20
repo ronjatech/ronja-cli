@@ -11,17 +11,10 @@ import (
 	"time"
 )
 
-// Same discipline as workflow_test.go: the fixture is TAG VERIFICATION against
-// rscheduledjob.ScheduledJobWithActionResponse and the rdb.ScheduledJob it
-// embeds, because a name that does not match decodes to the zero value in
-// silence — and here that silence reads as an automation with no schedule, no
-// watched tables, or no action at all.
-//
-// The two ROW spellings are the point of half of it: the row emits
-// `emailAllowedFromAddrs` and `watchedTableIDs`, while the create/update bodies
-// read `emailAllowedFromAddresses` and `watchedTableIds`. A mirror that used the
-// input names on the read type would decode both to empty and report a
-// configured allowlist as unconfigured.
+// The fixture is TAG VERIFICATION against
+// rscheduledjob.ScheduledJobWithActionResponse: a mismatched name decodes
+// silently to zero. The row emits `emailAllowedFromAddrs` and `watchedTableIDs`
+// while the write bodies read `emailAllowedFromAddresses` and `watchedTableIds`.
 const automationFixture = `{
   "id": "sj-abc",
   "tenantID": "t-1",
@@ -143,8 +136,6 @@ func TestGetAutomationDecodesEveryMirroredField(t *testing.T) {
 		}
 	}
 
-	// The action is the whole reason this route is usable — before this branch
-	// GET returned the bare row and only LIST carried one.
 	if a.Action == nil {
 		t.Fatal("no action decoded — a folder cannot be read back without it")
 	}
@@ -154,23 +145,20 @@ func TestGetAutomationDecodesEveryMirroredField(t *testing.T) {
 	if a.Action.Config.Model == nil || *a.Action.Config.Model != "standard" {
 		t.Errorf("action config model = %v", a.Action.Config.Model)
 	}
-	// References ride INSIDE the action's config, so a route that returns the
-	// action returns them — there is no second call to make.
+	// References ride INSIDE the action's config: no second call.
 	if len(a.Action.Config.References) != 2 ||
 		a.Action.Config.References[0] != (AutomationReference{ResourceID: "note-policy", Kind: "note"}) {
 		t.Errorf("references = %+v", a.Action.Config.References)
 	}
 
-	// optional.V[int]: an explicit value is a pointer, `null` stays nil — the
-	// difference between a declared limit and "inherit the organization's".
+	// `null` stays nil: "inherit the organization's", not a declared limit.
 	if a.RateLimitPerMinute == nil || *a.RateLimitPerMinute != 5 {
 		t.Errorf("RateLimitPerMinute = %v", a.RateLimitPerMinute)
 	}
 	if a.RateLimitPerDay != nil {
 		t.Errorf("a null rate limit must stay nil, got %v", *a.RateLimitPerDay)
 	}
-	// optional.V[string] marshals `null` when unset, and unmarshalling null into
-	// a string is a documented no-op.
+	// Unmarshalling the server's `null` into a string is a no-op.
 	if a.WorkspaceID != "" {
 		t.Errorf("WorkspaceID = %q, want empty", a.WorkspaceID)
 	}
@@ -183,10 +171,9 @@ func TestGetAutomationDecodesEveryMirroredField(t *testing.T) {
 	}
 }
 
-// TestAutomationStampIsTheLockAnchor: the value has to be one spelling, because
-// it is compared against ITSELF across runs — and a ZERO time must answer "",
-// which disarms the guard, rather than a well-formed year-1 anchor that claims
-// agreement and can never match again.
+// The stamp is compared against ITSELF across runs, so it must have one
+// spelling; a ZERO time answers an empty string, disarming the guard, rather
+// than a year-1 anchor that can never match again.
 func TestAutomationStampIsTheLockAnchor(t *testing.T) {
 	a := &Automation{UpdatedAt: time.Date(2026, 9, 2, 9, 15, 0, 0, time.UTC)}
 	if got := a.Stamp(); got != "2026-09-02T09:15:00Z" {
@@ -205,8 +192,6 @@ func TestAutomationStampIsTheLockAnchor(t *testing.T) {
 		t.Errorf("a nil automation must disarm the guard, got %q", got)
 	}
 }
-
-// ── The list, and the cliff it refuses to walk off ──────────────────────────
 
 func TestListAutomationsAsksForOneFeatureAndOnePage(t *testing.T) {
 	var gotQuery string
@@ -240,13 +225,9 @@ func TestListAutomationsAsksForOneFeatureAndOnePage(t *testing.T) {
 	}
 }
 
-// TestListAutomationsRefusesATruncatedPage is the load-bearing one.
-//
-// The server's page token encodes an OFFSET, so paging while rows are created or
-// deleted skips one — and a row a sync loop cannot see reads as deleted, which
-// the next push acts on by creating a duplicate beside the live one. A short
-// list is the same failure with no error attached. So: refuse, and name the
-// cliff.
+// Paging by OFFSET while rows change skips one, and a row a sync loop cannot
+// see reads as deleted, so the next push creates a duplicate. A short list must
+// be refused.
 func TestListAutomationsRefusesATruncatedPage(t *testing.T) {
 	calls := 0
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -291,16 +272,9 @@ func TestListAutomationsAcceptsACompletePage(t *testing.T) {
 	}
 }
 
-// TestListAutomationsDropsWhatTheServerDidNotFilter is the guard against the
-// deployment this CLI cannot see.
-//
-// `ronja` is `go install`-ed independently of the instance it points at. Against
-// a backend older than the `featureID` parameter the filter is accepted and
-// ignored: the response is every automation the caller can see, `total` is the
-// organization-wide count, and for an organization under the page cap that count
-// EQUALS what came back — so the truncation refusal passes and the whole
-// organization arrives looking exactly like one feature's set. Phase B's orphan
-// detection reads this list and deletes what the folder does not have.
+// A backend older than the `featureID` parameter ignores it and returns the
+// whole organization with a matching total, so the truncation refusal passes;
+// orphan detection would then delete what the folder does not have.
 func TestListAutomationsDropsWhatTheServerDidNotFilter(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		// An unfiltered answer: three rows, two of them somebody else's feature,
@@ -318,17 +292,14 @@ func TestListAutomationsDropsWhatTheServerDidNotFilter(t *testing.T) {
 	if len(rows) != 1 || rows[0].ID != "sj-1" {
 		t.Fatalf("rows = %+v — a row this feature does not own must not be reported as its own", rows)
 	}
-	// A legacy row with no featureID at all is the same case: it cannot belong
-	// to the feature that was asked for, whatever the server meant by returning
-	// it. And Normalize still ran on what survived.
+	// A legacy row with no featureID cannot belong to the feature asked for.
 	if rows[0].ApprovedTools == nil {
 		t.Errorf("nil slices survived Normalize: %+v", rows[0])
 	}
 }
 
-// A feature the caller cannot read is a 404, matching the sibling trash route so
-// the two cannot disagree — a 403 would confirm the feature exists. The status
-// has to reach the caller, which is what api.Error carries.
+// A feature the caller cannot read is a 404, as on the sibling trash route: a
+// 403 would confirm it exists.
 func TestListAutomationsSurfacesTheStatus(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -340,16 +311,9 @@ func TestListAutomationsSurfacesTheStatus(t *testing.T) {
 	}
 }
 
-// ── The write bodies ────────────────────────────────────────────────────────
-
-// TestCreateAutomationSendsOneSpellingAndNoPrivate is the shape check that
-// matters more than any field it asserts.
-//
-// Sending BOTH spellings of one aliased field is a 400, so the body must carry
-// exactly one — and `private` must not appear at all: the update route refuses a
-// changed value, and a folder that could declare visibility would make the row
-// invisible to the next colleague who pushes, whose status then reports it gone
-// and whose push creates a duplicate.
+// Both spellings of one aliased field is a 400. `private` must never be sent: a
+// folder that declared visibility would hide the row from the next colleague
+// who pushes, whose push then creates a duplicate.
 func TestCreateAutomationSendsOneSpellingAndNoPrivate(t *testing.T) {
 	var body map[string]any
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -392,22 +356,18 @@ func TestCreateAutomationSendsOneSpellingAndNoPrivate(t *testing.T) {
 			t.Errorf("the body carries both %q and %q — sending both spellings is a 400", canonical, alias)
 		}
 	}
-	// A false `enabled` has to survive: it is a pointer precisely so "declared
-	// off" is distinguishable from "not managed", and omitempty on a bare bool
-	// would have collapsed the two.
+	// A false `enabled` must survive: "declared off" is not "not managed".
 	if got, ok := body["enabled"]; !ok || got != false {
 		t.Errorf("enabled = %v (present=%v), want an explicit false", got, ok)
 	}
-	// The one-time reveal is decoded, because it appears nowhere else ever.
+	// The one-time reveal appears nowhere else ever.
 	if created.WebhookSigningSecret != "shhh" {
 		t.Errorf("the create response's signing secret was lost: %+v", created)
 	}
 }
 
-// TestAutomationPatchCanClearAListAndSaysNothingOtherwise: every field is a
-// pointer so an explicit empty list REPLACES and an absent one leaves the value
-// alone. A plain slice with omitempty collapses the two, which makes it
-// impossible to remove the last watched table.
+// An explicit empty list REPLACES and an absent one leaves the value alone;
+// omitempty on a plain slice would make the last watched table unremovable.
 func TestAutomationPatchCanClearAListAndSaysNothingOtherwise(t *testing.T) {
 	var body map[string]any
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -443,8 +403,8 @@ func TestAutomationPatchCanClearAListAndSaysNothingOtherwise(t *testing.T) {
 	}
 }
 
-// TestAutomationPatchEmpty: Update and the reference/action writes are separate
-// server-side calls, so a needless PUT is another chance to half-apply.
+// Update and the reference/action writes are separate server calls, so a
+// needless PUT is another chance to half-apply.
 func TestAutomationPatchEmpty(t *testing.T) {
 	if !(AutomationPatch{}).Empty() {
 		t.Error("a zero patch must report empty")

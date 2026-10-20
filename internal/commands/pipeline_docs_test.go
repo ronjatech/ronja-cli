@@ -13,7 +13,6 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// writeSidecar puts a docs sidecar into a pipeline folder.
 func writeSidecar(t *testing.T, root, alias, body string) {
 	t.Helper()
 	dir := filepath.Join(root, wfdir.TableDocsDirName)
@@ -26,8 +25,7 @@ func writeSidecar(t *testing.T, root, alias, body string) {
 }
 
 // declareTableDependency adds an alias → id binding to a folder's manifest, the
-// way `ronja bind` does. It is what makes one committed folder deployable to
-// several organizations, and it is how a docs sidecar names its table.
+// way `ronja bind` does.
 func declareTableDependency(t *testing.T, root string, key wfdir.InstanceKey, alias, id string) {
 	t.Helper()
 	manifest := pipelineManifestOf(t, root)
@@ -35,9 +33,8 @@ func declareTableDependency(t *testing.T, root string, key wfdir.InstanceKey, al
 		manifest.Dependencies = map[string]wfdir.Dependency{}
 	}
 	manifest.Dependencies[alias] = wfdir.Dependency{Kind: "table"}
-	// The bind map lives on the ENTRY, not on the embedded Binding — see
-	// wfdir.Instance.Bind — so it is written in place rather than through
-	// SetBinding, which replaces an entry wholesale.
+	// The bind map lives on the entry, not the embedded Binding, so it is written
+	// in place: SetBinding replaces an entry wholesale.
 	found := false
 	for i := range manifest.Instances {
 		if !wfdir.Matches(manifest.Instances[i].Key(), key) {
@@ -57,15 +54,11 @@ func declareTableDependency(t *testing.T, root string, key wfdir.InstanceKey, al
 	}
 }
 
-// TestPipelinePushSendsTheHeaderAsDocumentation is the whole wire contract for
-// the .sql carrier: what goes on the CREATE, what goes on the draft PUT, and in
-// what ORDER.
 func TestPipelinePushSendsTheHeaderAsDocumentation(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
-	// The columns the table has MEASURED. `margin` is deliberately not among
-	// them — the join rule's right-hand side, and the case the report exists for.
+	// `margin` is deliberately not a measured column: the unmatched case.
 	f.fields["table-revenue"] = []string{"id", "total"}
 	editFile(t, root, "revenue.sql", strings.Join([]string{
 		"-- @table One row per invoice line.",
@@ -80,9 +73,8 @@ func TestPipelinePushSendsTheHeaderAsDocumentation(t *testing.T) {
 		t.Fatalf("push: %v\n%s", err, stderr)
 	}
 
-	// TWO PUTs, and the SECOND is the documentation. The order is the rule: the
-	// join rule attaches prose to the columns the table has MEASURED, so the
-	// documentation must follow the build.
+	// The docs PUT must follow the code PUT: prose attaches only to columns the
+	// build has measured.
 	if len(f.updates) != 2 {
 		t.Fatalf("want a code PUT then a docs PUT, got %+v", f.updates)
 	}
@@ -90,9 +82,8 @@ func TestPipelinePushSendsTheHeaderAsDocumentation(t *testing.T) {
 	if !code.SetsCode || code.Fields != nil || code.Description != nil {
 		t.Errorf("the code PUT must carry no documentation: %+v", code)
 	}
-	// THE DOCS PUT NAMES NO `code` AND NO `inputModels`. Every field of the
-	// server's patch is an optional, so an absent key leaves the column alone —
-	// and a body that sent `"code": ""` would wipe the SQL this push just wrote.
+	// The server's patch leaves an absent key alone, so a docs body sending
+	// `"code": ""` would wipe the SQL this push just wrote.
 	if docs.SetsCode || docs.SetsInputModels {
 		t.Fatalf("the documentation PUT named code/inputModels: %+v", docs)
 	}
@@ -118,7 +109,6 @@ func TestPipelinePushSendsTheHeaderAsDocumentation(t *testing.T) {
 		}
 	}
 
-	// THE REPORT, read back from the server rather than predicted.
 	payload := decodeJSON(t, out)
 	file := payload["files"].([]any)[0].(map[string]any)
 	if file["outcome"] != pushOutcomePushed {
@@ -139,14 +129,13 @@ func TestPipelinePushSendsTheHeaderAsDocumentation(t *testing.T) {
 	}
 }
 
-// TestPipelinePushWithoutAHeaderSendsNoDocumentation: opt-in is the whole design.
-// A folder that has not adopted the header must make byte-identical requests to
-// the ones it made before this feature existed.
+// TestPipelinePushWithoutAHeaderSendsNoDocumentation: documentation is opt-in,
+// so a folder without a header sends no docs fields and records no fingerprint.
 func TestPipelinePushWithoutAHeaderSendsNoDocumentation(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
-	// A leading comment that does NOT open with @table. Ordinary commentary.
+	// A leading comment that does not open with @table is ordinary commentary.
 	editFile(t, root, "revenue.sql", "-- joins orders to customers, watch the fanout\nSELECT 1 FROM {{ ref('table-orders') }}")
 
 	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json"); err != nil {
@@ -158,8 +147,6 @@ func TestPipelinePushWithoutAHeaderSendsNoDocumentation(t *testing.T) {
 	if f.updates[0].Fields != nil || f.updates[0].Description != nil {
 		t.Fatalf("a folder that did not opt in must send no documentation: %+v", f.updates[0])
 	}
-	// And nothing is recorded, so the guard it would arm does not exist for this
-	// folder either.
 	if meta := lockTableMetaOf(t, root, f, "revenue.sql"); meta != "" {
 		t.Errorf("a folder that documents nothing recorded a documentation fingerprint: %q", meta)
 	}
@@ -188,11 +175,9 @@ func TestPipelinePushSendsTheHeaderOnCreate(t *testing.T) {
 	}
 }
 
-// TestPipelinePushRefusesWhenTheDocumentationMoved is the third drift leg.
-//
-// It is a SEPARATE leg from the SQL fingerprint on purpose: the file's SQL is
-// untouched here, so a guard that only watched `code` would let this push
-// silently overwrite an admin's prose at the next publish.
+// TestPipelinePushRefusesWhenTheDocumentationMoved: documentation drift is its
+// own leg, separate from the SQL fingerprint, because a guard watching only
+// `code` would let a push overwrite an admin's prose while the SQL is untouched.
 func TestPipelinePushRefusesWhenTheDocumentationMoved(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -201,7 +186,6 @@ func TestPipelinePushRefusesWhenTheDocumentationMoved(t *testing.T) {
 	documented := "-- @table Ours.\n-- @column id: our prose\nSELECT * FROM {{ ref('table-orders') }}"
 	editFile(t, root, "revenue.sql", documented)
 
-	// First push: records the agreement.
 	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json"); err != nil {
 		t.Fatalf("first push: %v\n%s", err, stderr)
 	}
@@ -209,13 +193,10 @@ func TestPipelinePushRefusesWhenTheDocumentationMoved(t *testing.T) {
 		t.Fatal("the first documenting push recorded no fingerprint, so the guard is disarmed for ever")
 	}
 
-	// Somebody rewrites the LIVE table's description in the web app. The SQL is
-	// untouched.
 	f.mu.Lock()
 	f.tables["table-revenue"].Description = "somebody else wrote this"
 	f.mu.Unlock()
 
-	// A push of the same file — edited, so there is something to push.
 	editFile(t, root, "revenue.sql", documented+"\n-- trailing edit")
 	_, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json")
 	if err == nil {
@@ -224,17 +205,12 @@ func TestPipelinePushRefusesWhenTheDocumentationMoved(t *testing.T) {
 	if !strings.Contains(stderr, "documentation") {
 		t.Fatalf("the refusal must name what moved: %s", stderr)
 	}
-	// And it must not say the SQL moved. Nothing about the code changed on the
-	// server, so a reader sent to look for a code difference finds none — and a
-	// message that is wrong in a case people meet is one nobody reads in the
-	// cases it is right.
 	if strings.Contains(stderr, "the SQL of table-revenue changed") {
 		t.Errorf("a documentation-only drift was announced as a SQL change: %s", stderr)
 	}
 
-	// --force overwrites, and RE-RECORDS the agreement — or the same difference
-	// would be re-reported on every later push and --force would become a
-	// permanent part of the command line.
+	// --force must re-record the agreement, or every later push re-reports the
+	// same difference.
 	before := lockTableMetaOf(t, root, f, "revenue.sql")
 	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--force", "--json"); err != nil {
 		t.Fatalf("forced push: %v\n%s", err, stderr)
@@ -244,14 +220,12 @@ func TestPipelinePushRefusesWhenTheDocumentationMoved(t *testing.T) {
 	}
 }
 
-// TestPipelinePushDocumentsASidecarTable is the second carrier: a table this
-// folder does NOT build, named through the alias layer so one committed folder
-// can deploy to several organizations.
+// TestPipelinePushDocumentsASidecarTable: a sidecar documents a table this folder
+// does not build, named through the alias layer.
 func TestPipelinePushDocumentsASidecarTable(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
-	// An INTEGRATION table: no .sql file anywhere, and never will be one.
 	f.AddTable(&api.Table{ID: "table-raw", Name: "Fortnox invoices", FeatureID: "collection-1", Kind: "integration"})
 	f.fields["table-raw"] = []string{"invoice_no", "amount"}
 	declareTableDependency(t, root, f.Key(), "fortnox_invoices", "table-raw")
@@ -280,13 +254,13 @@ func TestPipelinePushDocumentsASidecarTable(t *testing.T) {
 	if got := toStrings(result["attachedColumns"]); len(got) != 1 || got[0] != "amount" {
 		t.Errorf("attachedColumns = %v", got)
 	}
-	// THE JOIN RULE, and the reason a committed docs file is safe to keep in git:
-	// a name the data does not have is reported, never an error.
+	// A name the data does not have is reported, never an error, so a committed
+	// docs file survives a column rename.
 	if got := toStrings(result["unmatchedColumns"]); len(got) != 1 || got[0] != "renamed_last_week" {
 		t.Errorf("unmatchedColumns = %v", got)
 	}
 
-	// THREE-STATE: `invoice_no` was never named, so it must be untouched.
+	// A column the file never names is left untouched.
 	f.mu.Lock()
 	stored := f.columnDocs["table-raw"]
 	description := f.tables["table-raw"].Description
@@ -301,7 +275,6 @@ func TestPipelinePushDocumentsASidecarTable(t *testing.T) {
 		t.Errorf("description = %q", description)
 	}
 
-	// A second push writes nothing: the row already says what the file says.
 	updatesBefore := len(f.updates)
 	out, stderr, err = runPipelineCLI(t, root, "pipeline", "push", "--json")
 	if err != nil {
@@ -315,19 +288,16 @@ func TestPipelinePushDocumentsASidecarTable(t *testing.T) {
 	if entry["outcome"] != docsOutcomeUpToDate {
 		t.Errorf("outcome = %v, want %q", entry["outcome"], docsOutcomeUpToDate)
 	}
-	// And the RUN says so. `upToDate` is the one key a script watches to decide
-	// whether a push changed the organization, and it is reported from the
-	// outcomes rather than from the early return that only a folder with no
-	// sidecars at all can now reach.
+	// `upToDate` is what a script watches, so it must be derived from the docs
+	// outcomes too, not only from the no-work early return.
 	if payload["upToDate"] != true {
 		t.Errorf("a clean run over a sidecar folder reported upToDate = %v", payload["upToDate"])
 	}
 }
 
-// TestPipelinePushRefusesASidecarWithNoBinding: the loop may only ever ask about
-// names the folder already declares. A sidecar naming an alias nothing binds is
-// refused where it is written rather than resolved by browsing the organization
-// for a table with a similar name.
+// TestPipelinePushRefusesASidecarWithNoBinding: a sidecar naming an alias nothing
+// binds is refused, never resolved by searching the organization for a similar
+// table name.
 func TestPipelinePushRefusesASidecarWithNoBinding(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -350,10 +320,8 @@ func TestPipelinePushRefusesASidecarWithNoBinding(t *testing.T) {
 	}
 }
 
-// TestPipelinePushRefusesASidecarThatDoesNotParse: an unknown key is an ERROR,
-// not a dropped field. A dropped key is the failure this whole loop exists to
-// remove — the file says one thing, the row keeps another, and nothing reports
-// a difference.
+// TestPipelinePushRefusesASidecarThatDoesNotParse: an unknown key is an error,
+// never a dropped field, or the file and the row would disagree silently.
 func TestPipelinePushRefusesASidecarThatDoesNotParse(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -370,14 +338,11 @@ func TestPipelinePushRefusesASidecarThatDoesNotParse(t *testing.T) {
 	if entry["outcome"] != docsOutcomeRefused {
 		t.Fatalf("docs entry = %+v", entry)
 	}
-	// And nothing was written: the refusal is local, before any request.
 	if len(f.updates) != 0 {
 		t.Errorf("an unparseable file still reached the server: %+v", f.updates)
 	}
 }
 
-// TestPipelinePushRefusesASidecarWhoseTableMoved is the sidecar's drift guard,
-// and --force overriding it.
 func TestPipelinePushRefusesASidecarWhoseTableMoved(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -391,8 +356,6 @@ func TestPipelinePushRefusesASidecarWhoseTableMoved(t *testing.T) {
 		t.Fatalf("first push: %v\n%s", err, stderr)
 	}
 
-	// Somebody documents another column in the web app, and edits the file here
-	// so there is something to push.
 	f.mu.Lock()
 	f.fields["table-raw"] = append(f.fields["table-raw"], "invoice_no")
 	f.columnDocs["table-raw"]["invoice_no"] = "somebody else's prose"
@@ -417,15 +380,12 @@ func TestPipelinePushRefusesASidecarWhoseTableMoved(t *testing.T) {
 	if stored["amount"] != "ours, reworded" {
 		t.Errorf("--force did not write: %q", stored["amount"])
 	}
-	// The unmanaged column survives the overwrite: --force is permission to write
-	// what this folder declares, not to blank what it does not.
+	// --force writes what this folder declares; it never blanks what it does not.
 	if stored["invoice_no"] != "somebody else's prose" {
 		t.Errorf("--force cleared a column the file never named: %q", stored["invoice_no"])
 	}
-	// And the agreement is RE-RECORDED, which the next push is the only honest
-	// test of: without it the same difference is reported for ever and --force
-	// becomes a permanent part of the command line, which trains it past the one
-	// time it means something.
+	// --force must re-record the agreement, or every later push re-reports the
+	// same difference.
 	out, _, err = runPipelineCLI(t, root, "pipeline", "push", "--json")
 	if err != nil {
 		t.Fatalf("the push after a --force was refused again: %v", err)
@@ -436,14 +396,9 @@ func TestPipelinePushRefusesASidecarWhoseTableMoved(t *testing.T) {
 	}
 }
 
-// TestASidecarThatDoesNotParseIsStillAUseOfItsDependency: one mistake, one
-// message.
-//
-// The sidecar's FILENAME is what names the alias; its body is not consulted to
-// decide that. A file whose JSON is broken already earns a refusal naming the
-// file and the fix — and skipping it in the use-scan earns it a second warning
-// saying the dependency it plainly names is dead config, which sends the author
-// to delete a manifest entry that is perfectly correct.
+// TestASidecarThatDoesNotParseIsStillAUseOfItsDependency: the sidecar's filename,
+// not its body, names the alias, so a broken file earns one refusal and no
+// second "dead dependency" warning about a correct manifest entry.
 func TestASidecarThatDoesNotParseIsStillAUseOfItsDependency(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -461,10 +416,9 @@ func TestASidecarThatDoesNotParseIsStillAUseOfItsDependency(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusReportsSidecars: `pipeline status` — and through it
-// `ronja sync status`, which walks a whole tree of folders — has to understand
-// the second carrier, or a repository-level gate would call a folder clean while
-// a push from it would change the organization.
+// TestPipelineStatusReportsSidecars: status (and `ronja sync status` through it)
+// must report pending sidecars, or a gate would call a folder clean that a push
+// would still change.
 func TestPipelineStatusReportsSidecars(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -476,8 +430,7 @@ func TestPipelineStatusReportsSidecars(t *testing.T) {
 
 	out, _, err := runPipelineCLI(t, root, "pipeline", "status", "--json")
 	if err != nil {
-		// Non-zero is expected here only for drift; a pending sidecar is not
-		// drift, so status must exit clean.
+		// A pending sidecar is not drift, so status must exit clean.
 		t.Fatalf("status: %v", err)
 	}
 	remote := decodeJSON(t, out)["remote"].(map[string]any)
@@ -494,10 +447,8 @@ func TestPipelineStatusReportsSidecars(t *testing.T) {
 	}
 }
 
-// TestPipelinePushNarrowsDocsToNamedPaths: `push tables/raw.json` is the obvious
-// thing to type after editing one, and naming any path must narrow BOTH halves —
-// a command that quietly re-pushed every other sidecar would be doing more than
-// it was asked.
+// TestPipelinePushNarrowsDocsToNamedPaths: naming any path narrows the sidecars
+// as well as the .sql files.
 func TestPipelinePushNarrowsDocsToNamedPaths(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -528,8 +479,7 @@ func TestPipelinePushNarrowsDocsToNamedPaths(t *testing.T) {
 }
 
 // TestSidecarAliasIsSeenAsAUseOfTheDependency: without this the alias pre-flight
-// reports every dependency a folder declares purely to document a table as dead
-// config — on every push, every status and every `sync check`.
+// reports a dependency declared only to document a table as dead config.
 func TestSidecarAliasIsSeenAsAUseOfTheDependency(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -564,7 +514,6 @@ func lockTableMetaOf(t *testing.T, root string, f *fakePipelineInstance, path st
 	return pipelineStateOf(t, root, f.Key()).TableStateFor(path).MetaSHA256
 }
 
-// toStrings decodes a --json string array.
 func toStrings(v any) []string {
 	list, ok := v.([]any)
 	if !ok {
@@ -577,10 +526,6 @@ func toStrings(v any) []string {
 	return out
 }
 
-// TestMetaSHA256MatchesTheRowItWasTakenFrom pins the fingerprint's one
-// invariant at the boundary the CLI actually uses it across: it is computed from
-// a GetTable answer's own fields, so a row read twice with nothing changed
-// hashes the same, and a row whose prose moved does not.
 func TestMetaSHA256MatchesTheRowItWasTakenFrom(t *testing.T) {
 	row := &api.Table{
 		Description: "One row per invoice.",
@@ -597,17 +542,16 @@ func TestMetaSHA256MatchesTheRowItWasTakenFrom(t *testing.T) {
 	if metaOf(row) == first {
 		t.Fatal("documenting a column must move the fingerprint")
 	}
-	// A column with no prose contributes nothing, so a table nobody has
-	// documented hashes the same however many columns it has.
+	// A column with no prose contributes nothing, so adding undocumented columns
+	// never moves the fingerprint.
 	bare := &api.Table{Fields: []api.TableField{{Name: "a"}, {Name: "b"}}}
 	if metaOf(bare) != tabledocs.MetaSHA256("", nil) {
 		t.Fatal("undocumented columns must not move the fingerprint")
 	}
 }
 
-// TestSidecarRoundTripsThroughTheLock: the recorded id is what makes the
-// fingerprint comparable, and a sidecar repointed at a different table must drop
-// it rather than compare one table's prose against a hash taken from another's.
+// TestSidecarRoundTripsThroughTheLock: a sidecar repointed at a different table
+// must drop its fingerprint, never compare one table's prose to another's hash.
 func TestSidecarRoundTripsThroughTheLock(t *testing.T) {
 	lock := &wfdir.Lock{}
 	lock.SetTableDocsSeen("prod", "tables/raw.json", "table-a", "hash-a", "declared-a")
@@ -618,7 +562,6 @@ func TestSidecarRoundTripsThroughTheLock(t *testing.T) {
 	if id, meta, declared := lock.TableDocsSeen("prod", "tables/raw.json"); id != "table-b" || meta != "" || declared != "" {
 		t.Fatalf("a rebound sidecar kept the old fingerprint: %q %q %q", id, meta, declared)
 	}
-	// And it survives a marshal/unmarshal, since the file is committed.
 	body, err := json.Marshal(lock)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -632,16 +575,9 @@ func TestSidecarRoundTripsThroughTheLock(t *testing.T) {
 	}
 }
 
-// TestPipelinePushDoesNotBankAFileWhoseDocumentationFailed is the whole reason
-// the documentation write moved ABOVE the baseline.
-//
-// A docs_failed push has written and built the SQL, so the temptation is to call
-// the file synced. Do that and the file's content hash is in the baseline, the
-// bare-push selector never picks it again, and `status` reads green — the
-// committed file and the row say different things for ever, silently, which is
-// the one divergence this loop exists to remove. It bites hardest where it is
-// most likely: a caller who may not write `fields` at all fails on EVERY
-// documented file of the first push and is then never offered a retry.
+// TestPipelinePushDoesNotBankAFileWhoseDocumentationFailed: a docs_failed file
+// has its SQL built but must not enter the baseline, or the bare push never
+// picks it again and the committed header and the row disagree silently.
 func TestPipelinePushDoesNotBankAFileWhoseDocumentationFailed(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -661,20 +597,13 @@ func TestPipelinePushDoesNotBankAFileWhoseDocumentationFailed(t *testing.T) {
 	if file["outcome"] != pushOutcomeDocsFailed {
 		t.Fatalf("outcome = %v, want %q: %+v", file["outcome"], pushOutcomeDocsFailed, file)
 	}
-	// The 400 arm: a bare "field not allowed: fields" says nothing about WHO may
-	// do it, and that is the whole of the reader's problem.
 	if !strings.Contains(file["error"].(string), "admin") {
 		t.Errorf("the refusal must explain who can write column prose: %v", file["error"])
 	}
-	// The report must not claim what did not land. `description: true` beside
-	// `error` is the report contradicting itself, and a script reading the first
-	// key believes prose was written that was not.
 	report := file["docs"].(map[string]any)
 	if report["description"] == true {
 		t.Errorf("a failed write reported a description as written: %+v", report)
 	}
-	// The SQL is publishable, and the summary has to say so rather than counting
-	// this file among the ones that did not land.
 	summary := payload["error"].(string)
 	if strings.Contains(summary, "did not land,") || strings.Contains(summary, "1 of 1 file(s) did not land") {
 		t.Errorf("a built, publishable file was counted as one that did not land: %q", summary)
@@ -683,14 +612,12 @@ func TestPipelinePushDoesNotBankAFileWhoseDocumentationFailed(t *testing.T) {
 		t.Errorf("the summary must say the SQL landed: %q", summary)
 	}
 
-	// THE BASELINE IS UNMOVED, which is what makes the retry exist at all.
 	inst := pipelineStateOf(t, root, f.Key())
 	if inst.Files["revenue.sql"].SHA256 == wfdir.HashString(documented) {
 		t.Fatal("the file was recorded as synced although its documentation never landed — the next bare push will skip it for ever")
 	}
 
-	// The instance is widened (or an admin runs it) and a BARE push — no paths,
-	// no --force — picks the same file up and lands the prose.
+	// A bare push, no paths and no --force, must pick the file up again.
 	delete(f.failDocsPut, "table-draft-1")
 	if _, stderr, err = runPipelineCLI(t, root, "pipeline", "push", "--json"); err != nil {
 		t.Fatalf("retry: %v\n%s", err, stderr)
@@ -707,11 +634,9 @@ func TestPipelinePushDoesNotBankAFileWhoseDocumentationFailed(t *testing.T) {
 	_ = stderr
 }
 
-// TestPipelinePushWritesNoDocumentationWhenTheBuildFails pins what is currently
-// true by ORDER alone: the documentation write sits below the build, so a failed
-// build returns before it. Unpinned, a later reshuffle would write prose onto a
-// draft whose columns were never measured — every name unmatched, on a table
-// whose real schema nobody has seen.
+// TestPipelinePushWritesNoDocumentationWhenTheBuildFails pins an ordering: the
+// docs write sits below the build, so prose never lands on a draft whose columns
+// were never measured.
 func TestPipelinePushWritesNoDocumentationWhenTheBuildFails(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -734,17 +659,12 @@ func TestPipelinePushWritesNoDocumentationWhenTheBuildFails(t *testing.T) {
 	}
 }
 
-// TestPipelinePushRefusesASidecarForATableThisFolderBuilds: ONE TABLE, ONE
-// CARRIER.
-//
-// The check is on the ID a sidecar resolves to, and these are the two spellings
-// that reach it — neither of them collides with a filename, so the alias
-// pre-flight's name check sees nothing. Documenting a table twice writes the
-// header onto the draft and the sidecar onto the LIVE row; `publish` then copies
-// the draft's rows over the sidecar's work, the sidecar's baseline is stale, and
-// every later push refuses with drift the folder caused itself.
+// TestPipelinePushRefusesASidecarForATableThisFolderBuilds: one table, one
+// carrier. The check is on the resolved ID, since neither spelling here collides
+// with a filename; a table documented twice gets the header on the draft and the
+// sidecar on the live row, publish overwrites the sidecar's work, and every later
+// push refuses with self-inflicted drift.
 func TestPipelinePushRefusesASidecarForATableThisFolderBuilds(t *testing.T) {
-	// A sidecar named after the literal id a sibling .sql file builds.
 	t.Run("literal id", func(t *testing.T) {
 		f := newFakePipelineInstance(t)
 		signInPipeline(t, f)
@@ -773,8 +693,6 @@ func TestPipelinePushRefusesASidecarForATableThisFolderBuilds(t *testing.T) {
 		}
 	})
 
-	// And the same table reached through an ALIAS, which is the spelling nothing
-	// local can spot without resolving it: the name `raw` collides with no stem.
 	t.Run("alias bound to a built table", func(t *testing.T) {
 		f := newFakePipelineInstance(t)
 		signInPipeline(t, f)
@@ -793,10 +711,8 @@ func TestPipelinePushRefusesASidecarForATableThisFolderBuilds(t *testing.T) {
 	})
 }
 
-// TestPipelinePushDocumentsUnicodeColumnNames: a column name is matched by its
-// EXACT name against a measured set, and nothing in either carrier is entitled
-// to normalize one. A folded, trimmed or re-encoded name would be reported
-// unmatched for ever while looking perfectly correct in the file.
+// TestPipelinePushDocumentsUnicodeColumnNames: column names match exactly and no
+// carrier may normalize one, or a correct-looking name stays unmatched for ever.
 func TestPipelinePushDocumentsUnicodeColumnNames(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -823,12 +739,11 @@ func TestPipelinePushDocumentsUnicodeColumnNames(t *testing.T) {
 	if len(attached) != 3 {
 		t.Fatalf("attachedColumns = %v", attached)
 	}
-	// Sorted by name, which is what makes two checkouts of the same folder send
-	// byte-identical bodies — over code points, not over a locale's collation.
+	// Sorted by code point, not a locale's collation, so two checkouts send
+	// byte-identical bodies.
 	if attached[0] != "année" || attached[1] != "belopp_kr" || attached[2] != "商品名" {
 		t.Errorf("attachedColumns is not sorted by code point: %v", attached)
 	}
-	// And the header carrier, on the same names.
 	f.mu.Lock()
 	header := f.columnDocs["table-draft-1"]["année"]
 	f.mu.Unlock()
@@ -838,13 +753,8 @@ func TestPipelinePushDocumentsUnicodeColumnNames(t *testing.T) {
 }
 
 // TestPipelinePublishRecordsNoDocumentationFingerprintForAnUndocumentedFolder:
-// the third drift leg arms ONLY for a folder that documents something, and that
-// rule is about `publish` too.
-//
-// Without it every pipeline folder in existence grows a `metaSHA256` per table
-// in its COMMITTED lock on its next publish — a diff in a file people review,
-// for a feature nobody in that folder has adopted, arming a guard that then
-// pauses a later push over prose that was never this folder's business.
+// publish, like push, arms the documentation leg only for a folder that documents
+// something, or every folder's committed lock grows a guard it never opted into.
 func TestPipelinePublishRecordsNoDocumentationFingerprintForAnUndocumentedFolder(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -860,19 +770,16 @@ func TestPipelinePublishRecordsNoDocumentationFingerprintForAnUndocumentedFolder
 	}
 }
 
-// The other half of the same rule: a file that DOES carry a header must record
-// the agreement, or the next documenting push reports this folder's own publish
-// as somebody else's edit.
+// A file that carries a header must record the agreement on publish, or the next
+// push reports this folder's own publish as somebody else's edit.
 func TestPipelinePublishRecordsTheDocumentationFingerprintForADocumentedFile(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedStagedFolder(t, f, "private")
 	f.fields["table-orders"] = []string{"id"}
 	f.columnDocs["table-orders"] = map[string]string{"id": "the order's own id"}
-	// The DRAFT carries the description, because that is where a push puts it and
-	// the commit is what copies it onto the live row. The agreement recorded
-	// below is an agreement with the row, so the fixture has to be a row that
-	// really holds what the file declares — see docsLanded.
+	// The agreement is recorded only if the row really holds what the file
+	// declares (docsLanded), so the draft the commit copies must carry it.
 	f.tables["table-draft-5"].Description = "Orders."
 	editFile(t, root, "orders.sql", "-- @table Orders.\n-- @column id: the order's own id\nSELECT staged FROM raw")
 
@@ -884,18 +791,9 @@ func TestPipelinePublishRecordsTheDocumentationFingerprintForADocumentedFile(t *
 	}
 }
 
-// TestPipelineStatusOnAFreshCloneWithASidecar is the FRESH CLONE, which is not
-// an edge case: `.ronja/` is gitignored and correctly never committed, so
-// `f.State.For(f.Key)` is nil for everybody who has not yet pushed from this
-// checkout — and `pipeline status` hands that nil straight to liveHashes rather
-// than going through pipelineBaseline the way push and publish do.
-//
-// The sidecar read then dereferenced it. Inside a status worker goroutine, so it
-// was a raw process panic: no message, no exit code anybody could act on, and it
-// fired on the first command a colleague ran after cloning a folder that keeps
-// one docs file. The other two accessors on the same struct
-// (InstanceState.TableStateFor, Lock.TableDocsSeen) have always answered the
-// no-baseline case; these were the pair that did not.
+// TestPipelineStatusOnAFreshCloneWithASidecar: `.ronja/` is gitignored, so on a
+// fresh clone the instance state is nil and status, unlike push and publish,
+// does not go through pipelineBaseline; the sidecar read must not dereference it.
 func TestPipelineStatusOnAFreshCloneWithASidecar(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -904,15 +802,12 @@ func TestPipelineStatusOnAFreshCloneWithASidecar(t *testing.T) {
 	declareTableDependency(t, root, f.Key(), "invoices", "table-invoices")
 	writeSidecar(t, root, "invoices", `{"description":"One row per invoice.","columns":{"amount":"SEK, ex VAT."}}`)
 
-	// THE FRESH CLONE: everything committed is there, and nothing local is.
 	if err := os.RemoveAll(filepath.Join(root, wfdir.StateDirName)); err != nil {
 		t.Fatalf("remove local baseline: %v", err)
 	}
 
 	out, stderr, _ := runPipelineCLI(t, root, "pipeline", "status", "--json")
-	// The exit code is deliberately not asserted — a folder with no baseline is
-	// allowed to report whatever it reports. What must not happen is a panic,
-	// which produces no JSON at all.
+	// The exit code is deliberately not asserted; only a panic is wrong here.
 	if strings.Contains(stderr, "panic:") || strings.Contains(stderr, "nil pointer") {
 		t.Fatalf("status panicked on a fresh clone carrying a docs sidecar:\n%s", stderr)
 	}
@@ -920,32 +815,20 @@ func TestPipelineStatusOnAFreshCloneWithASidecar(t *testing.T) {
 	if len(docs) != 1 {
 		t.Fatalf("docs = %+v", docs)
 	}
-	// And it answers the right thing: no recording here yet, so nothing to
-	// compare against — never "no drift", which is the answer that gets somebody
-	// else's prose overwritten.
+	// Never "no drift": that answer gets somebody else's prose overwritten.
 	if got := docs[0].(map[string]any)["drift"]; got != driftNoBaseline {
 		t.Errorf("drift = %v, want %q on a checkout that has never synced", got, driftNoBaseline)
 	}
 }
 
-// TestPipelinePublishDoesNotBankDocumentationItDidNotAchieve is the other half
-// of TestPipelinePushDoesNotBankAFileWhoseDocumentationFailed, and the hole that
-// one left open.
-//
-// Push withholds recordSynced when the prose is refused, precisely so the file
-// stays re-pushable. Publish then ran in a SEPARATE PROCESS with no memory of
-// that, decided the file was "documented" by parsing its header, and banked both
-// the content baseline and the documentation agreement — so the file hashed
-// clean, the bare push skipped it, `status` read driftNone, and the committed
-// header and the row disagreed permanently. That is exactly what the drift guard
-// exists to prevent, defeated by the command it is meant to protect.
+// TestPipelinePublishDoesNotBankDocumentationItDidNotAchieve: publish runs in a
+// separate process from the push that withheld recordSynced, so it must check
+// the row, not the header, before banking the file.
 func TestPipelinePublishDoesNotBankDocumentationItDidNotAchieve(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
 	f.fields["table-revenue"] = []string{"id"}
-	// The non-admin's 400 on `fields`: the SQL PUT lands and builds, the
-	// documenting PUT does not.
 	f.failDocsPut["table-draft-1"] = 400
 	documented := "-- @table One row per invoice line.\n-- @column id: the line's own id\nSELECT * FROM {{ ref('table-orders') }}"
 	editFile(t, root, "revenue.sql", documented)
@@ -953,26 +836,16 @@ func TestPipelinePublishDoesNotBankDocumentationItDidNotAchieve(t *testing.T) {
 	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json"); err == nil {
 		t.Fatalf("a documentation write that did not land must exit non-zero\n%s", stderr)
 	}
-	// The draft holds the SQL and is publishable — which is what the push report
-	// says, and what the author does next.
 	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "publish", "--json"); err != nil {
 		t.Fatalf("publish: %v\n%s", err, stderr)
 	}
 
-	// The commit landed. The prose never did, and the folder still has to say so.
 	inst := pipelineStateOf(t, root, f.Key())
 	if inst.Files["revenue.sql"].SHA256 == wfdir.HashString(documented) {
 		t.Fatal("publish banked a file whose documentation was refused — the next bare push skips it for ever, and the committed header and the row disagree in silence")
 	}
-	// And the divergence is REPORTED, not merely retryable: `status` must still
-	// show the file as locally changed. That is the signal a human reads, and it
-	// is the one the banked baseline erased.
-	//
-	// (The meta fingerprint is deliberately not asserted here. Leg (c) asks "did
-	// the ROW move since we agreed", and it did not — nothing landed on it — so
-	// the fork-time recording push adopted is still an honest answer. The signal
-	// for a .sql file's own prose is its CONTENT hash, which is what a header
-	// lives inside.)
+	// The meta fingerprint is deliberately not asserted: the row did not move, so
+	// the existing recording stays honest; a header's own signal is the content hash.
 	out, stderr, err := runPipelineCLI(t, root, "pipeline", "status", "--json")
 	if err != nil {
 		t.Fatalf("status: %v\n%s", err, stderr)
@@ -982,9 +855,6 @@ func TestPipelinePublishDoesNotBankDocumentationItDidNotAchieve(t *testing.T) {
 		t.Fatalf("status reports nothing to do for a file whose documentation never landed: %+v", local)
 	}
 
-	// The retry is what the withheld baseline buys, so it is asserted rather
-	// than assumed: the instance is widened, a BARE push — no paths, no --force
-	// — picks the same file up, and the prose lands.
 	delete(f.failDocsPut, "table-draft-2")
 	f.failDocsPut = map[string]int{}
 	if _, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json"); err != nil {
@@ -1003,13 +873,8 @@ func TestPipelinePublishDoesNotBankDocumentationItDidNotAchieve(t *testing.T) {
 	}
 }
 
-// TestPipelinePushWarnsAboutAnEmptySidecarRatherThanRefusing: a placeholder
-// somebody committed and has not filled in must not break the folder.
-//
-// As a Problem it was a refusal, and one refused sidecar makes the whole run
-// exit non-zero — so an empty `{}` failed EVERY push in that folder from then
-// on, including `push one-unrelated-file.sql`. Nothing is at stake: the file
-// declares nothing, so nothing is sent and nothing is overwritten.
+// TestPipelinePushWarnsAboutAnEmptySidecarRatherThanRefusing: an empty sidecar
+// declares nothing, so it warns; a refusal would fail every push in the folder.
 func TestPipelinePushWarnsAboutAnEmptySidecarRatherThanRefusing(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1031,14 +896,9 @@ func TestPipelinePushWarnsAboutAnEmptySidecarRatherThanRefusing(t *testing.T) {
 	if doc["outcome"] != docsOutcomeNothing {
 		t.Errorf("outcome = %v, want %q", doc["outcome"], docsOutcomeNothing)
 	}
-	// Said out loud, which is the whole reason it is not silently skipped: a
-	// committed file that does nothing is nearly always one somebody meant to
-	// fill in.
 	if doc["warning"] == nil || !strings.Contains(doc["warning"].(string), "documents nothing") {
 		t.Errorf("warning = %v", doc["warning"])
 	}
-	// Answered before the network — there is nothing to compare and nothing to
-	// send, so it must not cost a read of the row.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, request := range f.Requests {
@@ -1049,15 +909,9 @@ func TestPipelinePushWarnsAboutAnEmptySidecarRatherThanRefusing(t *testing.T) {
 	}
 }
 
-// TestPipelinePushWarnsAboutOrphanedColumnDirectives: a `-- @column` written
-// below a bare `--` is not read — that terminator is deliberate — and until now
-// it was not REPORTED either, which is the one shape where a documented name is
-// silently lost. The observed case was 26 of them below `--` paragraph
-// separators: the push said "description written" and 0/26 columns landed.
-//
-// ONE note, however many orphans: push prints one stderr line AND appends one
-// notes[] entry per warning, so a warning per directive would be 26 of each for
-// a single mistake.
+// TestPipelinePushWarnsAboutOrphanedColumnDirectives: a bare `--` deliberately
+// ends the header, so directives below it are not read and must be reported, in
+// ONE note per file however many there are.
 func TestPipelinePushWarnsAboutOrphanedColumnDirectives(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1079,12 +933,8 @@ func TestPipelinePushWarnsAboutOrphanedColumnDirectives(t *testing.T) {
 	if !strings.Contains(stderr, "2 documentation directives below it are not read") {
 		t.Errorf("the note does not name the count:\n%s", stderr)
 	}
-	// And machine-readable, so a CI run sees what a person does. Selected by
-	// CONTENT, never by position or by the length of the slice: `notes[]` is a
-	// shared channel — upstream validation appends its own "validated against
-	// live" line there — so a length check or a `notes[0]` index would go red
-	// for a reason that has nothing to do with this warning, and a guard that
-	// goes spuriously red is a guard somebody deletes.
+	// Selected by content, never position or length: `notes[]` is shared with
+	// other warnings, such as upstream validation's line.
 	var matched []string
 	for _, entry := range decodeJSON(t, out)["files"].([]any) {
 		file := entry.(map[string]any)
@@ -1106,10 +956,8 @@ func TestPipelinePushWarnsAboutOrphanedColumnDirectives(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusDoesNotFailOnAnEmptySidecar is the same rule on the read
-// side, and it is the one a CI gate feels: pipelineStatusVerdict scores Problem
-// and Drift, so an empty sidecar reported as a Problem failed a gate that was
-// asking whether the SERVER had moved.
+// TestPipelineStatusDoesNotFailOnAnEmptySidecar: pipelineStatusVerdict scores
+// Problem and Drift, so an empty sidecar must be a warning, not a Problem.
 func TestPipelineStatusDoesNotFailOnAnEmptySidecar(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1127,15 +975,13 @@ func TestPipelineStatusDoesNotFailOnAnEmptySidecar(t *testing.T) {
 	if doc["problem"] != nil {
 		t.Errorf("an empty sidecar is a warning, not a problem: %v", doc["problem"])
 	}
-	// A file that says nothing can never say something the table does not.
 	if doc["pending"] == true {
 		t.Errorf("an empty sidecar reported as pending: %+v", doc)
 	}
 	if doc["warning"] == nil {
 		t.Errorf("the placeholder was not reported at all: %+v", doc)
 	}
-	// And the human report says it too — --json above suppresses the printer, so
-	// the rendering is exercised on its own run.
+	// --json suppresses the human printer, so it needs its own run.
 	human, stderr, err := runPipelineCLI(t, root, "pipeline", "status")
 	if err != nil {
 		t.Fatalf("status: %v\n%s", err, stderr)
@@ -1145,13 +991,9 @@ func TestPipelineStatusDoesNotFailOnAnEmptySidecar(t *testing.T) {
 	}
 }
 
-// TestPipelinePushClearsTheDraftPointerWhenTheDocsPutIs404: a draft stops
-// existing the moment somebody commits or discards it from the web app, and a
-// 404 on the documentation PUT is that, seen through the second write.
-//
-// awaitBuild's 404 arm has always cleared the recorded pointer. This one did
-// not, so the next `publish` went on to commit a row that is gone — and reported
-// a failure about a draft id rather than about what happened.
+// TestPipelinePushClearsTheDraftPointerWhenTheDocsPutIs404: a 404 on the docs PUT
+// means the draft was committed or discarded elsewhere, so the pointer must be
+// cleared, as the build-wait 404 does, or the next publish commits a gone row.
 func TestPipelinePushClearsTheDraftPointerWhenTheDocsPutIs404(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1168,13 +1010,9 @@ func TestPipelinePushClearsTheDraftPointerWhenTheDocsPutIs404(t *testing.T) {
 	}
 }
 
-// TestDocsResultTellsNoReportFromNoColumnsSent: the two empty answers are
-// different facts and were reported as the same one.
-//
-// api.UpdateTableDocs folds an absent join report into nil — an instance older
-// than the report, or a body that carried no `fields` — so a header documenting
-// only columns (no `-- @table`) produced an all-zero result: no human line at
-// all, and `"docs":{}` in --json, on a push that really did write prose.
+// TestDocsResultTellsNoReportFromNoColumnsSent: api.UpdateTableDocs returns a nil
+// join report both for an older instance and for a body with no `fields`, so the
+// column count must come from the file when no report came back.
 func TestDocsResultTellsNoReportFromNoColumnsSent(t *testing.T) {
 	columnsOnly := tabledocs.Docs{Columns: map[string]string{
 		"id": "the line's own id", "total": "SEK, ex VAT",
@@ -1187,13 +1025,11 @@ func TestDocsResultTellsNoReportFromNoColumnsSent(t *testing.T) {
 	if !strings.Contains(line, "2 column(s) written") {
 		t.Errorf("a push that wrote prose printed %q", line)
 	}
-	// A report that DID come back is authoritative; the count must not be
-	// invented beside it, or the report would claim work twice.
+	// A report that came back is authoritative; no count is invented beside it.
 	withReport := docsResultFrom(columnsOnly, &api.ColumnDocReport{AttachedColumns: []string{"id"}}, nil)
 	if withReport.ColumnsWritten != 0 {
 		t.Errorf("columnsWritten was set although the server reported: %+v", withReport)
 	}
-	// And a write that carried nothing still says nothing.
 	if line := describeDocsResult(docsResultFrom(tabledocs.Docs{}, nil, nil)); line != "" {
 		t.Errorf("an empty carrier printed %q", line)
 	}

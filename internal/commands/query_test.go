@@ -13,26 +13,19 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// `ronja query` is a thin command over one endpoint, so the tests are about the
-// three things that are NOT thin: which of the three SQL sources won, what
-// landed on stdout versus stderr, and whether a failure was noticed at all —
-// the last being the trap the command exists to close, since a failed query is
-// HTTP 200.
-
 // queryServer answers POST /api/v2/duckdb/query with a scripted envelope.
 type queryServer struct {
 	t      *testing.T
 	server *httptest.Server
 
-	// answer is what the endpoint returns. Zero value = an empty successful
-	// result, which is enough for the tests that are about the request.
+	// answer's zero value is an empty successful result.
 	answer api.QueryResult
 	// status overrides the HTTP status; 0 is 200.
 	status int
 
 	inputs []api.QueryInput
-	// raws are the same bodies as JSON objects, for what the struct cannot
-	// say: whether a key was sent at all.
+	// raws are the same bodies as JSON objects, to see whether a key was sent
+	// at all.
 	raws []map[string]any
 }
 
@@ -83,8 +76,8 @@ const sampleCSV = "id,amount\n1,10\n2,20\n"
 
 // --- the happy path ---------------------------------------------------------
 
-// CSV on stdout and nothing else there, and csv_meta on the wire — the format
-// is the CLI's decision, not a flag, so it is asserted rather than assumed.
+// The wire format (csv_meta) is the CLI's decision, not a flag, so it is
+// asserted.
 func TestQueryPrintsTheCSV(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -122,8 +115,6 @@ func TestQueryPassesMaxRows(t *testing.T) {
 	}
 }
 
-// --json is the whole envelope, one object, on stdout. A caller wanting the row
-// count or the truncation flag should not have to parse CSV to get it.
 func TestQueryJSONEmitsTheWholeEnvelope(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{
@@ -143,8 +134,8 @@ func TestQueryJSONEmitsTheWholeEnvelope(t *testing.T) {
 	if payload["rowCount"] != float64(2) {
 		t.Errorf("rowCount = %v", payload["rowCount"])
 	}
-	// Present-but-false rather than absent: a shape that changes with the
-	// answer is a shape a consumer has to branch on.
+	// Present-but-false, not absent: a shape that changes with the answer is
+	// one a consumer must branch on.
 	if _, ok := payload["truncated"]; !ok {
 		t.Errorf("truncated missing from the envelope: %v", payload)
 	}
@@ -155,9 +146,8 @@ func TestQueryJSONEmitsTheWholeEnvelope(t *testing.T) {
 
 // --- the 200-with-an-error trap ---------------------------------------------
 
-// The reason this command exists rather than `ronja api -X POST
-// /api/v2/duckdb/query`: the transport is perfectly happy, and a pipeline built
-// on the generic runner would continue over a query that never ran.
+// A failed query is HTTP 200 with an error in the envelope; exiting non-zero on
+// it is why this command exists beside `ronja api`.
 func TestQueryFailsOnAnEnvelopeError(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Error: `Catalog Error: Table "orders" does not exist`}
@@ -175,9 +165,8 @@ func TestQueryFailsOnAnEnvelopeError(t *testing.T) {
 	}
 }
 
-// In --json the envelope is still the answer to what was asked, so it is
-// emitted before the failure is returned. A caller left with only an exit code
-// has to run the query again to find out why.
+// The envelope is emitted before the failure is returned, so a caller need not
+// re-run the query to learn why.
 func TestQueryJSONStillEmitsTheEnvelopeOnAFailure(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Error: "syntax error at or near \"SELCT\""}
@@ -192,7 +181,6 @@ func TestQueryJSONStillEmitsTheEnvelopeOnAFailure(t *testing.T) {
 	}
 }
 
-// An HTTP-level failure is the other non-zero path.
 func TestQueryFailsOnAnHTTPError(t *testing.T) {
 	q := newQueryServer(t)
 	q.status = http.StatusForbidden
@@ -205,8 +193,8 @@ func TestQueryFailsOnAnHTTPError(t *testing.T) {
 
 // --- truncation -------------------------------------------------------------
 
-// Truncation is a note, not a failure: the rows are real, there are simply more
-// of them. It goes to stderr because stdout is a CSV somebody is parsing.
+// Truncation is a note on stderr, not a failure: stdout is a CSV somebody is
+// parsing.
 func TestQueryNotesTruncationOnStderrAndExitsZero(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 100000, Truncated: true}
@@ -231,8 +219,6 @@ func TestQueryNotesTruncationOnStderrAndExitsZero(t *testing.T) {
 	}
 }
 
-// ...and silence when it is not truncated. A note on every query is a note
-// nobody reads.
 func TestQuerySaysNothingWhenTheResultIsComplete(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -271,12 +257,10 @@ func TestQueryWritesToAFileAndLeavesStdoutEmpty(t *testing.T) {
 	if got := readFile(t, path); got != sampleCSV {
 		t.Errorf("file = %q, want the CSV", got)
 	}
-	// The narration belongs on stderr, so `--out` composes with a redirect.
 	if !strings.Contains(stderr, "2 rows written to") {
 		t.Errorf("no narration on stderr:\n%s", stderr)
 	}
-	// Owner-only: this is tenant data the caller was authorised to read and
-	// nobody else on the machine was.
+	// Owner-only: tenant data nobody else on the machine may read.
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -286,9 +270,8 @@ func TestQueryWritesToAFileAndLeavesStdoutEmpty(t *testing.T) {
 	}
 }
 
-// Writing over an EXISTING file is the case os.WriteFile gets wrong: its mode
-// argument applies only on create, so a rows.csv an earlier tool left at 0644
-// would keep that mode and publish the result to every account on the machine.
+// os.WriteFile's mode applies only on create, so an existing 0644 file would
+// keep that mode and expose the result to every account on the machine.
 func TestQueryOutTightensAnExistingFilesMode(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -315,9 +298,7 @@ func TestQueryOutTightensAnExistingFilesMode(t *testing.T) {
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("mode = %o, want 600 — a pre-existing file kept its own mode", perm)
 	}
-	// The temp file the atomic write goes through is a detail, but one it must
-	// clean up: a directory slowly filling with .rows.csv-* is a bug a user
-	// finds long after the run.
+	// The atomic write's temp file must be cleaned up.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -329,9 +310,8 @@ func TestQueryOutTightensAnExistingFilesMode(t *testing.T) {
 
 // --- the deadline -----------------------------------------------------------
 
-// A heavy query can take minutes server-side, so the deadline has to be
-// movable. The plumbing that makes a value past the client's own ceiling
-// actually apply is pinned in internal/api; this is the flag reaching it.
+// Only the flag reaching the client; that a value past the client's own
+// ceiling applies is pinned in internal/api.
 func TestQueryTimeoutFlagIsAccepted(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -345,8 +325,8 @@ func TestQueryTimeoutFlagIsAccepted(t *testing.T) {
 	}
 }
 
-// Zero is "wait as long as it takes", so it must not be read as a deadline that
-// has already passed — the shape context.WithTimeout(ctx, 0) would give it.
+// Zero means no deadline, never the already-passed one context.WithTimeout(ctx, 0)
+// would give.
 func TestQueryTimeoutZeroWaits(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -361,8 +341,6 @@ func TestQueryTimeoutZeroWaits(t *testing.T) {
 	}
 }
 
-// Negative has no meaning, and zero already means "no deadline" — so it is a
-// typo rather than an intent worth guessing at. Mirrors `wf test`.
 func TestQueryRefusesANegativeTimeout(t *testing.T) {
 	q := newQueryServer(t)
 	signInTo(t, q.URL())
@@ -395,8 +373,6 @@ func TestQueryReadsSQLFromAFile(t *testing.T) {
 	if _, err := runCLI(t, dir, "query", "--file", path); err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	// Verbatim, newlines and all — the multi-line case is the reason the flag
-	// exists rather than everyone quoting it into a shell argument.
 	if got := q.only().SQL; got != sql {
 		t.Errorf("sql = %q, want the file verbatim", got)
 	}
@@ -430,8 +406,8 @@ func TestQueryReadsSQLFromStdinWithFileDash(t *testing.T) {
 	}
 }
 
-// No source and a terminal: an error, immediately. Prompting is the one thing
-// this must never do, and blocking on a read of the terminal is worse.
+// No source on a terminal is an immediate error: never prompt, never block on a
+// terminal read.
 func TestQueryRefusesWithNoSourceOnATerminal(t *testing.T) {
 	q := newQueryServer(t)
 	signInTo(t, q.URL())
@@ -449,8 +425,6 @@ func TestQueryRefusesWithNoSourceOnATerminal(t *testing.T) {
 	}
 }
 
-// An empty pipe is a source that produced nothing, which is a different mistake
-// from giving no source at all — and both stop before a round trip.
 func TestQueryRefusesBlankSQL(t *testing.T) {
 	q := newQueryServer(t)
 	signInTo(t, q.URL())
@@ -498,9 +472,8 @@ func TestQueryRefusesWhenSignedOut(t *testing.T) {
 
 // --- the --jq flag-order footgun ---------------------------------------------
 
-// The same trap as `ronja api`, and here it is worse rather than better: with
-// "-r" bound as the expression, '.rowCount' becomes the SQL, the arity check
-// passes, and the round trip fails server-side with a syntax error nobody typed.
+// With "-r" bound as the expression, '.rowCount' would become the SQL, pass the
+// arity check, and fail server-side with a syntax error nobody typed.
 func TestQueryRefusesAFlagAsTheJQExpression(t *testing.T) {
 	q := newQueryServer(t)
 	signInTo(t, q.URL())
@@ -517,7 +490,6 @@ func TestQueryRefusesAFlagAsTheJQExpression(t *testing.T) {
 	}
 }
 
-// And the recommended form still runs: expression first, flag after it.
 func TestQueryAcceptsJQWithTheFlagAfterIt(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -534,8 +506,7 @@ func TestQueryAcceptsJQWithTheFlagAfterIt(t *testing.T) {
 
 // --- the hidden --attach flag ---------------------------------------------------
 
-// A database join: each --attach alias=secret lands in the body's attach map,
-// split on the FIRST = only.
+// Each --attach alias=secret splits on the first = only.
 func TestQueryAttachSendsEachDatabase(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -551,8 +522,6 @@ func TestQueryAttachSendsEachDatabase(t *testing.T) {
 	}
 }
 
-// A malformed value or an alias given twice is a usage error naming the flag,
-// before any request.
 func TestQueryAttachRefusesABadValue(t *testing.T) {
 	q := newQueryServer(t)
 	signInTo(t, q.URL())
@@ -572,8 +541,6 @@ func TestQueryAttachRefusesABadValue(t *testing.T) {
 	}
 }
 
-// No --attach is no attach key at all: the body is the one the CLI always
-// sent.
 func TestQueryWithoutAttachSendsNoAttachKey(t *testing.T) {
 	q := newQueryServer(t)
 	q.answer = api.QueryResult{Result: sampleCSV, RowCount: 2}
@@ -588,8 +555,7 @@ func TestQueryWithoutAttachSendsNoAttachKey(t *testing.T) {
 	}
 }
 
-// Hidden while the server's `attach` field is unpublished (no HTTP guide
-// documents joins yet): the flag works but is in no --help.
+// --attach stays hidden from --help while the HTTP join is unpublished.
 func TestQueryAttachFlagIsHidden(t *testing.T) {
 	f := newQueryCmd().Flags().Lookup("attach")
 	if f == nil {

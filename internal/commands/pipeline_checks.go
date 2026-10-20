@@ -13,43 +13,14 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The pipeline loop's HEALTH-CHECK half: `checks/<stem>.json`, the assertions a
-// folder makes about the tables it builds.
-//
-// Checks are UNGOVERNED — no draft, no review, no version history — and they
-// attach to a LIVE table id (a check put on a draft would stay on the version
-// snapshot the commit leaves behind). So this pass never writes against a draft,
-// and it writes against the live table only when THE LIVE-MATCHES RULE holds:
-// the live row's SQL equals the file, and the caller has no open draft of it.
-// Otherwise the file's checks are `checks_pending_publish` and nothing is sent;
-// `publish` applies them right after the commit lands, and the next `push`
-// finds live == file and lands them if the publish went to review instead.
-//
-// It visits EVERY stem with a checks file, not only the .sql files a push found
-// changed: the main case is checks added to a table whose SQL did not move. A
-// bare push also visits every checks file the lock records and the folder no
-// longer holds — a file with no entries, so the checks it created are orphans
-// (withDeletedChecksFiles).
-//
-// ONE TABLE'S CHECKS ARE APPLIED IN AN ORDER THAT IS LOAD-BEARING:
-//
-//  1. read the table's checks once;
-//  2. refuse on DRIFT (a check this folder owns was changed in the app since
-//     the folder last verified it) before anything is written, unless --force;
-//  3. ORPHANS — owned ROWS no entry resolves to (planTableChecks: each entry's
-//     row is found first, so a check renamed in the app is not an orphan of a
-//     file that renamed it too): refused unless --prune, and with
-//     --prune silenced BEFORE any create — a renamed freshness watchdog, or a
-//     rename at the per-table cap, only succeeds in one push that way, because
-//     the server allows one enabled watchdog and counts enabled checks;
-//  4. updates (only the declared fields that differ), then creates;
-//  5. one more read, and each written check is recorded only if the live row
-//     now says what the file says. An older server's PUT accepts
-//     {"enabled", "expression"} with a 200 and drops everything but `enabled`,
-//     and this is what catches it.
+// Checks attach to the LIVE table id, so they are written only when the live
+// SQL equals the file and the caller has no open draft (the live-matches rule).
+// One table's checks apply in a load-bearing order: read once, refuse on drift,
+// silence orphans before any create (one enabled watchdog, a per-table cap),
+// update then create, then re-read and record only what the live row confirms.
+// See cli/README.md → "Health checks".
 
-// Health-check outcomes. --json values, so a contract; the exit status is
-// non-zero iff any of them is one checksOutcomeFails names.
+// Health-check outcomes are --json values, so a contract.
 const (
 	checksOutcomeApplied        = "applied"
 	checksOutcomeUnchanged      = "unchanged"
@@ -91,18 +62,15 @@ type pipelineChecksFile struct {
 	File    checkfile.File
 	// Problem is why this file cannot be used as it stands; reported per file.
 	Problem string
-	// Deleted is a checks file the lock (or baseline) has a record for and the
-	// folder no longer holds: a file with no entries, on the table it was
-	// recorded against (TableID), so every check it created that is still
-	// enabled is an orphan. See withDeletedChecksFiles.
+	// Deleted is a recorded checks file the folder no longer holds: a file with
+	// no entries on TableID, so every still-enabled check it created is an orphan.
 	Deleted bool
 	TableID string
 }
 
-// withDeletedChecksFiles appends a Deleted file for each recorded checks path
-// the folder no longer holds, after the files it does hold — last, so a file a
-// rename moved the checks into has recorded them by the time the old record is
-// read (see checksClaimFor).
+// withDeletedChecksFiles appends Deleted files last, so a file a rename moved
+// the checks into has recorded them before the old record is read (see
+// checksClaimFor).
 func withDeletedChecksFiles(files []pipelineChecksFile, store liveHashes) []pipelineChecksFile {
 	present := map[string]bool{}
 	for _, file := range files {
@@ -121,12 +89,9 @@ func withDeletedChecksFiles(files []pipelineChecksFile, store liveHashes) []pipe
 	return files
 }
 
-// checksClaim is what the folder's OTHER checks files claim on one table: the
-// names they declare and the checks they own. A deleted file's record never
-// orphans a check another file on the same table claims — renaming a table's
-// stem together with its checks file (and rebinding it) hands the checks over,
-// and pruning them as the old file's orphans would silence what the new file
-// declares.
+// checksClaim is what the folder's OTHER checks files claim on one table. A
+// deleted file's record never orphans a check another file claims, so renaming
+// a stem with its checks file hands the checks over rather than silencing them.
 type checksClaim struct {
 	folds map[string]bool
 	ids   map[string]bool
@@ -136,13 +101,8 @@ func (c checksClaim) has(row *api.TableCheck) bool {
 	return row != nil && (c.ids[row.ID] || c.folds[checkfile.Fold(row.Name)])
 }
 
-// checksClaimFor is the claim on tableID of every present checks file other
-// than `except`: what their entries declare (by the binding, whether or not
-// their table is ready), and what the store records them as owning there.
-//
-// A file with a Problem still claims what the store records it as owning — the
-// lock, not the unreadable file, says that. Only its declared names are left
-// out, since they could not be read.
+// checksClaimFor: a file with a Problem still claims what the store records it
+// as owning; only its unreadable declared names are left out.
 func checksClaimFor(f *folder, files []pipelineChecksFile, store liveHashes, tableID, except string) checksClaim {
 	claim := checksClaim{folds: map[string]bool{}, ids: map[string]bool{}}
 	for _, file := range files {
@@ -163,8 +123,6 @@ func checksClaimFor(f *folder, files []pipelineChecksFile, store liveHashes, tab
 	return claim
 }
 
-// readChecksFiles reads a pipeline folder's `checks/` directory. A missing
-// directory is the ordinary case. Flat, one level, like `metrics/`.
 func readChecksFiles(root string, local map[string]string) ([]pipelineChecksFile, error) {
 	dir := filepath.Join(root, wfdir.ChecksDirName)
 	entries, err := os.ReadDir(dir)
@@ -215,10 +173,9 @@ func readChecksFiles(root string, local map[string]string) ([]pipelineChecksFile
 	return out, nil
 }
 
-// splitChecksArgs takes the checks files out of a push's positional arguments,
-// before the docs/metrics/SQL split sees them. Naming a path narrows every pass,
-// so with arguments the checks pass covers the files named, plus the checks of
-// every .sql file named.
+// splitChecksArgs takes the checks files out of a push's arguments before the
+// docs/metrics/SQL split. Naming a path narrows every pass; the caller adds the
+// checks of every .sql file named.
 func splitChecksArgs(root string, args []string, files []pipelineChecksFile) (rest []string, selected []pipelineChecksFile, err error) {
 	byPath := make(map[string]pipelineChecksFile, len(files))
 	for _, file := range files {
@@ -246,7 +203,6 @@ func splitChecksArgs(root string, args []string, files []pipelineChecksFile) (re
 	return rest, selected, nil
 }
 
-// checksCloneFile is one table's checks as clone lays them down.
 type checksCloneFile struct {
 	Path    string
 	TableID string
@@ -255,16 +211,10 @@ type checksCloneFile struct {
 	Count   int
 }
 
-// fetchCloneChecks reads each cloned table's checks and renders the ENABLED
-// ones as `checks/<stem>.json`: name, body, severity and a non-empty
-// description, never `enabled` — silencing is the operator's, not the file's.
-// Silenced checks are left out (they read as unmanaged), which also keeps the
-// file inside the parser's one-watchdog rule when a renamed watchdog left a
-// silenced one behind. A watchdog whose interval is not whole hours is skipped
-// with a note: hours is the only unit the file speaks.
-//
-// A table whose checks cannot be read is skipped with a note rather than
-// failing the clone — the SQL is what a clone is for.
+// fetchCloneChecks never writes `enabled` (silencing is the operator's) and
+// leaves silenced checks out, which also keeps the file inside the one-watchdog
+// rule. An unreadable table's checks are skipped with a note: the SQL is what a
+// clone is for.
 func fetchCloneChecks(ctx context.Context, client *api.Client, sources []cloneSource) []checksCloneFile {
 	var out []checksCloneFile
 	for _, s := range sources {

@@ -11,16 +11,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja db sql` is `ronja query`'s counterpart for a managed Postgres database,
-// and it reuses that command's machinery deliberately — the SQL-source
-// resolution, the atomic 0600 file write, the stderr-only narration. Two
-// commands that print a table should print it the same way.
-//
-// One thing is genuinely different, and it is an improvement rather than a
-// quirk: a failed statement here is an HTTP 400, not a 200 with an error field.
-// So there is no envelope to inspect and no trap to document — an ordinary error
-// return covers it, and every layer above (a shell, `set -e`, CI) does the right
-// thing without being told.
+// It reuses `ronja query`'s machinery (SQL-source resolution, the 0600 file
+// write, stderr-only narration). Unlike `ronja query`, a failed statement is an
+// HTTP 400, not a 200 with an error field, so a plain error return covers it.
 func newDatabaseSQLCmd() *cobra.Command {
 	var (
 		file    string
@@ -86,9 +79,8 @@ If the database has no write role yet, the first statement fails saying so.
 Mint one with:
 
   ronja api -X POST /api/v2/database/<id>/user -d '{"access":"write","featureID":"<feature-id>"}'`,
-		// Two positionals: the database id and (optionally) the SQL. Three would
-		// be somebody who forgot to quote their SQL, and cobra's own error says
-		// so better than a merged string that half-runs.
+		// A third positional is unquoted SQL; refusing it beats a merged string
+		// that half-runs.
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			databaseID := strings.TrimSpace(args[0])
@@ -129,24 +121,19 @@ Mint one with:
 				return err
 			}
 
-			// Which database answered, said before anything about the rows. Same
-			// rule as the truncation notice below and for a stronger reason: a
-			// result read as production's when it came from the copy is a wrong
-			// answer, not an incomplete one. Never stdout — that is the CSV.
+			// Which database answered, said first: a copy's result read as
+			// production's is a wrong answer, not an incomplete one.
 			reportEnvironment(environment, result.Environment, result.DatabaseID, result.ParentDatabaseID)
 
-			// Always stderr, in every mode: a truncation notice on stdout would
-			// land in the middle of the CSV a pipeline is parsing.
+			// Always stderr: stdout is the CSV a pipeline is parsing.
 			if result.Truncated {
 				fmt.Fprintf(os.Stderr,
 					"  Note: truncated at %d %s — this is a prefix, not the whole answer. Raise --max-rows (with --out for a large result), or aggregate in SQL.\n",
 					result.RowCount, plural(result.RowCount, "row"))
 			}
 
-			// What a write CHANGED, which is otherwise invisible: a statement with
-			// no result set prints an empty CSV, so a run that touched 40 rows and
-			// one that touched none look identical on stdout. Suppressed under
-			// --json, whose envelope carries the field itself.
+			// A write prints an empty CSV, so its affected count is otherwise
+			// invisible; --json's envelope carries the field itself.
 			if !flagJSON {
 				reportRowsAffected(result.RowsAffected)
 			}
@@ -155,11 +142,8 @@ Mint one with:
 				if err := writeResultFile(out, result.Result); err != nil {
 					return err
 				}
-				// ⚠️ RowCount is MULTIPLEXED — on a write it is rows AFFECTED, and
-				// nothing at all went into the file. "40 rows written to out.csv" for
-				// an empty file is a confident lie about a path the caller is about
-				// to hand to a parser, so the BODY decides what this line says; the
-				// affected count already had its own line above.
+				// ⚠️ On a write RowCount is rows AFFECTED and the file is empty, so
+				// the body, not RowCount, decides what this line says.
 				if result.Result == "" {
 					fmt.Fprintf(os.Stderr, "  no result set — %s is empty\n", out)
 				} else {
@@ -171,8 +155,7 @@ Mint one with:
 				return emitJSON(result)
 			}
 			if out == "" {
-				// Verbatim, with no added newline: this is data, and a byte the
-				// server did not send is a byte a diff will find.
+				// Verbatim, no added newline: this is data.
 				fmt.Print(result.Result)
 			}
 			return nil
@@ -194,16 +177,8 @@ Mint one with:
 	return cmd
 }
 
-// reportRowsAffected narrates what a write changed, on stderr, and says nothing
-// at all when the server did not report a number.
-//
-// ⚠️ nil is NOT zero. It is "not applicable, or not reliably knowable" — a
-// statement that returned rows, a body holding more than one statement, a driver
-// that reported no count — and printing "0 rows affected" for any of those would
-// be a confident lie about a statement that may have changed a great deal.
-// Silence is the honest rendering of a number nobody has.
-//
-// Never stdout: that is the CSV somebody is parsing.
+// ⚠️ nil is NOT zero: it means not applicable or not knowable (rows returned,
+// several statements, no driver count), so it prints nothing rather than "0".
 func reportRowsAffected(rowsAffected *int) {
 	if rowsAffected == nil {
 		return
@@ -211,23 +186,10 @@ func reportRowsAffected(rowsAffected *int) {
 	fmt.Fprintf(os.Stderr, "  %d %s affected\n", *rowsAffected, plural(*rowsAffected, "row"))
 }
 
-// parseSQLParams splits the --params JSON array into its raw elements.
-//
-// It is parsed here rather than forwarded as an opaque string so a malformed
-// value fails locally, naming the flag, instead of arriving at the server as a
-// type error about a field the user did not type. The accepted-value rule (which
-// scalars, and where a list may bind as an array) is left to the server, which
-// already enforces it for the agent's identical parameter path — duplicating it
-// here would be a second definition to keep in step.
-//
-// The elements stay as RAW JSON. Decoding them into []any would turn every
-// number into a float64 and silently lose precision above 2^53, so a bound
-// parameter of 1234567890123456789 would be written to the database as
-// ...800 — no error, wrong value. Splitting into json.RawMessage passes the
-// user's own bytes through untouched. Pinned by TestParseSQLParamsKeepsPrecision.
-//
-// An empty flag means "no parameters", which is NOT the same as an empty array;
-// both are accepted and both send nothing.
+// parseSQLParams splits the --params JSON array into its raw elements so a
+// malformed value fails naming the flag; which values are accepted is left to
+// the server. Elements stay raw JSON: decoding into []any would round integers
+// above 2^53 through float64 and write a wrong value.
 func parseSQLParams(raw string) ([]json.RawMessage, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil

@@ -9,9 +9,8 @@ import (
 	"testing"
 )
 
-// tagFixture is a realistic GET /tag/of/table/:id response in the shape rdb.Tag
-// actually marshals — including the fields this mirror does not carry, so the
-// test proves the tags MATCH rather than that a stripped fixture decodes.
+// tagFixture is in rdb.Tag's full marshalled shape, including fields this
+// mirror does not carry.
 const tagFixture = `[
   {"tenantID":"tenant-1","id":"tag-fin","name":"Finance","color":"blue","description":"","spaceID":"space-1","createdAt":"2026-09-01T00:00:00Z"},
   {"tenantID":"tenant-1","id":"tag-kpi","name":"Board KPI","color":"gold","description":"x","spaceID":"space-1","createdAt":"2026-09-02T00:00:00Z"}
@@ -35,8 +34,6 @@ func TestListTableTagsDecodesTheCatalogRow(t *testing.T) {
 	}
 }
 
-// An empty target answers `[]` or, from an older encoder, `null` — both must be
-// the same empty list, so "no tags" has one spelling downstream.
 func TestListTableTagsAnswersEmptyForNull(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) { writeString(w, `null`) })
 	tags, err := client.ListTableTags(context.Background(), "table-aov")
@@ -48,10 +45,6 @@ func TestListTableTagsAnswersEmptyForNull(t *testing.T) {
 	}
 }
 
-// TestPatchTableTagsSendsOnlyTheListsItHas: the method, the path, and an
-// absent list OMITTED rather than sent as null — the server refuses a body with
-// every list empty, and a client that always sent all three keys would make
-// "nothing to remove" indistinguishable from a bug in the sender.
 func TestPatchTableTagsSendsOnlyTheListsItHas(t *testing.T) {
 	var gotMethod, gotPath string
 	var body map[string]json.RawMessage
@@ -87,8 +80,7 @@ func TestPatchTableTagsSendsOnlyTheListsItHas(t *testing.T) {
 	}
 }
 
-// A 404 is how an instance older than the route answers, and the loop branches
-// on it — so the status has to survive into the error.
+// The metric loop reads a 404 as an instance older than the route.
 func TestPatchTableTagsReportsAMissingRouteByStatus(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
@@ -99,8 +91,6 @@ func TestPatchTableTagsReportsAMissingRouteByStatus(t *testing.T) {
 	}
 }
 
-// TestGetTableDecodesArchivedAndHidden: the two flags every TableView carries,
-// which the tag half reads to decide whether to reconcile at all.
 func TestGetTableDecodesArchivedAndHidden(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		writeString(w, strings.Replace(strings.Replace(metricRowFixture,

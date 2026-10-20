@@ -8,17 +8,8 @@ import (
 	"testing"
 )
 
-// goldenPath is this package's semantics file: the cases where a hand-rolled
-// lookalike gets jq wrong, run as assertions.
-//
-// ⚠️ IT MUST LIVE INSIDE THIS MODULE, not at the repo root. It was at the root
-// once, back when a second copy of this package served the backend, and that was
-// wrong in a way only CI could show: the test workflows use sparse-checkout
-// limited to their own module directory, so a root fixture is simply ABSENT
-// there — and cli/ is synced verbatim to the public ronja-cli mirror, where a
-// path climbing out of the module does not exist at all. It passed locally and
-// failed in both places. testdata/ beside the test is also just where Go
-// expects it.
+// ⚠️ goldenPath must stay inside this module: CI sparse-checks out only the
+// module directory, and cli/ is mirrored verbatim to the public ronja-cli repo.
 const goldenPath = "testdata/jq_golden.json"
 
 type goldenCase struct {
@@ -33,12 +24,8 @@ type goldenFile struct {
 	Cases []goldenCase `json:"cases"`
 }
 
-// TestGoldenSemantics is this package's regression suite for jq semantics
-// itself: `//`, `?`, an empty stream, and where a decode failure gets reported.
-// It was written when a second copy of this package served the backend and CI
-// diffed the two fixtures; that copy is gone, and the cases are worth keeping
-// on their own, because each one is a place a hand-rolled lookalike — or a gojq
-// upgrade — quietly gets jq wrong.
+// Each case is a place a hand-rolled lookalike, or a gojq upgrade, quietly gets
+// jq wrong: `//`, `?`, an empty stream, and where a decode failure is reported.
 func TestGoldenSemantics(t *testing.T) {
 	raw, err := os.ReadFile(goldenPath)
 	if err != nil {
@@ -59,8 +46,8 @@ func TestGoldenSemantics(t *testing.T) {
 				if err == nil {
 					t.Fatalf("expected a COMPILE error for %q", tc.Expr)
 				}
-				// The expression must be quoted: a bare parser position names a
-				// place in a string the reader cannot see.
+				// A bare parser position names a place in a string the reader
+				// cannot see.
 				if !strings.Contains(err.Error(), tc.Expr) {
 					t.Errorf("compile error should quote the expression, got: %v", err)
 				}

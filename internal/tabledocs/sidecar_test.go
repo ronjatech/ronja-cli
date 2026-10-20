@@ -6,10 +6,6 @@ import (
 	"testing"
 )
 
-// TestParseSidecarThreeState is the rule the whole carrier rests on: an ABSENT
-// key is UNMANAGED. A folder that documents three columns of a twelve-column
-// table must leave the other nine exactly as they are, and a file with no
-// "description" key must not clear the one the row holds.
 func TestParseSidecarThreeState(t *testing.T) {
 	docs, err := ParseSidecar([]byte(`{"columns":{"amount":"line total"}}`))
 	if err != nil {
@@ -24,9 +20,6 @@ func TestParseSidecarThreeState(t *testing.T) {
 	if _, managed := docs.Columns["qty"]; managed {
 		t.Fatal("a column the file never names must not be managed")
 	}
-	// Fingerprint is the "has this FILE changed" question, and an unmanaged key
-	// is not part of it: a file that documents `amount` says the same thing
-	// however much prose other people write on `qty`.
 	same, err := ParseSidecar([]byte(`{"columns":{"amount":"line total"}}`))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -43,13 +36,8 @@ func TestParseSidecarThreeState(t *testing.T) {
 	}
 }
 
-// TestFingerprintSeparatesAbsentFromEmpty is the three-state rule made
-// checkable: a MANAGED-but-empty claim ("clear this") is a declaration, and it
-// must not hash the same as saying nothing.
-//
-// This is exactly where Fingerprint and MetaSHA256 have to differ. On a ROW an
-// empty description and an absent one say the same thing, so MetaSHA256 folds
-// them together; in a FILE they are opposite instructions.
+// Where Fingerprint and MetaSHA256 must differ: in a file, absent and empty are
+// opposite instructions; on a row they say the same thing.
 func TestFingerprintSeparatesAbsentFromEmpty(t *testing.T) {
 	absent, err := ParseSidecar([]byte(`{"columns":{"amount":"x"}}`))
 	if err != nil {
@@ -67,9 +55,6 @@ func TestFingerprintSeparatesAbsentFromEmpty(t *testing.T) {
 	}
 }
 
-// TestParseSidecarExplicitEmptyClears: present-but-empty is a CLAIM, and the
-// claim is "there is no prose here". The distinction from absent is the only
-// way a folder can ever take a description back.
 func TestParseSidecarExplicitEmptyClears(t *testing.T) {
 	docs, err := ParseSidecar([]byte(`{"description":"","columns":{"amount":"","qty":null}}`))
 	if err != nil {
@@ -109,9 +94,8 @@ func TestParseSidecarRefusals(t *testing.T) {
 	}
 }
 
-// TestParseSidecarKeepsUnknownColumnNames: the JOIN RULE is the server's, and
-// this parser must not anticipate it. A name the table does not have is carried
-// exactly as written; the push reports it back as unmatched.
+// The join against the table's columns is the server's; the parser must not
+// anticipate it.
 func TestParseSidecarKeepsUnknownColumnNames(t *testing.T) {
 	docs, err := ParseSidecar([]byte(`{"columns":{"renamed_last_week":"still documented"}}`))
 	if err != nil {
@@ -122,12 +106,8 @@ func TestParseSidecarKeepsUnknownColumnNames(t *testing.T) {
 	}
 }
 
-// renderSidecar writes a Docs back out in the sidecar's own shape.
-//
-// TEST-ONLY, and it lives here rather than beside ParseSidecar because nothing
-// in the CLI writes one of these files: the sidecar is authored by a person and
-// only ever read. An exported renderer with no caller is a second definition of
-// the on-disk format waiting to drift from the one that matters.
+// renderSidecar is test-only because nothing in the CLI writes a sidecar; a
+// production renderer with no caller would be a second definition of the format.
 func renderSidecar(d Docs) ([]byte, error) {
 	file := sidecarFile{Description: d.Description}
 	if len(d.Columns) > 0 {
@@ -162,8 +142,6 @@ func TestRenderSidecarRoundTrips(t *testing.T) {
 	}
 }
 
-// TestMetaSHA256 pins the third drift leg's fingerprint. It is taken from a ROW,
-// compared against that row, and must not move for reasons the row did not.
 func TestMetaSHA256(t *testing.T) {
 	base := MetaSHA256("One row per invoice.", map[string]string{"amount": "line total", "qty": "count"})
 	if base != MetaSHA256("One row per invoice.", map[string]string{"qty": "count", "amount": "line total"}) {
@@ -175,13 +153,9 @@ func TestMetaSHA256(t *testing.T) {
 	if base == MetaSHA256("changed", map[string]string{"amount": "line total", "qty": "count"}) {
 		t.Fatal("changing the description must move the hash")
 	}
-	// An empty column description contributes nothing: a column that has never
-	// been documented and one whose prose was cleared say the same thing.
 	if MetaSHA256("d", map[string]string{"a": ""}) != MetaSHA256("d", nil) {
 		t.Fatal("an empty column description must not move the hash")
 	}
-	// The description is written under its own key, so it cannot collide with a
-	// column that happens to be named after it.
 	if MetaSHA256("x", nil) == MetaSHA256("", map[string]string{"description": "x"}) {
 		t.Fatal("a description and a column named description must not collide")
 	}

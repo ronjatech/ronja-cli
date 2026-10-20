@@ -10,21 +10,8 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The two KIND-AGNOSTIC readers, walked against wfdir's registry.
-//
-// Both were hand-kept switches over three kinds, and the fourth was added
-// without either. Neither failure is loud, and both mislead rather than refuse:
-//
-//   - folderKindAt reported an automation folder as `known=false`, which
-//     syncWalk turns into `unreadable` — a whole tree exiting 2 over a folder
-//     this build understands perfectly.
-//   - localWork left Kind empty, and printLocalWork's fallback then announced
-//     "this is a workflow folder" and printed the `ronja wf` verb list, which is
-//     precisely the misrouting Kind.Command was introduced to stop, delivered in
-//     the one message a lost caller reads.
-//
-// So this walks wfdir.AllKinds() rather than listing anything: a fifth kind
-// cannot be added without answering for both readers.
+// These walk wfdir.AllKinds() rather than a list, so a new kind cannot be added
+// without folderKindAt and localWork knowing it; neither failure is loud.
 
 func TestFolderKindAtRecognisesEveryRegisteredKind(t *testing.T) {
 	for _, want := range wfdir.AllKinds() {
@@ -45,8 +32,6 @@ func TestFolderKindAtRecognisesEveryRegisteredKind(t *testing.T) {
 		})
 	}
 
-	// The other half of `known`: a kind this build has genuinely never heard of
-	// must still come back false, or the flag says nothing.
 	root := t.TempDir()
 	writeKindManifest(t, root, "dashboard")
 	if _, known, err := folderKindAt(root); err != nil || known {
@@ -54,8 +39,6 @@ func TestFolderKindAtRecognisesEveryRegisteredKind(t *testing.T) {
 	}
 }
 
-// TestLocalWorkNamesEveryRegisteredKind: `ronja context` must never describe a
-// folder as a kind it is not, and must never offer it another loop's verbs.
 func TestLocalWorkNamesEveryRegisteredKind(t *testing.T) {
 	for _, want := range wfdir.AllKinds() {
 		t.Run(want.Name, func(t *testing.T) {
@@ -74,10 +57,6 @@ func TestLocalWorkNamesEveryRegisteredKind(t *testing.T) {
 	}
 }
 
-// TestFolderKindLabelsCoversTheRegistry pins the sentence `ronja sync` prints
-// about what it walks. It said "workflow, data-app and pipeline" while walking
-// four kinds, which is the sort of claim a reader checks their folder against
-// and then goes looking for a different tool.
 func TestFolderKindLabelsCoversTheRegistry(t *testing.T) {
 	labels := folderKindLabels()
 	for _, kind := range wfdir.AllKinds() {

@@ -9,13 +9,9 @@ import (
 	"time"
 )
 
-// The property under test is the one that is invisible from the outside:
-// http.Client.Timeout is a CEILING no per-request context can raise, so a
-// caller asking for longer than it gets silently capped. A query routed to
-// Batch compute legitimately runs for minutes, and the failure mode is a
-// perfectly healthy query killed with a message about a deadline nobody chose.
+// http.Client.Timeout is a CEILING no per-request context can raise, so a query
+// asking for longer would be silently capped.
 
-// slowQueryServer answers /api/v2/duckdb/query after a delay.
 func slowQueryServer(t *testing.T, delay time.Duration) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,9 +27,6 @@ func slowQueryServer(t *testing.T, delay time.Duration) *httptest.Server {
 	return srv
 }
 
-// A deadline PAST the client's own ceiling has to actually apply. The ceiling
-// here is deliberately tiny so the test is fast; the relationship it pins is
-// the same one 120s-vs-`--timeout 10m` has in production.
 func TestQueryTimeoutIsNotCappedByTheClientCeiling(t *testing.T) {
 	srv := slowQueryServer(t, 150*time.Millisecond)
 	client := &Client{
@@ -42,13 +35,11 @@ func TestQueryTimeoutIsNotCappedByTheClientCeiling(t *testing.T) {
 	}
 	in := QueryInput{SQL: "SELECT 1", Format: QueryFormatCSVMeta}
 
-	// Under the ceiling: still bounded, as it always was.
 	if _, err := client.Query(context.Background(), in, 30*time.Millisecond); err == nil {
 		t.Fatal("a 30ms deadline did not stop a 150ms query")
 	}
 
-	// Past the ceiling: succeeds. This is only possible if the ceiling moved —
-	// with the shared client it would have died at 40ms.
+	// With the shared client this would die at the 40ms ceiling.
 	result, err := client.Query(context.Background(), in, 5*time.Second)
 	if err != nil {
 		t.Fatalf("a deadline past the client ceiling was capped by it: %v", err)
@@ -58,9 +49,8 @@ func TestQueryTimeoutIsNotCappedByTheClientCeiling(t *testing.T) {
 	}
 }
 
-// Zero means NO deadline, which is `--timeout 0`. Note it cannot be expressed
-// by handing 0 to context.WithTimeout — that produces an already-expired
-// context, i.e. the exact opposite — so this is worth pinning.
+// context.WithTimeout(0) is an already-expired context, the opposite of
+// `--timeout 0`.
 func TestQueryZeroTimeoutMeansNoDeadline(t *testing.T) {
 	srv := slowQueryServer(t, 100*time.Millisecond)
 	client := &Client{
@@ -78,8 +68,6 @@ func TestQueryZeroTimeoutMeansNoDeadline(t *testing.T) {
 	}
 }
 
-// A caller's own cancellation still wins, whatever the request timeout says.
-// Removing the client ceiling must not remove the caller's control with it.
 func TestQueryStillHonoursTheCallersContext(t *testing.T) {
 	srv := slowQueryServer(t, 300*time.Millisecond)
 	client := &Client{BaseURL: srv.URL, HTTP: &http.Client{Timeout: 30 * time.Second}}
@@ -91,8 +79,8 @@ func TestQueryStillHonoursTheCallersContext(t *testing.T) {
 	}
 }
 
-// httpFor's three cases, stated directly: the shared client is reused where it
-// can be, so the connection pool is not duplicated per request.
+// The shared client is reused where it can be, so the connection pool is not
+// duplicated per request.
 func TestHTTPForReusesTheSharedClientWithinTheCeiling(t *testing.T) {
 	client := New("http://example.invalid", "")
 	if got := client.httpFor(requestTimeout); got != client.HTTP {
@@ -113,9 +101,6 @@ func TestHTTPForReusesTheSharedClientWithinTheCeiling(t *testing.T) {
 	}
 }
 
-// An envelope with no `advice` key — the server omits it when there is nothing
-// to say — re-encodes with `"advice": []`, never null, so `--json` and `--jq`
-// callers can iterate it unguarded.
 func TestQueryAdviceIsAnEmptyArrayWhenAbsent(t *testing.T) {
 	srv := slowQueryServer(t, 0)
 	client := &Client{BaseURL: srv.URL, HTTP: &http.Client{}}
@@ -136,12 +121,8 @@ func TestQueryAdviceIsAnEmptyArrayWhenAbsent(t *testing.T) {
 	}
 }
 
-// The CLI prints (or writes to --out) the csv_meta `result` verbatim, so the
-// text it shows is exactly what DuckDB's CSV writer produced server-side. This
-// pins that nothing on the client re-encodes it: a one-column NULL row stays
-// `""` (the server's repair, so the row survives any CSV reader the output is
-// piped into), a BOOLEAN stays `true`, a DECIMAL keeps its scale, and a script
-// whose last statement returns no rows reads as a zero-row `Success`.
+// Nothing on the client may re-encode the server's CSV: a one-column NULL row
+// stays `""` (the server's repair, so the row survives any CSV reader).
 func TestQueryResultIsTheServersCSVVerbatim(t *testing.T) {
 	for _, body := range []QueryResult{
 		{Result: "x\n1\n\"\"\n3\n", RowCount: 3},

@@ -16,67 +16,38 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/jqf"
 )
 
-// What `ronja api` does with a response: send it, judge it, and emit it.
-//
-// The command started as "copy the body to stdout and check the status", which
-// is the right default and is still the path taken when no flag asks for more.
-// Everything here is the set of behaviours that turned out to be missing when
-// people actually built things with it — filtering, waiting, saving, retrying —
-// each of which needs the response held rather than streamed, and none of which
-// knows a single thing about any endpoint.
+// What `ronja api` does with a response: send it, judge it, and emit it. No
+// behaviour here knows anything about a specific endpoint.
 
-// maxResponseBuffer bounds a response the command has to HOLD.
-//
-// Only the flags that must see the whole document pay this: --jq has to parse
-// it, --wait-until has to test it, --fail-on-error has to look inside it. The
-// default path and --out both still stream, so a large download is unaffected —
-// which is why this can be a bound that fails loudly rather than a truncation
-// that silently hands back a prefix.
+// maxResponseBuffer bounds a response the command has to hold (--jq,
+// --wait-until, --fail-on-error); the default path and --out stream, so this can
+// fail loudly rather than truncate.
 const maxResponseBuffer = 64 << 20
 
-// jqFilterTimeout bounds ONE application of a jq filter.
-//
-// ⚠️ THE COMMAND'S OWN CONTEXT IS NOT A BOUND. cmd.Context() carries no
-// deadline, and --timeout bounds the REQUEST, not what is done with the answer
-// — so `ronja query --jq 'def f: f; f'` had nothing at all standing between it
-// and a wedged terminal, and --wait-timeout 0 left the poll condition equally
-// unbounded. jqf's step budget refuses a runaway program on its own, but not
-// the shapes a step count cannot see (one enormous value costs a handful of
-// instructions), which is what this is for.
-//
-// Ten seconds is enormous for the work: the body is already in memory and the
-// heaviest realistic filter over one costs single-digit milliseconds. It is the
-// third of the three bounds a filter runs under — the other two are jqf's work
-// and memory budgets — and like them it FAILS rather than truncating, because
-// half an answer presented as a whole one is the outcome none of them may have.
+// jqFilterTimeout is the only time bound on one filter application:
+// cmd.Context() has no deadline and --timeout bounds only the request. ⚠️ Like
+// jqf's budgets it is checked between instructions, so it cannot cut one builtin
+// short (jqf's join residual); it fails rather than truncating.
 const jqFilterTimeout = 10 * time.Second
 
 // retryBaseDelay is the first pause before a retried attempt; it doubles up to
-// retryMaxDelay. A 429 or a 5xx from a pod restarting mid-deploy clears in
-// seconds, and starting lower just spends the budget before it does.
+// retryMaxDelay.
 const (
 	retryBaseDelay = 1 * time.Second
 	retryMaxDelay  = 30 * time.Second
 )
 
-// DefaultWaitInterval is the cadence --wait-until polls at.
-//
-// 3s matches what the web app polls a running workflow at, and the interval is
-// EXACT — it does not back off. A caller who names a cadence has said what they
-// want, and a poller that quietly stretched to 30s would make a --wait-interval
-// of 1s a lie. --wait-timeout is what bounds the total cost.
+// DefaultWaitInterval is the cadence --wait-until polls at. The interval is
+// exact and never backs off, so a named --wait-interval is honoured;
+// --wait-timeout bounds the total cost.
 const (
 	DefaultWaitInterval = 3 * time.Second
 	DefaultWaitTimeout  = 5 * time.Minute
 )
 
-// apiRequest is one fully-resolved request, replayable.
-//
-// Replayable is the load-bearing word: --retry and --wait-until both issue it
-// more than once, so the body is a BodySource rather than a reader. A reader is
-// consumed by the first attempt and the second would send nothing at all — and
-// an empty POST is the kind of thing a server accepts. Each attempt below calls
-// DoRaw again, which Opens the source afresh and closes what it opened.
+// apiRequest is one fully-resolved, replayable request. The body is a
+// BodySource, not a reader, because --retry and --wait-until send it more than
+// once: a consumed reader would silently send an empty body the second time.
 type apiRequest struct {
 	client  *api.Client
 	method  string
@@ -87,15 +58,9 @@ type apiRequest struct {
 	retries int
 }
 
-// send issues the request once, retrying the answers that mean "ask again".
-//
-// Only 429 and 5xx are retried: they are the server saying it could not deal
-// with the request, as opposed to a 4xx, which is it saying the request was
-// wrong — and repeating a wrong request just spends the budget to be told so
-// again. Transport failures are NOT retried either, because a connection that
-// dropped mid-request may well have delivered it.
-//
-// The caller owns the returned body and must close it.
+// send issues the request, retrying only 429 and 5xx up to r.retries times.
+// Transport failures are not retried: a connection that dropped mid-request may
+// have delivered it. The caller must close the returned body.
 func (r apiRequest) send(ctx context.Context) (*api.RawResponse, error) {
 	var lastStatus int
 	for attempt := 0; ; attempt++ {
@@ -116,13 +81,8 @@ func (r apiRequest) send(ctx context.Context) (*api.RawResponse, error) {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBuffer))
 		resp.Body.Close()
 
-		// One line per retry, on stderr. A silent retry turns a 40-second
-		// command into a mystery, and the status is the part that explains it.
 		fmt.Fprintf(os.Stderr, "  HTTP %d from %s %s — retrying in %s (%d of %d)\n",
 			lastStatus, r.method, r.path, delay.Round(time.Second), attempt+1, r.retries)
-		// The one honest warning about what a retry means. Repeating a GET is
-		// free; repeating a POST may commit it twice, and only the caller knows
-		// whether that endpoint is idempotent.
 		if attempt == 0 && !idempotentMethod(r.method) {
 			fmt.Fprintf(os.Stderr, "  Note: %s is not idempotent — this may deliver the request more than once.\n", r.method)
 		}
@@ -132,15 +92,10 @@ func (r apiRequest) send(ctx context.Context) (*api.RawResponse, error) {
 	}
 }
 
-// sizedPath is one file a streamed body was built from, with the size that was
-// measured for it at build time — the number that became its share of the
-// request's Content-Length — and the modification time it carried when that
-// measurement was taken.
-//
-// The modTime is what makes the after-the-fact check able to see a rewrite that
-// kept the length. It is optional: a zero value means the build-time modTime
-// was never captured, and checkFilesUnchanged then says nothing about it rather
-// than treating "unknown" as "changed".
+// sizedPath is one file a streamed body was built from, with the size (its share
+// of Content-Length) and modification time measured at build time. A zero
+// modTime means none was captured, and checkFilesUnchanged then claims nothing
+// about it.
 type sizedPath struct {
 	path    string
 	size    int64
@@ -155,18 +110,9 @@ type pathBody interface {
 }
 
 // explainUploadTimeout says which file was being sent when --timeout expired,
-// or nil when the failure was not that.
-//
-// --timeout bounds ONE REQUEST, and a request includes the body going up. That
-// is invisible until the body is large: a multi-gigabyte -F file=@big.bin dies
-// partway through the send, with an error about a deadline and nothing about
-// the upload — and the caller's reasonable reading, that the instance is slow,
-// is wrong. The remedy is also not the obvious one, because the default (120s)
-// is generous for every request that is not an upload and lowering the file
-// size is not an option, so the message names --timeout 0 explicitly.
-//
-// Narrowed by the body's own type, like explainBodySizeChange: a request with
-// no file in it times out for its own reasons and must keep its own message.
+// or nil when the failure was not that. --timeout bounds the whole request,
+// upload included, so a large file can hit it mid-send; a body with no file
+// keeps its own message.
 func explainUploadTimeout(err error, body api.BodySource, timeout time.Duration) error {
 	src, ok := body.(pathBody)
 	if !ok || !api.IsTimeout(err) {
@@ -180,40 +126,19 @@ func explainUploadTimeout(err error, body api.BodySource, timeout time.Duration)
 	for _, p := range paths {
 		names = append(names, p.path)
 	}
-	// The deadline is worth quoting because it is the thing to change, and a
-	// caller who did not pass --timeout has no idea what the default is.
 	return fmt.Errorf("the request stopped at the CLI's own --timeout (%s) while %s was being sent — the instance may have received part of it; pass --timeout 0 (or a longer one) and send it again: %w",
 		timeout, strings.Join(names, ", "), err)
 }
 
-// explainBodySizeChange names the file when a streamed body ran SHORT of the
-// length that was measured for it.
-//
-// A file body is stat'ed once and sent later, so the file can change in
-// between, and the two directions fail differently. A file that SHRANK ends
-// before the Content-Length already written, and net/http fails the request
-// outright with "http: ContentLength=N with Body length M" — which is the
-// honest outcome, and this is where it is translated. What the raw error does
-// not say is WHICH file, or that there is nothing wrong with the command. A
-// retry does not re-stat, so a file still being written produces this same
-// message on every attempt rather than a different one each time.
-//
-// A file that GREW does NOT fail here — see checkFilesUnchanged, which is the
-// other half of this window.
+// explainBodySizeChange names the file when a streamed body ran short of its
+// measured length: a file that shrank between stat and send fails in net/http
+// with "ContentLength=N with Body length M". A file that grew does not fail
+// here; checkFilesUnchanged catches it.
 func explainBodySizeChange(err error, body api.BodySource) error {
 	src, ok := body.(pathBody)
-	// Matched on the transport error's text because net/http offers no
-	// sentinel for it: the error is built with errors.New at the point of the
-	// write. Narrowed by the body's own type, so nothing else can be caught by
-	// it — a request with no file in it never reaches this line.
-	//
-	// ⚠️ The substring is a dependency on net/http's own wording, verified
-	// against Go 1.26.5 ("http: ContentLength=%d with Body length %d" in
-	// transfer.go). Nothing here fails loudly if that text changes — the
-	// message simply reverts to the transport's — so the guard is
-	// TestAPISaysWhenARealFileShrankWhileItWasSent, which drives a real short
-	// file through a real transport and asserts the translated message. If that
-	// test fails after a Go upgrade, this is the line to look at.
+	// ⚠️ Matched on net/http's error text, which has no sentinel; if the wording
+	// changes the message silently reverts to the transport's, and
+	// TestAPISaysWhenARealFileShrankWhileItWasSent is the guard.
 	if !ok || !strings.Contains(err.Error(), "ContentLength=") {
 		return err
 	}
@@ -221,13 +146,8 @@ func explainBodySizeChange(err error, body api.BodySource) error {
 	if len(paths) == 0 {
 		return err
 	}
-	// The transport error says a body was short; it does not say which part of
-	// a multipart body it came from. With one file the message can be definite,
-	// with several it must not pretend to be.
-	// Wrapped rather than replaced: the transport error is the evidence for
-	// everything this message asserts, and a caller that reaches for errors.Is
-	// or errors.As on it (api.Unanswered and api.IsTimeout both do) must not
-	// find a bare string where the chain used to be.
+	// The transport cannot say which part of a multipart body ran short. Wrapped,
+	// not replaced: api.Unanswered and api.IsTimeout inspect the chain.
 	if len(paths) == 1 {
 		return fmt.Errorf("%s changed size while it was being sent — send it again once it is complete: %w",
 			paths[0].path, err)
@@ -241,28 +161,11 @@ func explainBodySizeChange(err error, body api.BodySource) error {
 }
 
 // checkFilesUnchanged re-stats every file a streamed body was built from and
-// reports one that is no longer the file that was measured for it — a different
-// size, or the same size with a different modification time.
-//
-// This is the half of the stat-then-send window the transport does NOT catch,
-// and the asymmetry is not obvious. A file that shrank fails in net/http, as
-// explainBodySizeChange describes. A file that GREW does not: net/http writes
-// exactly Content-Length bytes off a LimitReader, so the request on the wire is
-// complete and valid — the server reads a whole upload of the declared size and
-// answers 200 — and the "ContentLength=N with Body length M" error is raised
-// only afterwards, racing the response in persistConn.roundTrip. Measured, it
-// is usually LOST: the command exits zero and the instance has stored a prefix
-// of the file as a finished upload.
-//
-// So growth is caught here instead: one re-stat, after the response has been
-// emitted (see the call site in `ronja api` — the caller sees what the server
-// said, and THEN a non-zero exit explaining what those bytes actually were).
-//
-// The re-stat compares the modification time as well as the size, because a
-// file rewritten IN PLACE to the SAME length is invisible to both halves
-// otherwise: nothing for the transport to fail on, and a size that matches. It
-// is the quietest member of this family — a mixed-content upload that exits
-// zero — so it is worth the second field.
+// reports one whose size or modification time changed since it was measured.
+// ⚠️ A file that grew is not caught by net/http: it sends exactly Content-Length
+// bytes, the server stores that prefix as a complete upload, and the transport's
+// late error usually loses the race with the response; `ronja api` calls this
+// after emitting the response.
 func checkFilesUnchanged(body api.BodySource) error {
 	src, ok := body.(pathBody)
 	if !ok {
@@ -272,10 +175,8 @@ func checkFilesUnchanged(body api.BodySource) error {
 	for _, p := range src.paths() {
 		fi, err := os.Stat(p.path)
 		if err != nil {
-			// Nothing left to compare against. A file that vanished after its
-			// bytes were read is not evidence of a truncated upload — the send
-			// read through a handle it already held — and manufacturing a
-			// failure out of a missing stat would fail correct commands.
+			// A vanished file is not evidence of a truncated upload: the send
+			// read through a handle it already held.
 			continue
 		}
 		if fi.Size() != p.size {
@@ -283,16 +184,8 @@ func checkFilesUnchanged(body api.BodySource) error {
 				p.path, p.size, fi.Size(), p.size))
 			continue
 		}
-		// Same length, different modification time: the file was rewritten IN
-		// PLACE while it was being read. Size alone cannot see this, and it is
-		// the one case that passes both halves of the window — the transport
-		// wrote exactly Content-Length bytes, so there is no mismatch for
-		// net/http to fail on, and the re-stat above finds the number it
-		// expected. What reached the instance is part of the old file and part
-		// of the new one, accepted as a complete upload.
-		//
-		// A zero build-time modTime means nothing was captured to compare
-		// against, so nothing is claimed: "not known" is not "changed".
+		// Same length, new modTime: rewritten in place mid-send, which neither
+		// the transport nor the size check can see.
 		if !p.modTime.IsZero() && !fi.ModTime().Equal(p.modTime) {
 			changed = append(changed, fmt.Sprintf("%s was modified while it was being sent — it is still %d bytes, so the request went out at its full declared length, but what the instance received is part of the old file and part of the new one; send it again now that the file has settled",
 				p.path, p.size))
@@ -304,12 +197,10 @@ func checkFilesUnchanged(body api.BodySource) error {
 	return errors.New(strings.Join(changed, "; "))
 }
 
-// retryableStatus reports the answers worth asking again.
 func retryableStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status >= 500
 }
 
-// idempotentMethod reports the methods a repeat cannot change the meaning of.
 func idempotentMethod(method string) bool {
 	switch strings.ToUpper(method) {
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
@@ -319,14 +210,8 @@ func idempotentMethod(method string) bool {
 	}
 }
 
-// retryDelay is the server's Retry-After when it named one, else exponential
-// backoff.
-//
-// Honouring the header is the point of carrying response headers at all: a rate
-// limiter that says "wait 30 seconds" and gets asked again in one has been told
-// its instruction does not apply, which is how a soft limit becomes a hard one.
-// Both header forms are accepted — a delay in seconds, and an HTTP date — since
-// which one a proxy emits is not something a client gets to choose.
+// retryDelay is the server's Retry-After (seconds or HTTP date) when it named
+// one, else exponential backoff, capped at retryMaxDelay either way.
 func retryDelay(attempt int, header http.Header) time.Duration {
 	if header != nil {
 		if after := strings.TrimSpace(header.Get("Retry-After")); after != "" {
@@ -356,15 +241,8 @@ func capDelay(d time.Duration) time.Duration {
 	return d
 }
 
-// sleepCtx waits, but stays interruptible. A Ctrl-C during a 30-second backoff
-// has to be felt now, not after it.
-//
-// Cancellation is checked BEFORE the select, not only inside it. A zero or
-// already-elapsed duration — a `Retry-After: 0`, a wait interval that has just
-// expired — makes both cases ready at once, and select picks between ready
-// cases at RANDOM. Without this check a cancelled context would be honoured
-// only about half the time, which is the worst kind of bug: correct in most
-// runs and not in the rest.
+// sleepCtx waits interruptibly. Cancellation is checked before the select too:
+// with a zero duration both cases are ready and select would pick at random.
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -382,7 +260,6 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// apiOutput is what to do with the response once there is one.
 type apiOutput struct {
 	filter      *jqf.Filter
 	raw         bool
@@ -390,22 +267,15 @@ type apiOutput struct {
 	failOnError bool
 }
 
-// buffered reports whether the whole body has to be held in memory.
-//
-// --out alone does not: it streams to the file. It is the flags that must read
-// INTO the document — filter it, or look for an error inside it — that force the
-// buffer, and saying so here keeps the streaming default from quietly eroding.
+// buffered reports whether the whole body must be held in memory; --out alone
+// streams.
 func (o apiOutput) buffered() bool {
 	return o.filter != nil || o.failOnError
 }
 
-// emit writes one response out, and reports whether the command failed.
-//
-// Ordering is deliberate and matters when flags are combined: --out always gets
-// the response VERBATIM (it is the archive of what the server said), --jq
-// writes the filtered view to stdout, and the unfiltered body reaches stdout
-// only when nothing else claimed it. So `--out resp.json --jq .id -r` saves the
-// whole answer and prints the one field, which is what both flags plainly mean.
+// emit writes one response out, and reports whether the command failed. --out
+// always gets the response verbatim, --jq writes the filtered view to stdout,
+// and the unfiltered body reaches stdout only when neither claimed it.
 func (o apiOutput) emit(ctx context.Context, resp *api.RawResponse, method, path string) error {
 	if !o.buffered() {
 		return o.emitStreaming(resp, method, path)
@@ -422,9 +292,7 @@ func (o apiOutput) emit(ctx context.Context, resp *api.RawResponse, method, path
 		fmt.Fprintf(os.Stderr, "  %d bytes written to %s\n", len(body), o.out)
 	}
 
-	// The HTTP status is judged BEFORE the body is interpreted, and the body is
-	// still shown: an error body is the most useful thing the server said, and a
-	// runner that swallowed it would make every 400 a second round trip.
+	// An error body is still shown: it is the most useful thing the server said.
 	if resp.Status >= 400 {
 		if o.out == "" {
 			os.Stdout.Write(body)
@@ -433,11 +301,8 @@ func (o apiOutput) emit(ctx context.Context, resp *api.RawResponse, method, path
 		return errAlreadyReported
 	}
 
-	// The 200-with-an-error trap, which `ronja query` has always handled and
-	// this command could not: a failed DuckDB query — and any endpoint that
-	// reports failure in its envelope — answers 200 with `error` set, so a
-	// generic runner exits ZERO on something that never ran, and a pipeline
-	// built on `&&` continues over a failure it never saw.
+	// A failed DuckDB query, like any endpoint reporting failure in its
+	// envelope, answers 200 with `error` set; without this the command exits 0.
 	if o.failOnError {
 		if msg := envelopeError(body); msg != "" {
 			if o.out == "" {
@@ -462,26 +327,10 @@ func (o apiOutput) emit(ctx context.Context, resp *api.RawResponse, method, path
 	return nil
 }
 
-// runFilter applies a compiled filter to one response body, under a deadline.
-//
-// THE RULE IT ENFORCES IS ALL-OR-NOTHING: every value the filter matched is
-// returned, or an error is, and there is no third outcome. Nothing is rendered
-// until the whole stream has been collected, so a filter that fails at value
-// 15,000 prints nothing rather than 14,999 lines and then a failure.
-//
-// ⚠️ AN EARLIER FORM TRUNCATED AT 10,000 VALUES with a note on stderr and a
-// zero exit, and that is why the rule is written down here rather than assumed.
-// `ids=$(ronja api ... --jq '.result[].id' -r 2>/dev/null)` throws the note away
-// and captures a silently wrong PREFIX — and unlike `ronja query`'s
-// `truncated:true`, which is IN the data, a jq stream has nowhere to put such a
-// field. A --jq-strict flag was tried and only moved the problem: the default
-// still lost data, and turning it on printed nothing at all for an answer that
-// had been printable in full. What bounds an enormous answer now is jqf's memory
-// budget, which fails loudly and names a remedy.
-//
-// The deadline is separate from --timeout (which bounds the REQUEST) because
-// cmd.Context() carries none of its own: `--jq 'def f: f; f'` had nothing at all
-// standing between it and a wedged terminal.
+// runFilter applies a compiled filter to one response body under
+// jqFilterTimeout. ⚠️ All or nothing: every matched value or an error, never a
+// truncated prefix, because a jq stream has nowhere to say it was cut and a
+// captured `$(… --jq …)` would silently hold a wrong prefix.
 func runFilter(ctx context.Context, filter *jqf.Filter, body []byte) ([]any, error) {
 	ctx, cancel := context.WithTimeout(ctx, jqFilterTimeout)
 	defer cancel()
@@ -489,8 +338,8 @@ func runFilter(ctx context.Context, filter *jqf.Filter, body []byte) ([]any, err
 	return filter.RunBytes(ctx, body)
 }
 
-// emitStreaming is the original path, unchanged in behaviour: the body is never
-// held, only copied — to a file when --out asked for one, else to stdout.
+// emitStreaming copies the body without holding it: to the --out file, else to
+// stdout.
 func (o apiOutput) emitStreaming(resp *api.RawResponse, method, path string) error {
 	if o.out != "" {
 		n, err := writeStreamFile(o.out, resp.Body)
@@ -505,7 +354,7 @@ func (o apiOutput) emitStreaming(resp *api.RawResponse, method, path string) err
 		return nil
 	}
 
-	// Streamed, and BEFORE the status is judged, for the reason above.
+	// Streamed before the status is judged, so an error body is still shown.
 	if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
 		return fmt.Errorf("read response from %s %s: %w", method, path, err)
 	}
@@ -518,8 +367,7 @@ func (o apiOutput) emitStreaming(resp *api.RawResponse, method, path string) err
 
 // readCapped reads a whole body, refusing anything past maxResponseBuffer.
 func readCapped(r io.Reader) ([]byte, error) {
-	// One byte past the cap, so "exactly at the limit" and "over it" are
-	// distinguishable rather than both looking full.
+	// One byte past the cap tells "exactly at the limit" from "over it".
 	body, err := io.ReadAll(io.LimitReader(r, maxResponseBuffer+1))
 	if err != nil {
 		return nil, err
@@ -532,14 +380,8 @@ func readCapped(r io.Reader) ([]byte, error) {
 }
 
 // envelopeError pulls a top-level `error` out of a JSON response, or "" when
-// there is none.
-//
-// Deliberately shallow, and deliberately not endpoint knowledge: this is the
-// shape the whole API uses for a failure it reports in-band (the same field
-// internal/api.parseError reads out of a non-2xx), so knowing it cannot drift
-// the way a route table can. A body that is not JSON, or not an object, has no
-// envelope and is therefore not a failure — this flag must never turn a
-// perfectly good CSV or zip into an error.
+// there is none. A body that is not a JSON object is never a failure, so a CSV
+// or zip passes.
 func envelopeError(body []byte) string {
 	var shape struct {
 		Error string `json:"error"`
@@ -550,33 +392,18 @@ func envelopeError(body []byte) string {
 	return strings.TrimSpace(shape.Error)
 }
 
-// waitPlan is the --wait-until loop's configuration.
 type waitPlan struct {
 	until    *jqf.Filter
 	interval time.Duration
 	timeout  time.Duration
 }
 
-// errWaitTimeout ends a wait that never came true. Its own error so the message
-// can say what was being waited FOR, which is the only thing worth knowing.
 var errWaitTimeout = errors.New("wait timed out")
 
-// wait re-issues the request until the condition holds, and hands back the
-// response that satisfied it.
-//
-// This is the shape the CLI's doctrine explicitly makes room for: a stateful
-// multi-step loop that plain HTTP does badly. Ronja is full of asynchronous
-// state machines — workflow runs, table builds, connector syncs, feature
-// exports, managed-database provisioning — and every caller was hand-rolling
-// the same sleep-and-poll around each of them. A verb per primitive would be a
-// wrapper and would drift; this knows only how to re-send a request the caller
-// already wrote, and works for every one of them, including the ones added
-// after it.
-//
-// Each attempt's body must be buffered (the condition has to read it), so the
-// polled response is capped like any other buffered one. The satisfying
-// response is returned UNREAD, as a replayed final request, so the caller's
-// normal emit path handles it identically to a one-shot call.
+// wait re-issues the request until the condition holds and returns the
+// satisfying response, rebuilt from the bytes the condition was tested against
+// so the caller's normal emit path handles it. Each polled body is capped like
+// any buffered one.
 func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, error) {
 	if plan.timeout > 0 {
 		var cancel context.CancelFunc
@@ -599,10 +426,8 @@ func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, 
 			return nil, fmt.Errorf("read response from %s %s: %w", r.method, r.path, readErr)
 		}
 
-		// An HTTP error during a wait ENDS it. A 404 on the thing being polled
-		// is not "not ready yet", it is the wrong path — and looping on it for
-		// five minutes would report a typo as a timeout. (429 and 5xx never
-		// reach here when --retry is set; without it they are a real answer.)
+		// An HTTP error ends the wait: a 404 is a wrong path, not "not ready
+		// yet". 429 and 5xx reach here only once --retry is spent or unset.
 		if status >= 400 {
 			os.Stdout.Write(body)
 			fmt.Fprintf(os.Stderr, "HTTP %d %s %s (while waiting)\n", status, r.method, r.path)
@@ -611,22 +436,16 @@ func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, 
 
 		results, err := runCondition(ctx, plan.until, body)
 		if err != nil {
-			// The WAIT's deadline can expire while the condition is being
-			// evaluated (a slow box, a --wait-timeout of a few ms). That is a
-			// timed-out wait, not a broken filter, and must read as one —
-			// jqf's own message quotes the expression with %q, so the
-			// condition the reader is looking for is not even in it verbatim.
+			// The wait's deadline expiring mid-evaluation is a timed-out wait,
+			// not a broken filter.
 			if ctx.Err() != nil {
 				return nil, waitFailure(plan, attempt, ctx.Err())
 			}
 			return nil, err
 		}
 		if jqf.Holds(results) {
-			// Handed back as a response the caller can emit, so --jq, --out and
-			// the plain body path all behave exactly as they would without a
-			// wait. Nothing re-fetches: these are the bytes the condition was
-			// tested against, which is also the only way the printed answer is
-			// guaranteed to be the one that satisfied it.
+			// Not re-fetched: the printed answer must be the one that satisfied
+			// the condition.
 			return &api.RawResponse{
 				Status: status,
 				Header: resp.Header,
@@ -640,17 +459,10 @@ func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, 
 	}
 }
 
-// runCondition evaluates a --wait-until condition against one response.
-//
-// It is the same all-or-nothing contract as runFilter, and a condition is where
-// that matters most: Holds requires EVERY output to be truthy, so a PREFIX that
-// happened to be all-truthy would end the poll on a response whose next value
-// was false — a wait reporting success for work that never finished. Nothing
-// truncates any more, so that cannot happen; when this path did truncate it had
-// to refuse outright, which is the asymmetry that is now gone.
-//
-// The condition gets the same deadline as any other filter: --wait-timeout may
-// legitimately be 0, so it cannot be relied on to bound one evaluation.
+// runCondition evaluates a --wait-until condition against one response, all or
+// nothing like runFilter: Holds needs every output truthy, so an all-truthy
+// prefix would end the wait early. It gets jqFilterTimeout because
+// --wait-timeout may be 0.
 func runCondition(ctx context.Context, until *jqf.Filter, body []byte) ([]any, error) {
 	ctx, cancel := context.WithTimeout(ctx, jqFilterTimeout)
 	defer cancel()
@@ -658,9 +470,7 @@ func runCondition(ctx context.Context, until *jqf.Filter, body []byte) ([]any, e
 	return until.RunBytes(ctx, body)
 }
 
-// waitFailure turns a cancelled or expired wait into a message that says what
-// was being waited for. "context deadline exceeded" after five silent minutes
-// is the least useful thing this could report.
+// waitFailure turns an expired wait into a message naming the condition.
 func waitFailure(plan waitPlan, attempts int, cause error) error {
 	if errors.Is(cause, context.DeadlineExceeded) {
 		return fmt.Errorf("%w after %s and %d %s: %s was never satisfied — raise --wait-timeout, or check the condition against one response first",

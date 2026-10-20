@@ -13,16 +13,10 @@ import (
 	"time"
 )
 
-// tableFixture is a realistic single-row GET response, in the shape
-// feature.TableView actually serves — including the fields this mirror
-// deliberately does NOT carry, so the test proves the tags MATCH rather than
-// that a stripped-down fixture happens to decode.
-//
-// The point of the fixture is TAG VERIFICATION: a field name that does not match
-// backend/api/v2/feature/tableview.go decodes to the zero value silently, and
-// here that means an empty `code` (a push that would "revert" a colleague's
-// table to nothing) or an absent buildVerdict (a failed build reported as
-// success).
+// tableFixture is in feature.TableView's full shape, including fields this
+// mirror does not carry. A tag that drifts from tableview.go decodes silently to
+// zero: an empty `code` would push a colleague's table to nothing, an absent
+// buildVerdict would report a failed build as success.
 const tableFixture = `{
   "id": "table-abc",
   "featureID": "collection-1",
@@ -131,8 +125,8 @@ func TestGetTableDecodesEveryMirroredField(t *testing.T) {
 		t.Errorf("UpdatedAt = %v", tbl.UpdatedAt)
 	}
 
-	// The row's stored form is positional; the canonical form is what everything
-	// downstream hashes and writes.
+	// The stored form is positional; everything downstream hashes and writes the
+	// canonical form.
 	code, unresolved := tbl.CanonicalCode()
 	if unresolved || code != "SELECT * FROM {{ ref('table-orders') }}" {
 		t.Errorf("CanonicalCode = %q, unresolved=%v", code, unresolved)
@@ -145,10 +139,7 @@ func TestGetTableDecodesEveryMirroredField(t *testing.T) {
 	}
 }
 
-// TestGetTableNormalizesAbsentInputModels: the server sends [] rather than
-// omitting it, but a hand-written fixture or an older instance can still send
-// null — and a nil that ranged differently from an empty slice would show up as
-// a spurious lineage difference.
+// An older instance can send null, which must not read as a lineage difference.
 func TestGetTableNormalizesAbsentInputModels(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"table-1","inputModels":null}`))
@@ -162,10 +153,8 @@ func TestGetTableNormalizesAbsentInputModels(t *testing.T) {
 	}
 }
 
-// TestGetTableDraftAnswersNilForNoDraft: the endpoint answers 200 with a JSON
-// `null` body rather than 404, so decoding into a struct would turn "no draft"
-// into a zero-value Table with an empty id — and every caller would then act on
-// a draft that does not exist.
+// The endpoint answers 200 with a JSON `null` for no draft, which must not
+// decode into a zero-value Table.
 func TestGetTableDraftAnswersNilForNoDraft(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v2/feature/model/table-abc/draft" {
@@ -182,9 +171,7 @@ func TestGetTableDraftAnswersNilForNoDraft(t *testing.T) {
 	}
 }
 
-// TestGetTableDraftNamesTheUnreachableParent: a 404 on /draft is the PARENT
-// table's read gate (trashed, trashed feature, or no access), never "no draft",
-// so the error must say so and still carry the status for StatusOf.
+// A 404 on /draft is the PARENT table's read gate, never "no draft".
 func TestGetTableDraftNamesTheUnreachableParent(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -240,8 +227,7 @@ const reviewFixture = `{
 
 func TestGetTableDraftReviewDecodesTheWholePayload(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
-		// The route is on the GOVERNANCE handler, NOT under /feature/model —
-		// getting this wrong is a 404 on an otherwise working loop.
+		// The route is on the GOVERNANCE handler, not under /feature/model.
 		if r.URL.Path != "/api/v2/table/draft/table-draft-1/review" {
 			t.Errorf("path = %s", r.URL.Path)
 		}
@@ -263,8 +249,7 @@ func TestGetTableDraftReviewDecodesTheWholePayload(t *testing.T) {
 	if !reflect.DeepEqual(rev.FieldsDelta, want) {
 		t.Errorf("fieldsDelta = %+v", rev.FieldsDelta)
 	}
-	// The lineage delta: the one change a commit can make with no SQL diff at
-	// all, so a tag that did not decode would hide it completely.
+	// The one change a commit can make with no SQL diff at all.
 	if rev.InputModelsDelta == nil {
 		t.Fatal("inputModelsDelta did not decode")
 	}
@@ -276,8 +261,7 @@ func TestGetTableDraftReviewDecodesTheWholePayload(t *testing.T) {
 	if rev.DraftRowCount != 4210 {
 		t.Errorf("draftRowCount = %d", rev.DraftRowCount)
 	}
-	// -1 IS NOT ZERO: it means "never built, no field stats yet", and rendering
-	// it as a row count would report an unbuilt table as an empty one.
+	// -1 means "never built", not an empty table.
 	if rev.LiveRowCount != -1 {
 		t.Errorf("liveRowCount = %d, want the -1 sentinel", rev.LiveRowCount)
 	}
@@ -289,21 +273,16 @@ func TestGetTableDraftReviewDecodesTheWholePayload(t *testing.T) {
 	if !rev.SubmittedForReview {
 		t.Error("submittedForReview did not decode")
 	}
-	// The value `pipeline publish --overwrite-remote` sends back as
-	// confirmHeadVersionID. A tag that did not decode would leave it empty, which
-	// the override reads as "nothing to confirm" and reports as a dead end on a
-	// table that has moved — a refusal with no way through.
+	// `pipeline publish --overwrite-remote` sends this back as
+	// confirmHeadVersionID; empty, the override has nothing to confirm.
 	if rev.HeadVersionID != "table-v2" {
 		t.Errorf("headVersionID = %q, want the id the override confirms", rev.HeadVersionID)
 	}
 }
 
-// TestUpdateTableCodeSendsBaseCodeSha256OnlyWhenAsserting pins the three-state
-// wire shape of the layer-1 precondition, which is the one tag on this type
-// where omitempty is load-bearing in the DESTRUCTIVE direction: the server
-// answers 400 to an explicit "" (rmodelv2.checkCodePrecondition refuses it
-// rather than reading it as "no check"), so a tag without omitempty would turn
-// every unconditional write in the loop into a bad request.
+// The server 400s an explicit empty baseCodeSha256
+// (rmodelv2.checkCodePrecondition), so without omitempty every unconditional
+// write would be refused.
 func TestUpdateTableCodeSendsBaseCodeSha256OnlyWhenAsserting(t *testing.T) {
 	const digest = "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"
 	for _, tt := range []struct {
@@ -331,12 +310,8 @@ func TestUpdateTableCodeSendsBaseCodeSha256OnlyWhenAsserting(t *testing.T) {
 	}
 }
 
-// TestCommitTableDraftSendsNoBodyWithoutAnOverride: an ordinary commit must send
-// the shape this route took before the CAS existed. The override is the only
-// thing that puts a body on it, and the field name has to match
-// rmodelv2.CommitDraftInput exactly — a misspelt tag decodes to the zero value
-// server-side, which is "no override", so the commit would be refused again with
-// nothing to show for it.
+// Only the override puts a body on a commit, and its field name must match
+// rmodelv2.CommitDraftInput: a misspelt tag reads server-side as "no override".
 func TestCommitTableDraftSendsNoBodyWithoutAnOverride(t *testing.T) {
 	var got []capture
 	client := serveCapturing(t, 200, "", &got)
@@ -356,9 +331,8 @@ func TestCommitTableDraftSendsNoBodyWithoutAnOverride(t *testing.T) {
 	}
 }
 
-// TestListFeatureTablesPaginates: the token is an OFFSET and is present only
-// while more rows remain, so the loop has to stop on an absent one — and must
-// not stop on the FIRST page merely because it is full.
+// The token is an OFFSET present only while more rows remain; a full first page
+// is not the end.
 func TestListFeatureTablesPaginates(t *testing.T) {
 	var paths []string
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -398,9 +372,8 @@ func TestListFeatureTablesPaginates(t *testing.T) {
 	}
 }
 
-// TestListFeatureTablesStopsOnANonAdvancingToken: the token is an offset, so an
-// instance that kept answering with the same one would loop forever. The guard
-// is not a limit on how many tables a feature may have.
+// An instance answering the same offset again would loop forever; the guard is
+// not a cap on how many tables a feature may have.
 func TestListFeatureTablesStopsOnANonAdvancingToken(t *testing.T) {
 	var calls int32
 	client := serve(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -411,9 +384,6 @@ func TestListFeatureTablesStopsOnANonAdvancingToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a stuck token must not be an error, it must just end: %v", err)
 	}
-	// Two requests: the first page, then one more that comes back with the SAME
-	// offset — which is where the loop notices and stops, rather than running to
-	// the page cap or forever.
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Errorf("expected the loop to stop on the repeated token, made %d requests", got)
 	}
@@ -424,7 +394,6 @@ func TestListFeatureTablesStopsOnANonAdvancingToken(t *testing.T) {
 
 // ── Writes ──────────────────────────────────────────────────────────────────
 
-// capture records the method, path and decoded body of each request.
 type capture struct {
 	method string
 	path   string
@@ -486,14 +455,10 @@ func TestCreateTableSendsTheDerivedShape(t *testing.T) {
 	}
 }
 
-// TestUpdateTableCodeAlwaysSendsInputModels is the one behaviour in the write
-// half that has to be pinned by a test rather than a comment.
-//
-// Server-side derivation fires only when the declared list is EMPTY, and a
-// checked-out draft inherits its parent's non-empty input_models — so an omitted
-// field 400s the moment an edit adds an upstream ref. And an explicit empty list
-// is a real declaration ("reads from nothing"), which must not be collapsed into
-// an absent key by omitempty.
+// Server-side derivation fires only when the declared list is EMPTY and a
+// draft inherits its parent's input_models, so an omitted field 400s once an
+// edit adds a ref; an explicit empty list is a real declaration omitempty must
+// not drop.
 func TestUpdateTableCodeAlwaysSendsInputModels(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
@@ -527,10 +492,8 @@ func TestUpdateTableCodeAlwaysSendsInputModels(t *testing.T) {
 	}
 }
 
-// TestLifecycleVerbsHitTheRightRoutes: checkout / sync / commit / discard all
-// take an id and differ only in the path, which is exactly the kind of thing a
-// copy-paste gets wrong silently — and request-review is on a DIFFERENT prefix
-// entirely (the governance handler), which is the one most likely to be missed.
+// request-review is on a different prefix (the governance handler) from the
+// other lifecycle verbs.
 func TestLifecycleVerbsHitTheRightRoutes(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -569,22 +532,18 @@ func TestLifecycleVerbsHitTheRightRoutes(t *testing.T) {
 
 // ── The poll loop ───────────────────────────────────────────────────────────
 
-// fastPoll collapses the schedule so the tests exercise the whole loop without
-// sleeping through it.
 func fastPoll(c *Client) *Client {
 	c.TableBuild = TableBuildPoll{
 		Interval:    time.Millisecond,
 		MaxInterval: 2 * time.Millisecond,
 		Timeout:     2 * time.Second,
-		// The failure tolerance is ELAPSED TIME, so it is collapsed here like
-		// every other duration rather than expressed as a retry count.
+		// The failure tolerance is elapsed time, not a retry count.
 		MaxFailureWindow: 20 * time.Millisecond,
 		RateLimitBackoff: time.Millisecond,
 	}
 	return c
 }
 
-// tableStates serves a scripted sequence of responses, repeating the last.
 func tableStates(t *testing.T, bodies ...string) *Client {
 	t.Helper()
 	var i int32
@@ -612,9 +571,6 @@ func TestWaitForTableBuildPollsToATerminalVerdict(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildReturnsAFailureAsData: a failed build is the ordinary
-// outcome of an iteration cycle, not a broken instance — the caller renders the
-// reason and keeps the draft.
 func TestWaitForTableBuildReturnsAFailureAsData(t *testing.T) {
 	client := tableStates(t, `{"id":"table-1","status":"ready","buildVerdict":"failed_stale",
 		"lastBuildError":{"message":"impossible with the given inputs","type":"invalid_input"}}`)
@@ -630,8 +586,6 @@ func TestWaitForTableBuildReturnsAFailureAsData(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildTreatsOKPartialAsUsable: the table IS queryable, so the
-// incompleteness is a warning to print rather than a reason to refuse.
 func TestWaitForTableBuildTreatsOKPartialAsUsable(t *testing.T) {
 	client := tableStates(t, `{"id":"table-1","status":"ready","buildVerdict":"ok_partial"}`)
 	res, err := client.WaitForTableBuild(context.Background(), "table-1")
@@ -643,12 +597,8 @@ func TestWaitForTableBuildTreatsOKPartialAsUsable(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildFallsBackOnAnOlderServer walks the whole truth table for
-// an instance that sends no buildVerdict at all.
-//
-// The `ready`-with-an-error row is the one that matters: without the fallback a
-// caller reading `status` alone would report a build that FAILED as success,
-// with the table still serving the previous build's data.
+// For an instance with no buildVerdict, `ready` with an error is a FAILED build
+// still serving the previous build's data, not a success.
 func TestWaitForTableBuildFallsBackOnAnOlderServer(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -676,9 +626,7 @@ func TestWaitForTableBuildFallsBackOnAnOlderServer(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildEndsOnAnUnrecognisedStatus: an unknown status yields no
-// verdict at all. Reporting what we saw is right; treating it as still-running
-// would hang until the deadline on a build that already finished.
+// Treating an unknown status as still-running would hang on a finished build.
 func TestWaitForTableBuildEndsOnAnUnrecognisedStatus(t *testing.T) {
 	client := tableStates(t, `{"id":"t","status":"cancelled"}`)
 	res, err := client.WaitForTableBuild(context.Background(), "t")
@@ -690,9 +638,8 @@ func TestWaitForTableBuildEndsOnAnUnrecognisedStatus(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildNamesTheCodelessSyncCause: a table with no `code` parks
-// at `pending` forever, the sync's 200 says nothing, and the failure is recorded
-// nowhere — so this deadline message is the only diagnosis that exists.
+// A table with no `code` parks at `pending` forever and the failure is recorded
+// nowhere, so this deadline message is the only diagnosis.
 func TestWaitForTableBuildNamesTheCodelessSyncCause(t *testing.T) {
 	client := tableStates(t, `{"id":"table-1","status":"pending","buildVerdict":"pending"}`)
 	client.TableBuild.Timeout = 5 * time.Millisecond
@@ -706,8 +653,6 @@ func TestWaitForTableBuildNamesTheCodelessSyncCause(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildTimesOutOnASlowBuild: a build still going is a different
-// message — it is not stuck, we just stopped watching.
 func TestWaitForTableBuildTimesOutOnASlowBuild(t *testing.T) {
 	client := tableStates(t, `{"id":"table-1","status":"building","buildVerdict":"building"}`)
 	client.TableBuild.Timeout = 5 * time.Millisecond
@@ -719,16 +664,12 @@ func TestWaitForTableBuildTimesOutOnASlowBuild(t *testing.T) {
 	if strings.Contains(err.Error(), "no `code`") {
 		t.Errorf("a building row is not the codeless case: %v", err)
 	}
-	// The last thing we knew is returned anyway — "still going, here is where it
-	// was" is a useful answer.
 	if last == nil || last.Verdict != BuildVerdictBuilding {
 		t.Errorf("last = %+v", last)
 	}
 }
 
-// TestWaitForTableBuildSurvivesATransientFailure: a poll that fails proves
-// nothing about the build, and the budget is consecutive — a successful read
-// starts it over.
+// The failure budget is consecutive: a successful read starts it over.
 func TestWaitForTableBuildSurvivesATransientFailure(t *testing.T) {
 	var i int32
 	client := fastPoll(serve(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -748,7 +689,6 @@ func TestWaitForTableBuildSurvivesATransientFailure(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildGivesUpOnAnUnreachableInstance.
 func TestWaitForTableBuildGivesUpOnAnUnreachableInstance(t *testing.T) {
 	client := fastPoll(serve(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
@@ -760,7 +700,6 @@ func TestWaitForTableBuildGivesUpOnAnUnreachableInstance(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildStopsOnACancelledContext.
 func TestWaitForTableBuildStopsOnACancelledContext(t *testing.T) {
 	client := tableStates(t, `{"id":"t","status":"building","buildVerdict":"building"}`)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -770,12 +709,8 @@ func TestWaitForTableBuildStopsOnACancelledContext(t *testing.T) {
 	}
 }
 
-// TestTableBuildPollDefaultsEveryField: a partially-set schedule is the natural
-// thing to write in a test (or to shorten a wait), and every field it leaves at
-// zero has to come back as the default.
-//
-// Timeout is the one worth pinning: a zero there used to mean "no deadline", so
-// a caller who set only the interval got a poll loop that would wait forever.
+// A zero Timeout must default, not mean "no deadline", or a caller who set only
+// the interval would wait forever.
 func TestTableBuildPollDefaultsEveryField(t *testing.T) {
 	got := TableBuildPoll{Interval: time.Second}.withDefaults()
 	if got.Interval != time.Second {
@@ -791,13 +726,8 @@ func TestTableBuildPollDefaultsEveryField(t *testing.T) {
 	}
 }
 
-// TestWaitForTableBuildBacksOffOnARateLimit: a 429 is the global rate limiter,
-// and it is the one transient failure where retrying at the same cadence is
-// actively wrong — an unchanged cadence is a promise to keep producing exactly
-// the load being complained about.
-//
-// It is also transient, not terminal: the build is unaffected and the next poll
-// answers.
+// A 429 is transient but must back off: an unchanged cadence keeps producing the
+// load being complained about.
 func TestWaitForTableBuildBacksOffOnARateLimit(t *testing.T) {
 	var i int32
 	client := fastPoll(serve(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -807,8 +737,7 @@ func TestWaitForTableBuildBacksOffOnARateLimit(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"id":"t","status":"ready","buildVerdict":"ok"}`))
 	}))
-	// MaxInterval caps the backoff, exactly as it caps the ordinary schedule, so
-	// it has to be raised for the bump to be visible at all.
+	// MaxInterval caps the backoff too, so it is raised to make the bump visible.
 	client.TableBuild.MaxInterval = 200 * time.Millisecond
 	client.TableBuild.RateLimitBackoff = 20 * time.Millisecond
 
@@ -820,8 +749,6 @@ func TestWaitForTableBuildBacksOffOnARateLimit(t *testing.T) {
 	if res.Verdict != BuildVerdictOK {
 		t.Errorf("result = %+v", res)
 	}
-	// The 1ms base interval alone could not have taken this long, so the backoff
-	// is what is being measured rather than the schedule.
 	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
 		t.Errorf("polled again after %s — the rate-limit backoff was not applied", elapsed)
 	}

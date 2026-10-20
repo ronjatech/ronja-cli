@@ -12,14 +12,8 @@ import (
 	"time"
 )
 
-// The flags that turned `ronja api` from a request runner into something you
-// can build with: --jq, -F, --out, --retry, --fail-on-error and --wait-until.
-//
-// What is worth pinning is not that they work once, but the rules that are
-// invisible from the output and expensive to get wrong: that a wait never
-// re-sends a POST, that a filtered response is the one the condition matched,
-// that --out never leaves a world-readable file, and that a retry is not
-// applied to a 4xx.
+// Tests for `ronja api`'s --jq, -F, --out, --retry, --fail-on-error and
+// --wait-until, pinning the rules invisible from the output.
 
 // --- --jq -------------------------------------------------------------------
 
@@ -37,8 +31,8 @@ func TestAPIJQFiltersTheResponse(t *testing.T) {
 	}
 }
 
-// The form the whole flag exists for: $(...) into another command. A quoted
-// "wf-1" substituted into a path is a path that does not exist.
+// A quoted "wf-1" substituted into a path via $(...) is a path that does not
+// exist.
 func TestAPIJQRawUnquotesStrings(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"id":"wf-1"}`
@@ -53,17 +47,9 @@ func TestAPIJQRawUnquotesStrings(t *testing.T) {
 	}
 }
 
-// A LARGE LISTING IS PRINTED IN FULL. There is no cap, so there is no prefix.
-//
-// Both halves of this were regressions against the previous release. A 10,000-
-// value cap meant `ronja api --jq '.result[].id' -r 2>/dev/null` captured a
-// silently wrong prefix and exited zero, and the flag added to opt out of that
-// (--jq-strict, implied by --fail-on-error) printed NOTHING for an answer that
-// had been printable in full one release earlier. --fail-on-error is in the
-// table below precisely because that combination was the worse of the two.
-//
-// 20,000 is deliberately twice the old cap: a test at the boundary would pass
-// on an off-by-one that reintroduced it.
+// A large listing is printed in full, with or without --fail-on-error: a cap
+// would capture a silently wrong prefix and exit zero. 20,000 is twice a 10,000
+// cap rather than at its boundary, so an off-by-one reintroducing one still fails.
 func TestAPIJQPrintsEveryValueOfALargeListing(t *testing.T) {
 	const items = 20000
 
@@ -82,9 +68,6 @@ func TestAPIJQPrintsEveryValueOfALargeListing(t *testing.T) {
 
 	for _, args := range [][]string{
 		{"api", "--jq", ".result[].id", "-r", "/api/v2/feature/query"},
-		// The combination that regressed hardest: on the previous release this
-		// printed all 20,000 lines and exited zero, and on the branch it printed
-		// none and exited 1.
 		{"api", "--fail-on-error", "--jq", ".result[].id", "-r", "/api/v2/feature/query"},
 	} {
 		t.Run(strings.Join(args[1:len(args)-1], " "), func(t *testing.T) {
@@ -104,14 +87,8 @@ func TestAPIJQPrintsEveryValueOfALargeListing(t *testing.T) {
 	}
 }
 
-// --jq-strict does not exist, and this pins that it stays gone.
-//
-// It was the flag that let a caller opt out of a silent truncation, and it was
-// removed with the truncation it described: with no prefix there is nothing for
-// it to make strict, and leaving it as a no-op would tell a script author their
-// output is guarded by something that is not there. cobra refuses an unknown
-// flag, which is the honest answer — the caller finds out at the command line
-// rather than from the size of the file they captured.
+// --jq-strict must stay an unknown flag: with no truncation there is nothing for
+// it to make strict, and a no-op would tell a script it is guarded when it is not.
 func TestAPIHasNoJQStrictFlag(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"result":[]}`
@@ -126,12 +103,8 @@ func TestAPIHasNoJQStrictFlag(t *testing.T) {
 	}
 }
 
-// A filter that FAILS prints nothing at all — not a prefix and then a failure.
-//
-// A jq program is a stream and a stream can fail late, so the CLI collects
-// every value before rendering any of them. Without that, `--jq` over a listing
-// with one bad row would write thousands of good lines to stdout and then exit
-// non-zero, and a caller redirecting stdout to a file would keep them.
+// A jq stream can fail late, so a failing filter must print nothing, not a
+// prefix a caller redirecting stdout would keep.
 func TestAPIJQPrintsNothingWhenTheFilterFailsLate(t *testing.T) {
 	e := newEchoServer(t)
 	var body strings.Builder
@@ -156,8 +129,7 @@ func TestAPIJQPrintsNothingWhenTheFilterFailsLate(t *testing.T) {
 	}
 }
 
-// A bad expression must cost nothing. Compiling after the round trip would
-// spend a request — and with --wait-until, a whole poll — to report a typo.
+// A bad expression must be refused before any request (or --wait-until poll).
 func TestAPIRefusesABadJQExpressionBeforeSending(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -204,14 +176,12 @@ func TestAPIFormSendsMultipart(t *testing.T) {
 	if ct := req.Header.Get("Content-Type"); !strings.HasPrefix(ct, "multipart/form-data; boundary=") {
 		t.Fatalf("Content-Type = %q, want multipart with a boundary", ct)
 	}
-	// The filename has to survive: an upload handler stores it as the file's
-	// name, and a part without one is a plain field most servers ignore.
+	// A part without a filename is a plain field most servers ignore.
 	if !strings.Contains(req.Body, `filename="quarterly.pdf"`) {
 		t.Errorf("body does not carry the filename:\n%s", req.Body)
 	}
-	// A real content type, not multipart's hardcoded octet-stream — Ronja
-	// records it on the file row, and octet-stream costs preview and text
-	// extraction.
+	// Ronja records the type on the file row; octet-stream costs preview and
+	// text extraction.
 	if !strings.Contains(req.Body, "Content-Type: application/pdf") {
 		t.Errorf("body does not carry a guessed content type:\n%s", req.Body)
 	}
@@ -220,8 +190,6 @@ func TestAPIFormSendsMultipart(t *testing.T) {
 	}
 }
 
-// A missing file must be caught before anything is sent. Otherwise --retry
-// spends its whole budget on a request that could never have succeeded.
 func TestAPIFormRefusesAMissingFileBeforeSending(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -236,9 +204,7 @@ func TestAPIFormRefusesAMissingFileBeforeSending(t *testing.T) {
 	}
 }
 
-// A pipe can be drained once, so a second reader gets EOF and its part goes out
-// EMPTY — accepted by the server, discovered much later. Refusing is the only
-// point at which it is diagnosable.
+// A second reader of a drained pipe sends an EMPTY part the server accepts.
 func TestAPIRefusesTwoFormFieldsReadingStdin(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -248,7 +214,6 @@ func TestAPIRefusesTwoFormFieldsReadingStdin(t *testing.T) {
 	if err == nil {
 		t.Fatal("two -F fields both reading stdin were accepted")
 	}
-	// Both halves have to be named, or the caller cannot see which pair clashed.
 	if !strings.Contains(err.Error(), "one=@-") || !strings.Contains(err.Error(), "two=@-") {
 		t.Errorf("the error does not name both readers: %v", err)
 	}
@@ -257,9 +222,8 @@ func TestAPIRefusesTwoFormFieldsReadingStdin(t *testing.T) {
 	}
 }
 
-// A caller-supplied multipart Content-Type names a boundary the body does not
-// use, so the server parses ZERO parts and reports success. The subtype is
-// honoured; the boundary is replaced with the real one.
+// A caller-supplied boundary would parse as ZERO parts and report success, so
+// the subtype is honoured and the boundary replaced.
 func TestAPIFormRewritesASuppliedMultipartBoundary(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -283,9 +247,7 @@ func TestAPIFormRewritesASuppliedMultipartBoundary(t *testing.T) {
 	if strings.Contains(ct, "WRONG") {
 		t.Fatalf("the stale boundary survived: %q", ct)
 	}
-	// The declared boundary must be the one the body actually uses, which is
-	// the whole point — assert it against the body rather than just against
-	// the string "WRONG".
+	// Asserted against the body, not just against the string "WRONG".
 	_, params, err := mime.ParseMediaType(ct)
 	if err != nil {
 		t.Fatalf("parse Content-Type %q: %v", ct, err)
@@ -295,9 +257,6 @@ func TestAPIFormRewritesASuppliedMultipartBoundary(t *testing.T) {
 	}
 }
 
-// A non-multipart Content-Type alongside -F is not an override, it is a
-// contradiction: the body IS multipart, and honouring the header has the server
-// parse it as something else.
 func TestAPIFormRefusesANonMultipartContentType(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -330,8 +289,6 @@ func TestAPIRefusesDataAndFormTogether(t *testing.T) {
 	}
 }
 
-// A filename carrying a quote must not be able to close the Content-Disposition
-// header early and have the rest read as further headers.
 func TestAPIFormEscapesAFilename(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -362,8 +319,8 @@ func TestAPIOutWritesTheBodyOwnerOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("api: %v", err)
 	}
-	// stdout stays empty, mirroring `query --out`: the file IS the answer, and
-	// a duplicate on stdout would land in whatever a pipeline is parsing.
+	// stdout stays empty, as with `query --out`: a duplicate would land in
+	// whatever a pipeline is parsing.
 	if out != "" {
 		t.Errorf("stdout = %q, want empty", out)
 	}
@@ -379,8 +336,8 @@ func TestAPIOutWritesTheBodyOwnerOnly(t *testing.T) {
 	}
 }
 
-// --out overwriting a pre-existing world-readable file must not inherit its
-// mode. os.WriteFile would; the temp-file-and-rename does not.
+// os.WriteFile would inherit a pre-existing file's world-readable mode; the
+// temp-file-and-rename does not.
 func TestAPIOutDoesNotInheritALooseMode(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -402,9 +359,6 @@ func TestAPIOutDoesNotInheritALooseMode(t *testing.T) {
 	}
 }
 
-// Both flags at once: the file gets the whole answer, stdout gets the field.
-// That is what each of them plainly means, so combining them must not make
-// either one lie.
 func TestAPIOutAndJQTogether(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"id":"wf-9","extra":"kept"}`
@@ -426,8 +380,7 @@ func TestAPIOutAndJQTogether(t *testing.T) {
 
 // --- --fail-on-error --------------------------------------------------------
 
-// The trap: a failed query is HTTP 200 with `error` set, so a plain runner
-// exits zero on something that never ran.
+// A failed query is HTTP 200 with `error` set.
 func TestAPIFailOnErrorCatchesA200Envelope(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"result":"","error":"Binder Error: no such column"}`
@@ -440,15 +393,12 @@ func TestAPIFailOnErrorCatchesA200Envelope(t *testing.T) {
 	if !strings.Contains(err.Error(), "Binder Error") {
 		t.Errorf("the server's message is not in the error: %v", err)
 	}
-	// Still printed: the body is the most useful thing the server said, and
-	// swallowing it makes every failure a second round trip.
 	if !strings.Contains(out, "Binder Error") {
 		t.Errorf("the body was swallowed: %q", out)
 	}
 }
 
-// Without the flag the behaviour is unchanged — this is opt-in precisely
-// because reading inside the body means holding all of it.
+// Opt-in, because reading inside the body means holding all of it.
 func TestAPIWithoutFailOnErrorA200EnvelopeStillExitsZero(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"error":"nope"}`
@@ -459,8 +409,6 @@ func TestAPIWithoutFailOnErrorA200EnvelopeStillExitsZero(t *testing.T) {
 	}
 }
 
-// A CSV or a zip has no envelope and must never be turned into a failure by a
-// flag that looks for one.
 func TestAPIFailOnErrorIgnoresANonJSONBody(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = "region,total\nEU,5\n"
@@ -483,7 +431,7 @@ func TestAPIRetriesA503AndSucceeds(t *testing.T) {
 		{Status: http.StatusServiceUnavailable, Body: `{"error":"restarting"}`},
 		{Status: http.StatusOK, Body: `{"ok":true}`},
 	}
-	// Named by the server so the retry does not sleep a real second.
+	// A server-named delay, so the retry does not sleep a real second.
 	e.replyHeader = http.Header{"Retry-After": []string{"0"}}
 	signInTo(t, e.URL())
 
@@ -499,8 +447,6 @@ func TestAPIRetriesA503AndSucceeds(t *testing.T) {
 	}
 }
 
-// A 4xx is the server saying the REQUEST was wrong. Repeating it just spends
-// the budget to be told so again.
 func TestAPIDoesNotRetryA400(t *testing.T) {
 	e := newEchoServer(t)
 	e.status = http.StatusBadRequest
@@ -543,10 +489,8 @@ func TestAPIWaitUntilPollsToATerminalState(t *testing.T) {
 		{Status: http.StatusOK, Body: `{"status":"running"}`},
 		{Status: http.StatusOK, Body: `{"status":"running"}`},
 		{Status: http.StatusOK, Body: `{"status":"success","rows":12}`},
-		// A DIFFERENT terminal answer, so a re-fetch after the condition held
-		// is visible in stdout as well as in the request count. Without it the
-		// repeating last entry would make a bug indistinguishable from correct
-		// behaviour.
+		// A DIFFERENT terminal answer makes a re-fetch after the condition held
+		// visible in stdout.
 		{Status: http.StatusOK, Body: `{"status":"reaped"}`},
 	}
 	signInTo(t, e.URL())
@@ -558,8 +502,7 @@ func TestAPIWaitUntilPollsToATerminalState(t *testing.T) {
 		t.Fatalf("api: %v", err)
 	}
 	// The emitted answer must be the response the condition MATCHED, not a
-	// re-fetch — otherwise the printed status can differ from the one that
-	// ended the wait.
+	// re-fetch.
 	if out != "success\n" {
 		t.Errorf("stdout = %q, want the matching response", out)
 	}
@@ -568,8 +511,7 @@ func TestAPIWaitUntilPollsToATerminalState(t *testing.T) {
 	}
 }
 
-// Re-sending a POST once per poll would create one resource per attempt,
-// silently, for the whole --wait-timeout.
+// Re-sending a POST once per poll would create one resource per attempt.
 func TestAPIWaitUntilRefusesANonIdempotentMethod(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -598,15 +540,13 @@ func TestAPIWaitUntilTimesOutNamingTheCondition(t *testing.T) {
 	if err == nil {
 		t.Fatal("a wait that never came true exited zero")
 	}
-	// "context deadline exceeded" after a silent wait is the least useful thing
-	// this could report; the condition is what the reader needs.
+	// The timeout must name the condition, not "context deadline exceeded".
 	if !strings.Contains(err.Error(), `.status == "done"`) {
 		t.Errorf("the timeout does not name the condition: %v", err)
 	}
 }
 
-// A 404 on the polled path is a typo, not "not ready yet". Looping on it for
-// the whole timeout would report a wrong path as a slow one.
+// A 404 on the polled path is a typo, not "not ready yet".
 func TestAPIWaitUntilStopsOnAnHTTPError(t *testing.T) {
 	e := newEchoServer(t)
 	e.status = http.StatusNotFound
@@ -624,8 +564,7 @@ func TestAPIWaitUntilStopsOnAnHTTPError(t *testing.T) {
 	}
 }
 
-// jq truthiness is the thing people are wrong about: an empty array is TRUE.
-// Pinned because a condition that fires immediately looks like success.
+// In jq an empty array is TRUE.
 func TestAPIWaitUntilAnEmptyArrayIsTruthy(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"errors":[]}`
@@ -641,11 +580,8 @@ func TestAPIWaitUntilAnEmptyArrayIsTruthy(t *testing.T) {
 	}
 }
 
-// A condition that produces NO OUTPUT AT ALL must not end the wait. This is
-// the rule vacuous truth would break, and the case that reaches it is a filter
-// over a stream rather than a comparison: `select(...)` that matches nothing
-// yields zero results, not false. Treating that as satisfied would stop polling
-// the instant an endpoint answered with a shape nobody expected.
+// A condition with NO OUTPUT (a `select(...)` matching nothing) must not end
+// the wait by vacuous truth.
 func TestAPIWaitUntilNoOutputDoesNotSatisfy(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"runs":[{"state":"running"}]}`
@@ -662,9 +598,7 @@ func TestAPIWaitUntilNoOutputDoesNotSatisfy(t *testing.T) {
 	}
 }
 
-// The neighbouring case, so the two are not confused: a comparison over an
-// ABSENT field yields one output, `false` — not zero. Both must keep waiting,
-// but they get there by different rules.
+// A comparison over an ABSENT field yields one output, `false`, not zero.
 func TestAPIWaitUntilAFalseConditionDoesNotSatisfy(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"other":1}`
@@ -696,11 +630,8 @@ func TestAPIWaitIntervalMustBePositive(t *testing.T) {
 
 // --- sleepCtx ---------------------------------------------------------------
 
-// A zero or already-elapsed duration makes both select cases ready at once, and
-// select picks between ready cases at RANDOM. A cancelled context has to win
-// every time, not half the time — the failure mode otherwise is a Ctrl-C (or a
-// --wait-timeout) that is honoured in most runs and silently ignored in the
-// rest.
+// With a zero duration both select cases are ready and select picks at RANDOM;
+// a cancelled context must win every time.
 func TestSleepCtxAlwaysHonoursACancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -723,10 +654,8 @@ func TestSleepCtxWaitsWhenLive(t *testing.T) {
 
 // --- the --jq flag-order footgun ---------------------------------------------
 
-// `--jq -r '.id'` binds "-r" as the EXPRESSION and leaves '.id' as a second
-// positional, so cobra answers "accepts 1 arg(s), received 2" — a message about
-// argument counts for a mistake that is entirely about a flag. The refusal has
-// to name the real problem and the one-word fix.
+// `--jq -r '.id'` binds "-r" as the EXPRESSION, and cobra's "accepts 1 arg(s)"
+// would hide that; the refusal must name the flag-order fix.
 func TestAPIRefusesAFlagAsTheJQExpression(t *testing.T) {
 	e := newEchoServer(t)
 	signInTo(t, e.URL())
@@ -747,8 +676,7 @@ func TestAPIRefusesAFlagAsTheJQExpression(t *testing.T) {
 	}
 }
 
-// A long flag is the same mistake, and --json is inherited from the root rather
-// than declared on this command — so the check has to read the complete flag
+// --json is inherited from the root, so the check must read the complete flag
 // set, not the local one.
 func TestAPIRefusesAnInheritedFlagAsTheJQExpression(t *testing.T) {
 	e := newEchoServer(t)
@@ -763,8 +691,7 @@ func TestAPIRefusesAnInheritedFlagAsTheJQExpression(t *testing.T) {
 	}
 }
 
-// The guard must not cost a legitimate expression. A leading dash is ordinary
-// jq — "-1" is negative one, and no command has a -1 flag.
+// A leading dash is ordinary jq: "-1" is negative one.
 func TestAPIAllowsADashLeadingJQExpression(t *testing.T) {
 	e := newEchoServer(t)
 	e.body = `{"id":"wf-1"}`
@@ -777,8 +704,7 @@ func TestAPIAllowsADashLeadingJQExpression(t *testing.T) {
 	if out != "-1\n" {
 		t.Errorf("stdout = %q", out)
 	}
-	// And the form the refusal recommends really works: expression first, flag
-	// after it.
+	// The form the refusal recommends really works.
 	out, err = runCLI(t, t.TempDir(), "api", "--jq", ".id", "-r", "/api/v2/thing")
 	if err != nil {
 		t.Fatalf("api: %v", err)

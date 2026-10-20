@@ -14,10 +14,9 @@ import (
 	"time"
 )
 
-// The `ronja secret create --in-browser` tests (plan §9 C5). The fake answers
-// POST /secret/pending once, then a SCRIPT of GET /secret/:id answers. Any other
-// request fails the test — above all POST /secret, the route that carries a
-// value: this path must never send one.
+// The pending fake answers POST /secret/pending once, then a script of
+// GET /secret/:id answers; any other request fails the test, above all
+// POST /secret, the value-carrying route this path must never call.
 
 const (
 	pendingID  = "secret-pend-1"
@@ -147,7 +146,6 @@ func fastInBrowser(t *testing.T, limit time.Duration) {
 	t.Cleanup(func() { inBrowserPollInterval, inBrowserWaitLimit = savedInterval, savedLimit })
 }
 
-// noPrompt fails the test if the echo-off prompt is reached.
 func noPrompt(t *testing.T) {
 	t.Helper()
 	saved := readPassword
@@ -160,8 +158,8 @@ func noPrompt(t *testing.T) {
 
 var stripeInBrowser = []string{"secret", "create", "--feature", "collection-1", "--name", "Stripe", "--host", "api.stripe.com", "--in-browser"}
 
-// C5: pending → ready; the SERVER's url is the one opened; the id is printed;
-// a sentinel on stdin is never read, never sent.
+// The server's url is the one opened, and a sentinel on stdin is never read or
+// sent.
 func TestSecretInBrowserPendingToReady(t *testing.T) {
 	fastInBrowser(t, 5*time.Second)
 	opened := fakeBrowser(t)
@@ -209,7 +207,6 @@ func TestSecretInBrowserPendingToReady(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// C5: a database login; --json is metadata only.
 func TestSecretInBrowserDatabaseJSON(t *testing.T) {
 	fastInBrowser(t, 5*time.Second)
 	fakeBrowser(t)
@@ -235,7 +232,6 @@ func TestSecretInBrowserDatabaseJSON(t *testing.T) {
 	assertNoForbiddenKeys(t, out)
 }
 
-// C5: existing[] is printed as a notice on stderr, and the command goes on.
 func TestSecretInBrowserPrintsExisting(t *testing.T) {
 	fastInBrowser(t, 5*time.Second)
 	fakeBrowser(t)
@@ -255,7 +251,6 @@ func TestSecretInBrowserPrintsExisting(t *testing.T) {
 	}
 }
 
-// C5: --no-browser prints the server's link and opens nothing.
 func TestSecretInBrowserNoBrowserPrintsTheLink(t *testing.T) {
 	fastInBrowser(t, 5*time.Second)
 	opened := fakeBrowser(t)
@@ -274,7 +269,6 @@ func TestSecretInBrowserNoBrowserPrintsTheLink(t *testing.T) {
 	}
 }
 
-// C5: refusals before anything is sent.
 func TestSecretInBrowserRefusals(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v.txt")
 	if err := os.WriteFile(path, []byte(secretSentinel), 0o600); err != nil {
@@ -305,8 +299,6 @@ func TestSecretInBrowserRefusals(t *testing.T) {
 	}
 }
 
-// C2/B4 of the plan: empty stdin without --in-browser never starts the browser
-// path, and the refusal points at it.
 func TestSecretCreateEmptyStdinPointsAtInBrowser(t *testing.T) {
 	opened := fakeBrowser(t)
 	withStdin(t, "")
@@ -320,7 +312,6 @@ func TestSecretCreateEmptyStdinPointsAtInBrowser(t *testing.T) {
 	}
 }
 
-// C5: the server's refusals.
 func TestSecretInBrowserForwardsRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -351,7 +342,6 @@ func TestSecretInBrowserForwardsRefusals(t *testing.T) {
 	}
 }
 
-// C5: the wait's limit, a deleted secret, and a re-used pending secret.
 func TestSecretInBrowserWaitEnds(t *testing.T) {
 	t.Run("timeout", func(t *testing.T) {
 		fastInBrowser(t, 30*time.Millisecond)
@@ -397,7 +387,6 @@ func TestSecretInBrowserWaitEnds(t *testing.T) {
 	})
 }
 
-// A browser that cannot start falls back to printing the link.
 func TestSecretInBrowserFallsBackToPrinting(t *testing.T) {
 	fastInBrowser(t, 5*time.Second)
 	saved := openBrowser

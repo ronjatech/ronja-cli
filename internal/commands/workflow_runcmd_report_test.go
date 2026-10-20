@@ -9,29 +9,16 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The other half of `wf run`: what it says once a run exists. The drift note it
-// makes instead of refusing, the run itself, the POST whose outcome is unknown,
-// the terminal statuses and what each is worth as an exit code, and the two
-// hints that make the loop findable.
-//
-// Split from workflow_runcmd_test.go, which holds the refusals — the two halves
-// ask different questions, and one file asking both was over the size a person
-// reads top to bottom.
-
 // --- drift on the live row ----------------------------------------------------
 
-// The drift the check above is structurally blind to: it compares disk against
-// the baseline, both local, so a colleague's republish over an untouched folder
-// passes it clean. A note, not a refusal — the live row is what this command
-// runs — but a clean folder otherwise reads as "you are running exactly what
-// you are looking at".
+// The local disk-vs-baseline check cannot see a colleague's republish over an
+// untouched folder. A note, not a refusal: the live row is what this runs.
 func TestRunNotesLiveChangesThatDidNotComeFromThisFolder(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
 	signIn(t, f)
 	withFastPolling(t)
 	root := liveFolder(t, f, nil)
-	// A colleague publishes over the live workflow.
 	f.putFile("wf-1", "main.py", "print(99)\n")
 
 	var err error
@@ -47,8 +34,6 @@ func TestRunNotesLiveChangesThatDidNotComeFromThisFolder(t *testing.T) {
 	}
 }
 
-// ...and silence when there is nothing to say. A note on every run is a note
-// nobody reads.
 func TestRunSaysNothingWhenTheLiveRowMatchesTheFolder(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -82,7 +67,6 @@ func TestRunRunsTheLiveRowAndReportsIt(t *testing.T) {
 	if len(f.runRequests) != 1 {
 		t.Fatalf("runs = %+v, want exactly one", f.runRequests)
 	}
-	// The LIVE row, never a draft.
 	if f.runRequests[0].WorkflowID != "wf-1" {
 		t.Errorf("ran %s, want the live workflow", f.runRequests[0].WorkflowID)
 	}
@@ -91,15 +75,13 @@ func TestRunRunsTheLiveRowAndReportsIt(t *testing.T) {
 			t.Errorf("report missing %q:\n%s", want, out)
 		}
 	}
-	// The publish hint belongs to a draft run: this code is already live.
 	if strings.Contains(out, "wf publish") {
 		t.Errorf("a live run offered publish:\n%s", out)
 	}
 }
 
-// $RONJA_URL and $RONJA_TOKEN outrank the credential file, so the instance the
-// side effects land on is worth one line — BEFORE the POST, because after it the
-// line is a record of where they already went.
+// The environment can outrank the credential file, so the instance is named
+// before the POST, while it can still stop anything.
 func TestRunNamesTheInstanceBeforeStarting(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
@@ -124,21 +106,17 @@ func TestRunNamesTheInstanceBeforeStarting(t *testing.T) {
 
 // --- a run POST that timed out --------------------------------------------------
 
-// The expensive one. The server commits the workflow_runs row and only then
-// dispatches, so a deadline of OURS says nothing about whether the run started
-// — and reported as a refusal, the natural retry fires a second live run into
-// replace-mode output tables. So the history is read back and the run that did
-// start is adopted, and the command carries on as if the POST had answered.
+// The server commits the run row before dispatching, so a client deadline says
+// nothing about whether it started; reported as a refusal, the natural retry
+// would fire a second live run into replace-mode output tables.
 func TestRunAdoptsTheRunThatStartedWhenThePostTimedOut(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
 	signIn(t, f)
 	withFastPolling(t)
 	root := liveFolder(t, f, nil)
-	// The row the POST committed before our deadline expired — stamped by the
-	// SERVER's clock, which by the time a request has been slow enough to time
-	// out is past the moment we asked. An older run sits beside it, because the
-	// rule is "the newest run since we asked" and not "the newest run".
+	// The older run is there because the rule is "the newest run since we
+	// asked", not "the newest run".
 	f.runHistory["wf-1"] = []api.WorkflowRun{
 		{ID: "run-earlier", WorkflowID: "wf-1", Status: api.RunStatusDone, ExecutedAt: time.Now().UTC().Add(-time.Hour)},
 		{ID: "run-9", WorkflowID: "wf-1", Status: api.RunStatusRunning, ExecutedAt: time.Now().UTC().Add(time.Minute)},
@@ -153,7 +131,6 @@ func TestRunAdoptsTheRunThatStartedWhenThePostTimedOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a run that had already started was reported as a failure: %v", err)
 	}
-	// The whole point: exactly one POST. A second one is a second live run.
 	if len(f.runRequests) != 1 {
 		t.Fatalf("run POSTs = %d, want exactly one — the timeout started a second run", len(f.runRequests))
 	}
@@ -165,8 +142,7 @@ func TestRunAdoptsTheRunThatStartedWhenThePostTimedOut(t *testing.T) {
 	}
 }
 
-// ...and when it cannot find one, it says the run MAY have started. Never that
-// it did not: that sentence is what makes somebody run it again.
+// "It did not start" is the sentence that makes somebody run it again.
 func TestRunNeverClaimsATimedOutRunDidNotStart(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -183,7 +159,7 @@ func TestRunNeverClaimsATimedOutRunDidNotStart(t *testing.T) {
 			t.Errorf("message missing %q: %v", want, err)
 		}
 	}
-	// The 409's sentence, which means the opposite and must never leak here.
+	// The 409's sentence, which means the opposite.
 	if strings.Contains(err.Error(), "Nothing ran") {
 		t.Errorf("an unconfirmed run was reported as one that never started: %v", err)
 	}
@@ -194,9 +170,8 @@ func TestRunNeverClaimsATimedOutRunDidNotStart(t *testing.T) {
 
 // --- terminal statuses --------------------------------------------------------
 
-// A park exits ZERO, exactly as it does for `wf test` — nothing failed, and the
-// run resumes by itself — so the loud line is the only thing standing between a
-// parked run and somebody recording a green tick against it.
+// A waiting run exits zero, so the loud line is all that stands between it and
+// a green tick.
 func TestRunParkedRunIsLoudAndStillExitsZero(t *testing.T) {
 	f := newFakeInstance(t)
 	parked := finishedRun(api.RunStatusWaiting, api.RunHealthWaiting)
@@ -214,16 +189,13 @@ func TestRunParkedRunIsLoudAndStillExitsZero(t *testing.T) {
 			t.Errorf("report missing %q:\n%s", want, out)
 		}
 	}
-	// The poll ENDED on it rather than sitting the park out.
 	if f.runPolls != 1 {
 		t.Errorf("polls = %d, want exactly one — the park was waited out", f.runPolls)
 	}
 }
 
-// The other way a live run ends without finishing: the wait ended and the work
-// moved to a newer run between two polls, so the poll terminates on "resuming".
-// Zero exit again, same reader about to record a verification — so the same loud
-// line has to stand in the way, saying the work is still going elsewhere.
+// The poll ends on "resuming" when the work moved to a newer run between two
+// polls; zero exit again, so the same loud line applies.
 func TestRunResumingRunIsLoudAndStillExitsZero(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusResuming, api.RunHealthDone)}
@@ -240,14 +212,13 @@ func TestRunResumingRunIsLoudAndStillExitsZero(t *testing.T) {
 			t.Errorf("report missing %q:\n%s", want, out)
 		}
 	}
-	// The poll ENDED on it: this row never executes again.
+	// This row never executes again.
 	if f.runPolls != 1 {
 		t.Errorf("polls = %d, want exactly one — the wake latch was waited out", f.runPolls)
 	}
 }
 
-// A failed live run exits non-zero and offers no resume: `wf test --resume`
-// continues a run of the DRAFT, and there is no draft here.
+// `wf test --resume` continues a draft run, and there is no draft here.
 func TestRunFailedRunExitsNonZeroAndOffersNoResume(t *testing.T) {
 	f := newFakeInstance(t)
 	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
@@ -262,7 +233,6 @@ func TestRunFailedRunExitsNonZeroAndOffersNoResume(t *testing.T) {
 	if err == nil {
 		t.Fatal("a failed run exited zero")
 	}
-	// The report is still printed: a failed run IS the answer.
 	if !strings.Contains(out, "ZeroDivisionError") {
 		t.Errorf("report did not carry the run's error:\n%s", out)
 	}
@@ -271,20 +241,11 @@ func TestRunFailedRunExitsNonZeroAndOffersNoResume(t *testing.T) {
 	}
 }
 
-// A LIVE run that died before the interpreter ever saw the author's code says
-// so, exactly as a draft run does.
-//
-// The notice used to sit under the resume hint's conditions — durable, draft,
-// journal — so `wf run` never printed it: the one command that runs published
-// code, in front of the person most likely to read a bare "AccessDenied" as
-// something they broke. What happened is a fact about the RUN, and nothing
-// about it depends on which row started it or on there being a draft to
-// continue. The resume hint is still withheld, because there is still no draft.
+// The notice is a fact about the run, so a live run gets it too; the resume
+// hint is still withheld, since there is no draft.
 func TestRunSaysNothingRanWhenTheLiveFailureWasSetup(t *testing.T) {
 	f := newFakeInstance(t)
 	failed := finishedRun(api.RunStatusError, api.RunHealthFailed)
-	// No stamp, no steps, no journal, no captured output: the container never
-	// got as far as producing any of them.
 	failed.Logs = ""
 	failed.Error = ptr("get S3 credentials: assume role: AccessDenied")
 	f.runScript = []api.RunResponse{failed}
@@ -299,15 +260,13 @@ func TestRunSaysNothingRanWhenTheLiveFailureWasSetup(t *testing.T) {
 	if !strings.Contains(out, "Nothing in your code ran") {
 		t.Errorf("a live setup failure did not say the code never ran:\n%s", out)
 	}
-	// Where the run died, not whose fault it was: see printNothingRanNotice.
+	// See printNothingRanNotice: where, never whose fault.
 	if strings.Contains(out, "not a bug in your files") {
 		t.Errorf("the notice claimed the author's files are innocent, which it cannot know:\n%s", out)
 	}
-	// The command worth repeating is the one that produced this run.
 	if !strings.Contains(out, "Run `ronja wf run` again") {
 		t.Errorf("the notice named a command that did not produce this run:\n%s", out)
 	}
-	// `wf run` offers no resume, notice or not: there is no draft to continue.
 	if strings.Contains(out, "--resume") {
 		t.Errorf("a live failure offered a draft resume:\n%s", out)
 	}
@@ -315,8 +274,7 @@ func TestRunSaysNothingRanWhenTheLiveFailureWasSetup(t *testing.T) {
 
 // --- output shape -------------------------------------------------------------
 
-// --json is the same single object `wf test` emits: the run row flattened at the
-// root, plus steps and health, on stdout and nowhere else.
+// --json is the same single object `wf test` emits.
 func TestRunJSONIsTheFlattenedRunResponse(t *testing.T) {
 	f := newFakeInstance(t)
 	f.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDegraded)}
@@ -339,9 +297,6 @@ func TestRunJSONIsTheFlattenedRunResponse(t *testing.T) {
 
 // --- the loop's own signposts -------------------------------------------------
 
-// The two hints that make the loop findable: publish points at the run it just
-// made possible, and `wf test`'s no-draft refusal names the command that runs
-// the live version instead.
 func TestPublishAndTestPointAtRun(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -355,7 +310,7 @@ func TestPublishAndTestPointAtRun(t *testing.T) {
 		t.Errorf("publish does not point at the run:\n%s", out)
 	}
 
-	// The draft is gone with the commit, so `wf test` now has nothing to run.
+	// The commit consumed the draft.
 	_, err = runCLI(t, root, "wf", "test")
 	if err == nil {
 		t.Fatal("test ran with no draft")

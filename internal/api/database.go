@@ -8,56 +8,34 @@ import (
 	"time"
 )
 
-// Managed-database shapes, hand-mirrored from backend/api/v2/database like every
-// other type in this package.
-//
-// One difference from Query is worth stating, because it changes what a caller
-// has to remember: there is NO error field here. A statement Postgres refused
-// comes back as HTTP 400 carrying the message, so an ordinary error return
-// covers it — no 200-with-an-error trap to check for, and no way to mistake a
-// failed statement for an empty result.
+// Managed-database shapes, hand-mirrored from backend/api/v2/database. Unlike
+// Query there is NO error field: a statement Postgres refused is an HTTP 400, so
+// an ordinary error return covers it.
 
-// DefaultDatabaseSQLTimeout bounds one `db sql` call when the caller names no
-// deadline.
-//
-// The slow bound, matching Query: a statement against a real Postgres database
-// is real work, and an aggregate over a large table legitimately outlasts a
-// read timeout. It remains only a DEFAULT — --timeout moves it, and a value past
-// the client's own ceiling is honoured (see httpFor).
+// DefaultDatabaseSQLTimeout is the slow bound, as for Query: an aggregate over a
+// large table legitimately outlasts a read timeout. --timeout moves it.
 const DefaultDatabaseSQLTimeout = slowRequestTimeout
 
-// DefaultMigrationTimeout bounds one migration set.
-//
-// Deliberately far longer than a query default. The server runs the whole set in
-// ONE transaction holding a per-database advisory lock, under a 20-minute
-// ceiling of its own; a client that gave up sooner would abandon a migration
-// that is still committing and leave the operator with no idea whether it
-// landed. Better to wait for the answer than to guess at it.
+// DefaultMigrationTimeout matches the server's own 20-minute ceiling on the one
+// transaction a set runs in: a client that gave up sooner would leave the
+// operator not knowing whether a still-committing set landed.
 const DefaultMigrationTimeout = 20 * time.Minute
 
 // Environment names WHICH COPY of a managed database a request runs against.
-//
-// A managed database can have a dev copy — a schema-identical sandbox with its
-// own ledger — and the server resolves it. The client never learns the copy's
-// id and never sends one: it names the PRODUCTION database and says which
-// environment it means. That asymmetry is the whole safety property, so do not
-// "simplify" this into a second database id the caller passes around.
+// The client never learns the dev copy's id: it names the PRODUCTION database
+// and the server resolves the copy. That asymmetry is the safety property, so do
+// not "simplify" it into a second database id.
 type Environment string
 
 const (
-	// EnvironmentProd is the database itself, and the default everywhere.
+	// EnvironmentProd is the default everywhere.
 	EnvironmentProd Environment = "prod"
-	// EnvironmentDev is the database's dev copy, resolved server-side.
-	EnvironmentDev Environment = "dev"
+	EnvironmentDev  Environment = "dev"
 )
 
-// ParseEnvironment validates a caller-typed environment name.
-//
-// Validated HERE rather than left to the server so a typo fails locally, before
-// a migration set or a statement is sent: the server answers a bad value with a
-// 400, which is correct but arrives as a message about a query parameter nobody
-// typed. Trimmed and case-folded because the server does the same, and a value
-// this command accepts must not become one the server rejects.
+// ParseEnvironment validates a caller-typed environment name locally, so a typo
+// fails before anything is sent. It must trim and case-fold as the server does,
+// so a value accepted here is never one the server rejects.
 func ParseEnvironment(raw string) (Environment, error) {
 	switch env := Environment(strings.ToLower(strings.TrimSpace(raw))); env {
 	case "", EnvironmentProd:
@@ -69,23 +47,10 @@ func ParseEnvironment(raw string) (Environment, error) {
 	}
 }
 
-// withEnvironment appends ?environment= to a path, and ONLY for dev.
-//
-// The asymmetry is deliberate. An explicit `environment=prod` says exactly what
-// sending nothing says, so adding it would change the bytes on the wire for
-// every existing caller in exchange for nothing — and a request that is
-// byte-identical to the one this CLI sent before dev copies existed is also the
-// one an older instance, which knows no such parameter, still answers correctly.
-//
-// No url.Values: env is one of two constants produced by ParseEnvironment, never
-// caller text, so there is nothing here to escape. Path-plus-query rides along
-// on `do`, which joins the path to the instance verbatim — the same thing
-// ListFeatureTables relies on.
-//
-// The separator is chosen rather than assumed. Every managed-database path is a
-// bare constant today, but a caller that appends a query of its own and then
-// gets a SECOND "?" sends a parameter no server parses — and the parameter that
-// goes missing is the one that says "not production".
+// withEnvironment appends ?environment= ONLY for dev, so a prod request stays
+// byte-identical to what an instance without dev copies answers. The separator
+// is chosen, not assumed: a second "?" would drop the parameter that says "not
+// production".
 func withEnvironment(path string, env Environment) string {
 	if env != EnvironmentDev {
 		return path
@@ -100,75 +65,39 @@ func withEnvironment(path string, env Environment) string {
 // DatabaseSQLInput is the POST :id/sql body.
 type DatabaseSQLInput struct {
 	SQL string `json:"sql"`
-	// Params are positional bound parameters for $1, $2 … placeholders, carried
-	// as RAW JSON rather than []any.
-	//
-	// That is load-bearing, not fussiness. Decoding a parameter list into []any
-	// turns every number into a float64, which silently loses precision above
-	// 2^53 — 9007199254740993 becomes ...992, and 1234567890123456789 becomes
-	// ...800. Re-encoding cannot recover what the decode threw away, so the wrong
-	// number would reach the database with no error at any layer. Passing the
-	// user's bytes through untouched means a bigint id survives the trip.
-	//
-	// Sent only when non-empty: the field is optional server-side, and an
-	// explicit null adds nothing.
+	// Params bind $1, $2 … as RAW JSON, never []any: a float64 decode would
+	// silently change a bigint id past 2^53.
 	Params  []json.RawMessage `json:"params,omitempty"`
 	MaxRows int               `json:"maxRows,omitempty"`
 }
 
-// DatabaseSQLResult is the POST :id/sql response.
-//
-// No omitempty anywhere: this struct is emitted verbatim by `ronja db sql
-// --json`, and a field that vanishes when it is zero makes the payload a
-// different shape depending on the answer.
+// DatabaseSQLResult is the POST :id/sql response. No omitempty anywhere: `ronja
+// db sql --json` emits it verbatim, and its shape must not depend on the answer.
 type DatabaseSQLResult struct {
 	DatabaseID string `json:"databaseID"`
-	// Result is the CSV, header row included. Empty for a statement with no
-	// result set — a plain INSERT, say — which is not the same as no rows.
+	// Result is the CSV, header included; empty for a statement with no result
+	// set, which is not the same as no rows.
 	Result   string `json:"result"`
 	RowCount int    `json:"rowCount"`
-	// RowsAffected is the number of rows affected by the statement's OUTER
-	// command, and nothing else — where RowCount multiplexes rows returned with
-	// rows affected and cannot say which it is holding.
+	// RowsAffected counts the OUTER command only. ⚠️ Writes inside a
+	// data-modifying CTE are not counted (Postgres returns one command tag).
 	//
-	// ⚠️ Postgres answers a statement with ONE command tag, the outer one, so
-	// the writes performed inside a data-modifying CTE are not counted in it:
-	// `WITH upd AS (UPDATE … RETURNING id) INSERT INTO ev SELECT … WHERE false`
-	// reports 0 while the inner UPDATE changed every row.
-	//
-	// nil means "not applicable, or not reliably knowable", NEVER zero: the
-	// statement returned a result set (a SELECT, or DML with RETURNING), the
-	// body held more than one statement, the command's result carries no count
-	// at all (DO, CALL, SET, TRUNCATE, COMMENT, CREATE …), or the driver
-	// reported no count. The server omits the key in those cases and it decodes
-	// to nil here, which is the same fact.
-	//
-	// It is a POINTER rather than an int precisely because of the struct's
-	// no-omitempty rule above: the key is always emitted by `--json`, and null
-	// is a value the caller must be able to tell apart from 0. Flattening it to
-	// an int would publish "changed nothing" for every read.
+	// nil, NEVER zero, means not applicable or not knowable (a result set,
+	// several statements, a command with no count), so it stays a pointer: an
+	// int would publish "changed nothing" for every read.
 	RowsAffected *int `json:"rowsAffected"`
-	// Truncated reports that the row cap cut the result off, so Result is a
-	// prefix rather than the answer.
+	// Truncated: Result is a prefix the row cap cut off.
 	Truncated  bool  `json:"truncated"`
 	DurationMs int64 `json:"durationMs"`
-	// Environment is which copy actually answered: "prod", or "dev" when the
-	// request was redirected to the database's dev copy.
+	// Environment is which copy actually answered.
 	Environment string `json:"environment"`
-	// ParentDatabaseID is the production database the caller named, and the
-	// server sets it ONLY when the request was redirected. So it is the honest
-	// signal that a redirect happened, where Environment is the label for it.
-	//
-	// It carries no omitempty here even though the server's does: this struct is
-	// emitted verbatim by `ronja db sql --json`, and a field that vanishes when
-	// it is empty makes the payload a different shape depending on the answer.
+	// ParentDatabaseID is set ONLY when the request was redirected to the dev
+	// copy: the signal a redirect happened. No omitempty, unlike the server's.
 	ParentDatabaseID string `json:"parentDatabaseID"`
 }
 
-// DatabaseSQL runs one statement against a managed database.
-//
-// env picks which copy: EnvironmentProd (the zero value's meaning too) runs
-// against the database itself, EnvironmentDev against its dev copy.
+// DatabaseSQL runs one statement against a managed database or, with
+// EnvironmentDev, its dev copy.
 func (c *Client) DatabaseSQL(ctx context.Context, databaseID string, in DatabaseSQLInput, env Environment, timeout time.Duration) (*DatabaseSQLResult, error) {
 	var out DatabaseSQLResult
 	if err := c.do(ctx, timeout, "POST", withEnvironment("database/"+databaseID+"/sql", env), in, &out); err != nil {
@@ -181,10 +110,9 @@ func (c *Client) DatabaseSQL(ctx context.Context, databaseID string, in Database
 type Migration struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
-	// SQL is sent VERBATIM. The server's ledger hash covers exactly these bytes,
-	// so trimming or normalising here — a trailing newline is the obvious
-	// temptation — would make a file hash differently from the way it was
-	// applied, and every applied migration would then report as drifted.
+	// SQL is sent VERBATIM: the server's ledger hash covers these exact bytes,
+	// and normalising them (even a trailing newline) would report every applied
+	// migration as drifted.
 	SQL string `json:"sql"`
 }
 
@@ -194,17 +122,14 @@ type MigrationSetInput struct {
 	DryRun     bool        `json:"dryRun,omitempty"`
 }
 
-// Migration outcomes, as reported per migration. The first two are what a real
-// apply returns; the last two only ever come back from a dry run.
+// Migration outcomes. Pending and drifted only ever come back from a dry run.
 const (
-	// MigrationApplied — the DDL ran and a ledger row was written.
 	MigrationApplied = "applied"
-	// MigrationSkipped — already in the ledger with identical SQL.
+	// MigrationSkipped: already in the ledger with identical SQL.
 	MigrationSkipped = "skipped"
-	// MigrationPending — not in the ledger; a real apply would apply it.
 	MigrationPending = "pending"
-	// MigrationDrifted — in the ledger under DIFFERENT SQL. A real apply
-	// refuses the whole set.
+	// MigrationDrifted: in the ledger under DIFFERENT SQL; a real apply refuses
+	// the whole set.
 	MigrationDrifted = "drifted"
 )
 
@@ -215,38 +140,22 @@ type MigrationResult struct {
 	Seq     int    `json:"seq"`
 }
 
-// MigrationSetResult is the POST :id/migrations response, and — identically —
-// the POST :id/promote one.
-//
-// Reused for promote rather than mirrored a second time, because it IS the same
-// shape: promote applies a set of migrations through the same server-side path,
-// so it returns the same verdicts. Sharing the type is what lets both commands
-// print through one reporter, which is the only way the two stay describable in
-// the same words.
-//
-// No omitempty anywhere, for the reason DatabaseSQLResult gives: `--json` emits
-// this verbatim.
+// MigrationSetResult is the POST :id/migrations and POST :id/promote response
+// (promote applies through the same server path). No omitempty: `--json` emits
+// it verbatim.
 type MigrationSetResult struct {
-	DatabaseID string            `json:"databaseID"`
-	DryRun     bool              `json:"dryRun"`
-	Results    []MigrationResult `json:"results"`
-	// Environment is which copy the set was applied to, or planned against:
-	// "prod", or "dev" when the request was redirected to the dev copy.
-	Environment string `json:"environment"`
-	// ParentDatabaseID is the production database the caller named, set only on
-	// a redirect. See DatabaseSQLResult.ParentDatabaseID.
+	DatabaseID  string            `json:"databaseID"`
+	DryRun      bool              `json:"dryRun"`
+	Results     []MigrationResult `json:"results"`
+	Environment string            `json:"environment"`
+	// ParentDatabaseID is set only on a redirect, as on DatabaseSQLResult.
 	ParentDatabaseID string `json:"parentDatabaseID"`
-	// Notes are advisory and never block. Only promote emits them today: a
-	// promoted migration that writes ROWS replays its SQL against production's
-	// data rather than the dev copy's, which only the operator can judge.
+	// Notes are advisory and never block; print them verbatim.
 	Notes []string `json:"notes"`
 }
 
-// Drifted returns the migrations the server reported as drifted.
-//
-// Only a DRY RUN can produce these: a real apply refuses the whole set and
-// returns an error instead, which is why `db migrate push` never needs to
-// inspect this and `db migrate status` always does.
+// Drifted returns the migrations reported as drifted, which only a DRY RUN can
+// produce: a real apply refuses the whole set with an error.
 func (r *MigrationSetResult) Drifted() []MigrationResult {
 	var out []MigrationResult
 	for _, res := range r.Results {
@@ -269,8 +178,6 @@ func (r *MigrationSetResult) Pending() []MigrationResult {
 }
 
 // ApplyMigrations applies (or, with DryRun, plans) an ordered migration set.
-//
-// env picks which copy the set lands on; see DatabaseSQL.
 func (c *Client) ApplyMigrations(ctx context.Context, databaseID string, in MigrationSetInput, env Environment, timeout time.Duration) (*MigrationSetResult, error) {
 	var out MigrationSetResult
 	if err := c.do(ctx, timeout, "POST", withEnvironment("database/"+databaseID+"/migrations", env), in, &out); err != nil {
@@ -279,26 +186,15 @@ func (c *Client) ApplyMigrations(ctx context.Context, databaseID string, in Migr
 	return &out, nil
 }
 
-// PromoteInput is the POST :id/promote body.
-//
-// It carries no migration list, and that is the design rather than an omission:
-// what promotes is exactly the tail the dev copy's ledger has past production's,
-// which the server computes from the two ledgers. There is nothing for a caller
-// to choose, so there is nothing for a caller to get wrong.
+// PromoteInput carries no migration list by design: what promotes is the tail
+// the dev copy's ledger has past production's, which the server computes.
 type PromoteInput struct {
 	DryRun bool `json:"dryRun,omitempty"`
 }
 
-// Promote moves the migrations a database's dev copy has and the database does
-// not onto the database itself.
-//
-// databaseID is the PRODUCTION database, never the copy — the copy has no id the
-// CLI ever sees. There is no environment parameter for the same reason the
-// server refuses a dev session here: this call names production explicitly, and
-// redirecting it would promote the copy into itself and report success.
-//
-// The tail is applied through the same server-side path ApplyMigrations uses, so
-// the response is a MigrationSetResult with the same four outcomes.
+// Promote moves the migrations a database's dev copy has onto the database.
+// It takes no environment: redirecting it would promote the copy into itself
+// and report success.
 func (c *Client) Promote(ctx context.Context, databaseID string, in PromoteInput, timeout time.Duration) (*MigrationSetResult, error) {
 	var out MigrationSetResult
 	if err := c.do(ctx, timeout, "POST", "database/"+databaseID+"/promote", in, &out); err != nil {
@@ -307,43 +203,34 @@ func (c *Client) Promote(ctx context.Context, databaseID string, in PromoteInput
 	return &out, nil
 }
 
-// DatabaseConnection is the GET :id/roles response — the shared cluster
-// endpoint, the physical database name, and the roles minted on it.
-//
-// Only the fields the CLI actually uses are mirrored. The roles list is
-// deliberately absent: `db env` and `db connect` need the PROXY block and
-// nothing else, and mirroring a role projection here would be a second,
-// permanently-stale copy of a shape `ronja api` already prints in full.
+// DatabaseConnection mirrors only the GET :id/roles fields the CLI uses; the
+// roles list is deliberately absent.
 type DatabaseConnection struct {
 	Host     string `json:"host"`
 	Port     string `json:"port"`
 	SSLMode  string `json:"sslMode"`
 	Database string `json:"database"`
-	// Proxy is how to reach this database with psql or pg_dump. ABSENT — a nil
-	// pointer, not a zero struct — when the instance has no Postgres-wire proxy
-	// deployed OR the caller is not an admin. The server does not say which, and
-	// a client must not guess: both are answered by the same refusal.
+	// Proxy is nil when the instance has no Postgres-wire proxy OR the caller is
+	// not an admin; the server does not say which, so neither may the client.
 	Proxy *DatabaseProxy `json:"proxy"`
 }
 
 // DatabaseProxy is the psql/pg_dump coordinates for one managed database.
 //
-// ⚠️ ConnectionString carries the literal placeholder <YOUR_PAT> where the
-// password goes — the server never sends a credential here, and neither `db
-// env` nor `db connect` prints this string with a real one substituted in. The
-// PAT the commands use is the one the profile already holds, and it moves into
-// an environment variable or a child process, never onto a terminal.
+// ⚠️ ConnectionString carries the literal placeholder <YOUR_PAT>, and no command
+// prints it with the real PAT substituted: the PAT goes into an environment
+// variable or a child process, never onto a terminal.
 type DatabaseProxy struct {
 	Host string `json:"host"`
 	Port string `json:"port"`
-	// Username is "<database-id>.read" — the tier is part of the login, because
-	// the proxy resolves the Postgres role server-side.
+	// Username is "<database-id>.read": the proxy resolves the role from the
+	// tier in the login.
 	Username         string `json:"username"`
 	Database         string `json:"database"`
 	ConnectionString string `json:"connectionString"`
-	// ReadRoleMinted is false when the database has no `read` role yet, which is
-	// the state a freshly provisioned one is in. The proxy refuses such a login
-	// AFTER authenticating, so the commands refuse it here instead.
+	// ReadRoleMinted is false on a freshly provisioned database. The proxy
+	// refuses such a login only AFTER authenticating, so the commands refuse it
+	// first.
 	ReadRoleMinted bool `json:"readRoleMinted"`
 }
 

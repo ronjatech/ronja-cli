@@ -11,14 +11,9 @@ import (
 	"time"
 )
 
-// A realistic full 200. The point of the fixture is TAG VERIFICATION: a field
-// name that does not match the server struct decodes to the zero value
-// silently, and here that means a report claiming a clean render of an app that
-// errored — a mirror nobody checks is a mirror that drifts.
-//
-// Note the shape it pins as much as the names: the envelope is FLAT. `rendered`
-// and `dataAppID` are siblings, because the server's PreviewResult EMBEDS
-// tools.PreviewObservation.
+// The fixture is TAG VERIFICATION: a mismatched name would report a clean
+// render of an app that errored. The envelope is FLAT because the server's
+// PreviewResult EMBEDS tools.PreviewObservation.
 const previewFixture = `{
   "rendered": true,
   "durationMs": 2412,
@@ -98,8 +93,7 @@ func TestPreviewDataAppDecodesEveryMirroredField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PreviewDataApp: %v", err)
 	}
-	// The bytes come back untouched, which is what `ronja app test` writes
-	// report.json from.
+	// `ronja app test` writes report.json from these untouched bytes.
 	if string(outcome.Raw) != previewFixture {
 		t.Errorf("the raw body should be the server's bytes verbatim, got:\n%s", outcome.Raw)
 	}
@@ -121,9 +115,7 @@ func TestPreviewDataAppDecodesEveryMirroredField(t *testing.T) {
 	if len(r.Ops) != 2 || r.Ops[0].Path != "/query" || r.Ops[0].Ms != 210 || !r.Ops[0].OK {
 		t.Errorf("ops: %+v", r.Ops)
 	}
-	// Rows is a POINTER: "no row count to report" and "returned nothing" are
-	// different facts, and telling a blank page from an empty result is half of
-	// what a preview is for.
+	// Rows is a POINTER: "no row count" is not "returned nothing".
 	if r.Ops[0].Rows == nil || *r.Ops[0].Rows != 42 {
 		t.Errorf("ops[0].rows = %v, want 42", r.Ops[0].Rows)
 	}
@@ -147,9 +139,7 @@ func TestPreviewDataAppDecodesEveryMirroredField(t *testing.T) {
 		r.Steps[0].DOMText != "Saved" || r.Steps[1].Skipped == "" {
 		t.Errorf("steps: %+v", r.Steps)
 	}
-	// The message keeps the server's envelope VERBATIM. The unwrap is a terminal
-	// concern; report.json is written from these bytes, and a reader opening it
-	// has to see how the server framed each string.
+	// The server's envelope stays VERBATIM: report.json is written from it.
 	if r.Errors[0].Message != "<untrusted_app_output>Cannot read properties of undefined</untrusted_app_output>" {
 		t.Errorf("errors[0].message should arrive framed exactly as sent, got %q", r.Errors[0].Message)
 	}
@@ -168,11 +158,9 @@ func TestPreviewDataAppDecodesEveryMirroredField(t *testing.T) {
 	}
 }
 
-// viewport / route / appOutputNote are all OMITTED by a server that has nothing
-// to say, and the mirror has to carry that absence rather than invent a value.
-// Today's deployed harness does not echo the settings it applied and a compile
-// failure renders nothing at all, so this is the ordinary answer, not the edge
-// case — and an empty Viewport means "we cannot tell", never "desktop".
+// A server with nothing to say OMITS viewport / route / appOutputNote, and the
+// mirror must carry the absence: an empty Viewport means "we cannot tell", never
+// "desktop".
 func TestPreviewDataAppCarriesUnstatedSettingsAsAbsent(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -187,8 +175,7 @@ func TestPreviewDataAppCarriesUnstatedSettingsAsAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PreviewDataApp: %v", err)
 	}
-	// Emphatically NOT the request echoed back: the CLI asked for mobile and
-	// #/orders, and neither may appear here.
+	// NOT the request echoed back.
 	if outcome.Result.Viewport != "" || outcome.Result.Route != "" {
 		t.Errorf("an unstated setting must stay empty, got viewport=%q route=%q",
 			outcome.Result.Viewport, outcome.Result.Route)
@@ -196,8 +183,7 @@ func TestPreviewDataAppCarriesUnstatedSettingsAsAbsent(t *testing.T) {
 	if outcome.Result.AppOutputNote != "" {
 		t.Errorf("no app output, so no note about it, got %q", outcome.Result.AppOutputNote)
 	}
-	// The control: the same decode DOES pick the fields up when the server sends
-	// them, so the assertion above is about absence rather than a broken tag.
+	// The control: the assertion above is about absence, not a broken tag.
 	var stated PreviewResult
 	if err := json.Unmarshal([]byte(previewFixture), &stated); err != nil {
 		t.Fatalf("decode fixture: %v", err)
@@ -207,9 +193,8 @@ func TestPreviewDataAppCarriesUnstatedSettingsAsAbsent(t *testing.T) {
 	}
 }
 
-// Re-marshalling the mirror has to say what the server said, absence included.
-// Without omitempty on Viewport a CLI that re-emitted this struct would assert
-// an applied viewport of "" — a claim the server never made.
+// Re-marshalling must keep the server's absence, or a re-emitted struct would
+// claim an applied viewport the server never named.
 func TestPreviewResultOmitsUnstatedSettings(t *testing.T) {
 	blank, err := json.Marshal(PreviewResult{})
 	if err != nil {
@@ -231,9 +216,8 @@ func TestPreviewResultOmitsUnstatedSettings(t *testing.T) {
 	}
 }
 
-// A 429 is its own type, not a status a caller has to remember to look for. It
-// means NOTHING about the app was observed, and a plain *Error would leave that
-// distinction to every call site to rediscover.
+// A 429 means NOTHING about the app was observed, so it is its own type rather
+// than a status every call site must remember.
 func TestPreviewDataAppSurfacesBusyAsItsOwnError(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "15")
@@ -258,8 +242,7 @@ func TestPreviewDataAppSurfacesBusyAsItsOwnError(t *testing.T) {
 	}
 }
 
-// A busy answer with no usable Retry-After reports ZERO rather than a guess, so
-// the caller can tell "the server named an interval" from "it did not".
+// No usable Retry-After reports ZERO rather than a guess.
 func TestParseRetryAfterOnlyAcceptsPositiveSeconds(t *testing.T) {
 	for _, tc := range []struct {
 		header string
@@ -278,8 +261,6 @@ func TestParseRetryAfterOnlyAcceptsPositiveSeconds(t *testing.T) {
 	}
 }
 
-// Anything else non-2xx stays an ordinary *Error, so StatusOf and CodeOf keep
-// working on it.
 func TestPreviewDataAppReportsAnOrdinaryError(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"interaction steps require an administrator"}`, http.StatusForbidden)
@@ -300,9 +281,8 @@ func TestPreviewDataAppReportsAnOrdinaryError(t *testing.T) {
 	}
 }
 
-// The two-call frame fetch, and the escaping that makes the second one resolve:
-// the storage key's own slashes go into ONE path segment, because the route is
-// /download/:key rather than a wildcard.
+// The storage key's slashes go into ONE path segment: the route is
+// /download/:key, not a wildcard.
 func TestDownloadFileByIDEscapesTheWholeKey(t *testing.T) {
 	const key = "dataapp/preview/data_app-1/frame 2.png"
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -310,8 +290,7 @@ func TestDownloadFileByIDEscapesTheWholeKey(t *testing.T) {
 		case "/api/v2/feature/file/file-1":
 			writeJSONTo(t, w, File{ID: "file-1", Name: "frame.png", FileKey: key, ContentType: "image/png"})
 		case "/api/v2/file/download/" + key:
-			// The server side sees the DECODED path, so arriving here at all is
-			// the proof that the escaped key round-tripped as one segment.
+			// Reaching here proves the escaped key arrived as one segment.
 			if raw := r.URL.RawPath; raw == "" || raw == r.URL.Path {
 				t.Errorf("the key should have been percent-encoded on the wire, RawPath = %q", raw)
 			}
@@ -336,8 +315,6 @@ func TestDownloadFileByIDEscapesTheWholeKey(t *testing.T) {
 	}
 }
 
-// A file row with no storage key cannot be fetched, and says so rather than
-// requesting /download/ and reporting whatever that answers.
 func TestDownloadFileByIDRefusesAKeylessRow(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		writeJSONTo(t, w, File{ID: "file-1", Name: "frame.png"})
@@ -347,11 +324,9 @@ func TestDownloadFileByIDRefusesAKeylessRow(t *testing.T) {
 	}
 }
 
-// DownloadFrame takes the key the preview already handed over, and that is not
-// an optimisation: /api/v2/feature/file/:id sits on a group with NO scope
-// annotation, which gt.requireScope fail-closes for any SCOPED token — so a
-// data-scoped agent that resolved the id first would get the frame ids and then
-// a 403. The key route is data-scoped like the preview itself.
+// DownloadFrame takes the preview's key, not the file id: /api/v2/feature/file/:id
+// has NO scope annotation, which gt.requireScope fail-closes for a SCOPED token,
+// while the key route is data-scoped like the preview.
 func TestDownloadFrameUsesTheKeyAndSkipsTheRowLookup(t *testing.T) {
 	const key = "dataapp/preview/data_app-1/frame 2.png"
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {

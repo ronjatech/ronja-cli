@@ -13,26 +13,17 @@ import (
 	"golang.org/x/term"
 )
 
-// Discard outcomes, the --json `outcome` vocabulary. Shared by both folder
-// loops — which row was affected is already named by the result's own
-// workflowID / dataAppID field, so the vocabulary stays kind-neutral.
+// Discard outcomes, the --json `outcome` vocabulary, kind-neutral because the
+// result's own workflowID / dataAppID names the row.
 const (
-	outcomeDiscarded = "discarded"
-	outcomeNoDraft   = "no_draft"
-	// outcomeResourceDeleted reports that --delete-workflow / --delete-app
-	// removed a never-published row, which is a different event from discarding
-	// a draft that left a live version standing.
+	outcomeDiscarded       = "discarded"
+	outcomeNoDraft         = "no_draft"
 	outcomeResourceDeleted = "resource_deleted"
 )
 
-// `ronja wf discard` throws your draft away and points the baseline back at
-// the live workflow.
-//
-// The escape hatch, and the reason it belongs in a CLI whose rule is otherwise
-// "no resource verbs": a draft wedged by a binding you cannot resolve (a table
-// somebody deleted) rejects every file write, and the only way forward is to
-// drop it and check out a fresh one. It operates on the sync loop's own
-// artifact, never on anything live.
+// `ronja wf discard` is allowed despite "no resource verbs": a draft wedged by an
+// unresolvable binding rejects every file write, and it touches only the sync
+// loop's own artifact, never anything live.
 func newWorkflowDiscardCmd() *cobra.Command {
 	var yes bool
 	var deleteWorkflow bool
@@ -104,23 +95,15 @@ func runDiscard(ctx context.Context, f *folder, yes, deleteWorkflow bool) (*disc
 		return nil, err
 	}
 
-	// The PARENT field, not the lifecycle alone, is what makes a draft
-	// parentless. A binding that names an EDIT SHADOW — a draft forked from a
-	// live workflow, which a hand-edited ronja.json can perfectly well hold —
-	// also reads as lifecycle=draft, and treating it as never-published would
-	// delete somebody's in-progress edits and unbind the folder from the live
-	// workflow, while reporting that nothing had ever been published.
+	// The parent field, not lifecycle alone: an edit shadow of a live workflow also
+	// reads as lifecycle=draft, and treating it as never-published would delete
+	// in-progress edits and unbind the folder.
 	if wf.Lifecycle == api.LifecycleDraft && wf.ParentWorkflowID != "" {
 		return nil, fmt.Errorf("%s names %s, which is a draft of workflow %s rather than the workflow itself — point the binding at %s (that is the id a push records) and try again",
 			wfdir.ManifestPath(f.Root), wf.ID, wf.ParentWorkflowID, wf.ParentWorkflowID)
 	}
-	// A parentless draft IS the workflow, so there is no "undo my edits" to
-	// perform on it — the only available action is deleting the whole row. That
-	// stays behind an explicit flag because `discard` reads as reverting, and
-	// deleting a workflow is not a surprise anyone should meet at the command
-	// line. But it has to be reachable: this is what an abandoned first push
-	// leaves, and a CLI whose premise is that an agent needs nothing but a
-	// terminal cannot answer with "use the web UI".
+	// A parentless draft IS the workflow, so deleting it stays behind an explicit
+	// flag, but reachable: an abandoned first push needs a terminal-only way out.
 	if wf.Lifecycle == api.LifecycleDraft {
 		if !deleteWorkflow {
 			return nil, fmt.Errorf("workflow %s has never been published, so it is a draft with nothing behind it — discarding would delete the workflow itself. Re-run with --delete-workflow to do that; your local files are kept",
@@ -128,9 +111,7 @@ func runDiscard(ctx context.Context, f *folder, yes, deleteWorkflow bool) (*disc
 		}
 		return deleteUnpublishedWorkflow(ctx, client, f, wf, yes)
 	}
-	// --delete-workflow is only meaningful on the branch above. Refusing it here
-	// rather than ignoring it keeps the flag from reading as "delete the live
-	// workflow too" on a folder where it would do nothing of the sort.
+	// Refused, not ignored, so the flag never reads as "delete the live one too".
 	if deleteWorkflow {
 		return nil, fmt.Errorf("--delete-workflow only applies to a workflow that has never been published; %s is live, so there is a published version to keep. Drop --delete-workflow to discard just your draft",
 			wf.ID)
@@ -156,22 +137,14 @@ func runDiscard(ctx context.Context, f *folder, yes, deleteWorkflow bool) (*disc
 		return nil, fmt.Errorf("discard %s: %w", draft.ID, err)
 	}
 
-	// The baseline now has to describe the LIVE row: the draft it was taken
-	// from no longer exists, and leaving it in place would make every local
-	// file read as drift against a row that is gone. A failure here is noted,
-	// not returned — the discard itself succeeded, and reporting it as failed
-	// would send the caller looking for a draft that is already gone.
+	// The baseline must describe the live row now, or every file reads as drift
+	// against a gone draft. A failure is noted, not returned: the discard succeeded.
 	noteBaselineRefresh(f.Kind, refreshBaselineFromLive(ctx, client, f, wf.ID, keepAnchor))
 	return &discardResult{Outcome: outcomeDiscarded, WorkflowID: wf.ID, DraftID: draft.ID}, nil
 }
 
-// deleteUnpublishedWorkflow removes a parentless draft — a workflow that has
-// never been published — and returns the folder to the state `init` left it in.
-//
-// Ordering is load-bearing: the server row goes first, and the manifest is only
-// unbound once it is gone. Clearing the binding first and then failing the
-// delete would strand a real workflow that no local command could name again,
-// which is the exact failure this command exists to clean up.
+// deleteUnpublishedWorkflow deletes the server row before unbinding: the reverse
+// order, on a failed delete, would strand a workflow no local command can name.
 func deleteUnpublishedWorkflow(ctx context.Context, client *api.Client, f *folder, wf *api.Workflow, yes bool) (*discardResult, error) {
 	ok, err := confirm(fmt.Sprintf("DELETE workflow %s (%q)? It has never been published, so this removes the workflow itself — it goes to the trash, and is purged for good 30 days later. Local files are kept.", wf.ID, wf.Title),
 		fmt.Sprintf("deletes workflow %s on the server", wf.ID), yes)
@@ -185,38 +158,21 @@ func deleteUnpublishedWorkflow(ctx context.Context, client *api.Client, f *folde
 		return nil, fmt.Errorf("delete %s: %w", wf.ID, err)
 	}
 
-	// Keep the feature, drop the workflow: the folder should behave exactly as
-	// it did after `init`, so the next push creates a fresh one in the same place.
 	f.recordBinding(wfdir.Binding{FeatureID: f.Binding.FeatureID})
 	if err := f.saveFolder(); err != nil {
 		return nil, fmt.Errorf("workflow %s was DELETED, but %s still names it: %w\n  Remove the workflowID from that file by hand, or the next push will look for a workflow that is gone",
 			wf.ID, wfdir.ManifestPath(f.Root), err)
 	}
-	// No baseline for THIS instance, for the same reason `init` leaves none:
-	// there is no server-side row left to have synced from, so every local file
-	// correctly reads as "added" until a push writes a real one. Only this
-	// binding's entry goes — the folder may be bound to staging and production
-	// too, and each of those still has a row its baseline describes.
+	// Only this instance's baseline goes, as after `init`: the folder may still be
+	// bound elsewhere, each with a row its baseline describes.
 	f.State.Clear(f.Key)
 	noteBaselineRefresh(f.Kind, wfdir.SaveState(f.Root, f.State))
 	return &discardResult{Outcome: outcomeResourceDeleted, WorkflowID: wf.ID}, nil
 }
 
-// confirm asks a human to approve a destructive action.
-//
-// Without a terminal there is nobody to ask, so --yes is required rather than
-// assumed: an agent or a CI job that did not pass it did not mean to delete
-// anything. Reading stdin blind in that case would hang a pipeline forever.
-//
-// --json says the same thing a missing terminal does, and says it even from
-// one: whoever asked for a machine-readable answer is a program, and a program
-// handed a [y/N] prompt on stderr deadlocks exactly as a pipeline would.
-//
-// effect names what is at stake, as a verb phrase ("deletes your draft on the
-// server"). It is a parameter rather than fixed prose because the same gate
-// stands in front of two different acts: throwing a draft away, and deleting a
-// whole workflow or data app. A refusal that says "this deletes your draft" in
-// front of the second one understates it exactly where it matters most.
+// confirm requires --yes without a terminal or under --json: a program handed a
+// [y/N] prompt deadlocks. effect is a parameter because the same gate fronts
+// both discarding a draft and deleting a whole workflow or data app.
 func confirm(question, effect string, yes bool) (bool, error) {
 	if yes {
 		return true, nil

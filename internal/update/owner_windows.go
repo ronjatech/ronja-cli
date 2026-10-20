@@ -2,9 +2,6 @@
 
 package update
 
-// dirOwnerUID has no answer on Windows: there is no uid, and os.Geteuid there
-// returns -1, so the caller's sudo branch is unreachable anyway. The file
-// exists so the package still compiles for anyone building the CLI for Windows
-// from source — the release pipeline does not, and `ronja update` refuses
-// there, but `go build` must not break.
+// dirOwnerUID has no answer on Windows (no uid, and os.Geteuid returns -1); the
+// file exists so the package still builds there from source.
 func dirOwnerUID(string) (int, bool) { return 0, false }

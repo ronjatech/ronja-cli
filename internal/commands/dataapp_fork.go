@@ -13,26 +13,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja app fork` copies one component-kit file into the folder.
-//
-// LOCAL-FIRST, and that is the whole design: it writes a file and changes
-// NOTHING on the server. No draft is opened, no row is touched, and a fork you
-// think better of is `rm` — not a discard.
-//
-// It is a sync verb rather than a resource verb, on the same doctrine as the
-// rest of this tree. It does not list the kit, browse it or address a row; it
-// moves bytes between the instance and the folder, which is the one thing plain
-// HTTP does badly here: an author forking a component over curl has to know the
-// docs route, know the folder path is the SAME path, and get both right in one
-// go, with a silent wrong answer (a file at the wrong path is just a new file)
-// if they do not.
-//
-// Shadowing is what makes this work at all. A data app compiles against the
-// embedded kit as a base layer, and an app file at the same path replaces the
-// kit's for the whole bundle — so `@/components/ui/button` keeps resolving,
-// from every file that imports it, with no import to update anywhere. Which is
-// also why the path is not a choice: fork it somewhere else and the kit's
-// version is still what everything compiles against.
+// `ronja app fork` copies one component-kit file into the folder and changes
+// nothing on the server. The path is not a choice: an app file at a kit path
+// shadows the kit's copy for the whole bundle, so a file anywhere else shadows
+// nothing.
 func newDataAppForkCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "fork <kit-path>",
@@ -76,14 +60,9 @@ The kit is listed at <instance>/docs/api/kit.md, one line per file.`,
 			if err != nil {
 				return err
 			}
-			// Every refusal that can be made locally is made before the request.
-			// A path this folder cannot hold does not become holdable after a
-			// round trip, and this is the form CI runs.
-			//
-			// CheckLocalPaths is the same gate clone applies to server-supplied
-			// paths, and for the same reason: a path the walk would never see
-			// again (a dot-directory, one of this kind's skipped directories) is
-			// a file written once and then invisible to every later command.
+			// Local refusals come before the request. CheckLocalPaths is clone's
+			// gate: a path the folder walk skips would be written once and then
+			// invisible to every later command.
 			if err := wfdir.CheckLocalPaths([]string{kitPath}, wfdir.DataAppKind); err != nil {
 				return err
 			}
@@ -101,19 +80,16 @@ The kit is listed at <instance>/docs/api/kit.md, one line per file.`,
 			if err != nil {
 				return err
 			}
-			// Validated once more inside WriteFile, which is what keeps a path
-			// that arrived from outside from writing anywhere but this folder.
+			// WriteFile validates again, confining the write to this folder.
 			if err := wfdir.WriteFile(f.Root, kitPath, source); err != nil {
 				return fmt.Errorf("write %s: %w", kitPath, err)
 			}
 
 			if flagJSON {
 				return emitJSON(map[string]any{
-					"root":  f.Root,
-					"path":  kitPath,
-					"bytes": len(source),
-					// Where the bytes came from, so a caller can go and read the
-					// same source without knowing the route family.
+					"root":   f.Root,
+					"path":   kitPath,
+					"bytes":  len(source),
 					"source": resolved.URL + api.KitDocsPath(kitPath),
 					"url":    resolved.URL,
 				})
@@ -125,14 +101,9 @@ The kit is listed at <instance>/docs/api/kit.md, one line per file.`,
 	return cmd
 }
 
-// normalizeKitPath turns what an author is likely to type into the kit path the
-// docs route and the folder both use.
-//
-// The alias form is the one worth accepting: the kit is imported as
-// "@/components/ui/button", so that string is what is on screen when someone
-// decides to fork it. The EXTENSION is deliberately not guessed — ".ts" and
-// ".tsx" both occur in the kit, and a wrong guess would fetch a file that
-// exists and shadow nothing.
+// normalizeKitPath turns what an author types (including the "@/" import alias)
+// into the kit path the docs route and the folder share. The extension is
+// deliberately not guessed: both .ts and .tsx occur in the kit.
 func normalizeKitPath(arg string) (string, error) {
 	path := strings.TrimSpace(arg)
 	path = strings.TrimPrefix(path, "@/")

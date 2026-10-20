@@ -9,19 +9,10 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The component-kit fork.
-//
-// Two properties carry the whole command, and both are invisible in the happy
-// path's output: the file lands at EXACTLY the kit path (anywhere else shadows
-// nothing, and a data app whose "customised" Button is never imported compiles
-// perfectly and looks unchanged), and NOTHING is written on the server.
-
-// kitButtonSource is a stand-in for a vendored kit component. Byte-exactness is
-// the assertion, so it deliberately carries the things a careless copy loses: a
-// trailing newline, a tab, and a non-ASCII character.
+// kitButtonSource carries what a careless copy loses (a trailing newline, a
+// tab, a non-ASCII character), since byte-exactness is the assertion.
 const kitButtonSource = "// Vendored from shadcn/ui — MIT.\nexport function Button() {\n\treturn null\n}\n"
 
-// forkFolder lays out a bound data-app folder for the fork tests.
 func forkFolder(t *testing.T, f *fakeAppInstance, files map[string]string) string {
 	t.Helper()
 	if files == nil {
@@ -36,9 +27,6 @@ func forkFolder(t *testing.T, f *fakeAppInstance, files map[string]string) strin
 	return root
 }
 
-// TestAppForkWritesTheKitFileVerbatim is the happy path, and the byte-exactness
-// is the point: the file has to be what the compiler currently resolves, or the
-// fork silently starts from something else.
 func TestAppForkWritesTheKitFileVerbatim(t *testing.T) {
 	f := newFakeAppInstance(t)
 	f.AddKitFile("components/ui/button.tsx", kitButtonSource)
@@ -52,9 +40,7 @@ func TestAppForkWritesTheKitFileVerbatim(t *testing.T) {
 	if got := readFile(t, root, "components", "ui", "button.tsx"); got != kitButtonSource {
 		t.Errorf("forked file is not the kit source verbatim:\n%q\nwant\n%q", got, kitButtonSource)
 	}
-	// LOCAL-FIRST: the only request a fork may make is the docs read. Anything
-	// else means a draft was opened or a row was touched by a command whose
-	// entire promise is that it changes nothing.
+	// The only request a fork may make is the docs read.
 	for _, req := range f.Requests {
 		if req != "GET /docs/api/kit/components/ui/button.tsx" {
 			t.Errorf("fork made a request it had no business making: %q (all: %v)", req, f.Requests)
@@ -65,8 +51,6 @@ func TestAppForkWritesTheKitFileVerbatim(t *testing.T) {
 	}
 }
 
-// The import alias is what is on screen when someone decides to fork a
-// component, so it is accepted and stripped rather than refused.
 func TestAppForkAcceptsTheImportAliasForm(t *testing.T) {
 	f := newFakeAppInstance(t)
 	f.AddKitFile("components/ui/button.tsx", kitButtonSource)
@@ -81,9 +65,7 @@ func TestAppForkAcceptsTheImportAliasForm(t *testing.T) {
 	}
 }
 
-// TestAppForkRefusesAnExistingFile: overwriting is the one failure with no
-// undo. A fork already made is the author's own code, and a file that merely
-// happens to sit at a kit path is being shadowed on purpose.
+// Overwriting is the one failure with no undo.
 func TestAppForkRefusesAnExistingFile(t *testing.T) {
 	f := newFakeAppInstance(t)
 	f.AddKitFile("components/ui/button.tsx", kitButtonSource)
@@ -106,8 +88,7 @@ func TestAppForkRefusesAnExistingFile(t *testing.T) {
 	if got := readFile(t, root, "components", "ui", "button.tsx"); got != mine {
 		t.Errorf("the existing file was modified:\n%q", got)
 	}
-	// Refusals before requests: this one is knowable locally, and CI should not
-	// pay a round trip to be told so.
+	// Refused locally, before any request.
 	for _, req := range f.Requests {
 		if strings.HasPrefix(req, "GET /docs/api/kit/") {
 			t.Errorf("fork fetched the kit before checking the local file: %v", f.Requests)
@@ -120,9 +101,7 @@ func TestAppForkRefusesAnExistingFile(t *testing.T) {
 func TestAppForkUnknownKitPathIsAClearError(t *testing.T) {
 	f := newFakeAppInstance(t)
 	f.AddKitFile("components/ui/button.tsx", kitButtonSource)
-	// Modelling the real 404: the breadcrumb carries a near-miss suggestion
-	// computed from the route table, and a one-letter typo is the likeliest way
-	// anyone gets here at all.
+	// The real 404 breadcrumb carries a near-miss suggestion.
 	f.kitNotFoundBody = "404 page not found\n\nThis is the Ronja API. Start at /llms.txt\n" +
 		"Did you mean:\n  GET /docs/api/kit/components/ui/button.tsx\n"
 	signInApp(t, f)
@@ -150,8 +129,6 @@ func TestAppForkUnknownKitPathIsAClearError(t *testing.T) {
 	}
 }
 
-// A kit path the folder could not hold is refused before the request, the same
-// way clone refuses a server file set it cannot lay out.
 func TestAppForkRefusesAPathTheFolderCannotHold(t *testing.T) {
 	f := newFakeAppInstance(t)
 	signInApp(t, f)
@@ -172,8 +149,6 @@ func TestAppForkRefusesAPathTheFolderCannotHold(t *testing.T) {
 	}
 }
 
-// --json is the agent path: the created path and where the bytes came from, on
-// stdout, with nothing else in it.
 func TestAppForkJSONReportsThePathAndSource(t *testing.T) {
 	f := newFakeAppInstance(t)
 	f.AddKitFile("lib/utils.ts", "export const cn = () => \"\"\n")

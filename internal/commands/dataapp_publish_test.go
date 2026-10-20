@@ -7,14 +7,8 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// `ronja app publish` told you WHETHER your draft went live and nothing about
-// who could then use it. For a system of record carrying a managed database's
-// write role, those are not the same question — the second is the one that
-// matters, and it was unanswered on every path.
-//
-// The sentence is composed server-side (rdataapp.DescribeAudience) and printed
-// verbatim, so these pin the PRINTING, not the wording: that both outcomes show
-// it, and that its absence degrades silently rather than printing a stub.
+// The audience sentence is composed server-side (rdataapp's DescribeAudience)
+// and printed verbatim, so these pin the printing, not the wording.
 
 func writeRoleAudience() *api.DataAppAudience {
 	return &api.DataAppAudience{
@@ -53,9 +47,8 @@ func TestPrintAppPublishReport_PublishedPrintsTheAudience(t *testing.T) {
 	}
 }
 
-// The review path is the ncr/1 shape — a non-admin editing an org-shared app —
-// so it is the path that most needs the line, and the one that had no body to
-// read it from until request-review started answering the commit shape.
+// The review path (a non-admin editing an org-shared app) is the one that most
+// needs the line.
 func TestPrintAppPublishReport_SubmittedForReviewPrintsTheAudience(t *testing.T) {
 	out := publishReportOutput(t, &appPublishResult{
 		Outcome:   outcomeSubmittedForReview,
@@ -72,8 +65,7 @@ func TestPrintAppPublishReport_SubmittedForReviewPrintsTheAudience(t *testing.T)
 	}
 }
 
-// An older instance sends no audience. The report must be exactly what it was
-// before rather than an empty bullet.
+// An older instance sends no audience; no empty bullet may appear.
 func TestPrintAppPublishReport_NoAudiencePrintsNothingExtra(t *testing.T) {
 	out := publishReportOutput(t, &appPublishResult{
 		Outcome:   outcomePublished,
@@ -92,8 +84,6 @@ func TestPrintAppPublishReport_NoAudiencePrintsNothingExtra(t *testing.T) {
 	}
 }
 
-// A summary that arrived with no sentence (server-side hydration produced the
-// structure but nothing to say) must not print a blank line either.
 func TestPrintAppPublishReport_EmptySentencePrintsNothing(t *testing.T) {
 	out := publishReportOutput(t, &appPublishResult{
 		Outcome:   outcomePublished,

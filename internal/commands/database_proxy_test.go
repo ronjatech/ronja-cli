@@ -42,14 +42,8 @@ const proxyRolesBody = `{
   }
 }`
 
-// TestDatabaseEnvEmitsPGVariables is the whole contract of `db env`: the six PG*
-// variables psql and pg_dump read, plus the profile's own token as PGPASSWORD.
-//
-// The token assertion is the one that matters. `db env` mints nothing and asks
-// for nothing — it moves the credential the CLI already holds into the place a
-// different program reads it from, exactly as `ronja env` does. A command that
-// obtained a SECOND credential here would be a new thing to revoke that nobody
-// knows exists.
+// The PGPASSWORD assertion matters most: `db env` must hand over the profile's
+// own token, never mint a second credential nobody knows to revoke.
 func TestDatabaseEnvEmitsPGVariables(t *testing.T) {
 	srv, gotPath := proxyServer(t, proxyRolesBody)
 	signInTo(t, srv.URL)
@@ -67,9 +61,8 @@ func TestDatabaseEnvEmitsPGVariables(t *testing.T) {
 		"export PGPORT='5432'",
 		"export PGUSER='mdb-abc.read'",
 		"export PGDATABASE='t_x_crm'",
-		// verify-full and the OS trust store, never `require`: the token travels
-		// as the password, so a mode that accepts any certificate hands it to
-		// whoever answers the socket.
+		// Never `require`: the token travels as the password, so a mode that
+		// accepts any certificate hands it to whoever answers the socket.
 		"export PGSSLMODE='verify-full'",
 		"export PGSSLROOTCERT='system'",
 		"export PGPASSWORD='test-token'",
@@ -102,14 +95,9 @@ func TestDatabaseEnvJSON(t *testing.T) {
 	}
 }
 
-// TestDatabaseProxyRefusals covers the two ways there is nothing to connect to,
-// and pins that they stay DIFFERENT messages.
-//
-// "No proxy block" has two causes the server deliberately does not distinguish
-// (no proxy deployed, or a caller who is not an admin), so the message names
-// both. "No read role" is a different problem entirely — the proxy is there and
-// the login would authenticate before being refused — and an admin told the
-// wrong one of these goes looking for a deployment problem that does not exist.
+// The two refusals must stay different messages. "No proxy block" has two
+// causes the server does not distinguish (no proxy, or not an admin), so it
+// names both; "no read role" means the proxy is there and is a different fix.
 func TestDatabaseProxyRefusals(t *testing.T) {
 	t.Run("no proxy block", func(t *testing.T) {
 		srv, _ := proxyServer(t, `{"host":"h","port":"5432","database":"t_x_crm","roles":[]}`)
@@ -125,16 +113,9 @@ func TestDatabaseProxyRefusals(t *testing.T) {
 		}
 	})
 
-	// The refusal is presented as THE FIX, not as prose, so the command it
-	// prints has to be one that works. It did not: it omitted `featureID`,
-	// which POST :id/user requires (backend agent/tools/database_core.go,
-	// createManagedDatabaseUser), so pasting it verbatim returned 400.
-	//
-	// The payload is therefore decoded rather than substring-matched — a
-	// substring check passes on a command that is no longer valid JSON, which
-	// is the other way this can regress. It is not proof the SERVER accepts
-	// it: `cli` is its own Go module and cannot import the backend guard, so
-	// that guard stays the authority and this pins the shape.
+	// The printed mint command must work as pasted: POST :id/user requires
+	// featureID. The payload is decoded, not substring-matched, so invalid JSON
+	// fails too; the backend guard stays the authority and this pins the shape.
 	t.Run("no read role minted", func(t *testing.T) {
 		body := strings.Replace(proxyRolesBody, `"readRoleMinted": true`, `"readRoleMinted": false`, 1)
 		srv, _ := proxyServer(t, body)
@@ -153,11 +134,8 @@ func TestDatabaseProxyRefusals(t *testing.T) {
 		if err := json.Unmarshal([]byte(mintPayload(t, msg)), &payload); err != nil {
 			t.Fatalf("the -d payload the refusal prints must be valid JSON: %v\nmessage:\n%s", err, msg)
 		}
-		// A STRING assertion, not a non-empty-rendering one. fmt.Sprint(nil) is
-		// "<nil>", so a payload of {"featureID":null} would satisfy a
-		// TrimSpace(Sprint(v)) != "" guard while the server answers 400 on
-		// TrimSpace(opts.FeatureID) == "" — i.e. the exact regression this test
-		// exists to catch would walk straight through it. Same for false and 0.
+		// A string assertion: fmt.Sprint(nil) is "<nil>", so {"featureID":null}
+		// would pass a non-empty-rendering check while the server answers 400.
 		for _, key := range []string{"access", "featureID"} {
 			v, ok := payload[key]
 			if !ok {
@@ -169,19 +147,14 @@ func TestDatabaseProxyRefusals(t *testing.T) {
 			}
 		}
 
-		// The second half of the remedy. featureID has no default, and the CLI
-		// deliberately does not borrow one from an existing role — see
-		// proxyForDatabase's comment for why that is a choice rather than a
-		// limitation. Naming a value is therefore the operator's job, and
-		// nothing else in the CLI tells them where to look.
+		// featureID has no default and is deliberately not borrowed from an
+		// existing role (see proxyForDatabase), so the refusal must say where
+		// to find one.
 		if !strings.Contains(msg, "/api/v2/feature/query") {
 			t.Errorf("refusal must say where to find a featureID, got:\n%s", msg)
 		}
-		// The message prints TWO commands, and the branch's premise is that a
-		// printed remedy has to work — so pin the second one's flag order too.
-		// `--jq` takes the next argument, so the widely-mistyped `--jq -r '<expr>'`
-		// binds `-r` AS the expression; it is caught at runtime rather than
-		// silently, but not by any assertion above.
+		// `--jq` takes the next argument, so `--jq -r '<expr>'` would bind `-r`
+		// as the expression.
 		jq, r := strings.Index(msg, "--jq '"), strings.LastIndex(msg, " -r")
 		if jq < 0 || r < jq {
 			t.Errorf("the discovery command must pass --jq '<expr>' BEFORE -r, got:\n%s", msg)
@@ -189,12 +162,8 @@ func TestDatabaseProxyRefusals(t *testing.T) {
 	})
 }
 
-// mintPayload returns the JSON the refusal's `-d '...'` argument carries.
-//
-// Anchored on `-d '` and the NEXT quote specifically. The message holds a
-// second single-quoted argument — the `--jq '...'` expression on the discovery
-// line — so a first-quote-to-last-quote span would swallow both commands and
-// decode as nothing.
+// mintPayload is anchored on `-d '` and the NEXT quote: the message holds a
+// second single-quoted `--jq '...'` argument a wider span would swallow.
 func mintPayload(t *testing.T, msg string) string {
 	t.Helper()
 	const anchor = "-d '"
@@ -210,11 +179,9 @@ func mintPayload(t *testing.T, msg string) string {
 	return rest[:j]
 }
 
-// TestDatabaseConnectRefusesEnvFlag: `db sql` and `db migrate` both take --env,
-// so somebody who used it five minutes ago will type it here. The honest answer
-// is not "unknown flag" — a dev copy IS a database at the proxy, addressed by
-// its own id, because the username is the id and there is nothing left for the
-// server's prod→dev overlay to redirect.
+// `db sql` and `db migrate` take --env, so it will be typed here; the refusal
+// says a dev copy is addressed at the proxy by its own id, since the username
+// is the id and there is no prod→dev overlay to redirect.
 func TestDatabaseConnectRefusesEnvFlag(t *testing.T) {
 	srv, _ := proxyServer(t, proxyRolesBody)
 	signInTo(t, srv.URL)
@@ -230,14 +197,9 @@ func TestDatabaseConnectRefusesEnvFlag(t *testing.T) {
 	}
 }
 
-// TestProxyConninfoCarriesTheKeepalive is why `db connect` exists at all beside
-// `db env`: libpq has no environment variable for keepalives_idle, so only a
-// command that builds the conninfo itself can keep a long interactive session
-// alive through the load balancer's idle timer.
-//
-// It also pins that the password is NOT in the string. It reaches psql through
-// the child's environment, which is what keeps it out of `ps` and out of the
-// shell history.
+// libpq has no environment variable for keepalives_idle, so only a built
+// conninfo survives the load balancer's idle timer. The password must not be in
+// it: it reaches psql through the child's environment, out of `ps`.
 func TestProxyConninfoCarriesTheKeepalive(t *testing.T) {
 	got := proxyConninfo(&api.DatabaseProxy{
 		Host: "pg.ronja.tech", Port: "5432",
@@ -253,20 +215,9 @@ func TestProxyConninfoCarriesTheKeepalive(t *testing.T) {
 	}
 }
 
-// TestPsqlCommandLeavesSIGINTToPsql is the reason psqlCommand exists as its own
-// function.
-//
-// Every command in this tree runs under the root's signal context, cancelled on
-// SIGINT. On Ctrl-C the terminal delivers SIGINT to psql anyway — it is in this
-// process's foreground process group — so a child built with
-// exec.CommandContext would ALSO have exec.Cmd's default Cancel fire on the same
-// keystroke and SIGKILL psql mid-session: no query cancellation, and no chance
-// to restore the terminal's tty settings, which leaves the user's shell wrecked
-// rather than back at a prompt.
-//
-// A nil Cancel is exactly what "no context is attached" looks like from the
-// outside, so that is what this asserts. Re-adding cmd.Context() here is a
-// one-line, entirely reasonable-looking change.
+// psql already gets Ctrl-C's SIGINT from the terminal; a child built with
+// exec.CommandContext on the root's signal context would also be SIGKILLed on
+// it, leaving the tty wrecked. A nil Cancel is what "no context" looks like.
 func TestPsqlCommandLeavesSIGINTToPsql(t *testing.T) {
 	child := psqlCommand("/usr/bin/psql", &api.DatabaseProxy{
 		Host: "pg.ronja.tech", Port: "5432",
@@ -281,12 +232,8 @@ func TestPsqlCommandLeavesSIGINTToPsql(t *testing.T) {
 	}
 }
 
-// TestPsqlCommandKeepsThePasswordOffTheCommandLine is the bug this whole shape
-// exists to prevent: a token on argv is visible to every process on the box
-// through `ps`, and to anything reading /proc.
-//
-// It travels on the CHILD's environment instead — not this process's, which is
-// why it also never leaks into anything else `db connect` might later spawn.
+// A token on argv is visible to every process on the box through `ps`; it
+// travels on the CHILD's environment, not this process's.
 func TestPsqlCommandKeepsThePasswordOffTheCommandLine(t *testing.T) {
 	const token = "pat-super-secret"
 	child := psqlCommand("/usr/bin/psql", &api.DatabaseProxy{
@@ -308,16 +255,12 @@ func TestPsqlCommandKeepsThePasswordOffTheCommandLine(t *testing.T) {
 	if found != 1 {
 		t.Errorf("PGPASSWORD=<token> appears %d times on the child env, want exactly 1", found)
 	}
-	// The parent process must not be carrying it either: `db env` is the command
-	// that exports, and this one exports nothing.
 	if os.Getenv("PGPASSWORD") == token {
 		t.Error("the token was set on THIS process's environment")
 	}
 }
 
-// TestPsqlCommandForwardsArgsVerbatim: everything after -- is psql's, unchanged
-// and in order, after the conninfo this command builds. A flag that looked like
-// one of ours must not be intercepted, reordered or dropped.
+// A flag after -- that looks like one of ours (--env) must reach psql unchanged.
 func TestPsqlCommandForwardsArgsVerbatim(t *testing.T) {
 	args := []string{"-n", "public", "-f", "report.sql", "--env", "dev"}
 	child := psqlCommand("/usr/bin/psql", &api.DatabaseProxy{
@@ -334,13 +277,8 @@ func TestPsqlCommandForwardsArgsVerbatim(t *testing.T) {
 	}
 }
 
-// TestDatabaseConnectWithoutPsql pins the message a caller gets when the tool
-// this command drives is not installed.
-//
-// It must name psql AND offer the way out that needs no psql at all — `db env`
-// works with any Postgres client — because "exec: psql: executable file not
-// found in $PATH" is a diagnostic about our implementation, not an answer to
-// what the caller was trying to do.
+// The refusal must name psql and offer `db env`, which works with any Postgres
+// client.
 func TestDatabaseConnectWithoutPsql(t *testing.T) {
 	srv, _ := proxyServer(t, proxyRolesBody)
 	signInTo(t, srv.URL)
@@ -359,9 +297,8 @@ func TestDatabaseConnectWithoutPsql(t *testing.T) {
 	}
 }
 
-// TestSplitAtDash: everything before -- is ours, everything after is psql's. The
-// boundary comes from cobra rather than from scanning the slice, so a database
-// id that happens to look like a flag is never mistaken for one.
+// The boundary comes from cobra, not from scanning the slice, so an id that
+// looks like a flag is never mistaken for one.
 func TestSplitAtDash(t *testing.T) {
 	cases := []struct {
 		name    string

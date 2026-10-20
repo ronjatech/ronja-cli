@@ -63,6 +63,7 @@ Leave "capabilities" empty unless the app calls one of these four, each declared
 by its manifest name:
 
   ai              completeAI — ask the AI for a completion
+                  (and env.ai.complete in a server function)
   query_external  queryExternal — read an external or managed database
                   (and env.db(...).query in a server function)
   write_external  executeExternal — write rows to a managed database

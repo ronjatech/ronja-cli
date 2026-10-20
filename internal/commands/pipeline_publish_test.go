@@ -9,14 +9,6 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// `ronja pipeline publish`.
-//
-// The command is mostly a DECISION — commit, or ask an admin to — taken up front
-// from the two server facts that decide it, plus two warnings about staleness.
-// One of those warnings is now backed by a server-side refusal: a commit onto a
-// table that has moved since the draft forked is a 409, and --overwrite-remote is
-// the deliberate way through it.
-
 // seedStagedFolder is seedBoundFolder plus an open, built draft of orders.sql,
 // recorded in the baseline the way a successful push would have left it.
 func seedStagedFolder(t *testing.T, f *fakePipelineInstance, scope string) string {
@@ -36,10 +28,6 @@ func seedStagedFolder(t *testing.T, f *fakePipelineInstance, scope string) strin
 	return root
 }
 
-// TestPipelinePublishCommitsInAPrivateFeature: the ordinary path, plus the two
-// things that have to happen AFTER the server-side change — the draft pointer
-// goes, and the baseline is re-pointed at the live table it was just committed
-// onto.
 func TestPipelinePublishCommitsInAPrivateFeature(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -63,7 +51,6 @@ func TestPipelinePublishCommitsInAPrivateFeature(t *testing.T) {
 	if len(f.reviewRequested) != 0 {
 		t.Errorf("a private feature must not file a review request: %v", f.reviewRequested)
 	}
-	// The draft's SQL is now the live table's.
 	if f.CodeOf("table-orders") != "SELECT staged FROM raw" {
 		t.Errorf("the commit did not land: %q", f.CodeOf("table-orders"))
 	}
@@ -72,18 +59,14 @@ func TestPipelinePublishCommitsInAPrivateFeature(t *testing.T) {
 	if inst.Tables["orders.sql"].DraftID != "" {
 		t.Errorf("the draft pointer survived a commit: %+v", inst.Tables["orders.sql"])
 	}
-	// The baseline now describes the LIVE table, so the next status compares
-	// against the row that actually exists.
 	if inst.Files["orders.sql"].SHA256 != wfdir.HashString("SELECT staged FROM raw") {
 		t.Error("the baseline was not refreshed from the live table after the commit")
 	}
 }
 
-// TestPipelinePublishRefusesToCallARejectedDraftPublished: the other half of the
-// commit-timeout reconcile. A draft stops existing on a discard and on a
-// reviewer's rejection just as surely as on a commit, so "your draft is gone"
-// proves nothing on its own — and an author told they published is an author who
-// stops looking.
+// TestPipelinePublishRefusesToCallARejectedDraftPublished: after a commit timeout
+// a vanished draft proves nothing alone, since a discard or a rejection also
+// removes it; the live SQL must match what the draft held.
 func TestPipelinePublishRefusesToCallARejectedDraftPublished(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -102,22 +85,15 @@ func TestPipelinePublishRefusesToCallARejectedDraftPublished(t *testing.T) {
 	if !strings.Contains(file["error"].(string), "does not hold the SQL that draft held") {
 		t.Errorf("the refusal does not say what was checked: %v", file["error"])
 	}
-	// And the baseline is not advanced onto a publish that never happened.
 	inst := pipelineStateOf(t, root, f.Key())
 	if inst.Files["orders.sql"].SHA256 == wfdir.HashString("SELECT staged FROM raw") {
 		t.Error("the baseline was refreshed as if the commit had landed")
 	}
 }
 
-// TestPipelinePublishReconcilesACommitThatTimedOutAndLanded: a commit whose
-// request died on a deadline may well have landed — and if it did, the cascade
-// fired too.
-//
-// Reported as a failure it is a lie with a tail: the draft pointer is never
-// cleared, so the next publish reports "committed or discarded elsewhere" about
-// the author's own successful publish, and the baseline never advances. Our own
-// draft being GONE is the test, because that is what a commit does and nothing
-// else this call could have done.
+// TestPipelinePublishReconcilesACommitThatTimedOutAndLanded: a commit that timed
+// out may have landed; reported as a failure, the draft pointer and baseline
+// would never advance past the author's own publish.
 func TestPipelinePublishReconcilesACommitThatTimedOutAndLanded(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -147,9 +123,6 @@ func TestPipelinePublishReconcilesACommitThatTimedOutAndLanded(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishReportsACommitThatTimedOutAndDidNot: the other half. The
-// draft is still open, so the commit did not land and saying so is the whole
-// answer — no review request, no baseline move.
 func TestPipelinePublishReportsACommitThatTimedOutAndDidNot(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -176,13 +149,9 @@ func TestPipelinePublishReportsACommitThatTimedOutAndDidNot(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishAsksForReviewInASharedFeature: the two-outcome honesty. A
-// non-admin publishing into a shared feature cannot commit, and reporting
-// "published" when what happened was "an admin now has a review request" is the
-// kind of lie people discover a week later.
-//
-// The route is decided UP FRONT from the feature's scope and the caller's role,
-// never by trying a commit and reading the rejection prose.
+// TestPipelinePublishAsksForReviewInASharedFeature: the commit-or-review route is
+// decided up front from the feature's scope and the caller's role, never by
+// trying a commit and reading the rejection prose.
 func TestPipelinePublishAsksForReviewInASharedFeature(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -200,21 +169,15 @@ func TestPipelinePublishAsksForReviewInASharedFeature(t *testing.T) {
 	if len(f.reviewRequested) != 1 || f.reviewRequested[0] != "table-draft-5" {
 		t.Errorf("reviewRequested = %+v", f.reviewRequested)
 	}
-	// Never attempted, because the decision was taken from the facts rather than
-	// from a refusal.
 	if len(f.committed) != 0 {
 		t.Errorf("a shared feature was committed to by a non-admin: %v", f.committed)
 	}
-	// And the draft is still there, so nothing local pretends it landed.
 	inst := pipelineStateOf(t, root, f.Key())
 	if inst.Tables["orders.sql"].DraftID != "table-draft-5" {
 		t.Errorf("a review request must not clear the draft: %+v", inst.Tables["orders.sql"])
 	}
 }
 
-// TestPipelinePublishCommitsAsAnAdminInASharedFeature: the other half of the
-// same decision — an admin may commit into a shared feature, so the review
-// branch must not fire on scope alone.
 func TestPipelinePublishCommitsAsAnAdminInASharedFeature(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -232,9 +195,8 @@ func TestPipelinePublishCommitsAsAnAdminInASharedFeature(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishFallsBackToReviewOnA400: the race the up-front routing
-// cannot close — the caller's role changed between the read and the commit, so
-// an admin's commit into a shared feature comes back needing review.
+// TestPipelinePublishFallsBackToReviewOnA400: the race up-front routing cannot
+// close, a role change between the read and the commit.
 func TestPipelinePublishFallsBackToReviewOnA400(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -256,9 +218,8 @@ func TestPipelinePublishFallsBackToReviewOnA400(t *testing.T) {
 }
 
 // TestPipelinePublishDoesNotAskForReviewOnAPrivateFeature: a 400 on a private
-// feature is some OTHER refusal, which a review request would neither fix nor
-// describe — and filing one would report a publish that never happened as a
-// successful hand-off.
+// feature is some other refusal, which a review request would neither fix nor
+// describe.
 func TestPipelinePublishDoesNotAskForReviewOnAPrivateFeature(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -274,9 +235,6 @@ func TestPipelinePublishDoesNotAskForReviewOnAPrivateFeature(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishNoRequestReviewFails: what CI wants when a merge is
-// expected to land directly — an error rather than a review request nobody is
-// watching for.
 func TestPipelinePublishNoRequestReviewFails(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -293,11 +251,9 @@ func TestPipelinePublishNoRequestReviewFails(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishRefusesAFailedDraft: publishing a draft that did not build
-// would put a table live with nothing behind it. The server would too, but the
-// CLI names the fix — and the refusal has to happen before the request, or the
-// 400 it comes back with lands in the needs-review fallback and reports a
-// publish that never happened as a review request.
+// TestPipelinePublishRefusesAFailedDraft: the refusal must happen before the
+// request, or the server's 400 lands in the needs-review fallback and is
+// reported as a review request.
 func TestPipelinePublishRefusesAFailedDraft(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -317,7 +273,6 @@ func TestPipelinePublishRefusesAFailedDraft(t *testing.T) {
 	if !strings.Contains(file["error"].(string), "did not build") {
 		t.Errorf("error = %v", file["error"])
 	}
-	// The fix is named, and nothing was sent.
 	if !strings.Contains(stderr, "pipeline push") {
 		t.Errorf("the refusal does not name the fix:\n%s", stderr)
 	}
@@ -327,17 +282,14 @@ func TestPipelinePublishRefusesAFailedDraft(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishRefusesANeverBuiltDraft: a checked-out draft sits at
-// `pending` until something syncs it, so the commonest way to reach that verdict
-// is a draft nobody has ever built — opened in the web builder, by chat, or by a
-// push that died before its write. "Still building — wait for it to finish" is
-// then advice to wait for something nobody started.
+// TestPipelinePublishRefusesANeverBuiltDraft: a checked-out draft stays `pending`
+// until something syncs it, so `pending` most often means never built, not
+// still building.
 func TestPipelinePublishRefusesANeverBuiltDraft(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
-	// A real checkout, from a push whose sync failed: the draft exists and holds
-	// the SQL, and nothing has ever built it.
+	// A push whose sync failed leaves a draft holding the SQL that nothing built.
 	editFile(t, root, "orders.sql", "SELECT 12 FROM raw")
 	f.failSync["table-draft-1"] = 500
 	if _, _, err := runPipelineCLI(t, root, "pipeline", "push"); err == nil {
@@ -371,9 +323,7 @@ func TestPipelinePublishRefusesANeverBuiltDraft(t *testing.T) {
 }
 
 // TestPipelinePublishKeepsTheFallbackWhenTheScopeIsUnreadable: an unreadable
-// scope is UNKNOWN, not private. Read as private it would also disarm the 400
-// fallback, so a shared-feature publish whose scope read happened to fail would
-// die on the commit instead of filing the review request it needed.
+// scope is unknown, not private, so the 400 review fallback stays armed.
 func TestPipelinePublishKeepsTheFallbackWhenTheScopeIsUnreadable(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -394,10 +344,8 @@ func TestPipelinePublishKeepsTheFallbackWhenTheScopeIsUnreadable(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishDoesNotResubmitADraftAlreadyInReview: the review payload
-// already says whether request-review has been called. Filing a second one is
-// harmless server-side and reads as progress that did not happen — the admin has
-// had it since the first time.
+// TestPipelinePublishDoesNotResubmitADraftAlreadyInReview: a second request is
+// harmless server-side but reads as progress that did not happen.
 func TestPipelinePublishDoesNotResubmitADraftAlreadyInReview(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -423,11 +371,10 @@ func TestPipelinePublishDoesNotResubmitADraftAlreadyInReview(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishRefusesAStaleBase: the commit carries a base-version CAS,
-// so a table that has been published to since this draft forked is REFUSED and
-// nothing is committed. The review payload's baseStale still runs first and is
-// still worth the round trip — it names the intervening versions, where the
-// server's 409 can only name the head.
+// TestPipelinePublishRefusesAStaleBase: the commit's base-version CAS refuses a
+// table published to since the draft forked. The review payload's baseStale
+// still runs first because it names the intervening versions, where the 409
+// names only the head.
 func TestPipelinePublishRefusesAStaleBase(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -447,8 +394,8 @@ func TestPipelinePublishRefusesAStaleBase(t *testing.T) {
 		t.Errorf("the refusal did not say what to do next:\n%s", stderr)
 	}
 	file := decodeJSON(t, out)["files"].([]any)[0].(map[string]any)
-	// `conflict`, not `refused`: an agent has to tell "somebody committed first,
-	// re-apply and try again" from "you may not do this at all".
+	// `conflict`, not `refused`: an agent must tell "retry after re-applying" from
+	// "you may not do this at all".
 	if file["outcome"] != outcomeConflict {
 		t.Errorf("outcome = %v", file["outcome"])
 	}
@@ -456,8 +403,6 @@ func TestPipelinePublishRefusesAStaleBase(t *testing.T) {
 	if len(warnings) == 0 || !strings.Contains(warnings[0].(string), "--overwrite-remote") {
 		t.Errorf("warnings = %+v", warnings)
 	}
-	// NOTHING was committed, and the draft is intact: the CAS runs inside the
-	// commit's own transaction, so a refusal leaves the work where it was.
 	if len(f.committed) != 0 {
 		t.Errorf("committed = %+v", f.committed)
 	}
@@ -466,11 +411,9 @@ func TestPipelinePublishRefusesAStaleBase(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishOverwriteRemoteConfirmsTheCurrentHead: the override
-// resolves the head and confirms it EXPLICITLY, rather than sending a bare
-// "force" the server would have to interpret. The version it wrote over is
-// recorded in the --json payload, because it is the only trace that somebody
-// else's work was discarded and by which version.
+// TestPipelinePublishOverwriteRemoteConfirmsTheCurrentHead: the override confirms
+// the resolved head explicitly rather than a bare "force", and reports the
+// overwritten version, the only trace that somebody else's work was discarded.
 func TestPipelinePublishOverwriteRemoteConfirmsTheCurrentHead(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -498,10 +441,9 @@ func TestPipelinePublishOverwriteRemoteConfirmsTheCurrentHead(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishOverwriteRemoteIsInertWithoutAConflict: the flag authorizes
-// a refusal that has actually happened. With nothing to overwrite it must not
-// send a confirm at all — a caller who types it out of habit must not be
-// silently pre-authorizing whatever lands next.
+// TestPipelinePublishOverwriteRemoteIsInertWithoutAConflict: with nothing to
+// overwrite the flag sends no confirm, so habitual use never pre-authorizes
+// whatever lands next.
 func TestPipelinePublishOverwriteRemoteIsInertWithoutAConflict(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -520,16 +462,14 @@ func TestPipelinePublishOverwriteRemoteIsInertWithoutAConflict(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishWarnsAboutStaleInputs: GetDependents excludes shadow rows,
-// so a staged draft is NEVER invalidated by an upstream publish. The confidence
-// report silently decays between push and publish, and nothing else would say
-// so.
+// TestPipelinePublishWarnsAboutStaleInputs: the server's GetDependents excludes
+// shadow rows, so an upstream publish never invalidates a staged draft and only
+// this warning says it is stale.
 func TestPipelinePublishWarnsAboutStaleInputs(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
 	f.AddDraft("table-revenue", "table-draft-6", "SELECT * FROM {{ ref('table-orders') }}")
-	// The upstream materialized AFTER the draft was built.
 	f.tables["table-orders"].UpdatedAt = f.tables["table-draft-6"].UpdatedAt.Add(time.Hour)
 	writePipelineBaseline(t, root, f.Key(), "collection-1",
 		map[string]string{
@@ -558,26 +498,17 @@ func TestPipelinePublishWarnsAboutStaleInputs(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishStillWarnsAboutStaleInputsWhenTheCodecRefusesTheFile.
-//
-// The staleness check runs on RESOLVED SQL so an alias or a sibling's stem is
-// checked too — and the codec answers "" for a file it refuses, which is a file
-// with no refs at all. Taken as the answer, the warning does not degrade: it
-// DISAPPEARS for that file, silently, while the comment beside it promises it
-// only under-reports.
-//
-// Reachable in an ordinary folder, which is why it matters: two `.sql` files of
-// the same stem in different subdirectories is a legal layout (they make two
-// tables of one name, which the schema permits) and it makes every stem ref in
-// the folder ambiguous. The file as written is the fallback, so its id-form refs
-// are still checked — which is exactly the under-reporting that was claimed.
+// TestPipelinePublishStillWarnsAboutStaleInputsWhenTheCodecRefusesTheFile: the
+// codec returns an empty string for a file it refuses, so the staleness check must
+// fall back to the file as written (its id-form refs) rather than see no refs.
+// Two same-stem files in different subdirectories is a legal layout that makes
+// every stem ref ambiguous.
 func TestPipelinePublishStillWarnsAboutStaleInputsWhenTheCodecRefusesTheFile(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	seedFeature(f, "private")
 
-	// revenue.sql reads its upstream by ID and also names an AMBIGUOUS stem, so
-	// pipelineCodec.toWire refuses it.
+	// An id-form ref plus an ambiguous stem, so pipelineCodec.toWire refuses it.
 	revenue := "SELECT * FROM {{ ref('table-orders') }} JOIN {{ ref('dup') }} USING (id)"
 	root := t.TempDir()
 	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales pipeline"}
@@ -595,8 +526,6 @@ func TestPipelinePublishStillWarnsAboutStaleInputsWhenTheCodecRefusesTheFile(t *
 		"staging/dup.sql": "SELECT 2",
 	})
 	f.AddDraft("table-revenue", "table-draft-9", revenue)
-	// The upstream moved AFTER the draft was built — the one thing the warning is
-	// about.
 	f.tables["table-orders"].UpdatedAt = f.tables["table-draft-9"].UpdatedAt.Add(time.Hour)
 	writePipelineBaseline(t, root, f.Key(), "collection-1",
 		map[string]string{"revenue.sql": revenue},
@@ -611,12 +540,9 @@ func TestPipelinePublishStillWarnsAboutStaleInputsWhenTheCodecRefusesTheFile(t *
 	}
 }
 
-// TestPipelinePublishCountsTheFolderLocalCascade: committing cascades
-// server-side, which is why this loop needs no `run` verb. The number reported
-// is the FOLDER's own, counted from its ref graph — never a tenant-wide N: the
-// real cascade is wider (it leaves the folder) and conditional (a zero-partition
-// parent defers it, a mid-build dependent is skipped, one with a dangling input
-// is parked), and a confident count would paper over both.
+// TestPipelinePublishCountsTheFolderLocalCascade: the count is the folder's own
+// ref graph, never a tenant-wide number, because the real server cascade is
+// wider and conditional.
 func TestPipelinePublishCountsTheFolderLocalCascade(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -634,11 +560,8 @@ func TestPipelinePublishCountsTheFolderLocalCascade(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishCommitsInDependencyOrder: a commit cascades, so publishing
-// a downstream before its upstream lands a table computed from data that is
-// about to be replaced and rebuilt again seconds later. The filenames are chosen
-// so alphabetical order is the WRONG order, otherwise a publish that never
-// sorted at all would pass.
+// TestPipelinePublishCommitsInDependencyOrder: the filenames make alphabetical
+// order the wrong order, so a publish that never sorted would fail.
 func TestPipelinePublishCommitsInDependencyOrder(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -675,8 +598,6 @@ func TestPipelinePublishCommitsInDependencyOrder(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishReportsNothingStaged: a folder with no staged draft is a
-// different answer from one whose drafts were all refused.
 func TestPipelinePublishReportsNothingStaged(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -695,13 +616,11 @@ func TestPipelinePublishReportsNothingStaged(t *testing.T) {
 }
 
 // TestPipelinePublishRecoversFromAStaleDraftPointer: the recorded draft id is a
-// HINT, never authority — a draft can be committed or discarded from the web UI
-// between two commands.
+// hint, never authority, since the web UI can commit or discard it meanwhile.
 func TestPipelinePublishRecoversFromAStaleDraftPointer(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedStagedFolder(t, f, "private")
-	// Somebody landed it from the web UI while we were away.
 	f.dropDraft("table-draft-5")
 
 	out, _, err := runPipelineCLI(t, root, "pipeline", "publish", "--json")
@@ -715,16 +634,14 @@ func TestPipelinePublishRecoversFromAStaleDraftPointer(t *testing.T) {
 	if !strings.Contains(file["error"].(string), "no open draft") {
 		t.Errorf("error = %v", file["error"])
 	}
-	// And the stale pointer is cleared, so the next command does not repeat it.
 	inst := pipelineStateOf(t, root, f.Key())
 	if inst.Tables["orders.sql"].DraftID != "" {
 		t.Errorf("the stale pointer survived: %+v", inst.Tables["orders.sql"])
 	}
 }
 
-// TestPipelinePublishWarnsWhenTheFolderIsDirty: publishing the draft as it
-// stands is reasonable, but it is also the one way to publish something other
-// than what you are looking at.
+// TestPipelinePublishWarnsWhenTheFolderIsDirty: a dirty folder warns but does not
+// refuse; publish commits the draft, not the local files.
 func TestPipelinePublishWarnsWhenTheFolderIsDirty(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -738,16 +655,13 @@ func TestPipelinePublishWarnsWhenTheFolderIsDirty(t *testing.T) {
 	if !strings.Contains(stderr, "local file(s) differ") {
 		t.Errorf("a dirty folder was not reported:\n%s", stderr)
 	}
-	// A warning, not a refusal.
 	if len(f.committed) != 1 {
 		t.Errorf("committed = %+v", f.committed)
 	}
 }
 
-// TestPipelinePublishIgnoresNonSQLDirt: warnIfDirty walks the folder with the
-// folder's OWN kind, so a README is not a local change being left behind.
-// Warning about one before every publish would train the reader to ignore the
-// warning that matters.
+// TestPipelinePublishIgnoresNonSQLDirt: warnIfDirty walks the folder with its own
+// kind, so a README edit is not reported as local dirt.
 func TestPipelinePublishIgnoresNonSQLDirt(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -763,12 +677,9 @@ func TestPipelinePublishIgnoresNonSQLDirt(t *testing.T) {
 	}
 }
 
-// TestPipelinePublishTellsANameCollisionApartFromAFork: three unrelated refusals
-// wear a 409 on this client, and reading a name collision as the fork one is
-// actively harmful — it sends the author to `pipeline discard` (which throws
-// away the work they are trying to publish) or `--overwrite-remote` (which
-// discards a colleague's version), and NEITHER frees the name. So the CLI has to
-// branch on the body's `code`, and say the thing that actually resolves it.
+// TestPipelinePublishTellsANameCollisionApartFromAFork: several refusals share a
+// 409, so the CLI branches on the body's `code`; fork advice (discard,
+// --overwrite-remote) for a name collision destroys work and never frees the name.
 func TestPipelinePublishTellsANameCollisionApartFromAFork(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -781,8 +692,6 @@ func TestPipelinePublishTellsANameCollisionApartFromAFork(t *testing.T) {
 	if file["outcome"] != pushOutcomeRefused {
 		t.Errorf("outcome = %v, want %q — a taken name is not a race somebody else won", file["outcome"], pushOutcomeRefused)
 	}
-	// The server's sentence names the row in the way; without it the author has
-	// a rule and nothing to act on.
 	if msg, _ := file["error"].(string); !strings.Contains(msg, why) {
 		t.Errorf("the server's own sentence was dropped:\n%s", msg)
 	}

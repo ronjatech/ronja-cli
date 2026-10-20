@@ -18,7 +18,6 @@ import (
 	"time"
 )
 
-// serveBytes answers every request with body.
 func serveBytes(t *testing.T, body []byte) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -78,8 +77,8 @@ func probeFile(t *testing.T) string {
 	return path
 }
 
-// tempDirOfOurOwn points os.TempDir() at a directory this test can assert
-// about — specifically, that a failed download left nothing in it.
+// tempDirOfOurOwn points os.TempDir() at a directory a test can assert a failed
+// download left empty.
 func tempDirOfOurOwn(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -105,10 +104,8 @@ func shortenBinaryCap(t *testing.T, cap int64) {
 	t.Cleanup(func() { maxBinaryBytes = previous })
 }
 
-// lowerBinaryFloor drops the minimum size so a test about something else can
-// use a one-line "binary" instead of a megabyte of padding. The floor itself
-// is proved at its SHIPPING value in
-// TestExtractRefusesAnEntryTooSmallToBeABinary, which lowers nothing.
+// lowerBinaryFloor lets a test use a one-line "binary"; the floor's shipping
+// value is proved in TestExtractRefusesAnEntryTooSmallToBeABinary.
 func lowerBinaryFloor(t *testing.T, floor int64) {
 	t.Helper()
 	previous := minBinaryBytes
@@ -116,8 +113,7 @@ func lowerBinaryFloor(t *testing.T, floor int64) {
 	t.Cleanup(func() { minBinaryBytes = previous })
 }
 
-// The cap has to distinguish "exactly the limit" from "one byte over", or a
-// release that grows to precisely the ceiling becomes uninstallable.
+// A release exactly at the ceiling must stay installable.
 func TestFetchAtAndOverTheLimit(t *testing.T) {
 	body := bytes.Repeat([]byte("x"), 64)
 	url := serveBytes(t, body)
@@ -134,8 +130,6 @@ func TestFetchAtAndOverTheLimit(t *testing.T) {
 	}
 }
 
-// The real MaxChecksums, so the shipping constant is on the path too and not
-// just the parameter.
 func TestFetchHonoursMaxChecksums(t *testing.T) {
 	url := serveBytes(t, bytes.Repeat([]byte("a"), MaxChecksums))
 	if _, err := Fetch(context.Background(), url, url, MaxChecksums); err != nil {
@@ -147,8 +141,6 @@ func TestFetchHonoursMaxChecksums(t *testing.T) {
 	}
 }
 
-// The limit is a parameter, so the boundary is proved with a small one rather
-// than by streaming the real 100 MiB — the arithmetic under test is the same.
 func TestDownloadRefusesMoreThanTheLimit(t *testing.T) {
 	tmp := tempDirOfOurOwn(t)
 	url := serveBytes(t, bytes.Repeat([]byte("x"), 1025))
@@ -165,8 +157,6 @@ func TestDownloadRefusesMoreThanTheLimit(t *testing.T) {
 	assertNoDownloadResidue(t, tmp)
 }
 
-// The bound that belongs on a body is progress, not wall time: a mirror that
-// answers and then goes quiet must not hold the command forever.
 func TestDownloadStallsOut(t *testing.T) {
 	previous := idleReadTimeout
 	idleReadTimeout = 100 * time.Millisecond
@@ -200,12 +190,9 @@ func TestDownloadStallsOut(t *testing.T) {
 	assertNoDownloadResidue(t, tmp)
 }
 
-// The property the whole handle-passing API exists for: what gets installed is
-// what got hashed, even if the file at that PATH is replaced in between.
-//
-// The swap here is the real attack shape — unlink and recreate, which is what a
-// symlink or a hostile file in a shared /tmp amounts to — and not a rewrite in
-// place, which would change the same inode and defeat any scheme.
+// What is installed is what was hashed, even if the path is replaced between.
+// The swap is unlink-and-recreate (the shared-/tmp attack), not an in-place
+// rewrite of the same inode, which no scheme could defeat.
 func TestExtractReadsTheHandleThatWasHashed(t *testing.T) {
 	tempDirOfOurOwn(t)
 	lowerBinaryFloor(t, 1)
@@ -246,10 +233,7 @@ func TestExtractReadsTheHandleThatWasHashed(t *testing.T) {
 }
 
 func TestExtractRefusesTheShapesThatAreNotABinary(t *testing.T) {
-	// What is under test here is the SHAPE of the archive, so the size floor is
-	// lowered out of the way: it is proved at its shipping value next door, and
-	// leaving it in would answer an ambiguous archive with a complaint about
-	// how big its first entry is.
+	// Otherwise the size floor would answer an ambiguous archive first.
 	lowerBinaryFloor(t, 1)
 	cases := []struct {
 		name    string
@@ -301,12 +285,9 @@ func TestExtractRefusesTheShapesThatAreNotABinary(t *testing.T) {
 	}
 }
 
-// A `ronja` entry with nothing in it passes every other check: the name is
-// right, the type is right, and the checksum matches, because the manifest is
-// generated from whatever the pipeline built. Installing it replaces a working
-// CLI with an unrunnable file and takes `ronja update` away in the same
-// rename, so there is nothing left to repair the install with. At the SHIPPING
-// floor, with the probe left as it was.
+// An empty `ronja` entry passes every other check (the manifest hashes whatever
+// the pipeline built), and installing it would also remove `ronja update`.
+// Run at the shipping floor.
 func TestExtractRefusesAnEntryTooSmallToBeABinary(t *testing.T) {
 	cases := map[string][]byte{
 		"an empty entry":        nil,
@@ -327,7 +308,6 @@ func TestExtractRefusesAnEntryTooSmallToBeABinary(t *testing.T) {
 	}
 }
 
-// A header is a claim, so it is checked before anything is decompressed.
 func TestExtractRefusesAnOversizedHeader(t *testing.T) {
 	shortenBinaryCap(t, 8)
 	dest := probeFile(t)
@@ -343,8 +323,7 @@ func TestExtractRefusesAnOversizedHeader(t *testing.T) {
 	}
 }
 
-// And the stream is checked too, because a header is only a claim: this is the
-// gzip-bomb shape, where the entry announces a modest size and keeps going.
+// The gzip-bomb shape: a header announcing a modest size, then more.
 func TestWriteBinaryRefusesAnOversizedStream(t *testing.T) {
 	shortenBinaryCap(t, 16)
 	dest := probeFile(t)
@@ -357,10 +336,7 @@ func TestWriteBinaryRefusesAnOversizedStream(t *testing.T) {
 	}
 }
 
-// The header is only a claim, so the floor is enforced on the stream as well:
-// an entry that announces a whole binary and then delivers nothing must not be
-// renamed over the running one — that is the case where `ronja update` itself
-// disappears and there is nothing left to repair the install with.
+// A header announcing a whole binary that then delivers nothing.
 func TestWriteBinaryRefusesAStreamBelowTheFloor(t *testing.T) {
 	lowerBinaryFloor(t, 32)
 	dest := probeFile(t)
@@ -375,10 +351,9 @@ func sha256Of(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// The probe sits in the binary's own directory — /usr/local/bin on a shared
-// machine — and is created moments before it is written. A symlink planted at
-// that name in the window between would otherwise be followed, and this write
-// would truncate whatever it points at with the running user's privileges.
+// The probe lives in the binary's directory (/usr/local/bin on a shared
+// machine); a symlink planted there before the write would otherwise truncate
+// its target with the running user's privileges.
 func TestWriteBinaryRefusesASymlink(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no O_NOFOLLOW here — the flag is zero and the guard is not available")
@@ -406,9 +381,6 @@ func TestWriteBinaryRefusesASymlink(t *testing.T) {
 	}
 }
 
-// A probe that was swept out from under a long download is recreated rather
-// than ending it at the last step: O_CREATE is what makes the sweep's worst
-// case a recoverable one.
 func TestWriteBinaryRecreatesASweptProbe(t *testing.T) {
 	lowerBinaryFloor(t, 1)
 	dest := probeFile(t)
@@ -427,9 +399,7 @@ func TestWriteBinaryRecreatesASweptProbe(t *testing.T) {
 	}
 }
 
-// The watchdog is about a body that went QUIET, and a slow one has not. A
-// download that keeps arriving in small pieces, each gap shorter than the idle
-// bound but the whole transfer many times longer than it, must run to the end.
+// Each gap is under the idle bound while the whole transfer is many times it.
 func TestDownloadSurvivesASlowButProgressingBody(t *testing.T) {
 	previous := idleReadTimeout
 	idleReadTimeout = 100 * time.Millisecond

@@ -7,10 +7,8 @@ import (
 	"testing"
 )
 
-// The folder note on `ronja context`. What matters is that it fires when there
-// IS something to say and stays silent otherwise — a command that editorialises
-// about every directory is one people stop reading, which would defeat the
-// whole purpose of putting the pointer there.
+// The folder note on `ronja context` must fire when there is something to say
+// and stay silent otherwise.
 
 func TestContextPointsAtWFInsideAWorkflowFolder(t *testing.T) {
 	f := newFakeInstance(t)
@@ -29,13 +27,9 @@ func TestContextPointsAtWFInsideAWorkflowFolder(t *testing.T) {
 	if !strings.Contains(out, "ronja wf push") {
 		t.Errorf("context inside a workflow folder does not mention wf:\n%s", out)
 	}
-	// Naming the workflow is what makes it read as "this folder", not as a
-	// generic advertisement.
 	if !strings.Contains(out, "Monthly report") {
 		t.Errorf("the note does not name the workflow:\n%s", out)
 	}
-	// An unbound manifest has never been pushed, and saying so is the
-	// difference between "keep editing" and "nothing is on the server yet".
 	if !strings.Contains(out, "Not pushed to this instance yet") {
 		t.Errorf("an unbound folder was not reported as such:\n%s", out)
 	}
@@ -107,10 +101,8 @@ func TestContextJSONCarriesTheLocalWorkflow(t *testing.T) {
 	}
 }
 
-// TestContextPointsAtPipelineInsideAPipelineFolder: the third folder kind. The
-// note has to name the commands that WORK here — pointing a pipeline folder at
-// `wf` would name commands LoadManifest's kind check then refuses, which is the
-// exact failure Kind.Command exists to prevent.
+// `wf` commands in a pipeline folder would be refused by LoadManifest's kind
+// check.
 func TestContextPointsAtPipelineInsideAPipelineFolder(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -142,9 +134,6 @@ func TestContextPointsAtPipelineInsideAPipelineFolder(t *testing.T) {
 	}
 }
 
-// TestContextPayloadCarriesTheFolderKind: the --json payload used to omit `kind`
-// entirely, so a program could see that there was a folder but not which
-// commands drive it — the one thing the note exists to say.
 func TestContextPayloadCarriesTheFolderKind(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)

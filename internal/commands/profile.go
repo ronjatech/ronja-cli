@@ -12,16 +12,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja profile` manages the local credential store.
-//
-// This is not a breach of the "sync verbs yes, resource verbs no" doctrine that
-// keeps the CLI from growing a subcommand per endpoint: a profile is local
-// machine state with no server-side counterpart, so there is no API surface for
-// these to drift from.
-//
-// There is deliberately no `profile add`. A profile is created by authenticating
-// — a profile without a working credential in it is a trap that reports "signed
-// in" and then 401s.
+// Not a breach of "sync verbs yes, resource verbs no": a profile is local
+// machine state with no server-side counterpart. There is deliberately no
+// `profile add` — a profile without a working credential reports "signed in"
+// and then 401s, so only authenticating creates one.
 func newProfileCmd() *cobra.Command {
 	profile := &cobra.Command{
 		Use:   "profile",
@@ -50,10 +44,8 @@ type profileRow struct {
 	UserEmail  string `json:"userEmail,omitempty"`
 	Current    bool   `json:"current"`
 	ExpiresAt  string `json:"tokenExpiresAt,omitempty"`
-	// Expired is derived from ExpiresAt rather than left to the caller, because
-	// it is the one thing the store can diagnose about itself without asking
-	// the server — and an expired credential explains a 401 that otherwise
-	// looks like a permissions problem.
+	// Expired explains a 401 that otherwise looks like a permissions problem,
+	// and is the one thing the store can diagnose without asking the server.
 	Expired bool `json:"expired,omitempty"`
 }
 
@@ -116,8 +108,6 @@ func printProfiles(rows []profileRow) {
 		}
 		org := r.TenantName
 		if org == "" {
-			// Distinguishes "no organization" from "we never learned its name",
-			// which are different situations with different fixes.
 			org = "—"
 		}
 		if r.Expired {
@@ -128,9 +118,8 @@ func printProfiles(rows []profileRow) {
 	_ = w.Flush()
 }
 
-// isExpired reports whether a recorded expiry has passed. An unparseable or
-// absent stamp is NOT expired: a token supplied with --with-token has no
-// recorded lifetime, and guessing "expired" for it would be a lie that sends
+// isExpired treats an unparseable or absent stamp as NOT expired: a
+// --with-token credential has no recorded lifetime, and "expired" would send
 // someone to re-run a login they do not need.
 func isExpired(raw string) bool {
 	if raw == "" {
@@ -166,8 +155,7 @@ can answer is a hang.`,
 				chosen, err := pickProfile()
 				if err != nil {
 					if errors.Is(err, errPickerCancelled) {
-						// Backing out is a choice, not a failure. Exit zero and
-						// say nothing changed.
+						// Backing out is a choice, not a failure: exit zero.
 						fmt.Fprintln(os.Stderr, "  Cancelled — still using the profile you were on.")
 						return nil
 					}
@@ -195,11 +183,8 @@ can answer is a hang.`,
 	}
 }
 
-// pickProfile runs the interactive chooser, returning the selected name.
 func pickProfile() (string, error) {
-	// --json means a machine is reading, and a machine cannot answer a picker.
-	// Refused with the flag named, rather than drawing escape sequences into
-	// something parsing our stdout.
+	// --json means a machine is reading stdout; it cannot answer a picker.
 	if flagJSON {
 		return "", errors.New("--json cannot open a picker — name the profile you want")
 	}
@@ -217,7 +202,6 @@ func pickProfile() (string, error) {
 	for i, name := range names {
 		p := f.Profiles[name]
 		if name == f.Current {
-			// Start on the current profile, so enter alone changes nothing.
 			start = i
 		}
 		org := p.TenantName
@@ -274,8 +258,6 @@ profile name, so renaming cannot orphan one.`,
 	}
 }
 
-// unknownProfile names what DOES exist. "No such profile" alone leaves the
-// reader to run a second command to find out what they should have typed.
 func unknownProfile(f *config.File, name string) error {
 	names := f.Names()
 	if len(names) == 0 {

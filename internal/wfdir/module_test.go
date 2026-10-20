@@ -5,18 +5,6 @@ import (
 	"testing"
 )
 
-// The folder-model half of the module loop. The COMMAND half lives in
-// internal/commands/module_test.go; what is checked here is the thing a command
-// cannot check for itself — that ONE Kind decides which files are syncable, and
-// that both entry points (Enumerate and CheckLocalPaths) read it identically.
-//
-// That equivalence is not a tidiness property. A path one keeps and the other
-// drops leaves a baseline claiming a file no later walk returns: `status`
-// invents a deletion and the next push acts on it by deleting the file
-// server-side. See the doc on Kind.
-
-// TestModuleKindSyncsPythonOnly pins the .py restriction at the level that
-// enforces it — the Kind — rather than at each caller.
 func TestModuleKindSyncsPythonOnly(t *testing.T) {
 	for _, tc := range []struct {
 		path string
@@ -25,8 +13,6 @@ func TestModuleKindSyncsPythonOnly(t *testing.T) {
 		{"__init__.py", true},
 		{"tracker.py", true},
 		{"sub/helpers.py", true},
-		// Case-insensitive, because `.PY` is an ordinary thing to find in a repo
-		// that has been through Windows.
 		{"Tracker.PY", true},
 		{"README.md", false},
 		{"data.csv", false},
@@ -39,9 +25,6 @@ func TestModuleKindSyncsPythonOnly(t *testing.T) {
 	}
 }
 
-// TestModuleEnumerateSkipsNonPython is the walk half of the rule, and it also
-// pins that the skips are REPORTED: a .md file the author believes is part of
-// the module and which the CLI silently ignores is the worst kind of surprise.
 func TestModuleEnumerateSkipsNonPython(t *testing.T) {
 	root := t.TempDir()
 	write(t, root, "__init__.py", "")
@@ -49,12 +32,9 @@ func TestModuleEnumerateSkipsNonPython(t *testing.T) {
 	write(t, root, "sub/nested.py", "y = 2")
 	write(t, root, "README.md", "# docs")
 	write(t, root, "fixtures/data.csv", "a,b\n")
-	// Compiled output: excluded by EXTENSION, not by a __pycache__ SkipDirs
-	// entry — which is why ModuleKind declares none. Worth pinning, because
-	// adding a SkipDirs entry later would be a second rule saying the same
-	// thing, and the two could disagree.
+	// Excluded by extension, not by a __pycache__ SkipDirs entry, which would be
+	// a second rule that could disagree.
 	write(t, root, "__pycache__/tracker.cpython-311.pyc", "\x00\x01")
-	// Folder machinery: never syncable, never reported.
 	write(t, root, ManifestName, `{"kind":"module"}`)
 	write(t, root, LockName, `{"stacks":{}}`)
 	write(t, root, StateDirName+"/"+StateFileName, `{}`)
@@ -92,10 +72,8 @@ func TestModuleEnumerateSkipsNonPython(t *testing.T) {
 	}
 }
 
-// TestModuleCheckLocalPathsRefusesNonPython is the OTHER side of the same rule,
-// and the one that actually protects a file. A `.md` the server somehow holds
-// would be written by clone once and then invisible to every walk — a phantom
-// deletion the next push acts on. The two entry points must answer identically.
+// A `.md` the server somehow holds would be cloned once and then read as a
+// phantom deletion the next push acts on.
 func TestModuleCheckLocalPathsRefusesNonPython(t *testing.T) {
 	err := CheckLocalPaths([]string{"__init__.py", "notes.md"}, ModuleKind)
 	if err == nil {
@@ -109,10 +87,8 @@ func TestModuleCheckLocalPathsRefusesNonPython(t *testing.T) {
 	}
 }
 
-// TestLoadManifestRefusesWrongKindForModule pins the guard that stops `ronja
-// module push` overwriting a workflow's Python with a module's — which is
-// exactly the shape it would destroy work in, since both kinds are .py files
-// plus a ronja.json and are otherwise indistinguishable.
+// A workflow folder and a module folder are both .py files plus a ronja.json,
+// so the manifest kind is all that stops one overwriting the other.
 func TestLoadManifestRefusesWrongKindForModule(t *testing.T) {
 	root := t.TempDir()
 	write(t, root, ManifestName, `{"kind":"workflow","title":"Report","instances":[]}`)
@@ -120,8 +96,7 @@ func TestLoadManifestRefusesWrongKindForModule(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a workflow folder to be refused by a module command")
 	}
-	// Names the command that WOULD work: a wrong kind is almost always the right
-	// folder and the wrong verb.
+	// A wrong kind is almost always the right folder and the wrong verb.
 	if !strings.Contains(err.Error(), WorkflowKind.Command) {
 		t.Fatalf("the refusal must name %q, got: %v", WorkflowKind.Command, err)
 	}
@@ -141,16 +116,12 @@ func TestLoadManifestRefusesWrongKindForModule(t *testing.T) {
 	if m.Name != "emab_tracker" {
 		t.Fatalf("name = %q, want emab_tracker", m.Name)
 	}
-	// A module has no entrypoint, and ModuleKind's empty DefaultEntrypoint is
-	// what keeps LoadManifest from inventing "main.py" for it.
+	// ModuleKind's empty DefaultEntrypoint keeps LoadManifest from inventing "main.py".
 	if m.Entrypoint != "" {
 		t.Fatalf("entrypoint = %q, want empty — a module has nothing to run", m.Entrypoint)
 	}
 }
 
-// TestModuleBindingRoundTrip pins the third id field: a module's binding must
-// not be answered with (or written into) a workflow's, which is the silent
-// wrong answer Binding.ResourceID exists to make unrepresentable.
 func TestModuleBindingRoundTrip(t *testing.T) {
 	b, err := Binding{}.WithResourceID(ModuleKind, "module-1")
 	if err != nil {
@@ -174,12 +145,8 @@ func TestModuleBindingRoundTrip(t *testing.T) {
 	}
 }
 
-// TestLockModuleRebindDropsAnchor pins the invariant on LockStack.HeadVersionID
-// for the new field: a pointer is only ever compared against the row it was
-// read from, so a stack repointed at a different module drops it. Kept, it
-// would be a version id read from one module and compared against another's
-// history — a guard that refuses every push and names a version nobody
-// recognises.
+// A head version is only ever compared against the row it was read from; kept
+// across a rebind, it would refuse every push to the new module.
 func TestLockModuleRebindDropsAnchor(t *testing.T) {
 	l := &Lock{}
 	l.SetBinding("dev", Binding{ModuleID: "module-1"})
@@ -191,8 +158,6 @@ func TestLockModuleRebindDropsAnchor(t *testing.T) {
 	if got := l.HeadVersion("dev"); got != "" {
 		t.Fatalf("rebinding to another module must clear the anchor, got %q", got)
 	}
-	// And the binding itself round-trips through the lock, which is what a stack
-	// folder's push reads instead of instances[].
 	if got := l.Binding("dev").ModuleID; got != "module-2" {
 		t.Fatalf("Lock.Binding ModuleID = %q, want module-2", got)
 	}

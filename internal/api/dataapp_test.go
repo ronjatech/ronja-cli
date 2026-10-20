@@ -6,14 +6,9 @@ import (
 	"testing"
 )
 
-// A realistic full response. The point of the fixture is TAG VERIFICATION: a
-// field name that does not match backend/ronja/rdb/table_data_app.go decodes to
-// the zero value silently, and a mirror nobody checks is a mirror that drifts.
-//
-// It matters more here than on the workflow row. A mistyped allowlist tag does
-// not merely blank a column — the CLI would read the app's grants as empty and
-// then PUSH them as empty, revoking the app's access to its own tables in the
-// course of syncing a source file.
+// The fixture is TAG VERIFICATION against backend/ronja/rdb/table_data_app.go.
+// A mistyped allowlist tag reads the app's grants as empty and then PUSHES them
+// as empty, revoking its access to its own tables.
 const dataAppFixture = `{
   "id": "data_app-abc",
   "workspaceID": null,
@@ -75,8 +70,7 @@ func TestGetDataAppDecodesEveryMirroredField(t *testing.T) {
 	if app.Entrypoint != "App.tsx" {
 		t.Errorf("entrypoint = %q", app.Entrypoint)
 	}
-	// The tag is the whole test: `specVersion` mistyped decodes to 0, which
-	// reads as "this app styles itself" — the opposite of what the server said.
+	// A mistyped `specVersion` decodes to 0: "this app styles itself".
 	if app.SpecVersion != 2 {
 		t.Errorf("specVersion = %d, want 2 (a mistyped tag decodes silently to zero)", app.SpecVersion)
 	}
@@ -117,16 +111,13 @@ func TestGetDataAppDecodesEveryMirroredField(t *testing.T) {
 			t.Errorf("%s = %v, want [%s]", tc.label, tc.got, tc.want)
 		}
 	}
-	// Normalize sorts, so the fixture's deliberately out-of-order tables come
-	// back ordered — which is what makes SameAccess a comparison of meaning.
+	// The fixture's tables are deliberately out of order; Normalize sorts.
 	if len(app.AllowedTableIDs) != 2 || app.AllowedTableIDs[0] != "table-1" {
 		t.Errorf("allowedTableIDs = %v, want them sorted", app.AllowedTableIDs)
 	}
 
-	// Stamped by the SERVER (DataAppView) on a FRONTEND origin, which is not
-	// the API origin this client was pointed at — the whole reason the CLI
-	// reads it instead of templating one. Absent on an instance with no
-	// configured frontend origin, which reads as "" and prints nothing.
+	// Stamped by the SERVER on the FRONTEND origin, which is not the API origin
+	// this client knows, so the CLI reads it rather than templating one.
 	if app.URL != "https://app.example.test/apps/data_app-abc" {
 		t.Errorf("url = %q", app.URL)
 	}
@@ -138,10 +129,8 @@ func TestGetDataAppDecodesEveryMirroredField(t *testing.T) {
 	}
 }
 
-// TestGetDataAppDraftDecodesNullAsNoDraft pins the shape the route actually
-// uses: 200 with a JSON `null` body, not a 404. Decoding that into a struct
-// would turn "no draft" into a zero-value row with an empty id, and every caller
-// would then act on a draft that does not exist.
+// "No draft" is 200 with a JSON `null` body; decoded into a struct it would be a
+// zero-value draft every caller then acts on.
 func TestGetDataAppDraftDecodesNullAsNoDraft(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -156,11 +145,8 @@ func TestGetDataAppDraftDecodesNullAsNoDraft(t *testing.T) {
 	}
 }
 
-// TestPutDataAppFileDecodesCompileError pins the response shape the backend fix
-// introduced: a failed recompile arrives INSIDE a 200, alongside the saved file.
-//
-// A client that treated this as an error could not push a multi-file app at all,
-// since the intermediate states do not compile by construction.
+// A failed recompile arrives INSIDE a 200 beside the saved file: a multi-file
+// push's intermediate states do not compile by construction.
 func TestPutDataAppFileDecodesCompileError(t *testing.T) {
 	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -179,7 +165,7 @@ func TestPutDataAppFileDecodesCompileError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a compile failure must not be a request failure: %v", err)
 	}
-	// The write LANDED — that is the whole justification for the shape.
+	// The write LANDED.
 	if saved.Content != "broken" || saved.DataAppID != "data_app-draft-1" {
 		t.Errorf("the saved file should come back: %+v", saved.DataAppFile)
 	}
@@ -191,11 +177,8 @@ func TestPutDataAppFileDecodesCompileError(t *testing.T) {
 	}
 }
 
-// TestSameAccessIgnoresOrderAndDuplicates: an allowlist is a SET. The server
-// stores it as one and the token mint reads it as one, so a manifest listing two
-// tables in the other order is the same grant — and treating it as drift would
-// make `app status` report a change forever and `app push` send a patch that
-// changes nothing.
+// An allowlist is a SET on the server; reading order as drift would make `app
+// status` report a change forever.
 func TestSameAccessIgnoresOrderAndDuplicates(t *testing.T) {
 	a := DataAppAccess{AllowedTableIDs: []string{"table-b", "table-a"}}
 	b := DataAppAccess{AllowedTableIDs: []string{"table-a", "table-b", "table-a"}}
@@ -213,13 +196,8 @@ func TestSameAccessIgnoresOrderAndDuplicates(t *testing.T) {
 	}
 }
 
-// TestDataAppPatchSetAccessSetsEveryList pins that an access patch is all-or-
-// nothing.
-//
-// Every field of the server's Patch is an optional: an absent key means
-// "unchanged". So a patch that filled in only the lists a folder happens to use
-// would leave the others pointing at whatever the row had — which is how an app
-// keeps a secret nobody declared.
+// An absent Patch key means "unchanged", so a patch filling only the lists a
+// folder uses would let an app keep a secret nobody declared.
 func TestDataAppPatchSetAccessSetsEveryList(t *testing.T) {
 	var patch DataAppPatch
 	patch.SetAccess(DataAppAccess{AllowedTableIDs: []string{"table-1"}})
@@ -241,8 +219,7 @@ func TestDataAppPatchSetAccessSetsEveryList(t *testing.T) {
 	}
 }
 
-// TestDataAppFilePathEscapesSegments: the route is a gin wildcard, so the path's
-// own slashes are part of it rather than something to encode away.
+// The route is a gin wildcard, so the path's own slashes stay unencoded.
 func TestDataAppFilePathEscapesSegments(t *testing.T) {
 	got := dataAppFilePath("data_app-1", "lib/my chart.tsx")
 	want := "dataapp/data_app-1/files/lib/my%20chart.tsx"

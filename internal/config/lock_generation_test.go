@@ -7,19 +7,9 @@ import (
 	"time"
 )
 
-// The guard these cover defends against an interleaving inside
-// takeOverStaleLock — a takeover landing between its Stat and its ReadFile,
-// after which it holds the NEW holder's content paired with the OLD staleness
-// verdict and evicts a live lock.
-//
-// They are written against sameStaleGeneration directly rather than by racing
-// goroutines because racing cannot discriminate: with the guard deleted,
-// TestWithLockStaleTakeoverSerializes still passes 150 consecutive local runs
-// and only fails under CI load. A test that cannot fail when the behaviour it
-// describes is removed is not testing anything.
+// These test sameStaleGeneration directly because a goroutine race almost
+// never hits the Stat/ReadFile interleaving it guards, and passes without it.
 
-// stale writes a lock file and backdates it past the staleness threshold,
-// returning the FileInfo a caller would have observed.
 func stale(t *testing.T, lockPath, body string) os.FileInfo {
 	t.Helper()
 	if err := os.WriteFile(lockPath, []byte(body), 0o600); err != nil {
@@ -46,13 +36,10 @@ func TestSameStaleGenerationAcceptsUntouchedLock(t *testing.T) {
 	}
 }
 
-// The regression this exists for: another process took over between the
-// caller's Stat and its ReadFile, so the file on disk is now a LIVE holder's.
 func TestSameStaleGenerationRejectsReplacedLock(t *testing.T) {
 	lockPath := filepath.Join(t.TempDir(), "cfg.lock")
 	info := stale(t, lockPath, lockBody("deadbeefdeadbeefdeadbeef"))
 
-	// A takeover lands: the abandoned lock is replaced by a live one.
 	if err := os.WriteFile(lockPath, []byte(lockBody("11112222333344445555")), 0o600); err != nil {
 		t.Fatalf("replace lock: %v", err)
 	}
@@ -64,7 +51,6 @@ func TestSameStaleGenerationRejectsReplacedLock(t *testing.T) {
 	}
 }
 
-// Same generation, but the holder refreshed it — it is no longer abandoned.
 func TestSameStaleGenerationRejectsRefreshedLock(t *testing.T) {
 	lockPath := filepath.Join(t.TempDir(), "cfg.lock")
 	info := stale(t, lockPath, lockBody("deadbeefdeadbeefdeadbeef"))

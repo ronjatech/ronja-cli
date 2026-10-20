@@ -7,12 +7,9 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// findingTier is how the renderers that COUNT or LABEL a workflow validate
-// finding bucket it: the `wf validate` headline, countErrors' refusal line,
-// push's per-finding stderr lines, and `sync check`'s error-versus-rest split.
-// One classification, so none of those can disagree about what a finding is.
-// printFindings is not among them: it labels each line with the server's own
-// word and sorts by IsError().
+// findingTier is the one classification every renderer that counts or labels
+// a validate finding uses, so none can disagree. printFindings is not one: it
+// prints the server's own word and sorts by IsError().
 type findingTier int
 
 const (
@@ -21,13 +18,8 @@ const (
 	tierNote
 )
 
-// classifyFinding buckets one finding by the server's own severity. `info` is
-// a note; `error` is an error; EVERYTHING else — `warning`, an empty tier, a
-// tier this build has never heard of — is a warning. The last case is the one
-// that matters: a CLI that counted an unknown tier as nothing would print
-// "Clean" over a finding it did not understand. printFindings reaches the same
-// place by its own route — it prints the server's word verbatim, with an empty
-// one as "warning" — rather than by calling this.
+// classifyFinding counts an empty or unknown severity as a warning, never as
+// nothing, or the CLI would print "Clean" over a finding it did not understand.
 func classifyFinding(f api.ValidateFinding) findingTier {
 	switch f.Severity {
 	case api.SeverityError:
@@ -39,7 +31,6 @@ func classifyFinding(f api.ValidateFinding) findingTier {
 	}
 }
 
-// findingCounts is a finding list tallied by classifyFinding.
 type findingCounts struct {
 	errors, warnings, notes int
 }
@@ -59,8 +50,6 @@ func countFindings(findings []api.ValidateFinding) findingCounts {
 	return c
 }
 
-// notesSuffix is ", N notes" when there are any — appended wherever notes
-// coexist with a tier the headline is actually about.
 func (c findingCounts) notesSuffix() string {
 	if c.notes == 0 {
 		return ""
@@ -68,11 +57,8 @@ func (c findingCounts) notesSuffix() string {
 	return fmt.Sprintf(", %d %s", c.notes, plural(c.notes, "note"))
 }
 
-// printPushFindingLines is the one-line-per-finding form `wf push` prints on
-// stderr once validate has cleared it — so none of these is an error, and the
-// only question is which of the other two tiers to call it. An `info`
-// advisory is a Note; labelling it "Warning" reported a note about a shape as
-// a problem with it.
+// printPushFindingLines runs only after validate cleared the push, so no
+// finding here is an error.
 func printPushFindingLines(out io.Writer, findings []api.ValidateFinding) {
 	for _, finding := range findings {
 		label := "Warning"

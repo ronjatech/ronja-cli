@@ -11,62 +11,25 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The metric loop's TAG half: `"tags": ["Finance", "Sales"]` in a metric file.
+// The metric loop's tag half. Tags are NOT drafted: one PATCH on the live
+// metric, a pass independent of the recipe in both directions. The rules (the
+// folder asserts its names, following recorded tag ids) are in cli/README.md →
+// "Tags — `"tags"` in the metric file"; push and status share planMetricTags.
 //
-// TAGS ARE NOT DRAFTED, and everything in this file follows from that. A tag
-// sits on the LIVE metric, so writing one needs no checkout, no build and no
-// publish — one PATCH to /tag/of/table/<metric id>, which adds and removes
-// atomically under the server's per-target lock and keeps every tag it does not
-// name. That is why the tag half is its own pass with its own outcome rather
-// than a field folded into the recipe: a tag-only edit must never check out,
-// stage or build a draft, and a recipe refusal, a failed build or an up-to-date
-// definition must never stop a tag edit from landing.
-//
-// THE FOLDER ASSERTS ITS NAMES, FOLLOWING TAG IDS (Adam, 2026-09-28):
-//
-//   - A name the file lists is put on the metric if it is not there — including
-//     when a colleague REMOVED it in the web app. The folder wins; the push says
-//     what it did.
-//   - A tag a colleague ADDED in the web app is never touched: the folder only
-//     ever removes a tag it recorded putting there (tagsApplied), and removes it
-//     by ID.
-//   - A tag an admin RENAMED in the web app is kept, never reverted and never
-//     re-minted beside the new name: the recorded id still on the metric
-//     satisfies the file's old name. Status says "renamed in the web app: Fin →
-//     Finance — update the file".
-//   - With no record at all — a legacy folder, a rebind, a folder's first `tags`
-//     key — the reconcile is ADDITIVE ONLY, because nothing here can tell the
-//     folder's tags from anybody else's.
-//
-// ONE PREDICATE, planMetricTags, and both `push` and `status` call it. Two
-// copies of "what would a push change" is how status comes to promise a push
-// that then does nothing, or the reverse.
-//
-// Every name comparison is the server's, lower(trim()) — metricfile.FoldTagName.
-//
-// ⚠️ NEVER KEY LOGIC ON THE RESPONSE'S `created`. It is a hint for the one line
-// that lets an author see a typo land in the catalog; the record is built from
-// the response's FINAL tag list, which is always true.
+// ⚠️ Never key logic on the response's `created`, a hint for the typo note; the
+// record is built from the response's final tag list.
 
 // Per-metric tag outcomes, the --json `tags.outcome` values.
 const (
 	tagOutcomeApplied         = "applied"
 	tagOutcomeUnchanged       = "unchanged"
 	tagOutcomeSkippedArchived = "skipped_archived"
-	// tagOutcomeRefused is the 20-tag cap (the server's `tag_limit`) — the ONLY
-	// refusal recorded, because it is the only one that answers the same way for
-	// every caller: RECORDED, said once, and never a reason for a non-zero exit.
-	// It is not purely the file's fault (tags added in the web app count too),
-	// so a recorded cap stays until the file's tags change or --retry-tags.
+	// tagOutcomeRefused is the 20-tag cap (`tag_limit`), the ONLY refusal
+	// recorded, since it answers the same for every caller; never a non-zero exit.
 	tagOutcomeRefused = "refused"
-	// tagOutcomeFailed is everything else: a failure that says nothing lasting
-	// about the FILE — a 5xx or a dropped connection, a role, visibility or
-	// scope 403 (a fact about this caller, and a colleague's push may be
-	// allowed), a 404/405 (an instance that does not serve the route yet), a
-	// race's 400, a rename race that repeated on the re-planned PATCH. NEVER
-	// recorded, so the next push tries again on its own; and a PROBLEM for the
-	// push, which exits non-zero and is not up to date, so neither CI nor `sync
-	// apply` reads an unapplied tag change as deployed.
+	// tagOutcomeFailed says nothing lasting about the FILE, so it is never
+	// recorded (a colleague's push may succeed); it makes the push exit non-zero
+	// so neither CI nor `sync apply` reads the tag change as deployed.
 	tagOutcomeFailed = "failed"
 )
 
@@ -76,46 +39,31 @@ const (
 	tagStatePending         = "pending"
 	tagStateSkippedArchived = "skipped_archived"
 	tagStateRefused         = "refused"
-	// tagStateUnread is a read that failed — a 5xx, a dropped connection, a
-	// token whose scope does not cover tags, a metric this caller cannot see,
-	// an instance with no tag route. "I could not look" is not "nothing to do",
-	// so the tree verdict counts it as unchecked.
+	// tagStateUnread is a failed read: "could not look" is not "nothing to
+	// do", so the tree verdict counts it as unchecked.
 	tagStateUnread = "unread"
 )
 
-// olderServerTagReason is what a 404 or 405 from the tag route means: the
-// organization's Ronja does not serve it yet — a CLI updated ahead of its
-// organization's deploy, or an instance mid-rollout. Never recorded: the
-// deploy that fixes it changes nothing in the folder, so a recorded refusal
-// would outlive it on every colleague's push.
+// olderServerTagReason answers a 404 or 405 from the tag route. Never
+// recorded: the deploy that fixes it changes nothing in the folder.
 const olderServerTagReason = "this organization's Ronja doesn't have tag support yet — push again after it's updated"
 
-// pipelineMetricTagResult is what a push did about one metric file's tags. Nil
-// on a file with no `tags` key, which does not manage them.
+// pipelineMetricTagResult is nil on a file with no `tags` key.
 type pipelineMetricTagResult struct {
 	Outcome string `json:"outcome"`
 	Reason  string `json:"reason,omitempty"`
 	// Added and Removed are tag NAMES, as the server spells them now.
 	Added   []string `json:"added,omitempty"`
 	Removed []string `json:"removed,omitempty"`
-	// Created are the added names that did not exist in the organization's
-	// catalog before — a HINT, reported so a typo is seen the first time it
-	// lands, and never read by anything else.
-	Created []string `json:"created,omitempty"`
-	// AlreadyGone are recorded tags this push meant to remove that were no
-	// longer on the metric when the PATCH ran — somebody got there first.
+	// Created is a HINT for the typo note, never read by anything else.
+	Created     []string `json:"created,omitempty"`
 	AlreadyGone []string `json:"unmatchedRemoves,omitempty"`
-	// Renamed are this folder's tags an admin renamed in the web app, as
-	// "Fin → Finance": kept, and worth updating the file for.
-	Renamed []string `json:"renamed,omitempty"`
-	// cause is the error behind a `failed` outcome when it was a failure to get
-	// an answer (a 5xx, a timeout, a dropped connection) — a write that may
-	// have landed, which `sync apply` reports as unknown rather than refused.
+	Renamed     []string `json:"renamed,omitempty"`
+	// cause is set when a `failed` write got no answer and may have landed,
+	// which `sync apply` reports as unknown rather than refused.
 	cause error
 }
 
-// pipelineMetricTagStatus is `pipeline status`'s answer about one metric file's
-// tags. Nil on a file with no `tags` key.
 type pipelineMetricTagStatus struct {
 	State   string   `json:"state"`
 	Add     []string `json:"add,omitempty"`
@@ -124,25 +72,18 @@ type pipelineMetricTagStatus struct {
 	Reason  string   `json:"reason,omitempty"`
 }
 
-// metricTagPlan is what a push would send to make the metric hold what the
-// file asserts.
 type metricTagPlan struct {
 	// Adds are FILE names no live tag matches and no recorded id covers.
 	Adds []string
 	// RemoveIDs are RECORDED tags still on the metric whose recorded name and
 	// current name are both absent from the file.
-	RemoveIDs []string
-	// removeNames maps each RemoveIDs entry to the name the metric shows now,
-	// for the report.
+	RemoveIDs   []string
 	removeNames map[string]string
-	// Renamed are recorded tags still on the metric under a different name
-	// while the file still says the old one, as "Old → New".
-	Renamed []string
+	Renamed     []string
 }
 
 func (p metricTagPlan) pending() bool { return len(p.Adds) > 0 || len(p.RemoveIDs) > 0 }
 
-// removeNamesList is the plan's removals as current names, in plan order.
 func (p metricTagPlan) removeNamesList() []string {
 	out := make([]string, 0, len(p.RemoveIDs))
 	for _, id := range p.RemoveIDs {
@@ -151,23 +92,10 @@ func (p metricTagPlan) removeNamesList() []string {
 	return out
 }
 
-// planMetricTags is THE predicate: given what the file lists, what the metric
-// holds now and what this folder recorded applying, what would a push change?
-//
-//   - A file name is SATISFIED by a live tag of the same folded name, or by a
-//     recorded entry of the same folded name whose id is still on the metric
-//     (the tag was renamed since). Otherwise it is an ADD — which is also how a
-//     tag a colleague removed in the web app comes back.
-//   - A recorded id is a REMOVE when it is still on the metric and NO recorded
-//     entry for that id has either its recorded name or the name the tag has
-//     now in the file. Asked of every entry for the id, not entry by entry: the
-//     record can hold two entries for one id (a file that listed a renamed
-//     tag's old AND new name), and dropping one of those names must not remove
-//     a tag the other still asserts — in whichever order they were recorded.
-//     A recorded id no longer on the metric needs nothing: it is gone, and if
-//     the file still wants the name the add above puts it back.
-//   - A live tag that is not recorded is never removed, whatever it is called.
-//     With no record, nothing is removed at all.
+// planMetricTags is the one predicate push and status share. A recorded id is
+// removed only when NO recorded entry for it is named in the file, by recorded
+// or current name — asked across every entry, since one id can be recorded
+// twice (a renamed tag's old and new name). An unrecorded tag is never removed.
 func planMetricTags(fileTags []string, live []api.Tag, applied []wfdir.AppliedTag) metricTagPlan {
 	liveByID := make(map[string]api.Tag, len(live))
 	liveByName := make(map[string]api.Tag, len(live))
@@ -191,10 +119,6 @@ func planMetricTags(fileTags []string, live []api.Tag, applied []wfdir.AppliedTa
 		}
 		plan.Adds = append(plan.Adds, name)
 	}
-	// asserted is each recorded id still on the metric that the file names by
-	// ANY of its entries — under the name it was recorded as, or (the author
-	// updated the file after a rename, or the tag was renamed TO a name the
-	// file lists) the name it has now.
 	asserted := make(map[string]bool, len(applied))
 	for _, entry := range applied {
 		tag, on := liveByID[entry.ID]
@@ -223,8 +147,6 @@ func planMetricTags(fileTags []string, live []api.Tag, applied []wfdir.AppliedTa
 	return plan
 }
 
-// coveringRecord is the recorded entry, if any, that satisfies a file name by
-// id: recorded under that folded name, and still on the metric.
 func coveringRecord(applied []wfdir.AppliedTag, liveByID map[string]api.Tag, fold string) *wfdir.AppliedTag {
 	for i := range applied {
 		if metricfile.FoldTagName(applied[i].Name) != fold {
@@ -237,15 +159,9 @@ func coveringRecord(applied []wfdir.AppliedTag, liveByID map[string]api.Tag, fol
 	return nil
 }
 
-// appliedAfter is the record a reconcile leaves: one entry per FILE name that
-// the metric now holds, against the id that holds it.
-//
-// A name matched by a live tag directly records that tag, spelled as the server
-// spells it. A name satisfied only through a renamed tag keeps its PRIOR entry —
-// the old name — because that entry is what tells the next run the file's name
-// is already satisfied; recording the new name there would make the next push
-// re-mint the old one. A name the metric does not hold (a concurrent removal
-// after the PATCH) is left out, and the next push adds it.
+// appliedAfter keeps a name satisfied only through a renamed tag under its
+// PRIOR (old) entry: recording the new name would make the next push re-mint
+// the old one.
 func appliedAfter(fileTags []string, live []api.Tag, prior []wfdir.AppliedTag) []wfdir.AppliedTag {
 	liveByID := make(map[string]api.Tag, len(live))
 	liveByName := make(map[string]api.Tag, len(live))
@@ -267,47 +183,22 @@ func appliedAfter(fileTags []string, live []api.Tag, prior []wfdir.AppliedTag) [
 	return out
 }
 
-// tagErrorKind is what a tag route's error means for the record.
 type tagErrorKind int
 
 const (
-	// tagErrorFailed says nothing lasting about the file: reported, never
-	// recorded, and retried by the next push.
 	tagErrorFailed tagErrorKind = iota
-	// tagErrorRefused is the 20-tag cap: recorded, so it is said once and not
-	// re-sent on every push.
 	tagErrorRefused
-	// tagErrorOverlap is the server's tag_overlap 400 — on a body this loop
-	// planned from a read, a tag renamed between that read and the PATCH. Worth
-	// one re-read and re-plan; never recorded.
+	// tagErrorOverlap means a tag was renamed between the read and the PATCH:
+	// worth one re-read and re-plan, never recorded.
 	tagErrorOverlap
 )
 
-// classifyTagError turns a tag route's error into a reason and a kind. `verb`
-// is the action the request needed ("read" for the GET, "write" for the
-// PATCH): it names the scope denial when the server's message does not, and it
-// tells the handler's two 403s apart.
-//
-// ONE THING IS RECORDED: the 400 coded `tag_limit`, the 20-tag cap — the only
-// refusal that answers the same way for every caller. It is keyed on the code
-// alone, never on the status: every other 400 (a race's "one or more tags not
-// found", an older server's uncoded cap) could answer differently on the next
-// push. It is not purely about the file — tags added in the web app count
-// toward it, including a colleague's concurrent add that tipped it over under
-// the server's lock — which is why --retry-tags exists.
-//
-// Everything else is `failed`, because it is a fact about the caller or the
-// deploy, and recording it in a COMMITTED lock would stop every colleague's
-// push from ever trying:
-//
-//   - a 403 — the token's scope (code insufficient_scope, or the middleware's
-//     prose from an instance that predates the code), the handler's role gate,
-//     or its visibility gate. The handler refuses both with a bare 403, and the
-//     GET and the PATCH share the visibility gate, so a 403 on the READ is
-//     visibility and one on the WRITE, after the read was answered, is the
-//     role;
-//   - a 404 or 405 — an instance that does not serve the route yet;
-//   - any other 400, a 5xx, a dropped connection, a timeout, a 401.
+// classifyTagError records ONLY the 400 coded `tag_limit`, keyed on the code
+// alone: anything else is a fact about the caller or the deploy, and recording
+// it in a COMMITTED lock would stop every colleague's push from trying. The
+// handler's role and visibility gates both answer a bare 403, and GET and PATCH
+// share the visibility gate, so a 403 on "read" is visibility and on "write" is
+// the role.
 func classifyTagError(err error, verb string) (reason string, kind tagErrorKind) {
 	status, code := api.StatusOf(err), api.WireCodeOf(err)
 	switch {
@@ -328,9 +219,8 @@ func classifyTagError(err error, verb string) (reason string, kind tagErrorKind)
 	}
 }
 
-// scopeDeniedAction is the action a scope 403 names — `token scope "data" does
-// not permit write` — echoed rather than assumed, or `fallback` when the
-// message names none (the route-not-reachable form).
+// scopeDeniedAction echoes the action a scope 403 names (`token scope "data"
+// does not permit write`), or fallback when the message names none.
 func scopeDeniedAction(err error, fallback string) string {
 	if _, action, ok := strings.Cut(api.CodeOf(err), " does not permit "); ok && strings.TrimSpace(action) != "" {
 		return strings.TrimSpace(action)
@@ -338,28 +228,20 @@ func scopeDeniedAction(err error, fallback string) string {
 	return fallback
 }
 
-// tagsNotAppliedError is a push whose problems were ONLY in metric files' tag
-// halves — and, possibly, in its health checks. Typed on the checks precedent
-// (checksNotAppliedError), so `sync apply` can publish the folder's SQL past
-// it: tags are not drafted, so an unapplied tag change must not hold a table
-// deploy hostage — least of all when the cause is an organization whose Ronja
-// has no tag route yet. It is still an error: the command exits non-zero and
-// says why, and the next push retries.
+// tagsNotAppliedError is a push whose problems were ONLY in tag halves (and
+// possibly health checks). Typed like checksNotAppliedError so `sync apply`
+// publishes the folder's SQL past it: undrafted tags must not hold a table
+// deploy hostage. Still an error: the command exits non-zero.
 type tagsNotAppliedError struct {
-	msg string
-	// problems names each metric file whose tag half did not apply, and why.
+	msg      string
 	problems []string
-	// cause is non-nil when a problem was a failure to get an answer.
-	cause error
-	// checks is the push's checks leg when that failed too, so `sync apply`
-	// can fold it into the folder's report.
-	checks *checksNotAppliedError
+	cause    error
+	checks   *checksNotAppliedError
 }
 
 func (e *tagsNotAppliedError) Error() string { return e.msg }
 func (e *tagsNotAppliedError) Unwrap() error { return e.cause }
 
-// newTagsNotApplied reads the failed tag halves out of a push's metric results.
 func newTagsNotApplied(msg string, metrics []pipelineMetricFileResult, checks *checksNotAppliedError) *tagsNotAppliedError {
 	out := &tagsNotAppliedError{msg: msg, checks: checks}
 	for _, m := range metrics {
@@ -374,18 +256,14 @@ func newTagsNotApplied(msg string, metrics []pipelineMetricFileResult, checks *c
 	return out
 }
 
-// tagsNotAppliedAfter folds a push's tag leg into the folder's error after the
-// publish. checksErr is what checksNotAppliedAfter returned for the checks
-// legs — nil, or a *checksNotAppliedError whose message already names the
-// published tables. nil tags leaves checksErr as it is.
+// tagsNotAppliedAfter takes checksErr from checksNotAppliedAfter: nil, or a
+// *checksNotAppliedError whose message already names the published tables.
 func tagsNotAppliedAfter(detail string, published []string, tags *tagsNotAppliedError, checksErr error) error {
 	if tags == nil {
 		return checksErr
 	}
 	out := &tagsNotAppliedError{problems: tags.problems, cause: tags.cause}
 	if checksErr != nil {
-		// The checks message already carries the detail and the published
-		// tables; the tag problems ride after it.
 		if c, ok := checksErr.(*checksNotAppliedError); ok {
 			out.checks = c
 			if out.cause == nil {
@@ -402,18 +280,10 @@ func tagsNotAppliedAfter(detail string, published []string, tags *tagsNotApplied
 	return out
 }
 
-// reconcileMetricTags is the push's tag half for one metric file, run once the
-// metric is known to exist and to BE a metric: immediately after a create, or
-// after the existing row's read and kind check — and before every recipe step
-// after the draft read (the drift refusals, the write, the build, the
-// up-to-date return), so none of those can skip it. A failed draft read, which
-// comes first because resolving the draft is part of the metric's identity, is
-// the one recipe step that still stops it.
-//
-// `row` is the live metric as just read — the ADOPTED row on a create refused
-// as name_taken, which may be archived or hidden like any other — and nil only
-// straight after a create that succeeded (a metric that did not exist a moment
-// ago is neither).
+// reconcileMetricTags must run once the row is known to BE a metric and before
+// every recipe step after the draft read (drift refusals, write, build, the
+// up-to-date return), so none of those can skip it. `row` is nil only straight
+// after a successful create; an ADOPTED name_taken row may be archived or hidden.
 func reconcileMetricTags(ctx context.Context, client *api.Client, live liveHashes,
 	file pipelineMetricFile, metricID string, row *api.Table, opts pipelinePushOptions) *pipelineMetricTagResult {
 
@@ -429,9 +299,8 @@ func reconcileMetricTags(ctx context.Context, client *api.Client, live liveHashe
 	applied, refused := live.metricTags(file.Path, metricID)
 	hash := metricfile.TagsFingerprint(fileTags)
 	if refused != nil && refused.FileTagsHash == hash && !opts.RetryTags {
-		// Said, and not re-sent: the file says what it said when the server
-		// refused it, and the server has no reason to answer differently. This is
-		// what keeps `sync apply` from looping on a permanent refusal.
+		// Not re-sent while the file is unchanged: what keeps `sync apply`
+		// from looping on a permanent refusal.
 		return &pipelineMetricTagResult{Outcome: tagOutcomeRefused,
 			Reason: refused.Reason + " (recorded at an earlier push — edit the file's tags, or push --retry-tags, to try again)"}
 	}
@@ -445,24 +314,17 @@ func reconcileMetricTags(ctx context.Context, client *api.Client, live liveHashe
 		return &pipelineMetricTagResult{Outcome: tagOutcomeFailed, Reason: reason, cause: noAnswer(err)}
 	}
 	if len(fileTags) == 0 && len(applied) == 0 {
-		// `[]` with nothing recorded: there is nothing this folder could remove
-		// and nothing it asserts, so no request is worth making.
 		live.setMetricTagsRefused(file.Path, metricID, nil)
 		return &pipelineMetricTagResult{Outcome: tagOutcomeUnchanged}
 	}
-	// A Ctrl-C stops the tag half where it stands, quietly: the request it
-	// would send is aborted anyway, and one "tags NOT applied" note per
-	// remaining metric describes the interrupt rather than the metrics.
+	// A Ctrl-C stops quietly: a "tags NOT applied" note per remaining metric
+	// would describe the interrupt, not the metrics.
 	interrupted := func() *pipelineMetricTagResult {
 		return &pipelineMetricTagResult{Outcome: tagOutcomeFailed, Reason: interruptedMessage}
 	}
 
-	// READ, PLAN, PATCH — and on tag_overlap, once more from a fresh read. The
-	// overlap is the server refusing an add that names a tag this PATCH removes
-	// by id, which on a plan built from a read means an admin renamed the tag
-	// in between: the re-read sees the new name, and the re-plan either keeps
-	// the tag (the file now names it as it is called) or drops the add. ONE
-	// re-plan: a race that repeats is `failed`, and the next push starts over.
+	// On tag_overlap (an add naming a tag this PATCH removes by id, so a rename
+	// raced the read), re-read and re-plan ONCE; a repeat is `failed`.
 	var plan metricTagPlan
 	var result *api.PatchTagsResult
 	for attempt := 0; ; attempt++ {
@@ -488,8 +350,8 @@ func reconcileMetricTags(ctx context.Context, client *api.Client, live liveHashe
 			break
 		}
 		if ctx.Err() != nil {
-			// Aborted mid-request: whether the merge landed is unknown, and the
-			// record is left as it was, so the next push reads and re-plans.
+			// Aborted mid-request: whether it landed is unknown, so the record is
+			// left as it was and the next push re-plans.
 			res := interrupted()
 			res.cause = err
 			return res
@@ -512,9 +374,7 @@ func reconcileMetricTags(ctx context.Context, client *api.Client, live liveHashe
 		Created: result.Created,
 		Renamed: plan.Renamed,
 	}
-	// Matched BY VALUE against what was sent: the server echoes each unmatched
-	// id trimmed, and the ids this client sends are the server's own, untrimmed
-	// only if the server ever issued one with padding.
+	// The server echoes each unmatched id trimmed; the ids sent are its own.
 	for _, id := range result.UnmatchedRemoves {
 		name := plan.removeNames[id]
 		if name == "" {
@@ -523,18 +383,14 @@ func reconcileMetricTags(ctx context.Context, client *api.Client, live liveHashe
 		out.AlreadyGone = append(out.AlreadyGone, name)
 	}
 	if len(out.Added) == 0 && len(out.Removed) == 0 {
-		// Everything the plan asked for was already true by the time it landed —
-		// a concurrent edit got there first. Nothing changed here.
+		// A concurrent edit got there first.
 		out.Outcome = tagOutcomeUnchanged
 	}
 	return out
 }
 
-// metricTagStatus is `pipeline status`'s tag half for one metric file, on the
-// same predicate a push runs and without ever writing: a refusal is not
-// recorded here, because status promises to change nothing.
-//
-// `row` is the live metric (nil for a file with no metric yet).
+// metricTagStatus never writes, not even a refusal: status changes nothing.
+// `row` is nil for a file with no metric yet.
 func metricTagStatus(ctx context.Context, client *api.Client, live liveHashes,
 	file pipelineMetricFile, row *api.Table) (*pipelineMetricTagStatus, bool) {
 
@@ -543,7 +399,6 @@ func metricTagStatus(ctx context.Context, client *api.Client, live liveHashes,
 	}
 	fileTags := *file.File.Tags
 	if row == nil {
-		// A push creates the metric and then puts every listed name on it.
 		if len(fileTags) == 0 {
 			return &pipelineMetricTagStatus{State: tagStateInPlace}, false
 		}
@@ -566,9 +421,7 @@ func metricTagStatus(ctx context.Context, client *api.Client, live liveHashes,
 	}
 	current, err := client.ListTableTags(ctx, metricID)
 	if err != nil {
-		// The push's own classification, so the two keep one predicate. A read
-		// is never refused — the cap answers only a write — so every failed
-		// read is `unread`, which the tree verdict counts as unchecked.
+		// The cap answers only a write, so every failed read is `unread`.
 		reason, _ := classifyTagError(err, "read")
 		return &pipelineMetricTagStatus{State: tagStateUnread, Reason: reason}, false
 	}
@@ -580,7 +433,6 @@ func metricTagStatus(ctx context.Context, client *api.Client, live liveHashes,
 		Remove: plan.removeNamesList(), Renamed: plan.Renamed}, true
 }
 
-// describeTagChange renders adds and removes as `+Sales −Operations`.
 func describeTagChange(added, removed []string) string {
 	parts := make([]string, 0, len(added)+len(removed))
 	for _, name := range added {
@@ -592,7 +444,6 @@ func describeTagChange(added, removed []string) string {
 	return strings.Join(parts, " ")
 }
 
-// printMetricTagResult renders a push's tag outcome under its metric's block.
 func printMetricTagResult(out *os.File, tags *pipelineMetricTagResult) {
 	if tags == nil {
 		return
@@ -619,7 +470,6 @@ func printMetricTagResult(out *os.File, tags *pipelineMetricTagResult) {
 	}
 }
 
-// printMetricTagStatus renders status's tag answer under its metric's block.
 func printMetricTagStatus(out *os.File, tags *pipelineMetricTagStatus) {
 	if tags == nil {
 		return

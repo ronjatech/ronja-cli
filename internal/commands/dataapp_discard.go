@@ -11,19 +11,9 @@ import (
 )
 
 // `ronja app discard` throws your draft away and points the baseline back at
-// the live app.
-//
-// The escape hatch, and the reason it belongs in a CLI whose rule is otherwise
-// "no resource verbs": a draft wedged by a binding you cannot resolve (a table
-// somebody deleted) rejects every write, and the only way forward is to drop it
-// and fork a fresh one. It operates on the sync loop's own artifact, never on
-// anything live.
-//
-// Since migration 000495 a data app CAN be its own draft: POST /dataapp creates
-// a parentless draft, exactly like a workflow, so a first push that is never
-// published leaves a row with nothing behind it. `discard` refuses that row by
-// default and --delete-app removes it, which is the same shape `wf discard`
-// needs.
+// the live app. It acts only on the sync loop's own draft, never on anything
+// live, which is why it fits the "no resource verbs" rule. A never-published
+// app is a parentless draft, so discarding it is refused unless --delete-app.
 func newDataAppDiscardCmd() *cobra.Command {
 	var yes bool
 	var deleteApp bool
@@ -87,27 +77,15 @@ func runAppDiscard(ctx context.Context, f *folder, yes, deleteApp bool) (*appDis
 	if err != nil {
 		return nil, err
 	}
-	// The PARENT field, not the lifecycle alone, is what makes a draft
-	// parentless. A binding that names an EDIT SHADOW — a draft forked from a
-	// live app, which a hand-edited ronja.json can perfectly well hold — also
-	// reads as lifecycle=draft, and treating it as never-published would delete
-	// somebody's in-progress edits and unbind the folder from the live app,
-	// while reporting that nothing had ever been published.
+	// ⚠️ Parentless is decided by the parent field, not lifecycle alone: a
+	// binding naming an edit shadow also reads as a draft, and treating it as
+	// never-published would delete someone's edits and unbind the live app.
 	if target.App != nil && target.App.Lifecycle == api.LifecycleDraft && target.App.ParentDataAppID != "" {
 		return nil, fmt.Errorf("%s names %s, which is a draft of data app %s rather than the app itself — point the binding at %s (that is the id a push records) and try again",
 			wfdir.ManifestPath(f.Root), target.App.ID, target.App.ParentDataAppID, target.App.ParentDataAppID)
 	}
-	// A parentless draft IS the app, so there is no "undo my edits" to perform
-	// on it — the only available action is deleting the whole row. That stays
-	// behind an explicit flag because `discard` reads as reverting, and deleting
-	// an app is not a surprise anyone should meet at the command line. But it
-	// has to be reachable: this is what an abandoned first push leaves, the push
-	// that failed to compile is when you most want it gone, and a CLI whose
-	// premise is that an agent needs nothing but a terminal cannot answer with
-	// "use the web UI".
-	//
-	// Reported separately from the no-draft case below, which would otherwise
-	// say "you have no open draft" about a row that is nothing but a draft.
+	// A parentless draft is the app itself, so the only action is deleting it,
+	// behind --delete-app because `discard` reads as reverting.
 	if target.App != nil && target.App.Lifecycle == api.LifecycleDraft {
 		if !deleteApp {
 			return nil, fmt.Errorf("data app %s has never been published, so it is a draft with nothing behind it — discarding would delete the app itself. Re-run with --delete-app to do that; your local files are kept",
@@ -115,9 +93,7 @@ func runAppDiscard(ctx context.Context, f *folder, yes, deleteApp bool) (*appDis
 		}
 		return deleteUnpublishedApp(ctx, client, f, target.App, yes)
 	}
-	// --delete-app is only meaningful on the branch above. Refusing it here
-	// rather than ignoring it keeps the flag from reading as "delete the live
-	// app too" on a folder where it would silently do nothing of the sort.
+	// Refused rather than ignored, so it never reads as "delete the live app".
 	if deleteApp {
 		return nil, fmt.Errorf("--delete-app only applies to an app that has never been published; %s is live, so there is a published version to keep. Drop --delete-app to discard just your draft",
 			target.App.ID)
@@ -138,10 +114,8 @@ func runAppDiscard(ctx context.Context, f *folder, yes, deleteApp bool) (*appDis
 		return nil, fmt.Errorf("discard %s: %w", target.Draft.ID, err)
 	}
 
-	// The baseline now has to describe the LIVE row: the draft it was taken from
-	// no longer exists, and leaving it in place would make every local file read
-	// as drift against a row that is gone. A failure here is noted, not returned
-	// — the discard itself succeeded.
+	// The baseline must now describe the live row. A failure is noted, not
+	// returned: the discard succeeded.
 	noteBaselineRefresh(f.Kind, refreshAppBaselineFromLive(ctx, client, f, target.App.ID, keepAnchor))
 	return &appDiscardResult{
 		Outcome:   outcomeDiscarded,
@@ -150,13 +124,10 @@ func runAppDiscard(ctx context.Context, f *folder, yes, deleteApp bool) (*appDis
 	}, nil
 }
 
-// deleteUnpublishedApp removes a parentless draft — an app that has never been
-// published — and returns the folder to the state `init` left it in.
-//
-// Ordering is load-bearing: the server row goes first, and the manifest is only
-// unbound once it is gone. Clearing the binding first and then failing the
-// delete would strand a real app that no local command could name again, which
-// is the exact failure this command exists to clean up.
+// deleteUnpublishedApp removes a never-published app and returns the folder to
+// the state `init` left it in. ⚠️ The server row goes first and the manifest is
+// unbound only after: the other order can strand an app no local command can
+// name.
 func deleteUnpublishedApp(ctx context.Context, client *api.Client, f *folder, app *api.DataApp, yes bool) (*appDiscardResult, error) {
 	ok, err := confirm(fmt.Sprintf("DELETE data app %s (%q)? It has never been published, so this removes the app itself — it goes to the trash, and is purged for good 30 days later. Local files are kept.", app.ID, app.Name),
 		fmt.Sprintf("deletes data app %s on the server", app.ID), yes)
@@ -170,19 +141,14 @@ func deleteUnpublishedApp(ctx context.Context, client *api.Client, f *folder, ap
 		return nil, fmt.Errorf("delete %s: %w", app.ID, err)
 	}
 
-	// Keep the feature, drop the app: the folder should behave exactly as it did
-	// after `init`, so the next push creates a fresh app in the same place.
+	// Keep the feature, drop the app, so the next push creates a fresh one.
 	f.recordBinding(wfdir.Binding{FeatureID: f.Binding.FeatureID})
 	if err := f.saveFolder(); err != nil {
 		return nil, fmt.Errorf("data app %s was DELETED, but %s still names it: %w\n  Remove the dataAppID from that file by hand, or the next push will look for an app that is gone",
 			app.ID, wfdir.ManifestPath(f.Root), err)
 	}
-	// No baseline for THIS instance, for the same reason `init` leaves none:
-	// there is no server-side row left to have synced from, so every local file
-	// correctly reads as "added" until a push writes a real one. Only this
-	// binding's entry goes — the folder may be bound to staging and production
-	// too, and each of those still has a row its baseline describes. Noted
-	// rather than returned — the delete and the unbind both succeeded.
+	// Only this binding's baseline is cleared: the folder may be bound to other
+	// stacks whose rows still exist. A save failure is noted, not returned.
 	f.State.Clear(f.Key)
 	noteBaselineRefresh(f.Kind, wfdir.SaveState(f.Root, f.State))
 	return &appDiscardResult{Outcome: outcomeResourceDeleted, DataAppID: app.ID}, nil

@@ -131,10 +131,8 @@ func TestPollDeviceHonoursContextCancellation(t *testing.T) {
 	}
 }
 
-// A PERSISTENT server failure must eventually surface, not be mistaken for
-// "still waiting" — otherwise a broken backend looks like a user who never
-// clicks. It is bounded by MaxPollFailureWindow rather than fatal on the first
-// one; see TestPollDeviceRidesOutTransientFailures.
+// A PERSISTENT server failure must surface after MaxPollFailureWindow, or a
+// broken backend looks like a user who never clicks.
 func TestPollDeviceSurfacesPersistentServerErrors(t *testing.T) {
 	calls := 0
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -161,10 +159,8 @@ func TestPollDeviceSurfacesPersistentServerErrors(t *testing.T) {
 	}
 }
 
-// A blip must not burn the login. A rolling deploy (5xx), the global rate
-// limiter (429) and a dropped connection all happen routinely inside the ten
-// minutes a device flow is alive, and the human on the other end has done
-// nothing wrong.
+// A rolling deploy (5xx), the rate limiter (429) and a dropped connection are
+// routine inside a device flow's life and must not burn the login.
 func TestPollDeviceRidesOutTransientFailures(t *testing.T) {
 	calls := 0
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -193,9 +189,8 @@ func TestPollDeviceRidesOutTransientFailures(t *testing.T) {
 	}
 }
 
-// The consecutive-failure budget resets on any clean answer, so a flow that
-// blips repeatedly but keeps recovering is not eventually killed by the sum of
-// unrelated hiccups.
+// The failure budget resets on any clean answer, so unrelated hiccups never add
+// up to a kill.
 func TestPollDeviceResetsFailureBudgetOnProgress(t *testing.T) {
 	calls := 0
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -238,9 +233,8 @@ func TestPollDeviceDoesNotRetryClientErrors(t *testing.T) {
 	}
 }
 
-// The first poll happens IMMEDIATELY. The server's throttle always passes a
-// first poll (last_polled_at IS NULL), so sleeping up front added a fixed
-// several-second delay to every single login for nothing.
+// The server's throttle always passes a first poll (last_polled_at IS NULL), so
+// sleeping up front would only delay every login.
 func TestPollDevicePollsBeforeSleeping(t *testing.T) {
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(DeviceToken{Token: "pat-instant"})
@@ -315,10 +309,8 @@ func TestDoBuildsV2Paths(t *testing.T) {
 	}
 }
 
-// A 429 is the global rate limiter, and it is the one transient failure where
-// retrying at the same cadence is actively wrong: the server is reporting too
-// much traffic, and an unchanged cadence promises to keep producing it. Every
-// other transient failure resumes the server's advertised interval.
+// A 429 reports too much traffic, so it is the one transient failure that backs
+// off; every other resumes the advertised interval.
 func TestPollDeviceBacksOffOnRateLimit(t *testing.T) {
 	calls := 0
 	var gaps []time.Duration

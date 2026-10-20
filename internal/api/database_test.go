@@ -10,9 +10,8 @@ import (
 	"time"
 )
 
-// TestParseEnvironment pins the accepted set. It is closed on purpose: the
-// server refuses anything else, so a value this accepts and that rejects would
-// be a flag that passes local validation and then 400s.
+// The set is closed: a value accepted here and refused by the server would pass
+// local validation and then 400.
 func TestParseEnvironment(t *testing.T) {
 	ok := map[string]Environment{
 		"":       EnvironmentProd,
@@ -33,8 +32,7 @@ func TestParseEnvironment(t *testing.T) {
 		}
 	}
 
-	// Everything else is a typo, including the plausible ones. "development"
-	// and "production" read as correct and are not.
+	// "development" and "production" read as correct and are not.
 	for _, in := range []string{"prd", "development", "production", "staging", "true"} {
 		if _, err := ParseEnvironment(in); err == nil {
 			t.Errorf("ParseEnvironment(%q) should be refused", in)
@@ -42,12 +40,8 @@ func TestParseEnvironment(t *testing.T) {
 	}
 }
 
-// TestWithEnvironmentOnlyForDev is the wire guarantee: asking for production —
-// explicitly or by saying nothing — sends the request this CLI has always sent.
-//
-// It matters beyond tidiness. An instance that predates dev copies knows no
-// `environment` parameter, and a byte-identical request is the one that keeps
-// working there.
+// An instance that predates dev copies knows no `environment` parameter, so a
+// production request must stay byte-identical.
 func TestWithEnvironmentOnlyForDev(t *testing.T) {
 	const path = "database/mdb-abc/sql"
 	if got := withEnvironment(path, EnvironmentProd); got != path {
@@ -60,17 +54,14 @@ func TestWithEnvironmentOnlyForDev(t *testing.T) {
 		t.Errorf("dev = %q, want %q", got, want)
 	}
 
-	// A path that already carries a query gets "&", not a second "?". A second
-	// "?" makes `environment` part of the previous parameter's value, so the
-	// server sees no environment at all — and a request with no environment
-	// runs against PRODUCTION.
+	// A second "?" would hide `environment` inside the previous value, and a
+	// request with no environment runs against PRODUCTION.
 	const withQuery = "database/mdb-abc/data?table=leads"
 	if got, want := withEnvironment(withQuery, EnvironmentDev), withQuery+"&environment=dev"; got != want {
 		t.Errorf("dev on a path with a query = %q, want %q", got, want)
 	}
 }
 
-// databaseServer records what one call actually put on the wire.
 func databaseServer(t *testing.T, status int, body string) (*Client, *http.Request, *[]byte) {
 	t.Helper()
 	var seen http.Request
@@ -86,8 +77,6 @@ func databaseServer(t *testing.T, status int, body string) (*Client, *http.Reque
 	return New(srv.URL, "token"), &seen, &payload
 }
 
-// TestDatabaseSQLSendsEnvironment covers both halves of the plumbing end to
-// end: the query parameter going out, and the two new fields coming back.
 func TestDatabaseSQLSendsEnvironment(t *testing.T) {
 	t.Run("dev asks for the copy", func(t *testing.T) {
 		client, seen, _ := databaseServer(t, 200, `{
@@ -134,9 +123,6 @@ func TestDatabaseSQLSendsEnvironment(t *testing.T) {
 	})
 }
 
-// TestApplyMigrationsSendsEnvironment mirrors the SQL case: same parameter, same
-// rule, because a migration set is exactly what someone wants to try on a copy
-// first.
 func TestApplyMigrationsSendsEnvironment(t *testing.T) {
 	client, seen, payload := databaseServer(t, 200, `{
 		"databaseID": "mdb-dev-1",
@@ -161,9 +147,8 @@ func TestApplyMigrationsSendsEnvironment(t *testing.T) {
 		t.Errorf("dev redirect not reported: %+v", out)
 	}
 
-	// The environment must NOT have leaked into the body. It is a query
-	// parameter on an admin-gated route precisely so it cannot be set by a JSON
-	// key that generated client code or an echoed payload happens to carry.
+	// The environment is a query parameter, never a body key, so an echoed
+	// payload cannot set it.
 	var body map[string]any
 	if err := json.Unmarshal(*payload, &body); err != nil {
 		t.Fatal(err)
@@ -179,8 +164,6 @@ func TestApplyMigrationsSendsEnvironment(t *testing.T) {
 	}
 }
 
-// TestPromoteDecodesNotes covers the promote call: the path, the dryRun body,
-// and the notes field only this endpoint sends.
 func TestPromoteDecodesNotes(t *testing.T) {
 	client, seen, payload := databaseServer(t, 200, `{
 		"databaseID": "mdb-abc",
@@ -216,10 +199,8 @@ func TestPromoteDecodesNotes(t *testing.T) {
 	}
 }
 
-// TestPromoteDivergenceIsAnOrdinaryError pins what makes `db promote` a usable
-// gate: divergence is an HTTP 400 with a written instruction, so it needs no
-// second failure mechanism in the command — an ordinary error return already
-// carries the server's own words and exits non-zero.
+// Divergence is an HTTP 400 with a written instruction, so `db promote` needs
+// no second failure mechanism.
 func TestPromoteDivergenceIsAnOrdinaryError(t *testing.T) {
 	const message = "the dev copy's history diverged from production at migration 2 (0002_score): refresh the dev copy to rebase, then re-apply your migrations"
 	client, _, _ := databaseServer(t, 400, `{"error":`+quote(message)+`}`)

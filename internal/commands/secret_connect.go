@@ -14,50 +14,25 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja secret connect` is the second credential handshake on `secret`: it
-// connects a Ronja-managed OAuth service (Gmail, Google Sheets, HubSpot, …) by
-// sending a person through the provider's own consent screen.
-//
-// No new flow. The CLI calls the same initiate route the app does and waits on
-// GET /secret/:id. What it opens is the secret's page in Ronja (initiate's
-// `url`), never the provider directly: the page says what is being connected
-// and who asked, and the provider's sign-in opens only when the person presses
-// Continue there — a sign-in window jumping up out of a terminal reads like
-// phishing. The page calls initiate again from the browser, so the state row
-// minted for the CLI's call expires unused. Against a server that returns no
-// `url` the command opens the authURL, as it always did. Either way the
-// provider redirects to Ronja's registered callback — the CLI never sees a
-// provider token, and the secret's value is never on any route it reads.
-//
-// What makes the wait honest is the scope set initiate now reports:
-//
-//   - "already connected" is claimed only when the secret is ready AND its
-//     recorded grant COVERS what this run would ask for (no --scope), or
-//     EQUALS it (--scope, which replaces the grant) — alreadyConnected;
-//   - completion is a status change from pending/reauth_required, or a CHANGE
-//     in grantedScopes from a ready secret — the column only the callback
-//     writes — and never updatedAt, which a background token refresh bumps;
-//   - after completion, a grant missing some of what was asked for (a granular
-//     consent screen with a box unticked) exits 1 naming them.
+// `ronja secret connect` opens the secret's page in Ronja (initiate's `url`),
+// never the provider directly: a sign-in window jumping out of a terminal reads
+// like phishing, so the provider opens only on Continue there (a server with no
+// `url` gets the authURL). The CLI never sees a provider token; the callback
+// is Ronja's own.
 
-// connectPollInterval and connectWaitLimit are package vars so the tests can
-// collapse them, as the login tests collapse the device-flow cadence. The limit
-// matches the state row's 10-minute TTL: past it the link is dead whatever the
-// person does.
+// Package vars so the tests can collapse them. connectWaitLimit matches the
+// OAuth state row's 10-minute TTL: past it the link is dead.
 var (
 	connectPollInterval = 3 * time.Second
 	connectWaitLimit    = 10 * time.Minute
-	// connectPageWaitLimit is the wait when the person starts from Ronja's
-	// page: its link does not expire, and Continue mints a fresh 10-minute
-	// state row, so the wait matches `secret create --in-browser`.
+	// Ronja's page link does not expire and Continue mints a fresh state
+	// row, so this wait matches `secret create --in-browser`.
 	connectPageWaitLimit = 15 * time.Minute
 )
 
-// offlineAccess is the OIDC pseudo-scope that asks for a refresh token. It must
-// be requested (Microsoft and Salesforce need it in the authorize URL) and is
-// never echoed back as granted — the same exception the server's
-// oauthregistry.ScopesCover makes. Without it here, every Microsoft connect
-// would read as "did not grant: offline_access" and never as already connected.
+// offlineAccess is requested but never echoed back as granted — the same
+// exception the server's oauthregistry.ScopesCover makes — so it is ignored when
+// comparing grants, or every Microsoft connect would read as "did not grant".
 const offlineAccess = "offline_access"
 
 func newSecretConnectCmd() *cobra.Command {
@@ -143,17 +118,14 @@ func runSecretConnect(ctx context.Context, client *api.Client, service string, i
 	}
 	provider := providerLabel(before.Name)
 
-	// The connection is one per provider and person, so an existing one keeps
-	// its feature whatever --feature says. Saying so is the difference between
-	// the person finding it and thinking the flag did nothing.
+	// One connection per provider and person: an existing one keeps its
+	// feature whatever --feature says.
 	if in.FeatureID != "" && before.FeatureID != nil && *before.FeatureID != "" && *before.FeatureID != in.FeatureID {
 		fmt.Fprintf(out, "%s already lives in feature %s; using it.\n", before.Name, *before.FeatureID)
 	}
 
 	requested := started.RequestedScopes
 	if requested != nil && before.Status == "ready" && alreadyConnected(grantedOf(before), *requested, in.Scopes != nil) {
-		// The state row this initiate minted is never used; it expires on
-		// its own in 10 minutes.
 		return reportConnected(true, before, []string{})
 	}
 
@@ -200,21 +172,10 @@ func runSecretConnect(ctx context.Context, client *api.Client, service string, i
 	return nil
 }
 
-// alreadyConnected decides whether a ready secret needs no consent at all.
-//
-// Without --scope the grant ACCUMULATES, and coverage is enough: if the
-// recorded grant already covers everything this run would ask for, a consent
-// could only REMOVE scopes the service does not use — for a selectable service
-// the request is the required set plus the stored scopes still in its catalog,
-// so a stale stored scope is exactly one that would be dropped. Equality here
-// would open the browser needlessly whenever the grant holds a full Google
-// scope and the service asks for its ".readonly" variant, and, since such a
-// consent changes nothing the completion rule can see, then wait out the whole
-// link lifetime.
-//
-// With --scope the grant is REPLACED, so only equality (offline_access aside)
-// means nothing would change: a broad grant covers a narrowing request, and
-// treating that as done would silently skip the narrowing asked for.
+// alreadyConnected: without --scope the grant ACCUMULATES, so coverage is
+// enough (equality would reopen consent for a ".readonly" variant of a held
+// scope, then wait out the link since nothing visible changes). With --scope
+// the grant is REPLACED, so only equality counts, or a narrowing is skipped.
 func alreadyConnected(granted, requested []string, replace bool) bool {
 	if replace {
 		return sameScopeSet(withoutOffline(granted), withoutOffline(requested))
@@ -222,9 +183,8 @@ func alreadyConnected(granted, requested []string, replace bool) bool {
 	return len(missingScopes(granted, requested)) == 0
 }
 
-// connectInitiateError turns initiate's refusals into what a person can act on.
-// A 400 is forwarded as the server worded it — an unknown service lists the
-// valid names, an unofferable --scope the allowed set.
+// connectInitiateError forwards a 400 as the server worded it: it lists the
+// valid service names or the allowed scopes.
 func connectInitiateError(err error) error {
 	if api.StatusOf(err) == http.StatusForbidden && (api.WireCodeOf(err) == api.InsufficientScopeCode || scopeDenied(err)) {
 		return errors.New("this login's token cannot write secrets (needs secrets:write)")
@@ -232,16 +192,9 @@ func connectInitiateError(err error) error {
 	return err
 }
 
-// waitForConnect polls the secret until the consent lands, the link expires,
-// the secret disappears, or the person presses Ctrl-C.
-//
-// Transient failures — a dropped connection, a 429, a 5xx from a pod restarting
-// — are tolerated for the login poll's window (client.MaxPollFailureWindow),
-// measured in elapsed time, and a 429 backs the cadence off; a 404 is terminal,
-// since a deleted secret will never complete.
-//
-// onPage is a wait that started on Ronja's page rather than the provider's:
-// that link never expires, so the wait is longer and the messages say so.
+// waitForConnect tolerates transient failures for client.MaxPollFailureWindow
+// of elapsed time; a 404 is terminal. onPage waits longer, since Ronja's page
+// link never expires.
 func waitForConnect(ctx context.Context, client *api.Client, before *api.SecretStatus, onPage bool) (*api.SecretStatus, error) {
 	limit, cancelled := connectWaitLimit, "cancelled; the sign-in link stays valid until it expires, and completing it still connects the secret"
 	if onPage {
@@ -289,8 +242,7 @@ func waitForConnect(ctx context.Context, client *api.Client, before *api.SecretS
 
 		if time.Now().After(deadline) {
 			// From ready, completion is seen only as a CHANGE in the grant, so a
-			// consent that finished granting nothing new (the person unticked
-			// exactly the new scopes) looks the same as one never finished.
+			// consent that granted nothing new looks the same as one never finished.
 			either := ""
 			if before.Status == "ready" {
 				either = ", or the consent finished without granting anything new: the recorded grant is unchanged"
@@ -305,10 +257,9 @@ func waitForConnect(ctx context.Context, client *api.Client, before *api.SecretS
 	}
 }
 
-// connectCompleted is the completion rule. From pending or reauth_required the
-// status reaching ready is unambiguous. From ready the only server-visible sign
-// of a consent is a CHANGE in grantedScopes — the column only the callback
-// writes. updatedAt is never read: a background token refresh bumps it.
+// connectCompleted: from ready, the only server-visible sign of a consent is a
+// CHANGE in grantedScopes, which only the callback writes. Never updatedAt: a
+// background token refresh bumps it.
 func connectCompleted(before, now *api.SecretStatus) bool {
 	if now.Status != "ready" {
 		return false
@@ -319,10 +270,8 @@ func connectCompleted(before, now *api.SecretStatus) bool {
 	return !sameScopeSet(grantedOf(before), grantedOf(now))
 }
 
-// reportConnected prints the one result line, or --json metadata. already is
-// true when no sign-in was needed. missing is nil when the server could not say
-// what was asked for, so the JSON can tell "nothing missing" ([]) from
-// "unknown" (null).
+// reportConnected takes a nil missing when the server could not say what was
+// asked for, so the JSON tells "nothing missing" ([]) from "unknown" (null).
 func reportConnected(already bool, s *api.SecretStatus, missing []string) error {
 	granted := grantedOf(s)
 	verb := "connected"
@@ -348,7 +297,6 @@ func reportConnected(already bool, s *api.SecretStatus, missing []string) error 
 	return nil
 }
 
-// grantedOf is the recorded grant as a non-nil slice.
 func grantedOf(s *api.SecretStatus) []string {
 	if s == nil || s.GrantedScopes == nil {
 		return []string{}
@@ -366,7 +314,6 @@ func withoutOffline(scopes []string) []string {
 	return out
 }
 
-// sameScopeSet compares two scope lists as sets.
 func sameScopeSet(a, b []string) bool {
 	as, bs := slices.Clone(a), slices.Clone(b)
 	slices.Sort(as)
@@ -374,9 +321,8 @@ func sameScopeSet(a, b []string) bool {
 	return slices.Equal(slices.Compact(as), slices.Compact(bs))
 }
 
-// missingScopes is what the grant lacks of what was asked for, by the server's
-// coverage rule (oauthregistry.ScopesCover): offline_access is never granted
-// back, and a full Google scope covers its ".readonly" variant.
+// missingScopes must agree with the server's oauthregistry.ScopesCover:
+// offline_access is never granted back, and a full scope covers its ".readonly".
 func missingScopes(granted, requested []string) []string {
 	have := make(map[string]bool, len(granted))
 	for _, s := range granted {
@@ -411,7 +357,6 @@ func providerLabel(secretName string) string {
 	return "the provider"
 }
 
-// humanDuration renders the wait limit the way a person says it.
 func humanDuration(d time.Duration) string {
 	if d >= time.Minute && d%time.Minute == 0 {
 		if m := int(d / time.Minute); m != 1 {

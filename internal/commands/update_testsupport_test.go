@@ -20,18 +20,9 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/update"
 )
 
-// The harness the `ronja update` and daily-notice tests share: a fake mirror, a
-// tarball builder, a stand-in for the installed binary, and the two seams that
-// point the command at both. Split out from update_test.go because the tests
-// themselves are the interesting part and were being read past three hundred
-// lines of scaffolding.
-//
-// The tests run the real command against this fake mirror and a real file on
-// disk. Two seams make that possible and nothing else is faked: releaseBaseURL
-// points the release lookup at an httptest server, and currentExecutable points
-// the swap at a temp file standing in for an installed ronja. Everything in
-// between — the checksum, the tar reader, the probe, the rename — is the
-// shipping code path.
+// The harness for the `ronja update` and daily-notice tests. Only two seams are
+// faked, releaseBaseURL and currentExecutable; the checksum, tar reader, probe
+// and rename are the shipping code path.
 
 const (
 	testCurrentVersion = "v0.28.4"
@@ -39,21 +30,12 @@ const (
 	oldBinaryBytes     = "the old ronja binary\n"
 )
 
-// newBinaryBytes is what the archive's `ronja` entry holds: a recognisable
-// marker followed by padding.
-//
-// The padding is not decoration. update.ExtractBinary refuses an entry too
-// small to be a Go binary — a mis-built release that ships an empty one would
-// otherwise be renamed over a working CLI, taking `ronja update` with it — so
-// a two-line stand-in is exactly what the floor is there to reject. Padding it
-// past the floor keeps every test on the shipping path rather than behind a
-// limit lowered for the tests. It costs nothing on the wire: a megabyte of
-// zeroes gzips to about a kilobyte.
+// newBinaryBytes is padded past update.ExtractBinary's minimum-size floor so
+// tests stay on the shipping path; a megabyte of zeroes gzips to a kilobyte.
 var newBinaryBytes = "the new ronja binary\n" + strings.Repeat("\x00", 1<<20)
 
-// assertBinaryReplaced checks the installed binary now holds the archive's
-// entry. A helper rather than an inline comparison because a failing inline %q
-// would print a megabyte of that padding into the test log.
+// assertBinaryReplaced exists so a failing comparison does not print a
+// megabyte of padding into the test log.
 func assertBinaryReplaced(t *testing.T, path string) {
 	t.Helper()
 	if body := readFile(t, path); body != newBinaryBytes {
@@ -68,23 +50,16 @@ func head(s string) string {
 	return fmt.Sprintf("%q", s)
 }
 
-// fakeMirror serves the release JSON, the checksum manifest and the archives.
 type fakeMirror struct {
 	srv    *httptest.Server
 	tag    string
 	assets map[string][]byte
 
-	// failRelease makes the release lookup answer 500, which is what a mirror
-	// that is down looks like from here.
 	failRelease bool
-	// truncate makes an asset request stop after the first half of the body,
-	// which is what a connection dropped mid-download looks like.
-	truncate bool
+	truncate    bool
 
-	// hook, if set, runs on the server's goroutine as each request arrives,
-	// with the requested path. It is how a test reaches the moment BETWEEN two
-	// of the command's steps — what another process would see, and do, while a
-	// download is in flight.
+	// hook runs on the server's goroutine as each request arrives, so a test can
+	// act between two of the command's steps.
 	hook func(path string)
 
 	mu       sync.Mutex
@@ -106,8 +81,7 @@ func newFakeMirror(t *testing.T, tag string, archive []byte) *fakeMirror {
 		hook := m.hook
 		m.mu.Unlock()
 		if hook != nil {
-			// Outside the lock: a hook looks at the filesystem, and one of them
-			// runs the command's own sweep.
+			// Outside the lock: one hook runs the command's own sweep.
 			hook(r.URL.Path)
 		}
 
@@ -125,9 +99,8 @@ func newFakeMirror(t *testing.T, tag string, archive []byte) *fakeMirror {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		// Serving the archive in two halves gives the test a moment in the
-		// middle of the download to look at the binary's directory — the
-		// assertion that unverified bytes never land beside the binary.
+		// Two halves give the test a moment mid-download to check that unverified
+		// bytes never land beside the binary.
 		half := len(body) / 2
 		w.Write(body[:half])
 		if f, ok := w.(http.Flusher); ok {
@@ -174,8 +147,6 @@ func (m *fakeMirror) releaseJSON() []byte {
 	return body
 }
 
-// assetRequests counts everything that is not the release lookup — i.e. the
-// bytes a command promising to change nothing must not have fetched.
 func (m *fakeMirror) assetRequests() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -188,7 +159,6 @@ func (m *fakeMirror) assetRequests() int {
 	return n
 }
 
-// requestCount is every request the mirror saw, of any kind.
 func (m *fakeMirror) requestCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -206,10 +176,8 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// tarball builds a release archive with the same flat layout goreleaser
-// publishes: ronja alongside README.md, LICENSE and NOTICE, no wrapping
-// directory. entries maps name to content; a nil content means a directory
-// entry, which is one of the shapes the extractor must refuse.
+// tarball uses goreleaser's flat layout; a nil content is a directory entry,
+// one of the shapes the extractor must refuse.
 func tarball(t *testing.T, entries map[string][]byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -238,9 +206,8 @@ func tarball(t *testing.T, entries map[string][]byte) []byte {
 	return buf.Bytes()
 }
 
-// tarballOf builds an archive from ordered, typed entries — the shapes the map
-// form above cannot express: a symlink or hard link wearing the binary's name,
-// and two entries claiming it.
+// tarballOf expresses what the map form cannot: links wearing the binary's
+// name, and two entries claiming it.
 type tarEntry struct {
 	name     string
 	body     []byte
@@ -290,8 +257,6 @@ func releaseTarball(t *testing.T) []byte {
 	})
 }
 
-// installedBinary writes a stand-in for the installed ronja and points
-// currentExecutable at it.
 func installedBinary(t *testing.T, dir string) string {
 	t.Helper()
 	path := filepath.Join(dir, "ronja")
@@ -301,9 +266,8 @@ func installedBinary(t *testing.T, dir string) string {
 	previous := currentExecutable
 	currentExecutable = func() (string, error) { return path, nil }
 	t.Cleanup(func() { currentExecutable = previous })
-	// The command resolves symlinks and reports the resolved path, and on
-	// macOS t.TempDir() sits under /var, which is a link to /private/var. So
-	// hand the caller the path the command will name.
+	// The command reports the symlink-resolved path, and macOS's t.TempDir() is
+	// under /var, a link to /private/var.
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		t.Fatalf("resolve stand-in binary: %v", err)
@@ -311,8 +275,6 @@ func installedBinary(t *testing.T, dir string) string {
 	return resolved
 }
 
-// useMirror points the release lookup at the fake and stamps the running
-// version, both restored when the test ends.
 func useMirror(t *testing.T, m *fakeMirror, version string) {
 	t.Helper()
 	previousURL, previousVersion := releaseBaseURL, Version
@@ -321,8 +283,6 @@ func useMirror(t *testing.T, m *fakeMirror, version string) {
 	t.Setenv("RONJA_CONFIG_DIR", t.TempDir())
 }
 
-// runUpdateCmd runs the command tree and returns stdout, stderr and the error,
-// so a test can assert both the report and the stdout-stays-empty rule.
 func runUpdateCmd(t *testing.T, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	workdir := t.TempDir()

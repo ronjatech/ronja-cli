@@ -6,13 +6,11 @@ import (
 	"time"
 )
 
-// The token half of the client is two READS. The CLI never mints a Ronja token:
-// POST /authentication/token is for a person's browser alone (the server
-// refuses every token on it), and nothing here calls it.
+// The CLI never mints a Ronja token: POST /authentication/token is for a
+// person's browser alone (the server refuses every token on it).
 
-// TokenLink is GET /authentication/token-link: the Account page's create-token
-// form, pre-filled and stamped with the organization. It is a link, not a
-// credential — a person opens it and decides.
+// TokenLink is GET /authentication/token-link: the Account page's pre-filled
+// create-token form. It is a link, not a credential — a person opens it and decides.
 type TokenLink struct {
 	URL string `json:"url"`
 }
@@ -33,12 +31,9 @@ func (c *Client) GetTokenLink(ctx context.Context, name string, scopes []string,
 	return &out, nil
 }
 
-// MyToken is one row of GET /authentication/token-mine.
-//
-// Deliberately WITHOUT the row's `token` field. The route blanks it anyway, but
-// a field this struct does not declare is one the decoder drops on the floor,
-// so no future server answer can carry a credential into anything a command
-// prints.
+// MyToken is one row of GET /authentication/token-mine. It deliberately omits
+// the row's `token` field, so no server answer can carry a credential into
+// anything a command prints.
 type MyToken struct {
 	ID          string            `json:"id"`
 	Name        string            `json:"name"`

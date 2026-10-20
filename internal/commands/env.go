@@ -10,26 +10,8 @@ import (
 	"golang.org/x/term"
 )
 
-// `ronja env` emits shell assignments for RONJA_URL and RONJA_TOKEN.
-//
-// Why this exists alongside the credential FILE:
-//
-//   - `eval "$(ronja env)"` sets the variables without the token ever being
-//     displayed — eval consumes the command's stdout, so the value moves from
-//     the credential file into the environment and nothing prints it. Reading
-//     a credential and echoing it are different things; this is the reading
-//     kind.
-//   - It needs no `jq`. The documented file-substitution form
-//     (`$(jq -r '.profiles[…].token' …)`) is fine but silently unavailable on a
-//     machine without jq, which is common enough to matter.
-//   - It carries the base URL too, so a caller stops hardcoding the instance.
-//
-// IMPORTANT for agents: shell state does not survive between tool invocations —
-// each call is typically a fresh shell. `eval "$(ronja env)"` in one call and
-// `$RONJA_TOKEN` in the next will find an empty variable. Combine them in a
-// single command:
-//
-//	eval "$(ronja env)" && curl -H "Authorization: Bearer $RONJA_TOKEN" "$RONJA_URL/api/v2/..."
+// Its output is for `eval`, which consumes stdout, so the token moves into the
+// environment without being displayed; it must never become a printing command.
 func newEnvCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "env",
@@ -63,10 +45,8 @@ not a POSIX shell.`,
 					resolved.URL, resolved.URL)
 			}
 
-			// A terminal on stdout means nothing is capturing this, so the
-			// credential is about to be displayed. Warn on stderr (which eval
-			// does not consume) rather than refusing — a human inspecting the
-			// output is a legitimate, if unwise, thing to do.
+			// A terminal on stdout means the credential is about to be
+			// displayed: warn on stderr rather than refuse.
 			if term.IsTerminal(int(os.Stdout.Fd())) {
 				fmt.Fprintln(os.Stderr,
 					"warning: this prints a live credential. Use: eval \"$(ronja env)\"")
@@ -85,11 +65,9 @@ not a POSIX shell.`,
 	}
 }
 
-// shellQuote wraps a value in single quotes so the shell takes it literally.
-//
-// Neither a base64url token nor an http(s) URL contains a quote today, but a
-// credential is exactly the wrong thing to leave one shell-metacharacter away
-// from being mis-parsed — or from injecting into the eval that consumes this.
+// shellQuote single-quotes a value for the eval that consumes it; no token or
+// URL contains a quote today, but a credential must not be one metacharacter
+// from injection.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

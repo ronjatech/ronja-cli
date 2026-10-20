@@ -15,10 +15,8 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// The `ronja secret connect` tests. The fake answers initiate once, then serves
-// a SCRIPT of GET /secret/:id answers — the first is the snapshot, each later one
-// a poll — so a test states exactly what the server says, in order, and the
-// assertion is when the command stops listening.
+// The connect fake answers initiate once, then a script of GET /secret/:id
+// answers: the first is the snapshot, each later one a poll.
 
 const (
 	connectSecretID = "secret-google-1"
@@ -43,22 +41,20 @@ type connectFake struct {
 	requests   []string
 	initBodies []map[string]any
 
-	// initiate is the initiate answer: a body, or initStatus+initBody for a
-	// refusal. requested nil omits requestedScopes, as an older server does.
+	// initStatus+initBody make initiate a refusal. requested nil omits
+	// requestedScopes, as an older server does.
 	initStatus int
 	initBody   string
 	requested  []string
-	// pageURL, when set, is initiate's `url` — the secret's page in Ronja, as
-	// a current server answers. Empty omits it, as an older server does.
+	// pageURL is initiate's `url`, the secret's page in Ronja; empty omits it,
+	// as an older server does.
 	pageURL string
 
-	answers []secretAnswer
-	gets    int
-	// getTimes is when each GET /secret/:id arrived, for the cadence tests.
+	answers  []secretAnswer
+	gets     int
 	getTimes []time.Time
-	// onGet, when set, runs after the n-th GET /secret/:id (1-based) has been
-	// answered — outside the lock. It exists for the Ctrl-C test, which must
-	// not raise SIGINT until the command is in its wait loop.
+	// onGet runs after the n-th GET /secret/:id (1-based) is answered, outside
+	// the lock, so a test can act once the command is in its wait loop.
 	onGet func(n int)
 }
 
@@ -105,8 +101,7 @@ func (f *connectFake) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		f.getTimes = append(f.getTimes, time.Now())
 		a := f.answers[0]
-		// The last answer repeats, so a wait that never completes keeps
-		// getting the same one until its limit.
+		// The last answer repeats until the wait's limit.
 		if len(f.answers) > 1 {
 			f.answers = f.answers[1:]
 		}
@@ -149,7 +144,6 @@ func (f *connectFake) getCount() int {
 	return f.gets
 }
 
-// fastConnect collapses the poll cadence and sets the wait limit.
 func fastConnect(t *testing.T, limit time.Duration) {
 	t.Helper()
 	savedInterval, savedLimit := connectPollInterval, connectWaitLimit
@@ -158,8 +152,8 @@ func fastConnect(t *testing.T, limit time.Duration) {
 	t.Cleanup(func() { connectPollInterval, connectWaitLimit = savedInterval, savedLimit })
 }
 
-// withPollKnobs sets the client's transient-failure window and 429 backoff,
-// which the wait reads from the client rather than from package vars.
+// withPollKnobs sets the knobs on the client because the wait reads them from
+// there, not from package vars.
 func withPollKnobs(t *testing.T, window, backoff time.Duration) {
 	t.Helper()
 	previous := newClient
@@ -178,7 +172,6 @@ func (f *connectFake) getTimesCopy() []time.Time {
 	return append([]time.Time(nil), f.getTimes...)
 }
 
-// fakeBrowser records every URL a browser would have been handed.
 func fakeBrowser(t *testing.T) *[]string {
 	t.Helper()
 	var opened []string
@@ -242,8 +235,7 @@ func TestSecretConnectPendingToReady(t *testing.T) {
 func TestSecretConnectReauthToReady(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	fakeBrowser(t)
-	// The grant does not change — only the status does, which is the whole
-	// signal from reauth_required.
+	// From reauth_required only the status changes, never the grant.
 	newConnectFake(t, []string{gMail},
 		secretAnswer{status: "reauth_required", granted: []string{gMail}},
 		secretAnswer{status: "reauth_required", granted: []string{gMail}},
@@ -284,10 +276,9 @@ func TestSecretConnectAlreadyConnectedOpensNothing(t *testing.T) {
 	}
 }
 
-// TestSecretConnectAccumulateWaitsForTheGrantToChange: a ready Google secret
-// asked for one more service. Only a CHANGE in grantedScopes is a consent; the
-// fake bumps updatedAt mid-wait, which a background refresh does, and the
-// command must keep waiting through it.
+// TestSecretConnectAccumulateWaitsForTheGrantToChange: only a change in
+// grantedScopes is a consent; an updatedAt bump (a background refresh) must not
+// end the wait.
 func TestSecretConnectAccumulateWaitsForTheGrantToChange(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	opened := fakeBrowser(t)
@@ -313,9 +304,9 @@ func TestSecretConnectAccumulateWaitsForTheGrantToChange(t *testing.T) {
 	}
 }
 
-// TestSecretConnectNarrowingScopeIsNotPrematureSuccess: --scope replaces a
-// broad grant with a narrow one. The broad grant already COVERS the narrow ask,
-// which is exactly what must not read as done.
+// TestSecretConnectNarrowingScopeIsNotPrematureSuccess: --scope replaces the
+// grant, so a broad grant that already covers the narrow ask must not read as
+// done.
 func TestSecretConnectNarrowingScopeIsNotPrematureSuccess(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	opened := fakeBrowser(t)
@@ -363,9 +354,9 @@ func TestSecretConnectPartialGrantExitsOneNamingTheMissing(t *testing.T) {
 	}
 }
 
-// TestSecretConnectOfflineAccessIsNeverMissing: offline_access asks for a
-// refresh token and is never granted back. It must neither block "already
-// connected" nor be reported as unticked — the server's ScopesCover rule.
+// TestSecretConnectOfflineAccessIsNeverMissing: offline_access is never granted
+// back, so it must neither block "already connected" nor be reported unticked,
+// matching the server's oauthregistry.ScopesCover.
 func TestSecretConnectOfflineAccessIsNeverMissing(t *testing.T) {
 	t.Run("already connected", func(t *testing.T) {
 		fastConnect(t, 5*time.Second)
@@ -431,9 +422,8 @@ func TestSecretConnectTimeoutPrintsTheRecordedGrant(t *testing.T) {
 	}
 }
 
-// From pending, completion is the status reaching ready, so a timeout there
-// can only be an unfinished sign-in: the "granted nothing new" reading — which
-// exists only for a connect that started from ready — is not offered.
+// From pending a timeout can only be an unfinished sign-in; the "granted
+// nothing new" reading applies only to a connect that started from ready.
 func TestSecretConnectTimeoutFromPendingSaysOnlyExpired(t *testing.T) {
 	fastConnect(t, 30*time.Millisecond)
 	fakeBrowser(t)
@@ -524,8 +514,6 @@ func TestSecretConnectUnknownServiceForwardsTheBody(t *testing.T) {
 	}
 }
 
-// TestSecretConnectFeatureMismatchIsSaid: --feature is ignored for a connection
-// that already exists, and the person is told where it really lives.
 func TestSecretConnectFeatureMismatchIsSaid(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	fakeBrowser(t)
@@ -548,8 +536,6 @@ func TestSecretConnectFeatureMismatchIsSaid(t *testing.T) {
 	}
 }
 
-// TestSecretConnectJSONIsMetadataOnly: --json stdout decodes, carries the
-// metadata, and never the sign-in link or anything named like a credential.
 func TestSecretConnectJSONIsMetadataOnly(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	fakeBrowser(t)
@@ -582,10 +568,9 @@ func TestSecretConnectJSONIsMetadataOnly(t *testing.T) {
 }
 
 // TestSecretConnectCoveringGrantOpensNothing: without --scope the grant
-// accumulates, so a ready grant that COVERS the request is already connected —
-// here a held full Drive scope covers the ".readonly" variant the service also
-// asks for. Under set equality this opened the browser, and a consent that
-// changes nothing would then wait out the whole link lifetime.
+// accumulates, so a ready grant that covers the request (full Drive covers
+// ".readonly") is already connected; a consent changing nothing would wait out
+// the whole link lifetime.
 func TestSecretConnectCoveringGrantOpensNothing(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	opened := fakeBrowser(t)
@@ -608,10 +593,9 @@ func TestSecretConnectCoveringGrantOpensNothing(t *testing.T) {
 	}
 }
 
-// TestSecretConnectStaleStoredScopeOpensNothing: for a selectable service the
-// request is the required set plus the stored scopes still in its catalog, so a
-// stored scope the catalog dropped is NOT in it. The grant still covers the
-// request, and a consent could only remove the stale scope — no browser.
+// TestSecretConnectStaleStoredScopeOpensNothing: a selectable service's request
+// is the required set plus the stored scopes still in its catalog, so a scope
+// the catalog dropped is not asked for and the grant still covers the request.
 func TestSecretConnectStaleStoredScopeOpensNothing(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	opened := fakeBrowser(t)
@@ -642,8 +626,6 @@ func TestSecretConnectWithScopeKeepsEquality(t *testing.T) {
 	}
 }
 
-// TestSecretConnectJSONSaysAlreadyConnected: --json tells already-connected
-// from a fresh connect.
 func TestSecretConnectJSONSaysAlreadyConnected(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -672,8 +654,6 @@ func TestSecretConnectJSONSaysAlreadyConnected(t *testing.T) {
 	}
 }
 
-// TestSecretConnectCtrlCMidWaitStops: Ctrl-C in the wait loop stops at once and
-// says the link stays live.
 func TestSecretConnectCtrlCMidWaitStops(t *testing.T) {
 	fastConnect(t, 10*time.Second)
 	fakeBrowser(t)
@@ -703,8 +683,6 @@ func TestSecretConnectCtrlCMidWaitStops(t *testing.T) {
 	}
 }
 
-// TestSecretConnectSnapshotNotFound: the secret initiate named is gone before
-// the first read — nothing opens and the person is told so.
 func TestSecretConnectSnapshotNotFound(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	opened := fakeBrowser(t)
@@ -722,9 +700,9 @@ func TestSecretConnectSnapshotNotFound(t *testing.T) {
 	}
 }
 
-// TestSecretConnectPrintsTheLinkWhenNoBrowser: --no-browser never calls the
-// browser, and a browser that fails to start falls back to the same wording.
-// Either way the link is on stderr only (runConnect checks stdout).
+// TestSecretConnectPrintsTheLinkWhenNoBrowser: --no-browser and a browser that
+// fails to start print the same wording, on stderr only (runConnect checks
+// stdout).
 func TestSecretConnectPrintsTheLinkWhenNoBrowser(t *testing.T) {
 	const wantLink = "Open this URL to sign in to Google:\n  " + connectAuthURL + "\n"
 	t.Run("--no-browser", func(t *testing.T) {
@@ -763,8 +741,7 @@ func TestSecretConnectPrintsTheLinkWhenNoBrowser(t *testing.T) {
 }
 
 // TestSecretConnectRateLimitBackoffResets: a 429 adds the backoff to the next
-// wait, and the first success puts the cadence back. Without the reset every
-// later poll would wait the backoff too.
+// wait, and the first success resets the cadence.
 func TestSecretConnectRateLimitBackoffResets(t *testing.T) {
 	fastConnect(t, 10*time.Second)
 	fakeBrowser(t)
@@ -796,9 +773,9 @@ func TestSecretConnectRateLimitBackoffResets(t *testing.T) {
 	}
 }
 
-// TestSecretConnectFailureWindowResetsOnSuccess: the transient window bounds an
-// UNBROKEN run of failures. Two blips separated by a success, further apart than
-// the window, must not add up to a give-up.
+// TestSecretConnectFailureWindowResetsOnSuccess: the window bounds an unbroken
+// run of failures, so two blips separated by a success must not add up to a
+// give-up.
 func TestSecretConnectFailureWindowResetsOnSuccess(t *testing.T) {
 	fastConnect(t, 10*time.Second)
 	fakeBrowser(t)
@@ -822,8 +799,6 @@ func TestSecretConnectFailureWindowResetsOnSuccess(t *testing.T) {
 	}
 }
 
-// TestSecretConnectGivesUpAfterTheFailureWindow: an unbroken run of transient
-// failures longer than the window ends the wait, naming it.
 func TestSecretConnectGivesUpAfterTheFailureWindow(t *testing.T) {
 	fastConnect(t, 10*time.Second)
 	fakeBrowser(t)
@@ -843,9 +818,8 @@ func TestSecretConnectGivesUpAfterTheFailureWindow(t *testing.T) {
 	}
 }
 
-// A current server answers initiate with the secret's page in Ronja. That page
-// is what opens — never the provider's sign-in, which only starts when the
-// person presses Continue on it.
+// When initiate returns the secret's page in Ronja, that page opens, never the
+// provider's sign-in (which starts when the person presses Continue there).
 func TestSecretConnectOpensRonjasPage(t *testing.T) {
 	fastConnect(t, 5*time.Second)
 	opened := fakeBrowser(t)

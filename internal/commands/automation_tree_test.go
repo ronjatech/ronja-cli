@@ -10,16 +10,10 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The automation folder as the TREE commands see it.
-//
-// `sync status` and `sync check` walk every kind, and a kind they do not handle
-// does not fail loudly: it falls through to another kind's computation and
-// answers confidently about the wrong thing. Phase A already fixed folderKindAt
-// — an automation folder used to come back `known=false` and score the whole
-// tree exit 2 — and these are the two legs above it.
+// The automation folder as the tree commands see it. A kind `sync status` and
+// `sync check` do not handle falls through to another kind's computation and
+// answers confidently about the wrong thing, rather than failing.
 
-// automationTree lays out one automation folder inside a directory a tree
-// command can be pointed at, and returns both paths.
 func automationTree(t *testing.T, f *fakeAutomationInstance, files map[string]string,
 	bound, seen map[string]string, deps map[string]wfdir.Dependency, bind map[string]string) (tree, root string) {
 	t.Helper()
@@ -36,9 +30,8 @@ func automationTree(t *testing.T, f *fakeAutomationInstance, files map[string]st
 	return tree, root
 }
 
-// TestSyncStatusSeesAnAutomationFolder: the tree verdict for this kind is
-// computed by the folder's OWN status function, not by a fall-through to the
-// workflow one — which is what `default:` would have given it.
+// The verdict must come from the automation status function, not a `default:`
+// fall-through to the workflow one.
 func TestSyncStatusSeesAnAutomationFolder(t *testing.T) {
 	f := newFakeAutomationInstance(t)
 	signInAutomation(t, f)
@@ -66,10 +59,7 @@ func TestSyncStatusSeesAnAutomationFolder(t *testing.T) {
 	}
 }
 
-// TestSyncStatusNeverDeployedAutomationFolderIsDrifted is the false green this
-// rule exists for: a repository holding an automation nobody has ever pushed is
-// not a healthy repository, and a gate that passed it would pass the one run
-// that matters most.
+// An automation nobody has pushed must not pass a gate as clean.
 func TestSyncStatusNeverDeployedAutomationFolderIsDrifted(t *testing.T) {
 	f := newFakeAutomationInstance(t)
 	signInAutomation(t, f)
@@ -86,10 +76,8 @@ func TestSyncStatusNeverDeployedAutomationFolderIsDrifted(t *testing.T) {
 	}
 }
 
-// TestSyncCheckResolvesAutomationFieldReferences: an automation's references are
-// a structured FIELD, so markers.Scan finds nothing in one — which means the
-// pipeline fall-through reported every automation folder as making no references
-// at all, `clean`, with a dangling note reference sitting in it.
+// An automation's references are a structured field markers.Scan cannot see, so
+// a fall-through would report a dangling reference as clean.
 func TestSyncCheckResolvesAutomationFieldReferences(t *testing.T) {
 	f := newFakeAutomationInstance(t)
 	signInAutomation(t, f)
@@ -100,7 +88,7 @@ func TestSyncCheckResolvesAutomationFieldReferences(t *testing.T) {
 }`}, nil, nil,
 		map[string]wfdir.Dependency{"policy": {Kind: "note"}}, nil)
 
-	// Declared and unbound: `unresolved`, decided with no server at all.
+	// Declared and unbound: `unresolved`, decided with no server.
 	out, err := runCLI(t, tree, "sync", "check", "--json")
 	if code := exitCodeOf(err); code != syncExitDrifted {
 		t.Fatalf("exit = %d (%v), want broken\n%s", code, err, out)
@@ -109,10 +97,8 @@ func TestSyncCheckResolvesAutomationFieldReferences(t *testing.T) {
 	folders := report["folders"].([]any)
 	folder := folders[0].(map[string]any)
 	edges, _ := folder["edges"].([]any)
-	// The FIELD edge, not the manifest-level declaration one: both are emitted
-	// (an unbound alias is a fact about the manifest AND about every field that
-	// writes it), and only the field edge proves this kind's references were read
-	// at all.
+	// The field edge, not the manifest-level one that is also emitted: only it
+	// proves the file's references were read.
 	found := false
 	for _, raw := range edges {
 		edge := raw.(map[string]any)
@@ -132,10 +118,8 @@ func TestSyncCheckResolvesAutomationFieldReferences(t *testing.T) {
 	}
 }
 
-// TestFolderStemsClaimsAutomationNames: an automation's name is its filename, so
-// a dependency declared under the same word is dead text that reads as if it
-// were in force — the collision `folderStems` exists to warn about, and which
-// this kind returned nothing for until the push existed.
+// An automation's name is its filename, so a dependency declared under the same
+// word is the collision folderStems warns about.
 func TestFolderStemsClaimsAutomationNames(t *testing.T) {
 	stems := folderStems(wfdir.AutomationKind, map[string]string{"nightly.json": "{}", "a/b.json": "{}"})
 	if len(stems) != 2 {
@@ -145,17 +129,13 @@ func TestFolderStemsClaimsAutomationNames(t *testing.T) {
 	if !strings.Contains(joined, "nightly") || !strings.Contains(joined, "b") {
 		t.Errorf("stems = %v", stems)
 	}
-	// Every other kind still claims nothing, which is what keeps this inert for
-	// the folders that existed before it.
 	if s := folderStems(wfdir.WorkflowKind, map[string]string{"main.py": ""}); s != nil {
 		t.Errorf("a workflow folder claimed stems: %v", s)
 	}
 }
 
-// TestAutomationFieldRefsCountAsAUse: markers.Scan reads a .json file and finds
-// nothing, so without the field leg every dependency an automation folder
-// declares would be reported as dead config on every push and status — the
-// warning crying wolf at the one kind with no other way to say what it uses.
+// markers.Scan finds nothing in a .json file, so without the field leg every
+// declared dependency would be reported as dead config.
 func TestAutomationFieldRefsCountAsAUse(t *testing.T) {
 	files := map[string]string{"nightly.json": `{
   "cronExpr": "0 2 * * *",
@@ -175,18 +155,15 @@ func TestAutomationFieldRefsCountAsAUse(t *testing.T) {
 			t.Errorf("a used dependency was reported as dead config: %q", warning)
 		}
 	}
-	// Without the field leg it IS reported — which is what the leg fixes, and
-	// pinning it here is what stops somebody dropping the argument as unused.
+	// Negative control: without the field leg it is reported.
 	withoutFields := checkAliases(manifest, sel, codec, files, nil, nil)
 	if len(withoutFields.Warnings) == 0 {
 		t.Errorf("the source-only pre-flight found the use after all; this test no longer proves anything")
 	}
 }
 
-// TestLiteralBindTargetInAnAutomationField: an id a bind already points at,
-// written literally in a field, is silently NON-PORTABLE — nothing drifts,
-// because an id compares equal to itself, and there is no symptom at all until
-// the folder is pushed to the second stack.
+// A bind target's id written literally is silently non-portable: nothing
+// drifts until the folder is pushed to a second stack.
 func TestLiteralBindTargetInAnAutomationField(t *testing.T) {
 	files := map[string]string{"nightly.json": `{
   "action": {"kind": "workflow", "config": {"workflowID": "workflow-1"}}
@@ -208,11 +185,6 @@ func TestLiteralBindTargetInAnAutomationField(t *testing.T) {
 	}
 }
 
-// TestPrintLocalWorkOffersTheAutomationVerbs: `ronja context` is the handoff
-// command, so it is where a lost reader decides what to do next. Before this
-// kind had a verb list it fell through to the "a kind with no verbs yet" branch
-// and said nothing at all — better than offering `ronja wf`, and still a
-// capability nobody could find.
 func TestPrintLocalWorkOffersTheAutomationVerbs(t *testing.T) {
 	stdout, restore := captureStdout(t)
 	printLocalWork(&localWorkflow{Root: "/tmp/x", Title: "Orders", Kind: wfdir.KindAutomation})
@@ -226,9 +198,6 @@ func TestPrintLocalWorkOffersTheAutomationVerbs(t *testing.T) {
 	if strings.Contains(printed, "ronja wf ") || strings.Contains(printed, "ronja pipeline ") {
 		t.Errorf("the note offers another loop's verbs:\n%s", printed)
 	}
-	// The two things worth knowing before the first edit, and the reason a verb
-	// list alone is not enough: there is nothing to publish, and an omitted field
-	// is an unmanaged one.
 	if !strings.Contains(printed, "no publish") {
 		t.Errorf("the note does not say there is no publish step:\n%s", printed)
 	}

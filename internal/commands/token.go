@@ -18,33 +18,20 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja token create` is the third credential handshake, and the one that never
-// touches the credential at all.
-//
-// A Ronja token is minted only by a person's browser session: POST
-// /authentication/token refuses every machine credential, the CLI's own login
-// included, because a login token is full access and "no wider than itself"
-// would bound nothing. So this command does not mint. It asks the server for
-// the Account page's create-token form, pre-filled and stamped with the
-// organization (GET /authentication/token-link, which validates the scopes
-// first), opens it, and waits for a token it did not see before, and that
-// matches the request, to appear in the caller's own token list. The person reviews the form, clicks Create and
-// copies the token from the page; it is never sent to this terminal, and the
-// list this command reads never carries it (api.MyToken has no field for it).
+// `ronja token create` never touches the credential: POST /authentication/token
+// refuses every machine credential (a login token is full access, so "no wider
+// than itself" would bound nothing). It opens the pre-filled form from GET
+// /authentication/token-link and waits for a matching new token in the caller's
+// list, which never carries the secret (api.MyToken has no field for it).
 
-// tokenPollInterval and tokenWaitLimit are package vars so the tests can
-// collapse them, as the connect tests do.
+// Package vars so tests can collapse them.
 var (
 	tokenPollInterval = 3 * time.Second
 	tokenWaitLimit    = 10 * time.Minute
 )
 
-// tokenScopeOrder is the order scopes are printed in — the Account page's.
-// The scope vocabulary itself is the server's (gt.AllScopes in the backend,
-// which GET /authentication/token-link validates against). This copy orders
-// the output and names the scopes in the --scope hint; a scope missing here
-// still prints, after these, and is still accepted — keep it in step with
-// gt.AllScopes all the same.
+// tokenScopeOrder is the Account page's print order; keep it in step with the
+// backend's gt.AllScopes, though a scope missing here still prints and is accepted.
 var tokenScopeOrder = []string{"data", "structure", "analytics", "automation", "agents", "secrets", "admin"}
 
 var (
@@ -152,10 +139,9 @@ Only an Admin can create a token.`,
 	return cmd
 }
 
-// parseTokenExpires checks the --expires SHAPE and returns what the link is
-// asked for: "" for never. The range and whether a date is in the past are the
-// server's call, and whether a date is in the FUTURE is the form's, against
-// the browser's own today — the terminal's clock and timezone decide nothing.
+// parseTokenExpires checks only the shape: range and past dates are the
+// server's call, future dates the form's against the browser's today, so the
+// terminal's clock decides nothing.
 func parseTokenExpires(raw string) (string, error) {
 	v := strings.TrimSpace(raw)
 	switch {
@@ -174,17 +160,14 @@ func runTokenCreate(ctx context.Context, client *api.Client, resolved *config.Re
 	if err != nil {
 		return tokenLinkError(err)
 	}
-	// Named up front because the form creates the token in whichever
-	// organization the browser ends up in: a person who dismisses the page's
-	// offer to switch creates it in their current one, and the banner there
-	// names it too, so the two can be compared.
+	// The form creates the token in whichever organization the browser ends up
+	// in, so name it here for comparison with the page's banner.
 	if org := tokenOrgLabel(resolved, link.URL); org != "" {
 		fmt.Fprintf(out, "Creating a token for organization %s.\n", org)
 	}
 
-	// The snapshot is taken BEFORE the link opens, so whatever appears after it
-	// is new — by id, which needs no agreement between two clocks. --no-wait
-	// never looks for the token, so it takes none.
+	// Snapshot before the link opens: new is decided by id, so no two clocks
+	// need agree.
 	var seen map[string]bool
 	if !noWait {
 		before, err := client.ListMyTokens(ctx)
@@ -235,11 +218,8 @@ type tokenCreateResult struct {
 	Tokens []api.MyToken `json:"tokens"`
 }
 
-// tokenOrgLabel names the organization the link was stamped with: the stored
-// profile's name for it when the credential came from that profile and the
-// profile is of the same organization, otherwise the id the server put in the
-// link's ?org=, which is the organization that answered — the one source that
-// is right under an environment token too.
+// tokenOrgLabel falls back to the link's ?org= id, the organization that
+// answered: the one source that is right under an environment token too.
 func tokenOrgLabel(resolved *config.Resolved, link string) string {
 	orgID := ""
 	if u, err := url.Parse(link); err == nil {
@@ -252,16 +232,13 @@ func tokenOrgLabel(resolved *config.Resolved, link string) string {
 	return orgID
 }
 
-// tokenRequest is what a new token must match to be the one this command
-// asked for.
 type tokenRequest struct {
 	name   string
 	grants map[string]string
 }
 
-// tokenRequestedGrants folds the --scope values into the grant the form
-// pre-fills. The server has already refused anything malformed or
-// contradictory, so this only has to read what it accepted.
+// tokenRequestedGrants trusts its input: the server already refused anything
+// malformed or contradictory.
 func tokenRequestedGrants(scopes []string) map[string]string {
 	grants := make(map[string]string, len(scopes))
 	for _, s := range scopes {
@@ -272,18 +249,13 @@ func tokenRequestedGrants(scopes []string) map[string]string {
 	return grants
 }
 
-// matches is the rule that ends the wait: the name asked for, or EXACTLY the
-// scopes asked for. Either alone, so a person may rename the token on the form
-// (its scopes still match) or change its scopes (its name still matches) — but
-// not both, since then nothing ties it to this request. A sign-in token, which
-// is what most often appears unbidden (`ronja login` or an MCP client signing
-// in elsewhere), is full access: no grant at all, so it never matches a
-// request, which always names at least one scope.
+// matches takes the name OR exactly the scopes, so the form may change one but
+// not both. A sign-in token, the usual unbidden arrival, has no grant at all and
+// never matches a request, which always names a scope.
 func (r tokenRequest) matches(t api.MyToken) bool {
 	return t.Name == r.name || maps.Equal(t.ScopeGrants, r.grants)
 }
 
-// tokenLinkError turns token-link's refusals into what a person can act on.
 func tokenLinkError(err error) error {
 	switch status := api.StatusOf(err); {
 	case status == http.StatusNotFound || status == http.StatusMethodNotAllowed:
@@ -291,8 +263,7 @@ func tokenLinkError(err error) error {
 	case status == http.StatusForbidden && (api.WireCodeOf(err) == api.InsufficientScopeCode || scopeDenied(err)):
 		return errors.New(tokenScopedLogin)
 	case status == http.StatusForbidden:
-		// A role short of Admin: the server's own sentence, the one the
-		// Account page shows.
+		// A role short of Admin: the server's own sentence.
 		if msg := api.CodeOf(err); msg != "" {
 			return errors.New(msg)
 		}
@@ -301,8 +272,8 @@ func tokenLinkError(err error) error {
 	return err
 }
 
-// tokenListError is a token-mine failure. A 403 there is only ever the login's
-// scope — the route is open to every member.
+// A 403 from token-mine is only ever the login's scope: the route is open to
+// every member.
 func tokenListError(err error) error {
 	switch api.StatusOf(err) {
 	case http.StatusForbidden:
@@ -313,18 +284,8 @@ func tokenListError(err error) error {
 	return fmt.Errorf("read your tokens: %w", err)
 }
 
-// waitForNewToken polls the caller's token list until a token not in seen that
-// matches req appears, the wait runs out, or the person presses Ctrl-C.
-// Transient failures get the login poll's window, as every handshake's wait
-// does.
-//
-// A new token that does NOT match is named on stderr once, when it appears,
-// and does not end the wait: it was created during the wait by something else
-// (another terminal's `ronja login`, an MCP client signing in), and reporting it
-// as this one would hand the caller the wrong token's id. There is no filter
-// for tokens a Ronja API credential manages: token-mine lists only personal
-// access tokens, and those credentials mint API tokens, so it would filter
-// nothing.
+// waitForNewToken names a non-matching new token on stderr and keeps waiting:
+// something else created it, and reporting it would hand over the wrong id.
 func waitForNewToken(ctx context.Context, client *api.Client, seen map[string]bool, req tokenRequest) ([]api.MyToken, error) {
 	const cancelled = "stopped waiting. The form stays open in your browser; a token created there is listed under Account → Access tokens"
 	deadline := time.Now().Add(tokenWaitLimit)
@@ -360,7 +321,6 @@ func waitForNewToken(ctx context.Context, client *api.Client, seen map[string]bo
 					fmt.Fprintf(os.Stderr, "A new token appeared that does not match: %s  %s (not reported as this one)\n", t.ID, t.Name)
 				}
 			}
-			// The name match first: it is the token as the form pre-filled it.
 			if created := append(byName, byScopes...); len(created) > 0 {
 				return created, nil
 			}
@@ -397,8 +357,7 @@ func waitForNewToken(ctx context.Context, client *api.Client, seen map[string]bo
 	}
 }
 
-// tokenScopeList renders a grant in the Account page's order, "full access"
-// for a token with none (a NULL grant is unrestricted).
+// A NULL grant is unrestricted, hence "full access".
 func tokenScopeList(grants map[string]string) string {
 	if len(grants) == 0 {
 		return "full access"
@@ -419,11 +378,9 @@ func tokenScopeList(grants map[string]string) string {
 	return strings.Join(append(parts, rest...), ", ")
 }
 
-// tokenExpiry is the expiry as an RFC 3339 instant with its offset, in this
-// machine's zone. Not a bare date: the form sends midnight in the BROWSER's
-// zone, and read in a different one (a UTC container, a browser in Stockholm)
-// that instant falls on the day before. The instant with its offset is right
-// whatever the two zones are.
+// tokenExpiry prints an instant with its offset, not a bare date: the form
+// sends midnight in the browser's zone, which falls on the day before in
+// another zone.
 func tokenExpiry(at *time.Time) string {
 	if at == nil || at.IsZero() {
 		return "never"

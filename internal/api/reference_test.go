@@ -6,17 +6,9 @@ import (
 	"testing"
 )
 
-// GetNote is the arm `ronja sync check` was missing.
-//
-// `note` is a MARKER-LESS dependency kind — nothing in a folder's source names
-// one — so its edges come from a declared reference set rather than from a
-// scanned marker. Without a read for it every note-declaring folder scored
-// `not_checked`, which is `unknown` for the folder and exit 2 for the tree: a
-// verdict nothing the reader does can clear.
 func TestGetNoteReadsEitherPrefix(t *testing.T) {
-	// A note rides `note-` and the legacy `skill-`, so the id is passed through
-	// as written rather than normalised — the server's own
-	// ValidateReferenceKind accepts both.
+	// The id is passed through as written: the server accepts both `note-` and
+	// the legacy `skill-` prefix.
 	for _, id := range []string{"note-policy", "skill-policy"} {
 		var gotPath string
 		client := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -36,9 +28,8 @@ func TestGetNoteReadsEitherPrefix(t *testing.T) {
 	}
 }
 
-// A 404 and a 400 both mean "not available to you" on this surface, and the
-// STATUS has to survive the error so the edge verifier can collapse them itself
-// rather than guess from the message.
+// A 404 and a 400 both mean "not available to you" here; the status must
+// survive so the edge verifier can collapse them without reading the message.
 func TestGetNoteSurfacesTheStatus(t *testing.T) {
 	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
 		client := serve(t, func(w http.ResponseWriter, r *http.Request) {

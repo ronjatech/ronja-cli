@@ -45,7 +45,7 @@ func newDataAppCmd() *cobra.Command {
 		Short:   "Develop a Ronja data app from a local folder",
 		Long: `Develop a Ronja data app from a local folder.
 
-A data-app folder holds your React/TSX source plus a small manifest
+A data-app folder holds your React (JSX) source plus a small manifest
 (ronja.json) recording the app's title, its entrypoint, which tables, secrets,
 agents and workflows the app is allowed to reach, and which app it maps to on
 each instance. The sync baseline lives in .ronja/, which is local-only and

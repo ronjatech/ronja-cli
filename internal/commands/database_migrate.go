@@ -16,19 +16,9 @@ import (
 )
 
 // `ronja db migrate` keeps a folder of .sql files in step with a managed
-// database's own migration ledger.
-//
-// The design decision worth knowing is what this does NOT do: it keeps no local
-// baseline and computes no hashes. The database's ledger already records exactly
-// what was applied and a digest of the bytes it applied, and the server's
-// migration endpoint is name-idempotent — it skips what matches, applies what is
-// new, and refuses the whole set when something has been edited after the fact.
-//
-// So `status` is a dry run of `push`, not a local comparison. That is not just
-// less code: a client computing its own hashes would have to agree with the
-// server about whitespace forever, and the first time it did not, every applied
-// migration would report as drifted. Drift is the one signal that must never cry
-// wolf, so the only thing entitled to raise it is the thing that stored the hash.
+// database's own migration ledger. It deliberately keeps no local baseline and
+// computes no hashes: `status` is a dry run of `push`, so only the server that
+// stored the hash can report drift (cli/README.md).
 func newDatabaseMigrateCmd() *cobra.Command {
 	migrate := &cobra.Command{
 		Use:   "migrate",
@@ -94,6 +84,12 @@ like.
 Exits non-zero when anything has drifted — that is a broken state, not a
 status worth reporting quietly.
 
+When more than 40 migrations are not yet applied (and none has drifted), it
+also prints a note that push would refuse the set and names where to split it.
+That note does not change the exit code: it is a warning about the next push,
+not a broken state, so a passing status does not mean the next push will
+succeed.
+
 --env dev asks the same question of the database's dev copy, which keeps its
 own ledger and therefore has its own answer.`,
 		Args: cobra.NoArgs,
@@ -119,13 +115,19 @@ func newDatabaseMigratePushCmd() *cobra.Command {
 		Short: "Apply every migration not yet in the database's ledger",
 		Long: `Apply every migration not yet in the database's ledger.
 
-The whole folder is sent and applied in ONE transaction: if the last migration
-fails, none of them applied. Migrations already in the ledger with identical
-SQL are skipped, so running this twice is safe and the second run changes
-nothing.
+The whole folder is sent, and the migrations not yet applied run in ONE
+transaction: if the last one fails, none of them applied. Migrations already in
+the ledger with identical SQL are skipped, so running this twice is safe and
+the second run changes nothing.
 
-Refuses the whole set if any migration has drifted. Run ` + "`status`" + ` first if you
-want to see what would happen.
+At most 40 migrations that are not yet applied run in one push, because they
+share that transaction. With more, push refuses the set, applies nothing and
+names the last migration that fits: move the later files out of the folder,
+push, then put them back and push again. The folder itself may hold up to 1000
+migrations.
+
+Refuses the whole set if any migration has drifted, before anything runs. Run
+` + "`status`" + ` first if you want to see what would happen.
 
 --env dev applies to the database's dev copy instead, so a change can be tried
 where getting it wrong costs nothing. ` + "`ronja db promote`" + ` then moves what
@@ -155,9 +157,8 @@ func bindMigrateFlags(cmd *cobra.Command, database, dir, env *string, timeout *t
 type migrateOpts struct {
 	dir      string
 	database string
-	// env is the RAW flag value, validated in runMigrate so the failure names
-	// --env rather than arriving as a server 400 about a query parameter the
-	// caller never typed.
+	// env is the raw flag value, validated in runMigrate so the failure names
+	// --env rather than a query parameter.
 	env     string
 	timeout time.Duration
 	dryRun  bool
@@ -195,30 +196,20 @@ func runMigrate(ctx context.Context, opts migrateOpts) error {
 		return err
 	}
 
-	// Record the binding only on a successful PUSH. A dry run is a question, and
-	// a folder should not become bound to a database by asking about it — least
-	// of all to one the push would have been refused against.
-	//
-	// The environment is deliberately NOT part of this condition. The binding
-	// records the PRODUCTION database id — the only id this CLI ever holds — and
-	// a dev push names exactly that id, so an --env dev push binds the folder to
-	// the same database a prod push would. Skipping the write for dev would leave
-	// a folder whose first successful push is remembered nowhere; keying the
-	// binding by environment would invent a second id that does not exist.
+	// Bound only on a successful push, never by a dry run. The environment is
+	// deliberately not part of this: the binding is the production id, the only
+	// id this CLI holds, which a dev push names too.
 	if !opts.dryRun && opts.database != "" {
 		binding, lerr := dbdir.Load(opts.dir)
 		if lerr == nil {
 			if serr := binding.Save(opts.dir, key, databaseID); serr != nil {
-				// Not fatal: the migrations applied, which is what was asked for.
-				// Losing the convenience of a remembered id is worth a warning, not
-				// an error that implies the work did not happen.
+				// Not fatal: the migrations applied.
 				fmt.Fprintf(os.Stderr, "  Note: could not record the database binding: %v\n", serr)
 			}
 		}
 	}
 
-	// Which database this landed on, said BEFORE anything else and in EVERY mode
-	// — including --json, whose envelope goes to stdout for something to parse.
+	// Which database this landed on, first and in every mode, --json included.
 	reportEnvironment(env, result.Environment, result.DatabaseID, result.ParentDatabaseID)
 
 	if flagJSON {
@@ -229,16 +220,11 @@ func runMigrate(ctx context.Context, opts migrateOpts) error {
 
 // resolveDatabaseBinding works out which database to target: the flag if given,
 // otherwise the folder's remembered binding.
-//
-// The organization is resolved LAZILY, and only when it is needed — a folder
-// with an explicit --database and nothing to look up costs no round trip.
 func resolveDatabaseBinding(ctx context.Context, resolved *config.Resolved, opts migrateOpts) (string, wfdir.InstanceKey, error) {
 	if opts.database != "" {
-		// An explicit id still needs the organization resolved, because a
-		// successful push records the binding under it — writing an untagged entry
-		// would produce exactly the ambiguity the key exists to prevent. This is
-		// the one round trip this path costs, and only when signed in via an env
-		// token that carries no organization of its own.
+		// The organization is still needed: a push records the binding under it,
+		// and an untagged entry would be ambiguous. ensureTenant asks the server
+		// only when the credential carries no organization.
 		if err := ensureTenant(ctx, resolved); err != nil {
 			return "", wfdir.InstanceKey{URL: resolved.URL}, err
 		}
@@ -265,25 +251,13 @@ func resolveDatabaseBinding(ctx context.Context, resolved *config.Resolved, opts
 	return databaseID, key, nil
 }
 
-// reportMigrations prints the human summary on stderr and nothing on stdout.
-//
-// Nothing on stdout is the point: this command's output is a report, not data,
-// and a caller that wants it machine-readable asks for --json. Splitting it that
-// way keeps `db migrate status --json | jq` clean.
-//
-// Shared by `db migrate status`, `db migrate push` and `db promote`, because all
-// three are the same answer — a list of migrations and what happened to each.
-// Three reporters would be three vocabularies for one thing.
-// Which database the set landed on is NOT printed here: reportEnvironment says
-// that, and its callers run it before this so the answer precedes the verdicts
-// in every mode. By the time the counts are on screen the reader has already
-// decided what they mean.
+// reportMigrations prints the human summary on stderr and nothing on stdout,
+// for `db migrate status`, `db migrate push` and `db promote`. Callers run
+// reportEnvironment first, so the target is named before the verdicts.
 func reportMigrations(r *api.MigrationSetResult) error {
 	if len(r.Results) == 0 {
-		// Only promote can get here: a migrations folder with no .sql files is
-		// refused before any request goes out. An empty tail means the copy's
-		// ledger already matches production, which is a clean repeatable no-op
-		// rather than a failure — so say so and still print the notes below.
+		// Only promote gets here (an empty folder is refused before any
+		// request): the copy already matches production, a clean no-op.
 		fmt.Fprintln(os.Stderr, "  Nothing to do — there is no migration here that the target does not already have.")
 		reportMigrationNotes(r)
 		return nil
@@ -317,9 +291,8 @@ func reportMigrations(r *api.MigrationSetResult) error {
 
 	reportMigrationNotes(r)
 
-	// Drift only ever reaches here from a dry run — a real apply is refused
-	// server-side and returns an error instead. Exiting non-zero makes `status`
-	// usable as a CI gate without parsing its output.
+	// Drift reaches here only from a dry run (a real apply is refused
+	// server-side); non-zero makes `status` a CI gate.
 	if drifted := r.Drifted(); len(drifted) > 0 {
 		names := make([]string, 0, len(drifted))
 		for _, d := range drifted {
@@ -332,18 +305,8 @@ func reportMigrations(r *api.MigrationSetResult) error {
 	return nil
 }
 
-// reportMigrationNotes prints the server's advisory notes, one per line.
-//
-// ADVISORY, and printed as such: a note never changes the exit code and never
-// stops anything. Today only promote emits them, and what they warn about is a
-// migration in the tail that writes ROWS — promote replays SQL, not data, so a
-// migration that seeded rows from whatever happened to be in the dev copy runs
-// against production's rows instead. Only the person promoting can tell a
-// deliberate backfill from a surprise, which is exactly why this is a line of
-// text and not a refusal.
-//
-// Anything the server sends is printed verbatim, so a note added server-side
-// reaches the reader without a CLI release.
+// reportMigrationNotes prints the server's advisory notes verbatim, one per
+// line; a note never changes the exit code.
 func reportMigrationNotes(r *api.MigrationSetResult) {
 	if len(r.Notes) == 0 {
 		return

@@ -14,15 +14,9 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// The CLI never mints a Ronja token (plan C7). POST /api/v2/authentication/token
-// is for a person's browser alone, and no command — today's or a future one —
-// may call it, whatever a fake would answer.
-//
-// Enforced for the WHOLE package rather than per fake, because a per-fake check
-// only covers the commands whose tests happen to use that fake: every client
-// this package builds (api.New) sends through http.DefaultTransport, so wrapping
-// it here sees every request every test makes. A hit fails the request and the
-// whole test binary.
+// The CLI never mints a Ronja token: POST /api/v2/authentication/token is for a
+// person's browser alone. Every api.New client sends through
+// http.DefaultTransport, so wrapping it here guards every test in the package.
 
 // mintAttempts counts the refused requests; TestMain fails the run on any.
 var mintAttempts atomic.Int64
@@ -47,16 +41,9 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// The guard's negative control: a POST to the mint route, sent the way every
-// command sends — through a client from api.New — is refused before it leaves
-// the process, with and without a trailing slash. This proves the
-// http.DefaultTransport swap above really sits under api.New's client; a guard
-// that did not would let every other test in the package pass vacuously.
-//
-// Each refusal counts as a hit, so the test undoes exactly its own hits (Add
-// with the negative of what it caused, never Store(0), which would also erase a
-// real offender's hit from another test). The TestMain exit branch itself is
-// not negatively testable without running the test binary in a subprocess.
+// The negative control: proves the transport swap sits under api.New's client,
+// or every other test would pass vacuously. It undoes exactly its own hits,
+// never Store(0), which would erase another test's real offence.
 func TestMintGuardRefusesAPostToTheMintRoute(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {

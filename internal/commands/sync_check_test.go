@@ -12,12 +12,7 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// seedPipelineFolder writes a pipeline folder bound to a fake instance's stack,
-// with whatever .sql files it is given.
-//
-// Bound through a NAMED stack because that is the shape the alias layer needs:
-// a bind map lives on a stack, and the whole point of `sync check` is to notice
-// when one of those binds is missing.
+// seedPipelineFolder binds through a named stack because a bind map lives on one.
 func seedPipelineFolder(t *testing.T, f *fakeInstance, dir string,
 	deps map[string]wfdir.Dependency, bind map[string]string, files map[string]string) string {
 	t.Helper()
@@ -40,8 +35,6 @@ func seedPipelineFolder(t *testing.T, f *fakeInstance, dir string,
 	return dir
 }
 
-// seedAppFolder is seedPipelineFolder for a data app, with a declared `access`
-// block.
 func seedAppFolder(t *testing.T, f *fakeInstance, dir string,
 	access api.DataAppAccess, files map[string]string) string {
 	t.Helper()
@@ -64,7 +57,6 @@ func seedAppFolder(t *testing.T, f *fakeInstance, dir string,
 	return dir
 }
 
-// checkFolders decodes a `sync check --json` payload's folder list.
 func checkFolders(t *testing.T, out string) []map[string]any {
 	t.Helper()
 	raw, ok := decodeJSON(t, out)["folders"].([]any)
@@ -78,7 +70,6 @@ func checkFolders(t *testing.T, out string) []map[string]any {
 	return folders
 }
 
-// edgesOf returns one folder's references.
 func edgesOf(t *testing.T, folder map[string]any) []map[string]any {
 	t.Helper()
 	raw, ok := folder["edges"].([]any)
@@ -92,7 +83,6 @@ func edgesOf(t *testing.T, folder map[string]any) []map[string]any {
 	return out
 }
 
-// findEdge returns the first reference matching a kind and a written form.
 func findEdge(t *testing.T, folder map[string]any, kind, ref string) map[string]any {
 	t.Helper()
 	for _, edge := range edgesOf(t, folder) {
@@ -104,7 +94,6 @@ func findEdge(t *testing.T, folder map[string]any, kind, ref string) map[string]
 	return nil
 }
 
-// requestsTo counts the fake's requests whose path contains a fragment.
 func requestsTo(f *fakeInstance, fragment string) int {
 	n := 0
 	for _, request := range f.Requests {
@@ -115,9 +104,6 @@ func requestsTo(f *fakeInstance, fragment string) int {
 	return n
 }
 
-// A folder whose every reference resolves is clean and exits zero. The workflow
-// leg is the instance's own validate endpoint, so "clean" here means the server
-// looked and found nothing.
 func TestSyncCheckCleanWorkflowTreeIsZero(t *testing.T) {
 	f, tree, _ := clonedTree(t)
 
@@ -128,17 +114,12 @@ func TestSyncCheckCleanWorkflowTreeIsZero(t *testing.T) {
 	if verdict := decodeJSON(t, out)["verdict"]; verdict != verdictClean {
 		t.Fatalf("verdict = %v, want %q\n%s", verdict, verdictClean, out)
 	}
-	// Clean because the instance was ASKED and answered, not because the leg
-	// quietly did nothing — which is how a check goes green while checking
-	// nothing at all.
 	if n := requestsTo(f, "/workflow/validate"); n != 1 {
 		t.Fatalf("validate was called %d times, want 1 — a clean verdict that asked nothing is worse than no check", n)
 	}
 }
 
-// The human report is what most people read, and it is the half a --json-only
-// test suite never exercises: a nil map or a bad format verb there is a panic in
-// front of a customer.
+// The human report is the half a --json-only suite never exercises.
 func TestSyncCheckHumanReportNamesTheProblem(t *testing.T) {
 	f := newFakeInstance(t)
 	f.tableNames["table-dead"] = "Legacy"
@@ -152,10 +133,8 @@ func TestSyncCheckHumanReportNamesTheProblem(t *testing.T) {
 	if exitCodeOf(err) == syncExitClean {
 		t.Fatalf("expected a non-zero verdict for this fixture\n%s", out)
 	}
-	// ⚠️ Asserted on the EDGE LINES, not on the whole report. The summary line
-	// prints every verdict word unconditionally ("0 ok, 1 unresolved, 1
-	// unreachable, …"), so a grep over the output passed even when every edge was
-	// labelled something else entirely — the test could not fail.
+	// Asserted on edge lines: the summary line prints every verdict word
+	// unconditionally, so a grep over the whole report cannot fail.
 	for _, want := range []string{
 		"unresolved   table orders",
 		"unreachable  table table-gone",
@@ -170,13 +149,8 @@ func TestSyncCheckHumanReportNamesTheProblem(t *testing.T) {
 	}
 }
 
-// The vocabulary's whole point: an id the server will not show us is
-// UNREACHABLE, and it is reported that way whether the refusal arrives as the
-// no-enumeration 404 or as the 400 a deleted row's table.ErrNoRows produces.
-//
-// A verifier keyed on 404 alone would read a deleted table as "my request was
-// malformed" and say nothing at all — which is the exact failure this command
-// exists to prevent.
+// A deleted row's table.ErrNoRows arrives as a 400, not the no-enumeration 404;
+// a verifier keyed on 404 alone would say nothing about a deleted table.
 func TestSyncCheckUnreachableOn400AndOn404(t *testing.T) {
 	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -200,9 +174,7 @@ func TestSyncCheckUnreachableOn400AndOn404(t *testing.T) {
 	}
 }
 
-// The local id-shape pre-check is what makes the 400/404 collapse above safe: a
-// name that was never an id must be `unresolved` — decided here, definitively —
-// and must cost no request at all, because there is nothing to ask about.
+// The local id-shape pre-check is what makes the 400/404 collapse above safe.
 func TestSyncCheckUnresolvedNameCostsNoRequest(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -224,10 +196,7 @@ func TestSyncCheckUnresolvedNameCostsNoRequest(t *testing.T) {
 	}
 }
 
-// The leg that needs no network at all, and the failure the whole alias layer
-// exists to fix: an alias this folder declares and this stack binds nothing to.
-// It has to be reported signed OUT, because that is where a CI job with a
-// rotated token lands and it is still the truth.
+// Signed out, because that is where a CI job with a rotated token lands.
 func TestSyncCheckUnboundDependencyIsFoundSignedOut(t *testing.T) {
 	f := newFakeInstance(t)
 	signOut(t, f)
@@ -237,7 +206,7 @@ func TestSyncCheckUnboundDependencyIsFoundSignedOut(t *testing.T) {
 		map[string]string{"revenue.sql": "SELECT * FROM {{ ref('orders') }}\n"})
 
 	out, err := runCLI(t, tree, "sync", "check", "--stack", "dev", "--json")
-	// Non-zero either way; what matters is that the refusal is IN the payload.
+	// Any non-zero exit; the finding must be in the payload.
 	if exitCodeOf(err) == syncExitClean {
 		t.Fatalf("a folder with an unbound dependency reported clean\n%s", out)
 	}
@@ -254,19 +223,10 @@ func TestSyncCheckUnboundDependencyIsFoundSignedOut(t *testing.T) {
 	}
 }
 
-// The boundary that decides whether an unbound alias is a FINDING or a
-// SHRUG, with NO --stack given. Both sides, because they run through the same
-// code and the wrong answer on either is invisible from the message text alone.
-//
-// The folder that resolves an entry for this credential is the flagship case
-// this whole project exists to catch: it has a target, its alias binds to
-// nothing for that target, and that is `unresolved` / exit 1 with no network.
-//
-// The folder whose stacks all name ANOTHER organization is not the same
-// statement at all. We do not know which organization it targets, so "this alias
-// is unbound" is not something anything here is entitled to say — it falls
-// through to an unbound Selection whose Bind is nil, which looks identical from
-// inside checkAliases and is not. That is `not_checked` / exit 2.
+// With no --stack, an unbound alias on a stack for this organization is
+// unresolved, but when every stack names another organization nothing knows the
+// target: that falls through to a nil-Bind Selection, which looks identical
+// inside checkAliases and must be not_checked instead.
 func TestSyncCheckUnboundAliasNeedsAResolvedStack(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -299,8 +259,6 @@ func TestSyncCheckUnboundAliasNeedsAResolvedStack(t *testing.T) {
 			}
 			writeLocal(t, dir, "revenue.sql", "SELECT * FROM {{ ref('orders') }}\n")
 
-			// No --stack, deliberately: that is the direction the named-stack rule
-			// did not cover.
 			out, err := runCLI(t, tree, "sync", "check", "--json")
 			if code := exitCodeOf(err); code != test.wantExit {
 				t.Fatalf("exit = %d (%v), want %d\n%s", code, err, test.wantExit, out)
@@ -310,9 +268,6 @@ func TestSyncCheckUnboundAliasNeedsAResolvedStack(t *testing.T) {
 				if folder["reason"] != syncReasonNotBoundHere {
 					t.Fatalf("reason = %v, want %q\n%s", folder["reason"], syncReasonNotBoundHere, out)
 				}
-				// The old message named an "instances" entry a stacks-only manifest
-				// does not contain, which sent the reader after config that is not
-				// there. It must name what the folder DOES declare.
 				detail, _ := folder["detail"].(string)
 				if strings.Contains(detail, "instances") {
 					t.Errorf("the detail names an \"instances\" entry this manifest does not have: %s", detail)
@@ -330,10 +285,8 @@ func TestSyncCheckUnboundAliasNeedsAResolvedStack(t *testing.T) {
 	}
 }
 
-// Codex and mailbox cannot be verified by id AT ALL — the codex route group
-// declares no access scope so every scoped token is refused, and there is no
-// read-one-mailbox route to ask. Both must say so rather than pass as ok, and
-// neither may cost a request.
+// The codex route group declares no access scope, so every scoped token is
+// refused, and there is no read-one-mailbox route: neither kind is verifiable.
 func TestSyncCheckCodexAndMailboxAreNotChecked(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -364,11 +317,8 @@ func TestSyncCheckCodexAndMailboxAreNotChecked(t *testing.T) {
 	}
 }
 
-// POST /workflow/validate refuses without a featureID, and a stack that has
-// none is the NORMAL state before a folder's first push — the onboarding case
-// for a repository being adopted. It must be not_checked with a named reason:
-// reporting it as broken would fail every new folder, and skipping it silently
-// would report one as fine.
+// A stack with no featureID is normal before a first push, and validate refuses
+// it: not_checked, since broken would fail every new folder.
 func TestSyncCheckWorkflowWithoutAFeatureIsNotChecked(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -400,11 +350,8 @@ func TestSyncCheckWorkflowWithoutAFeatureIsNotChecked(t *testing.T) {
 	}
 }
 
-// A folder-level "could not check" does NOT throw away what was already
-// decided. The dependency leg needs no server at all, so a folder whose remote
-// half could not be reached must still report the alias its stack binds nothing
-// to — otherwise the one finding that never needed the network disappears
-// precisely when the network is what failed.
+// The dependency leg needs no server, so its finding must survive a
+// folder-level could-not-check.
 func TestSyncCheckKeepsLocalFindingsWhenTheFolderCannotBeChecked(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -437,11 +384,9 @@ func TestSyncCheckKeepsLocalFindingsWhenTheFolderCannotBeChecked(t *testing.T) {
 	}
 }
 
-// The server's per-marker findings map onto the vocabulary, and `secret_dropped`
-// is the one worth pinning: it is a WARNING server-side, because refusing a save
-// over a credential somebody is about to connect would be obstructive. That is a
-// policy about writing. This command asks whether every reference resolves, and
-// a dropped secret is one that does not — the workflow runs with nothing bound.
+// secret_dropped is a warning server-side (a save must not wait on a credential
+// about to be connected), but here it is unreachable: the workflow runs with
+// nothing bound.
 func TestSyncCheckMapsValidateFindings(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -457,11 +402,8 @@ func TestSyncCheckMapsValidateFindings(t *testing.T) {
 			Severity: "warning", Code: "secret_dropped", Message: "secret not reachable", Path: "main.py",
 			Marker: "{{ secret('secret-gone', 'token') }}",
 		}, syncExitDrifted, edgeUnreachable},
-		// `{{ module }}` is a per-reference marker like the rest, and an
-		// unmapped code is not a silent drop — it lands in the folder's
-		// `findings` and still reddens the verdict — so the thing this case
-		// actually pins is that it arrives as an EDGE, which is the only shape
-		// a reader can scan for the module by name.
+		// An unmapped code would still redden the verdict via findings; this
+		// pins that a module arrives as an edge, scannable by name.
 		{"unresolved module", api.ValidateFinding{
 			Severity: "error", Code: "unresolved_module", Message: "no such module", Path: "main.py",
 			Marker: "{{ module('module-gone') }}",
@@ -484,14 +426,7 @@ func TestSyncCheckMapsValidateFindings(t *testing.T) {
 	}
 }
 
-// `--allow-dropped-bindings` is the hatch `ronja wf push` already has for the
-// same finding: a `{{ secret }}` naming a credential nobody has created yet is
-// the ordinary state of a repository mid-setup, and without it the only way to a
-// green tree is not to run the command.
-//
-// ⚠️ It must change the SCORE and never the REPORT. A flag that hid the evidence
-// would be the failure mode, so both directions assert the edge is still there,
-// still `unreachable`, still marked as the drop it is.
+// ⚠️ --allow-dropped-bindings must change the score and never the report.
 func TestSyncCheckAllowDroppedBindings(t *testing.T) {
 	dropped := api.ValidateFinding{
 		Severity: "warning", Code: "secret_dropped", Message: "secret not reachable", Path: "main.py",
@@ -514,7 +449,6 @@ func TestSyncCheckAllowDroppedBindings(t *testing.T) {
 			if code := exitCodeOf(err); code != test.wantExit {
 				t.Fatalf("exit = %d (%v), want %d\n%s", code, err, test.wantExit, out)
 			}
-			// The evidence survives in BOTH runs, unchanged.
 			edge := findEdge(t, checkFolders(t, out)[0], markers.KindSecret, "secret-gone")
 			if edge["verdict"] != edgeUnreachable {
 				t.Errorf("verdict = %v, want %q — the flag changed the report, not just the score", edge["verdict"], edgeUnreachable)
@@ -529,9 +463,6 @@ func TestSyncCheckAllowDroppedBindings(t *testing.T) {
 	}
 }
 
-// A hatch nobody can find is not a hatch: when a dropped binding is part of what
-// pushed the run to exit 1, the refusal names the flag — the same thing
-// `ronja wf push` does in the same place.
 func TestSyncCheckNamesTheDroppedBindingsFlag(t *testing.T) {
 	f, tree, _ := clonedTree(t)
 	f.validate = &api.ValidateResult{Findings: []api.ValidateFinding{{
@@ -545,8 +476,6 @@ func TestSyncCheckNamesTheDroppedBindingsFlag(t *testing.T) {
 	}
 }
 
-// A finding that is not about ONE reference — a file mixing positional and id
-// refs — is a folder-level finding rather than an edge, and still fails the run.
 func TestSyncCheckReportsNonReferenceFindings(t *testing.T) {
 	f, tree, _ := clonedTree(t)
 	f.validate = &api.ValidateResult{Findings: []api.ValidateFinding{{
@@ -564,12 +493,9 @@ func TestSyncCheckReportsNonReferenceFindings(t *testing.T) {
 	}
 }
 
-// Both directions of the data app's declared-versus-used comparison.
-//
-// The used-but-undeclared half is the one that matters: the HTTP route the CLI
-// pushes through calls UpsertFileChecked and nothing else, so unlike the agent
-// path a CLI-pushed app's allowlist is NEVER auto-repaired. Such an app pushes
-// clean, compiles, publishes, and then fails at run time with rejected_access.
+// Used-but-undeclared is the half that matters: unlike the agent path, the HTTP
+// push route never auto-repairs the allowlist, so such an app fails only at run
+// time with rejected_access.
 func TestSyncCheckDataAppComparesDeclaredAndUsed(t *testing.T) {
 	f := newFakeInstance(t)
 	f.tableNames["table-used"] = "Orders"
@@ -579,8 +505,6 @@ func TestSyncCheckDataAppComparesDeclaredAndUsed(t *testing.T) {
 	seedAppFolder(t, f, filepath.Join(tree, "app"),
 		api.DataAppAccess{AllowedTableIDs: []string{"table-used", "table-dead"}},
 		map[string]string{
-			// One declared id used, one declared id used by nothing, and one id
-			// the source reaches for that nothing declares.
 			"App.tsx": "const q = \"{{ ref('table-used') }}\";\nconst other = \"table-undeclared\";\n",
 		})
 
@@ -594,10 +518,8 @@ func TestSyncCheckDataAppComparesDeclaredAndUsed(t *testing.T) {
 	if len(findings) != 1 || !strings.Contains(findings[0].(string), "table-undeclared") {
 		t.Errorf("used-but-undeclared was not reported: %v\n%s", folder["findings"], out)
 	}
-	// ⚠️ The `access` block is the app's PRIVILEGES, so the finding must not lead
-	// with "add it". A message whose default advice is to widen an allowlist
-	// turns every false positive into a grant nobody meant to make — and deleting
-	// a leftover reference is the other half of the answer, not a footnote.
+	// ⚠️ The `access` block is the app's privileges: advice that only widens the
+	// allowlist turns every false positive into an unintended grant.
 	if !strings.Contains(findings[0].(string), "delete the reference") {
 		t.Errorf("the finding advertises widening without offering the other remedy: %v", findings[0])
 	}
@@ -609,10 +531,8 @@ func TestSyncCheckDataAppComparesDeclaredAndUsed(t *testing.T) {
 	}
 }
 
-// A positional `{{ ref('0') }}` indexes the table row's OWN input_models on the
-// server, so what it points at is a property of the row rather than of the file
-// on disk. Reported as not checked rather than skipped: an edge nobody looked at
-// must not read as an edge that is fine.
+// A positional ref indexes the row's own input_models on the server, so the
+// file cannot say what it points at.
 func TestSyncCheckPositionalRefIsNotChecked(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -631,10 +551,8 @@ func TestSyncCheckPositionalRefIsNotChecked(t *testing.T) {
 	}
 }
 
-// A data-app folder that does not manage its `access` block has nothing
-// declared to compare its source against — the allowlist lives in Ronja. Said
-// out loud, and never green: an app whose grants this folder does not own is one
-// this command cannot fully vouch for.
+// Without a managed `access` block the allowlist lives in Ronja, so there is
+// nothing declared to compare against: never green.
 func TestSyncCheckUnmanagedAccessIsNotChecked(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -643,7 +561,6 @@ func TestSyncCheckUnmanagedAccessIsNotChecked(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// No SetAccess: the folder declares no allowlist at all.
 	manifest := &wfdir.Manifest{
 		Kind: wfdir.KindDataApp, Title: "Revenue explorer", Entrypoint: "App.tsx",
 		Stacks: map[string]wfdir.Stack{"dev": {URL: f.URL(), TenantID: testTenantID, FeatureID: "feat-1"}},
@@ -663,15 +580,9 @@ func TestSyncCheckUnmanagedAccessIsNotChecked(t *testing.T) {
 	}
 }
 
-// wfdir.DataAppKind declares NO SyncExt, so an app folder syncs everything the
-// structural rules allow — README, design notes, test fixtures. A quoted
-// `table-…` in any of those used to fail the whole tree, and the remedy the
-// finding advertised was to add that id to the app's real `access` allowlist.
-//
-// ⚠️ That is a security regression produced by a false positive, which is worse
-// than the miss it prevents: a red gate with a one-line fix that quietly grants
-// the app a row it does not need. The scan is scoped to the files the bundle
-// actually executes.
+// ⚠️ An app folder syncs README, notes and fixtures too, and a false positive
+// there invites granting the app a row it does not need; the scan covers only
+// the files the bundle executes.
 func TestSyncCheckIgnoresIDsOutsideAppSource(t *testing.T) {
 	f := newFakeInstance(t)
 	f.tableNames["table-used"] = "Orders"
@@ -680,8 +591,7 @@ func TestSyncCheckIgnoresIDsOutsideAppSource(t *testing.T) {
 	seedAppFolder(t, f, filepath.Join(tree, "app"),
 		api.DataAppAccess{AllowedTableIDs: []string{"table-used"}},
 		map[string]string{
-			"App.tsx": "const q = \"{{ ref('table-used') }}\";\n",
-			// Every shape of committed non-source file that mentions an id.
+			"App.tsx":               "const q = \"{{ ref('table-used') }}\";\n",
 			"README.md":             "Reads `table-documented` in production.\n",
 			"docs/design.md":        "We used to read \"table-legacy\".\n",
 			"testdata/fixture.json": "{\"tableID\": \"table-fixture\"}\n",
@@ -698,8 +608,6 @@ func TestSyncCheckIgnoresIDsOutsideAppSource(t *testing.T) {
 	}
 }
 
-// The other side of the same boundary: inside real app source, a quoted id IS
-// very likely a real reference, and that is the break worth catching.
 func TestSyncCheckStillGatesOnIDsInAppSource(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -716,8 +624,6 @@ func TestSyncCheckStillGatesOnIDsInAppSource(t *testing.T) {
 	}
 }
 
-// Ids repeat heavily across a feature's folders, so verification is deduped by
-// (kind, id) across the WHOLE tree — one row read, however many folders read it.
 func TestSyncCheckDedupesLookupsAcrossTheTree(t *testing.T) {
 	f := newFakeInstance(t)
 	f.tableNames["table-shared"] = "Orders"
@@ -734,15 +640,11 @@ func TestSyncCheckDedupesLookupsAcrossTheTree(t *testing.T) {
 	if code := exitCodeOf(err); code != syncExitClean {
 		t.Fatalf("exit = %d (%v), want %d\n%s", code, err, syncExitClean, out)
 	}
-	// Four references to one row, across two folders, in one process.
 	if n := requestsTo(f, "/feature/model/table-shared"); n != 1 {
 		t.Fatalf("%d lookups of one table id, want exactly 1 — the (kind, id) dedupe is not spanning the tree", n)
 	}
 }
 
-// "Could not tell" wins over a finding, exactly as it does for `sync status`:
-// the strongest true statement about a folder where one reference is broken and
-// another could not be looked at is that not everything was verified.
 func TestSyncCheckUnknownDominatesBroken(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -760,8 +662,7 @@ func TestSyncCheckUnknownDominatesBroken(t *testing.T) {
 	}
 }
 
-// A renamed or moved directory must not sail through the gate reporting
-// success. Zero folders is exit 2, never 0 — the same rule `sync status` has.
+// A renamed or moved directory must not sail through the gate.
 func TestSyncCheckEmptyWalkIsUnknown(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -775,9 +676,6 @@ func TestSyncCheckEmptyWalkIsUnknown(t *testing.T) {
 	}
 }
 
-// A folder that does not declare the stack asked for is skipped rather than
-// aborting the run, and is never counted as clean — the same rule, and the same
-// walk, `sync status` uses.
 func TestSyncCheckUnknownStackIsNeverGreen(t *testing.T) {
 	_, tree, _ := clonedTree(t)
 
@@ -791,18 +689,9 @@ func TestSyncCheckUnknownStackIsNeverGreen(t *testing.T) {
 	}
 }
 
-// `ronja sync check` must not touch the customer's repository. AT ALL.
-//
-// It matters MORE here than for `sync status`: the obvious way to reuse
-// `ronja wf validate` is to open the folder the way that command does, and
-// openFolder calls adoptStack, which REWRITES ronja.json. A tree command doing
-// that in forty folders as a side effect of a check is the exact failure this
-// pins. wfdir.SaveState also writes a .gitignore.
-//
-// ⚠️ This test used to stage a legacy instances[] folder and then run with NO
-// --stack — a fixture adoptStack returns from immediately, so the test was green
-// whether or not the command wrote. seedLockAdoptedFolder is the shape that
-// really reaches it; see its own note for why it is the only one that does.
+// openFolder calls adoptStack, which rewrites ronja.json, so reusing the
+// `ronja wf validate` path would write as a side effect of a check.
+// seedLockAdoptedFolder is the fixture that actually reaches adoptStack.
 func TestSyncCheckWritesNothing(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(
@@ -812,8 +701,7 @@ func TestSyncCheckWritesNothing(t *testing.T) {
 	signIn(t, f)
 	tree := t.TempDir()
 	seedLockAdoptedFolder(t, f, filepath.Join(tree, "adopts"))
-	// A pipeline folder with a real reference, so the run does network work
-	// rather than bailing early on every folder it looks at.
+	// A real reference, so the run does network work rather than bailing early.
 	seedPipelineFolder(t, f, filepath.Join(tree, "pipe"), nil, nil, map[string]string{
 		"revenue.sql": "SELECT * FROM {{ ref('table-gone') }}\n",
 	})
@@ -825,8 +713,7 @@ func TestSyncCheckWritesNothing(t *testing.T) {
 	})
 }
 
-// The exit code has to survive `run`, not only the RunE error, because that is
-// the only thing a CI job actually sees.
+// The exit code must survive `run`, not only RunE: it is all a CI job sees.
 func TestSyncCheckExitCodeReachesTheProcess(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -837,14 +724,8 @@ func TestSyncCheckExitCodeReachesTheProcess(t *testing.T) {
 	}
 }
 
-// Every arm of the lookup switch, because a wrong route is invisible in exactly
-// two directions: it either reports a live row as unreachable (a red build over
-// nothing) or an id that resolves nowhere as ok (a green build over a broken
-// reference). Three of the four arms had no test at all, and the harness carried
-// agent and secret routes nothing populated.
-//
-// The pipeline folder is the vehicle because its markers cover every kind in one
-// file, and each kind is asserted on BOTH sides of its own route.
+// Each kind on both sides of its route: a wrong route either reddens a build
+// over a live row or greens one over a broken reference.
 func TestSyncCheckVerifiesEveryKindByID(t *testing.T) {
 	f := newFakeInstance(t)
 	f.tableNames["table-live"] = "Orders"
@@ -883,10 +764,7 @@ SELECT 1
 	}
 }
 
-// A folder-level finding SCORES like a broken edge, so it has to be COUNTED like
-// one. It was not: a used-but-undeclared table exited 1 saying "(0 unresolved, 0
-// unreachable)" — a self-contradicting sentence, on the one line a CI job
-// prints.
+// A folder-level finding scores like a broken edge, so the refusal must count it.
 func TestSyncCheckCountsFindingsInTheRefusal(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -907,10 +785,6 @@ func TestSyncCheckCountsFindingsInTheRefusal(t *testing.T) {
 	}
 }
 
-// The dependency leg needs no server, so a SIGNED-OUT run must still report it —
-// which this file's own comment, the README and the customer guide all promise.
-// The workflow leg returned `no_credential` before reaching it, so the one kind
-// a CI job under a rotated token hits first reported nothing at all.
 func TestSyncCheckSignedOutStillReportsDependencies(t *testing.T) {
 	f := newFakeInstance(t)
 	signOut(t, f)
@@ -931,10 +805,8 @@ func TestSyncCheckSignedOutStillReportsDependencies(t *testing.T) {
 	}
 	writeLocal(t, dir, "main.py", "read(\"{{ ref('orders') }}\")\n")
 
-	// NO --stack: with one, an unresolvable organization lands on the
-	// stack_unverified path instead, which the test below covers. Signed out, the
-	// stack still matches on the instance alone, so the folder is bound and this
-	// is genuinely the no-credential path.
+	// No --stack: with one, this lands on stack_unverified (the next test).
+	// Signed out, the stack still matches on the instance alone.
 	out, err := runCLI(t, tree, "sync", "check", "--json")
 	if exitCodeOf(err) == syncExitClean {
 		t.Fatalf("a folder with an unbound dependency reported clean\n%s", out)
@@ -949,14 +821,10 @@ func TestSyncCheckSignedOutStillReportsDependencies(t *testing.T) {
 	}
 }
 
-// The same promise on the other unverifiable path: --stack names a stack this
-// folder declares for an organization we cannot confirm is ours. Every REMOTE
-// leg is unsafe there — an id lookup would ask our organization about another
-// one's rows and call every one unreachable — but the dependency leg compares
-// the committed file against itself and is answerable regardless.
+// For an organization we cannot confirm is ours, every remote leg is unsafe (an
+// id lookup would call another org's rows unreachable); the dependency leg is not.
 func TestSyncCheckUnverifiedOrganizationStillReportsDependencies(t *testing.T) {
 	f := newFakeInstance(t)
-	// The organization lookup fails, so nothing can confirm whose stack this is.
 	f.failMe = 500
 	signIn(t, f)
 	tree := t.TempDir()
@@ -975,16 +843,13 @@ func TestSyncCheckUnverifiedOrganizationStillReportsDependencies(t *testing.T) {
 	if edge := findEdge(t, folder, "dependency", "orders"); edge["verdict"] != edgeUnresolved {
 		t.Errorf("the no-network leg was dropped: %v", edge)
 	}
-	// And no id of ours was asked about another organization's rows.
 	if n := requestsTo(f, "/feature/model/"); n != 0 {
 		t.Errorf("%d id lookups against an organization we could not confirm", n)
 	}
 }
 
-// The literal scan's prefixes come from markers.IDPrefixes(), not from a second
-// hand-kept list — so a kind added to markers cannot silently stop being
-// covered here. Asserted by driving every prefix the package declares through
-// the real command.
+// A kind added to markers must be covered by the literal scan without a second
+// hand-kept list.
 func TestSyncCheckLiteralScanCoversEveryMarkerPrefix(t *testing.T) {
 	for _, prefix := range markers.IDPrefixes() {
 		id := prefix + "orphan"

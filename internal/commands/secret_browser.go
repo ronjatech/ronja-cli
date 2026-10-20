@@ -12,33 +12,23 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// `ronja secret create --in-browser` is the browser-paste handshake: for a value
-// that must not pass through whatever runs the command — an AI agent has no
-// terminal to be prompted at, and its transcript is no place for the value.
-// That is the whole guarantee: the value never passes through this process, its
-// arguments, a shell history or a transcript. It is not a boundary against the
-// caller: whoever can edit the secret or the feature's workflows — the same
-// login included — can still use the value and change where it goes.
+// `ronja secret create --in-browser`: the value never passes through this
+// process, its arguments, a shell history or a transcript — the whole guarantee.
+// It is no boundary against the caller: whoever can edit the secret or the
+// feature's workflows, the same login included, can still use the value.
 //
-// The CLI reads NO value. It asks the server for a pending secret (POST
-// /secret/pending), opens the page the SERVER names, and waits on GET
-// /secret/:id until the person the secret belongs to has entered the value
-// there and it turns ready. pending → ready is the whole signal: nothing else
-// moves a pending secret to ready.
-//
-// It is an explicit choice, never a fallback. Nothing on stdin is refused with
-// a pointer here rather than silently opening a browser, because an agent with
-// an empty pipe has to hear that it supplied nothing.
+// The CLI reads NO value: it opens the page the SERVER names and polls until
+// pending turns ready, which only entering the value does. Never a fallback for
+// an empty stdin — an agent with an empty pipe must hear it supplied nothing.
 
-// inBrowserPollInterval and inBrowserWaitLimit are package vars so the tests can
-// collapse them. Fifteen minutes: longer than a sign-in, since the person may
-// have to go and find the key; the secret stays pending past it either way.
+// Package vars so the tests can collapse them. The secret stays pending past
+// the wait limit either way.
 var (
 	inBrowserPollInterval = 3 * time.Second
 	inBrowserWaitLimit    = 15 * time.Minute
 )
 
-// inBrowserOlderServer is the answer when the route does not exist (plan §5.3).
+// inBrowserOlderServer is the answer when the route does not exist.
 const inBrowserOlderServer = "this Ronja server can't take a value in the browser yet (the CLI is newer). Run in a terminal to be prompted, or pipe the value on stdin."
 
 func runSecretInBrowser(ctx context.Context, client *api.Client, in api.CreatePendingSecretInput, fieldNames []string, noBrowser bool) error {
@@ -87,9 +77,8 @@ func runSecretInBrowser(ctx context.Context, client *api.Client, in api.CreatePe
 	return reportEnteredSecret(&sec, in, fieldNames)
 }
 
-// pendingCreateError turns the pending route's refusals into what a person can
-// act on. A 409 (a pending secret of that name already exists with different
-// settings) and a 400 are the server's own sentences, which name the field.
+// pendingCreateError passes a 409 or 400 through as the server's own sentence,
+// which names the field.
 func pendingCreateError(err error, featureID string) error {
 	switch status := api.StatusOf(err); {
 	case status == http.StatusNotFound && api.CodeOf(err) == "":
@@ -111,9 +100,8 @@ func pendingCreateError(err error, featureID string) error {
 	return err
 }
 
-// waitForValue polls the secret until it is ready, the wait runs out, the
-// secret disappears, or the person presses Ctrl-C. Transient failures get the
-// login poll's window, as every handshake's wait does.
+// waitForValue gives transient failures the login poll's window
+// (MaxPollFailureWindow), as every handshake's wait does.
 func waitForValue(ctx context.Context, client *api.Client, id, link string) error {
 	deadline := time.Now().Add(inBrowserWaitLimit)
 	interval := inBrowserPollInterval
@@ -163,9 +151,8 @@ func waitForValue(ctx context.Context, client *api.Client, id, link string) erro
 	}
 }
 
-// reportEnteredSecret prints the result line in the terminal path's shape. The
-// lengths the terminal path prints are unknown here — the value never passed
-// through this process — so it says where the value was entered instead.
+// reportEnteredSecret prints the terminal path's result shape, but says where
+// the value was entered in place of its lengths, which this process never saw.
 func reportEnteredSecret(sec *api.CreatedSecret, in api.CreatePendingSecretInput, fieldNames []string) error {
 	featureID := in.FeatureID
 	if sec.FeatureID != nil && *sec.FeatureID != "" {

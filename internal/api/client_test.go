@@ -11,14 +11,9 @@ import (
 	"testing"
 )
 
-// Unanswered decides whether a CLI may say "the instance did not answer" and
-// carry on. Its membership is therefore a safety property, not a convenience:
-// every error it accepts is one some caller will WARN about and then keep
-// writing files.
-//
-// The cases are built through a real client against a real server wherever the
-// wrapping matters, because what Unanswered actually sees is `%w`-nested — a
-// *url.Error inside a "GET …" wrapper — and a hand-built sentinel would test a
+// Unanswered's membership is a safety property: every error it accepts is one a
+// caller WARNs about and then keeps writing files. Cases go through a real
+// client where the `%w` nesting matters, since a hand-built sentinel tests a
 // shape the code never receives.
 func TestUnansweredMembership(t *testing.T) {
 	answers := func(status int) *Client {
@@ -100,10 +95,8 @@ func TestUnansweredMembership(t *testing.T) {
 	}
 }
 
-// clientTimeoutError builds the error http.Client.Timeout produces: a
-// *url.Error whose wrapped error says nothing but Timeout(). It is built by
-// hand because the real thing takes a real expiring client, and what matters
-// here is the SHAPE — a url.Error carrying no context sentinel at all.
+// clientTimeoutError hand-builds http.Client.Timeout's SHAPE: a *url.Error
+// carrying Timeout() and no context sentinel.
 func clientTimeoutError() error {
 	return &url.Error{
 		Op:  "Get",
@@ -129,9 +122,8 @@ func TestClientTimeoutIsATimeoutAndNotAnOutage(t *testing.T) {
 	}
 }
 
-// A cancelled request is not a timeout either, and the two questions are
-// deliberately separate: IsTimeout answers "the write may have landed, go and
-// look", which is not what Ctrl-C before a read means.
+// IsTimeout means "the write may have landed, go and look", which is not what
+// Ctrl-C before a read means.
 func TestIsTimeoutIgnoresACancelledContext(t *testing.T) {
 	c := serve(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -147,12 +139,9 @@ func TestIsTimeoutIgnoresACancelledContext(t *testing.T) {
 	}
 }
 
-// AsNameTaken has to be gated on the CODE and not on the 409, because three
-// unrelated refusals wear that status on this client: an optimistic-concurrency
-// conflict on a draft commit, a file precondition, and this. Reading a name
-// collision as one of the first two sends the author to `pipeline discard` or
-// `--overwrite-remote` — neither of which frees a name, and one of which throws
-// away a colleague's version to no purpose.
+// AsNameTaken is gated on the CODE, not the 409, which a draft-commit conflict
+// and a file precondition also wear; misreading a name collision as either
+// sends the author to a command that frees no name.
 func TestAsNameTakenReadsTheCodeAndReturnsTheServersSentence(t *testing.T) {
 	const sentence = `a table named "orders" already exists in this feature (table-d1abc)`
 	err := errorFrom(409, []byte(`{"error":`+strconv.Quote(sentence)+`,"code":"name_taken"}`))
@@ -188,9 +177,8 @@ func TestAsNameTakenIgnoresEveryOther409AndNonHTTPError(t *testing.T) {
 	}
 }
 
-// A refusal it has CLAIMED must never come back with an empty sentence: the
-// caller prints it, and a blank line under "that name is taken" is worse than
-// the raw error.
+// A CLAIMED refusal must never come back with an empty sentence: the caller
+// prints it.
 func TestAsNameTakenNeverReturnsAnEmptySentence(t *testing.T) {
 	why, taken := AsNameTaken(errorFrom(409, []byte(`{"code":"name_taken"}`)))
 	if !taken {
@@ -201,8 +189,7 @@ func TestAsNameTakenNeverReturnsAnEmptySentence(t *testing.T) {
 	}
 }
 
-// TestWireCodeOf pins that the body's `code` — not CodeOf's `error` message —
-// is what a caller keys on, and that an uncoded or non-HTTP error has none.
+// The body's `code`, not CodeOf's `error` message, is what a caller keys on.
 func TestWireCodeOf(t *testing.T) {
 	cases := []struct {
 		name string

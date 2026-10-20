@@ -16,22 +16,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// The daily-notice tests drive the REAL entry point, run(), because that is
-// where the two halves meet: PersistentPreRunE starts the check and run joins
-// it. A test that called root.ExecuteContext directly would exercise the start
-// and never the finish, which is where every outcome rule lives.
-//
-// The command under test is `profile list` — the cheapest thing in the tree
-// that reaches RunE, talks to no server, and prints on stdout, so the
-// "stdout is untouched" assertion has something to be untouched.
+// The tests drive run() because PersistentPreRunE starts the check and run
+// joins it; ExecuteContext alone would never reach the finish. `profile list`
+// reaches RunE, talks to no server and prints on stdout.
 
-// noticeCommand is the command every silent-condition test runs. Nothing about
-// it matters except that it succeeds and is not one of the excluded names.
 var noticeCommand = []string{"profile", "list"}
 
-// forceTerminals answers the isTerminal seam per stream, so "stdout is a
-// terminal but stderr is not" — a real case, `ronja ... 2>log` — is reachable
-// without allocating a pty.
+// forceTerminals reaches "stdout is a terminal but stderr is not" without a pty.
 func forceTerminals(t *testing.T, stdout, stderr bool) {
 	t.Helper()
 	previous := isTerminal
@@ -47,9 +38,7 @@ func forceTerminals(t *testing.T, stdout, stderr bool) {
 	t.Cleanup(func() { isTerminal = previous })
 }
 
-// noticeEnv puts the process in the one state where the notice can print: a
-// stamped release version, both streams a terminal, an isolated config dir, a
-// fake mirror, no CI markers, and an executable path that is not a cask.
+// noticeEnv is the one state where the notice can print.
 func noticeEnv(t *testing.T, m *fakeMirror, current string) {
 	t.Helper()
 	useMirror(t, m, current)
@@ -63,8 +52,6 @@ func noticeEnv(t *testing.T, m *fakeMirror, current string) {
 	t.Cleanup(func() { currentExecutable = previous })
 }
 
-// runNotice runs one invocation through run() and hands back everything the
-// assertions need.
 func runNotice(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	t.Chdir(t.TempDir())
@@ -76,15 +63,12 @@ func runNotice(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	return code, stdout, stderr
 }
 
-// expectedNotice is the exact line, built from the shipping formatter so a
-// change to the wording is a change to one place.
+// expectedNotice uses the shipping formatter, so the wording lives in one place.
 func expectedNotice(t *testing.T) string {
 	t.Helper()
 	return expectedNoticeFor(t, testLatestVersion)
 }
 
-// expectedNoticeFor is the same line for a release other than the fixture's —
-// the one a concurrent write put on disk while the command ran.
 func expectedNoticeFor(t *testing.T, latest string) string {
 	t.Helper()
 	return update.Notice(testCurrentVersion, latest, update.MethodSwap)
@@ -97,7 +81,6 @@ func assertNoNotice(t *testing.T, stderr string) {
 	}
 }
 
-// seedState writes the update-check cache the test wants the run to start from.
 func seedState(t *testing.T, s update.State) {
 	t.Helper()
 	if err := update.SaveState(s); err != nil {
@@ -114,9 +97,6 @@ func loadState(t *testing.T) update.State {
 	return s
 }
 
-// assertNear fails unless got is within a minute of want, which is as precise
-// as "≈ now" needs to be and does not make the test depend on how long the
-// command took.
 func assertNear(t *testing.T, field string, got, want time.Time) {
 	t.Helper()
 	if d := got.Sub(want); d > time.Minute || d < -time.Minute {
@@ -124,9 +104,6 @@ func assertNear(t *testing.T, field string, got, want time.Time) {
 	}
 }
 
-// The happy path: a stale cache, a mirror with a newer release, one line on
-// stderr, stdout byte-identical to the same command with the check switched
-// off, and all three timestamps recorded.
 func TestUpdateNoticePrintsOnceOnAStaleCache(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
@@ -139,12 +116,10 @@ func TestUpdateNoticePrintsOnceOnAStaleCache(t *testing.T) {
 	if got, want := noticeLines(stderr), []string{expectedNotice(t)}; !equalLines(got, want) {
 		t.Errorf("stderr notice lines = %q, want %q\nfull stderr:\n%s", got, want, stderr)
 	}
-	// The notice is one line and carries no blank line of its own.
 	if !strings.HasSuffix(stderr, expectedNotice(t)+"\n") {
 		t.Errorf("the notice is not the last line of stderr:\n%q", stderr)
 	}
 
-	// The same command with the check disabled, to prove stdout is untouched.
 	t.Setenv("RONJA_NO_UPDATE_CHECK", "1")
 	_, control, controlErr := runNotice(t, noticeCommand...)
 	assertNoNotice(t, controlErr)
@@ -164,12 +139,9 @@ func TestUpdateNoticePrintsOnceOnAStaleCache(t *testing.T) {
 	}
 }
 
-// One subtest per row of the silent-conditions table. Each says what it changes
-// and how many requests the mirror is allowed to see.
 func TestUpdateNoticeStaysSilent(t *testing.T) {
 	cases := []struct {
-		name string
-		// arrange runs after noticeEnv and returns the args to run.
+		name     string
 		arrange  func(t *testing.T, m *fakeMirror) []string
 		requests int
 	}{{
@@ -213,8 +185,7 @@ func TestUpdateNoticeStaysSilent(t *testing.T) {
 			return []string{"env"}
 		},
 	}, {
-		// `update --check` prints its own report; the notice must not double it.
-		// The mirror sees this command's own release lookup, not the check's.
+		// The mirror sees update's own release lookup, not the check's.
 		name:     "update reports for itself",
 		requests: 1,
 		arrange: func(t *testing.T, m *fakeMirror) []string {
@@ -232,8 +203,7 @@ func TestUpdateNoticeStaysSilent(t *testing.T) {
 			return []string{"completion", "bash"}
 		},
 	}, {
-		// The fetch still runs — the cache is stale — but the user was told
-		// within the day, so nothing is printed.
+		// The cache is stale, so the fetch still runs.
 		name:     "already notified an hour ago",
 		requests: 1,
 		arrange: func(t *testing.T, m *fakeMirror) []string {
@@ -278,8 +248,6 @@ func TestUpdateNoticeStaysSilent(t *testing.T) {
 	}
 }
 
-// A mirror that is down is a day of quiet, not a retry on every command: the
-// CheckedAt written before the fetch stands.
 func TestUpdateNoticeKeepsCheckedAtAfterAFailedLookup(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	mirror.failRelease = true
@@ -291,9 +259,6 @@ func TestUpdateNoticeKeepsCheckedAtAfterAFailedLookup(t *testing.T) {
 	assertNear(t, "CheckedAt", loadState(t).CheckedAt, time.Now())
 }
 
-// A state file that cannot be written means no request at all. Failing toward
-// silence rather than toward the network is what keeps an unwritable config
-// directory from costing a second and a github.com request on every command.
 func TestUpdateNoticeSkipsEverythingWhenTheStateIsUnwritable(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write a 0500 directory")
@@ -314,9 +279,6 @@ func TestUpdateNoticeSkipsEverythingWhenTheStateIsUnwritable(t *testing.T) {
 	}
 }
 
-// A state file that cannot be READ is as disqualifying as one that cannot be
-// written, and for the same reason: without it there is no way to know whether
-// today's check already happened, so every single command would fetch.
 func TestUpdateNoticeSkipsEverythingWhenTheStateIsUnreadable(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can read a 0000 file")
@@ -338,10 +300,8 @@ func TestUpdateNoticeSkipsEverythingWhenTheStateIsUnreadable(t *testing.T) {
 	}
 }
 
-// The same rule from the sudo side. `sudo ronja ...` on somebody else's config
-// directory writes nothing (update.ErrStateNotOwned), so it must also ask
-// nothing and say nothing — otherwise the one unwritable state that still
-// fetched would be this one, once per command, forever.
+// `sudo ronja ...` on somebody else's config directory writes nothing
+// (update.ErrStateNotOwned), so it must also fetch nothing.
 func TestUpdateNoticeSkipsEverythingUnderSudo(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no uid to compare — the refusal cannot trigger here")
@@ -363,8 +323,6 @@ func TestUpdateNoticeSkipsEverythingUnderSudo(t *testing.T) {
 	}
 }
 
-// A 200 carrying something that is not a release is a failed lookup like any
-// other: nothing printed, and the CheckedAt written before the fetch stands.
 func TestUpdateNoticeSurvivesAnUnparseableAnswer(t *testing.T) {
 	garbage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("<html>proxy sign-in required</html>"))
@@ -385,9 +343,7 @@ func TestUpdateNoticeSurvivesAnUnparseableAnswer(t *testing.T) {
 	}
 }
 
-// A fetch that runs out of time rewinds CheckedAt to 23 h ago, so the retry is
-// hourly. Run against the seam-shortened timeout: the real one-second bound has
-// its own test below.
+// Runs against the seam-shortened timeout; the real bound has its own test.
 func TestUpdateNoticeBacksOffAnHourAfterATimeout(t *testing.T) {
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond)
@@ -407,8 +363,6 @@ func TestUpdateNoticeBacksOffAnHourAfterATimeout(t *testing.T) {
 	assertNear(t, "CheckedAt", loadState(t).CheckedAt, time.Now().Add(-updateCheckTimeoutBackdate))
 }
 
-// The shipping bound, exercised for real: a mirror that never answers must not
-// hold a command for more than about a second.
 func TestUpdateNoticeIsBoundedByOneSecond(t *testing.T) {
 	stall := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(3 * time.Second)
@@ -427,23 +381,17 @@ func TestUpdateNoticeIsBoundedByOneSecond(t *testing.T) {
 	if elapsed > 1500*time.Millisecond {
 		t.Errorf("run() took %s, want under 1.5s — the fetch deadline did not bound it", elapsed)
 	}
-	// The upper bound alone is passed by a check that never started, which is
-	// the one way this test could go green while the feature is dead. These two
-	// say the real deadline fired and the timeout branch is where it landed.
+	// A check that never started also passes the upper bound; this lower bound
+	// proves the real deadline fired.
 	if elapsed < 800*time.Millisecond {
 		t.Errorf("run() took %s — too fast for a one-second deadline to have been waited on", elapsed)
 	}
 	assertNear(t, "CheckedAt", loadState(t).CheckedAt, time.Now().Add(-updateCheckTimeoutBackdate))
 }
 
-// Ctrl-C is a timeout, not a refusal: a check the user interrupted learned
-// nothing about the mirror, so it backs off an hour rather than a day.
-//
-// Driven through the two halves directly rather than through run(), because
-// run installs its own signal context and the only way to cancel that from here
-// is to signal the test binary itself. The cancelled context is real, and so is
-// the fetch it kills — this is what proves the error a killed request carries
-// still matches context.Canceled through net/http's wrapper.
+// Driven through the two halves directly, because cancelling run's own signal
+// context would mean signalling the test binary. The real killed fetch proves
+// its error still matches context.Canceled through net/http's wrapper.
 func TestUpdateNoticeBacksOffAnHourAfterACancellation(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
@@ -466,9 +414,7 @@ func TestUpdateNoticeBacksOffAnHourAfterACancellation(t *testing.T) {
 	assertNear(t, "CheckedAt", loadState(t).CheckedAt, time.Now().Add(-updateCheckTimeoutBackdate))
 }
 
-// A valued global flag before the command name is the case that broke the
-// first design: `ronja --profile acme update` read "acme" as the command and
-// nagged underneath the update's own report.
+// An argv scan read `ronja --profile acme update` as command "acme".
 func TestUpdateNoticeIsNotFooledByValuedGlobalFlags(t *testing.T) {
 	for _, args := range [][]string{
 		{"--profile", "acme", "update", "--check"},
@@ -485,8 +431,7 @@ func TestUpdateNoticeIsNotFooledByValuedGlobalFlags(t *testing.T) {
 	}
 }
 
-// A cache checked within the day asks the mirror nothing — and still tells the
-// user, because the check may have happened in a shell that could not print.
+// The check may have happened in a shell that could not print.
 func TestUpdateNoticePrintsFromACacheWithoutFetching(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
@@ -501,9 +446,7 @@ func TestUpdateNoticePrintsFromACacheWithoutFetching(t *testing.T) {
 	}
 }
 
-// A cache older than a day fetches, and CheckedAt is on disk BEFORE the mirror
-// answers: that write is the multi-process guard, so a second shell starting a
-// moment later reads fresh rather than firing its own request.
+// CheckedAt on disk before the mirror answers is the multi-process guard.
 func TestUpdateNoticeClaimsTheCheckBeforeFetching(t *testing.T) {
 	var sawCheckedAt atomic.Bool
 	var requests atomic.Int32
@@ -515,7 +458,6 @@ func TestUpdateNoticeClaimsTheCheckBeforeFetching(t *testing.T) {
 
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		// Read the state file the way another process would.
 		if s, err := update.LoadState(); err == nil && s.CheckedAt.After(stale) {
 			sawCheckedAt.Store(true)
 		}
@@ -536,8 +478,6 @@ func TestUpdateNoticeClaimsTheCheckBeforeFetching(t *testing.T) {
 	}
 }
 
-// A fetch amends the cache, it does not rewrite it: a NotifiedAt recorded
-// earlier today must survive, or the next command tells the user again.
 func TestUpdateNoticeFetchKeepsNotifiedAt(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
@@ -556,10 +496,6 @@ func TestUpdateNoticeFetchKeepsNotifiedAt(t *testing.T) {
 	}
 }
 
-// The cached path writes back ONLY what it learned, which is NotifiedAt and
-// nothing else. It read the cache at PreRun and asked the mirror nothing since,
-// so assigning its copy of CheckedAt and Latest back over the file would rewind
-// whatever another shell's `ronja update` recorded while the command ran.
 func TestUpdateNoticeDoesNotRewindAConcurrentWrite(t *testing.T) {
 	const newerRelease = "v0.30.0"
 	concurrent := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
@@ -567,8 +503,7 @@ func TestUpdateNoticeDoesNotRewindAConcurrentWrite(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
 
-	// The window is the command's own request: by the time the instance is
-	// answering, this run has read the cache and has not yet written it back.
+	// The window: this run has read the cache and not yet written it back.
 	var wrote atomic.Bool
 	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !wrote.Swap(true) {
@@ -588,11 +523,7 @@ func TestUpdateNoticeDoesNotRewindAConcurrentWrite(t *testing.T) {
 	signInTo(t, instance.URL)
 	seedState(t, update.State{CheckedAt: time.Now().Add(-time.Hour), Latest: testLatestVersion})
 
-	// The line names the CONCURRENT tag, not the one this run read at PreRun.
-	// A cached run learned no version of its own, so the one it announces is
-	// whatever the file says when the command ends — otherwise it would point
-	// the user at a release that stopped being the newest a second ago, and
-	// then record NotifiedAt and stay quiet about the real one for a day.
+	// A cached run announces the file's Latest as it stands at the end.
 	_, _, stderr := runNotice(t, "whoami")
 	if got, want := noticeLines(stderr), []string{expectedNoticeFor(t, newerRelease)}; !equalLines(got, want) {
 		t.Errorf("stderr notice lines = %q, want %q\nfull stderr:\n%s", got, want, stderr)
@@ -614,23 +545,17 @@ func TestUpdateNoticeDoesNotRewindAConcurrentWrite(t *testing.T) {
 	assertNear(t, "NotifiedAt", state.NotifiedAt, time.Now())
 }
 
-// A fetch that FAILED learned nothing about the mirror, so it writes nothing
-// about it back. c.result != nil says a fetch was attempted, not that it came
-// home with something — and a 500 that wrote its PreRun copy of Latest back
-// would rewind whatever another shell's `ronja update` recorded meanwhile.
 func TestUpdateNoticeKeepsAConcurrentLatestAfterAFailedFetch(t *testing.T) {
 	const newerRelease = "v0.30.0"
 	concurrent := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
 
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
-	// Stale, so the fetch runs; with a Latest already known, a notice is due
-	// whatever the fetch does — which is what makes the run write at all.
+	// With a Latest already known a notice is due, which is what makes the run write.
 	seedState(t, update.State{CheckedAt: time.Now().Add(-25 * time.Hour), Latest: testLatestVersion})
 
 	var wrote atomic.Bool
 	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Another shell's `ronja update` lands while this fetch is in flight.
 		if !wrote.Swap(true) {
 			if err := update.SaveState(update.State{CheckedAt: concurrent, Latest: newerRelease}); err != nil {
 				t.Errorf("the concurrent write failed: %v", err)
@@ -641,9 +566,6 @@ func TestUpdateNoticeKeepsAConcurrentLatestAfterAFailedFetch(t *testing.T) {
 	t.Cleanup(failing.Close)
 	releaseBaseURL = failing.URL
 
-	// A failed fetch learned nothing either, so the same rule applies: the
-	// announced version is the one on disk at the end, which is the concurrent
-	// write's.
 	_, _, stderr := runNotice(t, noticeCommand...)
 	if got, want := noticeLines(stderr), []string{expectedNoticeFor(t, newerRelease)}; !equalLines(got, want) {
 		t.Errorf("stderr notice lines = %q, want %q\nfull stderr:\n%s", got, want, stderr)
@@ -662,10 +584,6 @@ func TestUpdateNoticeKeepsAConcurrentLatestAfterAFailedFetch(t *testing.T) {
 	assertNear(t, "NotifiedAt", state.NotifiedAt, time.Now())
 }
 
-// The NotifiedAt gate is read from disk at the end, not from the copy taken at
-// PreRun: another shell may have printed the notice while this command ran, and
-// telling the user the same thing twice in a minute is exactly what the
-// once-a-day rule exists to prevent.
 func TestUpdateNoticeReadsNotifiedAtAfterTheCommand(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
@@ -673,7 +591,6 @@ func TestUpdateNoticeReadsNotifiedAtAfterTheCommand(t *testing.T) {
 	var wrote atomic.Bool
 	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !wrote.Swap(true) {
-			// Another shell tells the user, while this command is still running.
 			if err := update.SaveState(update.State{
 				CheckedAt:  time.Now(),
 				NotifiedAt: time.Now(),
@@ -704,9 +621,6 @@ func TestUpdateNoticeReadsNotifiedAtAfterTheCommand(t *testing.T) {
 	}
 }
 
-// A timestamp in the future is stale, not fresh. A clock that was wrong when
-// the file was written would otherwise leave both gates shut for good: now.Sub
-// reads negative, which is inside the 24-hour window and never leaves it.
 func TestUpdateNoticeTreatsAFutureTimestampAsStale(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
@@ -731,9 +645,8 @@ func TestUpdateNoticeTreatsAFutureTimestampAsStale(t *testing.T) {
 	}
 }
 
-// cobra answers --version and an unknown command before it runs any hook, so
-// PersistentPreRunE never fires and run() joins a check that does not exist.
-// Nothing may panic, print or reach the network on that path.
+// cobra answers --version and an unknown command before any hook, so run()
+// joins a check that never started.
 func TestUpdateNoticeSurvivesACommandThatNeverReachesThePreRun(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -758,8 +671,6 @@ func TestUpdateNoticeSurvivesACommandThatNeverReachesThePreRun(t *testing.T) {
 	}
 }
 
-// The notice is additive to a failure, never a replacement for it: the exit
-// code and the command's own one error line are exactly what they were.
 func TestUpdateNoticeLeavesAFailingCommandAlone(t *testing.T) {
 	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
 	noticeEnv(t, mirror, testCurrentVersion)
@@ -776,7 +687,6 @@ func TestUpdateNoticeLeavesAFailingCommandAlone(t *testing.T) {
 	}
 }
 
-// The remedy follows the install: a cask binary is Homebrew's to replace.
 func TestUpdateNoticeNamesTheInstallMethod(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -803,10 +713,8 @@ func TestUpdateNoticeNamesTheInstallMethod(t *testing.T) {
 	}
 }
 
-// The root's PersistentPreRunE is the only one in the tree, and has to stay
-// that way: cobra runs the NEAREST PersistentPreRun it finds walking up from
-// the command, so one on any subcommand would silently shadow the root's and
-// switch the check off for that whole branch — with nothing failing to say so.
+// cobra runs only the NEAREST PersistentPreRun, so one on any subcommand would
+// silently switch the check off for that branch.
 func TestNoSubcommandShadowsTheRootPersistentPreRun(t *testing.T) {
 	root := newRootCmd()
 	var walk func(c *cobra.Command)
@@ -821,8 +729,7 @@ func TestNoSubcommandShadowsTheRootPersistentPreRun(t *testing.T) {
 	walk(root)
 }
 
-// noticeLines pulls out only the lines that are an update notice, so a
-// command's own output cannot make an assertion pass or fail by accident.
+// noticeLines keeps a command's own output from passing or failing an assertion.
 func noticeLines(stderr string) []string {
 	var out []string
 	for _, line := range strings.Split(stderr, "\n") {

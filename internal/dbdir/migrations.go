@@ -10,22 +10,12 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// ReadMigrations loads migrations/*.sql from dir, in filename order.
+// ReadMigrations loads migrations/*.sql from dir. A migration's name is its
+// filename stem, and order is lexical by filename (10_x sorts before 9_x)
+// deliberately: no natural sort, since re-ordering after the fact is drift.
 //
-// The name of a migration is its filename STEM — 0001_leads.sql is the migration
-// "0001_leads" — so the file you can see in a diff is the thing the ledger
-// records, with no separate manifest to fall out of step with it.
-//
-// Order is lexical by filename, which is why the conventional zero-padded prefix
-// matters: 10_x.sql sorts before 9_x.sql, and a set applied in the wrong order
-// fails at the database rather than quietly doing the wrong thing. That is a
-// footgun worth naming rather than hiding behind a natural sort, because the
-// ledger records what ran and re-ordering after the fact is drift.
-//
-// The SQL is read VERBATIM — no trimming, no newline normalisation. The server's
-// ledger hash covers exactly these bytes, so a client that tidied them would
-// make the same file hash differently from the way it was applied, and every
-// applied migration would report as drifted forever after.
+// The SQL is read verbatim: the server's ledger hash covers exactly these
+// bytes, and any tidying would report every applied migration as drifted.
 func ReadMigrations(dir string) ([]api.Migration, error) {
 	root := filepath.Join(dir, MigrationsDir)
 	entries, err := os.ReadDir(root)
@@ -49,10 +39,8 @@ func ReadMigrations(dir string) ([]api.Migration, error) {
 	seen := make(map[string]string, len(names))
 	for _, name := range names {
 		stem := strings.TrimSuffix(name, filepath.Ext(name))
-		// Two files whose stems collide — 0001_leads.sql and 0001_leads.SQL on a
-		// case-insensitive filesystem — would send two migrations under one ledger
-		// name, which is precisely the duplicate-name state that makes drift
-		// detection ambiguous. Refuse rather than pick one.
+		// Stems equal up to case would put two migrations under one ledger name
+		// on a case-insensitive filesystem, making drift detection ambiguous.
 		if prev, dup := seen[strings.ToLower(stem)]; dup {
 			return nil, fmt.Errorf("%s and %s would both be the migration %q — rename one", prev, name, stem)
 		}

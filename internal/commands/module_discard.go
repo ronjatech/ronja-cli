@@ -10,18 +10,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// `ronja module discard` throws the draft away and points the baseline back at
-// the live module.
-//
-// The escape hatch, and the reason it belongs in a CLI whose rule is otherwise
-// "no resource verbs": a draft nobody can commit — wedged, or simply abandoned
-// — blocks the ONE draft slot a module has, so until it is gone nobody can
-// check one out. It operates on the sync loop's own artifact, never on anything
-// live.
-//
-// ⚠️ A module has ONE draft, not one per author, so this may throw away a
-// COLLEAGUE'S work. The confirmation names the drafter for exactly that reason,
-// and --yes is what a caller with no terminal has to type to mean it.
+// A resource verb the CLI allows because a wedged or abandoned draft blocks a
+// module's one draft slot. ⚠️ That one draft may be a colleague's, so the
+// confirmation names the drafter.
 func newModuleDiscardCmd() *cobra.Command {
 	var yes bool
 	var deleteModule bool
@@ -87,16 +78,10 @@ func runModuleDiscard(ctx context.Context, f *folder, yes, deleteModule bool) (*
 	mod, err := client.GetModule(ctx, f.Binding.ModuleID)
 	if err != nil {
 		if api.StatusOf(err) == 404 {
-			// GET /module/:id resolves live modules AND the caller's own draft or
-			// proposal, so the ORDINARY unpublished case now falls through to the
-			// resolved branch below (moduleIsUnpublished) rather than arriving
-			// here. What is left is a module that is gone, or somebody else's
-			// in-flight row.
-			//
-			// --delete-module still acts on it, and that is deliberate rather
-			// than leftover: the folder holds the id, the withdraw/discard verbs
-			// take it, and the server is the gate on whether the caller may. An
-			// unbind-only fallback would leave a row nobody here can name.
+			// GET resolves live modules and the caller's own draft or proposal,
+			// so a 404 is a module that is gone or somebody else's in-flight row.
+			// --delete-module still acts on it deliberately: the server gates
+			// whether the caller may, and unbinding alone would strand the row.
 			if deleteModule {
 				return deleteUnpublishedModule(ctx, client, f, f.Binding.ModuleID, "", yes)
 			}
@@ -109,13 +94,8 @@ func runModuleDiscard(ctx context.Context, f *folder, yes, deleteModule bool) (*
 		return nil, err
 	}
 
-	// An unpublished module IS the module, so there is no "undo my edits" to
-	// perform on it — the only available action is removing the whole row. That
-	// stays behind an explicit flag because `discard` reads as reverting, and
-	// removing a module is not a surprise anyone should meet at the command line.
-	// But it has to be reachable: this is what an abandoned first push leaves,
-	// and a CLI whose premise is that an agent needs nothing but a terminal
-	// cannot answer with "use the web UI".
+	// An unpublished module IS the module, so discarding it removes the row;
+	// that stays behind an explicit flag because `discard` reads as reverting.
 	if moduleIsUnpublished(mod) {
 		if !deleteModule {
 			return nil, fmt.Errorf("module %s has never been published, so it is a %s with nothing behind it — discarding would remove the module itself. Re-run with --delete-module to do that; your local files are kept",
@@ -123,9 +103,8 @@ func runModuleDiscard(ctx context.Context, f *folder, yes, deleteModule bool) (*
 		}
 		return deleteUnpublishedModule(ctx, client, f, mod.ID, mod.Lifecycle, yes)
 	}
-	// --delete-module is only meaningful on the branch above. Refusing it here
-	// rather than ignoring it keeps the flag from reading as "delete the live
-	// module too" on a folder where it would do nothing of the sort.
+	// Refused, not ignored, so the flag never reads as "delete the live module
+	// too".
 	if deleteModule {
 		return nil, fmt.Errorf("--delete-module only applies to a module that has never been published; %s is live, so there is a published version to keep. Drop --delete-module to discard just the draft",
 			mod.ID)
@@ -139,9 +118,6 @@ func runModuleDiscard(ctx context.Context, f *folder, yes, deleteModule bool) (*
 		return &moduleDiscardResult{Outcome: outcomeNoDraft, ModuleID: mod.ID}, nil
 	}
 
-	// The drafter is NAMED, because a module has one draft and it may not be
-	// yours. "Discard your draft" would be a false statement half the time, and
-	// the half where it is false is the half that costs somebody their work.
 	whose := "the draft"
 	if draft.DrafterUserID != "" {
 		whose = fmt.Sprintf("the draft opened by %s", draft.DrafterUserID)
@@ -160,37 +136,17 @@ func runModuleDiscard(ctx context.Context, f *folder, yes, deleteModule bool) (*
 		return nil, fmt.Errorf("discard %s: %w", draft.ID, err)
 	}
 
-	// The baseline now has to describe the LIVE row: the draft it was taken from
-	// no longer exists, and leaving it in place would make every local file read
-	// as drift against a row that is gone.
-	//
-	// keepAnchor, deliberately: a discard leaves the folder's files exactly as
-	// they are, so if a colleague published while that draft was open,
-	// re-anchoring on live would stamp a version whose content the committed
-	// files do not contain — and the next fresh checkout would vouch on it and
-	// overwrite their publish with preconditions that pass. See reanchorOnLive.
+	// keepAnchor, deliberately: the files are unchanged, so re-anchoring on a
+	// live version a colleague published meanwhile would let a later checkout
+	// overwrite that publish with passing preconditions. See reanchorOnLive.
 	noteBaselineRefresh(f.Kind, refreshModuleBaselineFromLive(ctx, client, f, mod.ID, keepAnchor))
 	return &moduleDiscardResult{Outcome: outcomeDiscarded, ModuleID: mod.ID, DraftID: draft.ID}, nil
 }
 
-// deleteUnpublishedModule removes a module that has never been published and
-// returns the folder to the state `init` left it in.
-//
-// TWO server-side shapes, one command: a parentless DRAFT (private feature) is
-// discarded, a PROPOSAL (shared feature) is withdrawn. They are the same event
-// from the folder's side — the module stops existing and the binding has to go —
-// which is why one function owns both rather than the caller branching.
-//
-// A lifecycle we could not read (the 404 path, where the row is unpublished and
-// GET refuses it) tries the discard first and falls back to the withdraw: both
-// are idempotent-shaped refusals on the wrong row, and trying is cheaper than
-// asking the caller which kind of feature their module is in.
-//
-// Ordering is load-bearing: the server row goes first, and the manifest is only
-// unbound once it is gone. Clearing the binding first and then failing the
-// delete would strand a real module that no local command could name again —
-// and, because the package name is unique among live modules, would make every
-// later push collide with a row nobody can reach.
+// deleteUnpublishedModule discards a parentless draft or withdraws a proposal
+// and returns the folder to its post-`init` state. Ordering is load-bearing: the
+// row goes first and the binding only after, or a failed delete strands a module
+// no local command can name.
 func deleteUnpublishedModule(ctx context.Context, client *api.Client, f *folder, moduleID, lifecycle string, yes bool) (*moduleDiscardResult, error) {
 	ok, err := confirm(fmt.Sprintf("DELETE module %s? It has never been published, so this removes the module itself. Local files are kept.", moduleID),
 		fmt.Sprintf("removes module %s on the server", moduleID), yes)
@@ -207,10 +163,8 @@ func deleteUnpublishedModule(ctx context.Context, client *api.Client, f *folder,
 	case api.LifecycleDraft:
 		err = client.DiscardModuleDraft(ctx, moduleID)
 	default:
-		// Lifecycle unknown (the 404 path). Try the draft verb, then the
-		// proposal one — the first refusal is about the row's shape, not about
-		// authority, so falling through costs one request and answers the
-		// question the CLI could not.
+		// Lifecycle unknown (the 404 path): a refusal here is about the row's
+		// shape, not authority, so fall through to the proposal verb.
 		if err = client.DiscardModuleDraft(ctx, moduleID); err != nil {
 			if withdrawErr := client.WithdrawModuleProposal(ctx, moduleID); withdrawErr == nil {
 				err = nil
@@ -221,18 +175,13 @@ func deleteUnpublishedModule(ctx context.Context, client *api.Client, f *folder,
 		return nil, fmt.Errorf("remove %s: %w", moduleID, err)
 	}
 
-	// Keep the feature, drop the module: the folder should behave exactly as it
-	// did after `init`, so the next push creates a fresh one in the same place.
 	f.recordBinding(wfdir.Binding{FeatureID: f.Binding.FeatureID})
 	if err := f.saveFolder(); err != nil {
 		return nil, fmt.Errorf("module %s was REMOVED, but %s still names it: %w\n  Remove the moduleID by hand, or the next push will look for a module that is gone",
 			moduleID, f.bindingFiles(), err)
 	}
-	// No baseline for THIS instance, for the same reason `init` leaves none:
-	// there is no server-side row left to have synced from, so every local file
-	// correctly reads as "added" until a push writes a real one. Only this
-	// binding's entry goes — the folder may be bound to staging and production
-	// too, and each of those still has a row its baseline describes.
+	// Only this binding's baseline goes: the folder may be bound to other
+	// stacks whose rows still exist.
 	f.State.Clear(f.Key)
 	noteBaselineRefresh(f.Kind, wfdir.SaveState(f.Root, f.State))
 	return &moduleDiscardResult{Outcome: outcomeResourceDeleted, ModuleID: moduleID}, nil

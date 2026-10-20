@@ -13,22 +13,10 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// `ronja pipeline` init / clone / status / discard.
-//
-// The push and publish halves have files of their own; what is here is the
-// folder's birth and its read-only surfaces, which is where the invariants that
-// everything else depends on are established: canonical SQL on disk, a baseline
-// that describes the rows it hashed, and a bindings map nothing else can invent.
-
 // --- capture ----------------------------------------------------------------
 
-// runPipelineCLI is runCLI with stderr captured as well.
-//
-// It exists because this loop says a great deal on stderr that is not
-// decoration — the skipped-kind report, the drift refusals, the staleness
-// warnings, the "no confidence report" degradation. Those are the messages a
-// person acts on, and a test that could not read them would be asserting only
-// that the command did not crash.
+// runPipelineCLI captures stderr too: this loop's skip reports, drift refusals
+// and staleness warnings go there, and they are what a person acts on.
 func runPipelineCLI(t *testing.T, workdir string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	stderr = captureStderr(t, func() {
@@ -37,10 +25,8 @@ func runPipelineCLI(t *testing.T, workdir string, args ...string) (stdout, stder
 	return stdout, stderr, err
 }
 
-// countRequest counts EXACT "METHOD /path" matches, which is what the two-tier
-// assertions need: "GET /api/v2/feature/model/table-x" and
-// "GET /api/v2/feature/model/table-x/draft" are different requests, and a
-// substring count would fold them together.
+// countRequest counts EXACT "METHOD /path" matches: a substring count would fold
+// ".../table-x" and ".../table-x/draft" together.
 func countRequest(f *fakePipelineInstance, want string) int {
 	n := 0
 	for _, got := range f.requestOrder() {
@@ -85,7 +71,8 @@ func TestPipelineInitWritesAManifestWithNoEntrypoint(t *testing.T) {
 	if len(binding.Tables) != 0 {
 		t.Errorf("init must bind no tables, got %+v", binding.Tables)
 	}
-	// Nothing server-side: init reads /me for the organization and stops there.
+	// Nothing table-side: init reads /me for the organization and probes the
+	// feature, and makes no table request.
 	if n := countRequest(f, "GET /api/v2/feature/model"); n != 0 {
 		t.Errorf("init made %d table requests", n)
 	}
@@ -111,15 +98,10 @@ func TestPipelineInitRefusesASecondTime(t *testing.T) {
 	}
 }
 
-// TestPipelineInitChecksTheFeatureIDShape: --feature is written into a
-// COMMITTED manifest and nothing reads it until the first push, so a typo is
-// otherwise invisible for several files and possibly several days — and what it
-// reports there is a create that failed, not a manifest that was wrong from the
-// moment it was written.
-//
-// By shape, BEFORE the round trip confirmFeatureIn makes: an id that is not a
-// feature id at all is answerable without asking, and the shape refusal names
-// the real prefix, which "has no feature ... you can reach" would not.
+// TestPipelineInitChecksTheFeatureIDShape: --feature lands in a committed
+// manifest nothing reads until the first push, so a typo would otherwise surface
+// days later as a failed create. The shape check runs before confirmFeatureIn's
+// round trip and names the real prefix.
 func TestPipelineInitChecksTheFeatureIDShape(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	f.AddFeature("col-legacy", "Legacy", "private")
@@ -135,27 +117,22 @@ func TestPipelineInitChecksTheFeatureIDShape(t *testing.T) {
 		if !strings.Contains(err.Error(), "collection-") {
 			t.Errorf("the refusal does not name the real prefix: %v", err)
 		}
-		// A refused init leaves the directory exactly as it found it.
 		if _, statErr := os.Stat(filepath.Join(dir, wfdir.ManifestName)); statErr == nil {
 			t.Errorf("a refused init wrote a manifest for %q", bad)
 		}
 	}
-	// The legacy prefix is still minted nowhere and still held by real rows.
+	// The legacy prefix is minted nowhere but still held by real rows.
 	dir := t.TempDir()
 	if _, _, err := runPipelineCLI(t, dir, "pipeline", "init", "--feature", "col-legacy"); err != nil {
 		t.Errorf("the legacy feature prefix must be accepted: %v", err)
 	}
-	// And no --feature at all is a folder that refuses at its first push, which
-	// is a state init is allowed to create.
+	// No --feature at all is allowed: that folder refuses at its first push.
 	empty := t.TempDir()
 	if _, _, err := runPipelineCLI(t, empty, "pipeline", "init"); err != nil {
 		t.Errorf("init without --feature: %v", err)
 	}
 }
 
-// TestPipelineInitCreatesNoDirectoryWhenItRefuses: the manifest check comes
-// BEFORE the directory is created, so a mistyped path (or a second init) leaves
-// no empty folder behind.
 func TestPipelineInitCreatesNoDirectoryWhenItRefuses(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -172,7 +149,6 @@ func TestPipelineInitCreatesNoDirectoryWhenItRefuses(t *testing.T) {
 
 // --- clone ------------------------------------------------------------------
 
-// seedFeature registers a feature and its tables for the clone tests.
 func seedFeature(f *fakePipelineInstance, scope string) {
 	f.AddFeature("collection-1", "Sales pipeline", scope)
 	f.AddTable(&api.Table{ID: "table-orders", Name: "Orders", FeatureID: "collection-1",
@@ -181,17 +157,12 @@ func seedFeature(f *fakePipelineInstance, scope string) {
 		Code: "SELECT * FROM {{ ref('table-orders') }}", InputModels: []string{"table-orders"}})
 }
 
-// TestPipelineCloneWritesOneFilePerDerivedTable: the shape of a cloned folder —
-// a .sql per derived table, a bindings map, and a baseline that hashes exactly
-// what was written.
 func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	seedFeature(f, "private")
-	// One row that must NOT become a file — an integration table has no SQL a
-	// file could hold — and one that becomes a file of a DIFFERENT kind: a
-	// metric is a recipe, so it clones into metrics/<name>.json rather than into
-	// .sql.
+	// An integration table has no SQL a file could hold; a metric clones into
+	// metrics/<name>.json, not .sql.
 	f.AddTable(&api.Table{ID: "table-raw", Name: "Raw orders", FeatureID: "collection-1", Kind: "integration"})
 	f.AddTable(&api.Table{ID: "table-mrr", Name: "MRR", FeatureID: "collection-1", Kind: api.TableKindMetric,
 		MetricRecipe: json.RawMessage(`{"source":"table-orders","value":"revenue","version":1}`)})
@@ -211,9 +182,9 @@ func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 		t.Errorf("title = %v", payload["title"])
 	}
 
-	// The stem is the table's name VERBATIM, case included: it is what a push
-	// stamped at create, and folding it here would write a second file beside
-	// the one git already tracks.
+	// The stem is the table's name verbatim, case included: it is what a push
+	// stamped at create, and folding it would write a second file beside the one
+	// git tracks.
 	if got := readFile(t, root, "Orders.sql"); got != "SELECT * FROM raw" {
 		t.Errorf("Orders.sql = %q", got)
 	}
@@ -226,9 +197,8 @@ func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "mrr.sql")); err == nil {
 		t.Error("a metric must not become a .sql file")
 	}
-	// The metric IS cloned, into its own carrier, with the recipe verbatim in id
-	// form — the same form the .sql files' refs are written in, because a cloned
-	// folder declares no dependencies for an alias to resolve through.
+	// The recipe is written in id form, like the .sql refs: a cloned folder
+	// declares no dependencies for an alias to resolve through.
 	if got := readFile(t, root, "metrics/MRR.json"); !strings.Contains(got, `"source": "table-orders"`) {
 		t.Errorf("metrics/MRR.json = %q", got)
 	}
@@ -242,17 +212,12 @@ func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 	}
 	assertPipelineBaselineMatchesDisk(t, root, f.Key())
 
-	// The metric's identity is in the LOCK, never in the manifest's `tables` map:
-	// that map is keyed by .sql path and is walked by the whole SQL half of the
-	// loop, so a metric in it would be pushed as SQL.
+	// A metric's identity never goes in the manifest's `tables` map: the SQL half
+	// of the loop walks that map, so a metric in it would be pushed as SQL.
 	if _, inTables := binding.Tables["metrics/MRR.json"]; inTables {
 		t.Errorf("a metric must not land in the manifest's tables map: %+v", binding.Tables)
 	}
 
-	// The non-derived skip is still reported by kind. The metric one is GONE
-	// rather than reworded: a note saying metrics were "not cloned (out of scope
-	// for this loop)" is exactly the caveat that outlives its own deploy, and
-	// this clone just made it false.
 	if !strings.Contains(stderr, "kinds: integration") {
 		t.Errorf("the non-derived skip was not reported by kind:\n%s", stderr)
 	}
@@ -264,17 +229,14 @@ func TestPipelineCloneWritesOneFilePerDerivedTable(t *testing.T) {
 	}
 }
 
-// TestPipelineCloneCanonicalizesPositionalRefs: the retired AI build persisted
-// POSITIONAL refs, so any table it touched still holds them.
-// A folder-sync loop hashes remote code, so without canonicalization the same
-// SQL would hash two ways and every such table would read as permanently
-// drifted.
+// TestPipelineCloneCanonicalizesPositionalRefs: tables the retired AI build
+// touched still hold positional refs, and without canonicalization the same SQL
+// would hash two ways and read as permanently drifted.
 func TestPipelineCloneCanonicalizesPositionalRefs(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	f.AddFeature("collection-1", "Sales", "private")
 	f.AddTable(&api.Table{ID: "table-orders", Name: "Orders", FeatureID: "collection-1", Code: "SELECT 1"})
-	// Exactly what the retired AI build (POST /:id/build) left behind.
 	f.AddTable(&api.Table{ID: "table-revenue", Name: "Revenue", FeatureID: "collection-1",
 		Code:        "SELECT o.* FROM {{ ref('0') }} o JOIN {{ ref('0') }} b ON TRUE",
 		InputModels: []string{"table-orders"}})
@@ -286,11 +248,9 @@ func TestPipelineCloneCanonicalizesPositionalRefs(t *testing.T) {
 	}
 	root := filepath.Join(dir, "out")
 
-	// Asserted against the DIRECTORY LISTING, not os.Stat: FileSlug preserves
-	// the table name's case (Revenue -> Revenue.sql, see wfdir.FileSlug), and a
-	// stat by the wrong case still succeeds on the case-insensitive filesystems
-	// dev machines run — which is exactly how this test's stale lowercase
-	// expectation passed 78 local runs while failing every Linux CI run.
+	// Asserted against the directory listing, not os.Stat: wfdir.FileSlug keeps
+	// the name's case, and a wrong-case stat still succeeds on the
+	// case-insensitive filesystems dev machines run, while Linux CI fails.
 	entries, dirErr := os.ReadDir(root)
 	if dirErr != nil {
 		t.Fatalf("read clone folder: %v\nstderr:\n%s", dirErr, stderr)
@@ -311,19 +271,15 @@ func TestPipelineCloneCanonicalizesPositionalRefs(t *testing.T) {
 	if !strings.Contains(got, "{{ ref('table-orders') }}") {
 		t.Errorf("the ref was not rewritten to id form: %q", got)
 	}
-	// The baseline has to hash the CANONICAL form, or the next status reports
+	// The baseline must hash the canonical form, or the next status reports
 	// drift against a table nobody touched.
 	assertPipelineBaselineMatchesDisk(t, root, f.Key())
 }
 
-// TestPipelineCloneRefusesAnUnresolvablePositionalRef: the one silently
-// destructive path in the design.
-//
-// A ref this client cannot resolve means the stored SQL and the stored input
-// list disagree. Written to disk as-is, the next push would send it back, the
-// server would re-resolve it against the FRESHLY DERIVED (and sorted) input
-// list, and the SQL would start reading a different table with the build
-// succeeding and nothing anywhere saying so.
+// TestPipelineCloneRefusesAnUnresolvablePositionalRef: an unresolvable ref
+// means the stored SQL and input list disagree; written as-is, the next push
+// would have the server re-resolve it against the freshly derived input list,
+// silently reading a different table.
 func TestPipelineCloneRefusesAnUnresolvablePositionalRef(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -336,12 +292,11 @@ func TestPipelineCloneRefusesAnUnresolvablePositionalRef(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unresolvable positional ref must refuse the clone")
 	}
-	// Naming both halves is the point: which table, and which marker.
 	if !strings.Contains(err.Error(), "table-revenue") || !strings.Contains(err.Error(), "ref('3')") {
 		t.Errorf("the refusal names neither the table nor the ref: %v", err)
 	}
-	// And nothing is written: a folder missing one file would have a baseline
-	// that never mentions it, so the file would simply never appear.
+	// Nothing is written: a folder missing one file would have a baseline that
+	// never mentions it, so the file would never appear.
 	assertNothingWritten(t, filepath.Join(dir, "out"))
 }
 
@@ -363,37 +318,29 @@ func TestPipelineClonePrefersYourOwnDraft(t *testing.T) {
 	if got := readFile(t, root, "Orders.sql"); got != "SELECT draft" {
 		t.Errorf("the draft's SQL was not cloned: %q", got)
 	}
-	// The BINDING names the stable identity, never the draft: a draft's id dies
-	// at commit while the binding lives in the customer's git.
+	// The binding names the live table, never the draft: a draft's id dies at
+	// commit while the binding lives in the customer's git.
 	binding := pipelineBindingOf(t, root, f.Key())
 	if binding.Tables["Orders.sql"] != "table-orders" {
 		t.Errorf("the binding must name the live table, got %+v", binding.Tables)
 	}
-	// The BASELINE records the draft, so the next push resumes it instead of
-	// trying to check out a second one (which the server refuses).
+	// The baseline records the draft, so the next push resumes it instead of
+	// checking out a second one, which the server refuses.
 	inst := pipelineStateOf(t, root, f.Key())
 	if inst.Tables["Orders.sql"].DraftID != "table-draft-9" {
 		t.Errorf("the baseline did not record the draft: %+v", inst.Tables["Orders.sql"])
 	}
 }
 
-// TestPipelineCloneRoundTripsFilenames: a clone has to write back the filenames
-// the folder pushed, because a pipeline folder lives in the customer's git.
-//
-// A table's display name is the file stem push stamped at create, so the name
-// makes a round trip through the server. wfdir.Slug folds `_` into `-`, which
-// broke it: an author committing orders_clean.sql got orders-clean.sql back —
-// two files for one table, and a phantom deletion the moment either is pushed.
-// Collision suffixing is asserted in the same test because it runs on the same
-// slug and is the thing a change here is most likely to break.
+// TestPipelineCloneRoundTripsFilenames: a table's name is the file stem push
+// stamped at create, so clone must write back exactly that stem (orders_clean,
+// not orders-clean) or one table becomes two files in the customer's git.
 func TestPipelineCloneRoundTripsFilenames(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	f.AddFeature("collection-1", "Sales", "private")
 	f.AddTable(&api.Table{ID: "table-clean", Name: "orders_clean", FeatureID: "collection-1", Code: "SELECT 1"})
 	f.AddTable(&api.Table{ID: "table-region", Name: "Revenue By Region", FeatureID: "collection-1", Code: "SELECT 2"})
-	// Two names that slugify to the same thing, which is an ordinary state for a
-	// feature and must not lose a file.
 	f.AddTable(&api.Table{ID: "table-dupe-a", Name: "Orders", FeatureID: "collection-1", Code: "SELECT 3"})
 	f.AddTable(&api.Table{ID: "table-dupe-b", Name: "orders", FeatureID: "collection-1", Code: "SELECT 4"})
 
@@ -409,8 +356,6 @@ func TestPipelineCloneRoundTripsFilenames(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "orders-clean.sql")); err == nil {
 		t.Error("the underscore was folded into a dash — the filename no longer round-trips")
 	}
-	// Everything that is NOT an underscore still slugifies as before: a space is
-	// not a character a filename should carry.
 	if got := readFile(t, root, "Revenue-By-Region.sql"); got != "SELECT 2" {
 		t.Errorf("Revenue-By-Region.sql = %q", got)
 	}
@@ -419,20 +364,15 @@ func TestPipelineCloneRoundTripsFilenames(t *testing.T) {
 	if binding.Tables["orders_clean.sql"] != "table-clean" {
 		t.Errorf("the binding does not name the underscored file: %+v", binding.Tables)
 	}
-	// The collision is suffixed rather than dropped: a skipped file is a table
-	// the folder silently does not manage.
-	// Two names that differ only by case are ONE file on macOS and Windows, so
-	// the second is suffixed even though the stems are now distinct strings —
-	// CheckLocalPaths would otherwise refuse the whole clone.
+	// Names differing only by case are one file on macOS and Windows, so the
+	// second is suffixed rather than dropped; CheckLocalPaths would otherwise
+	// refuse the whole clone.
 	if binding.Tables["Orders.sql"] == "" || binding.Tables["orders-2.sql"] == "" {
 		t.Errorf("the name collision lost a file: %+v", binding.Tables)
 	}
 	assertPipelineBaselineMatchesDisk(t, root, f.Key())
 }
 
-// TestPipelineCloneRefusesAFeatureWithNoDerivedTables: a folder with no files is
-// not a useful thing to have created, and the reason is worth saying. A feature
-// holding only integration tables has neither SQL nor a recipe for a file.
 func TestPipelineCloneRefusesAFeatureWithNoDerivedTables(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -452,15 +392,14 @@ func TestPipelineCloneRefusesAFeatureWithNoDerivedTables(t *testing.T) {
 // --- status -----------------------------------------------------------------
 
 // seedBoundFolder lays out a two-table folder whose baseline matches both the
-// disk and the server — the clean starting point most status/push tests want.
+// disk and the server.
 func seedBoundFolder(t *testing.T, f *fakePipelineInstance) string {
 	t.Helper()
 	seedFeature(f, "private")
 	files := map[string]string{
 		"orders.sql":  "SELECT * FROM raw",
 		"revenue.sql": "SELECT * FROM {{ ref('table-orders') }}",
-		// Not syncable, and deliberately present: a pipeline folder is an
-		// ordinary repo directory.
+		// Not syncable: a pipeline folder is an ordinary repo directory.
 		"README.md": "# how this works\n",
 	}
 	root := t.TempDir()
@@ -482,13 +421,9 @@ func seedBoundFolder(t *testing.T, f *fakePipelineInstance) string {
 	return root
 }
 
-// TestPipelineStatusReadsHealthFromOneListing: the two-tier rule.
-//
-// The list carries every bound row's kind, status and hasError, so the health
-// leg costs ONE request for any number of tables. Only the code — which the list
-// deliberately omits — is paid for per table. A regression here is invisible in
-// the output and shows up as a folder of thirty tables taking a minute to
-// report, so the request count is the assertion.
+// TestPipelineStatusReadsHealthFromOneListing: health comes from one list call
+// for any number of tables; only the code, which the list omits, costs a request
+// per table. A regression is invisible in the output, so the count is asserted.
 func TestPipelineStatusReadsHealthFromOneListing(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -525,29 +460,26 @@ func TestPipelineStatusReadsHealthFromOneListing(t *testing.T) {
 			t.Errorf("%v: drift = %v, want none", row["path"], row["drift"])
 		}
 	}
-	// The non-syncable file is neither a local change nor a skip report: a
-	// pipeline folder ignores it silently, which is the whole point of the rule.
 	local := payload["local"].(map[string]any)
 	if len(local["added"].([]any)) != 0 || len(local["modified"].([]any)) != 0 {
 		t.Errorf("README.md leaked into the local diff: %+v", local)
 	}
 }
 
-// TestPipelineStatusReportsRemoteDriftAndOpenDrafts: drift is remote-vs-BASELINE
-// (never remote-vs-local), and it is measured against the row a push would write
-// to — which is the draft when there is one.
+// TestPipelineStatusReportsRemoteDriftAndOpenDrafts: drift is remote-vs-baseline
+// (never remote-vs-local), measured against the row a push would write to: the
+// draft when there is one.
 func TestPipelineStatusReportsRemoteDriftAndOpenDrafts(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
-	// A colleague's chat edit, in the caller's own draft.
 	f.AddDraft("table-orders", "table-draft-7", "SELECT something else")
 	f.syncOutcome["table-draft-7"] = "build_failed"
 	f.tables["table-draft-7"].Status = api.TableStatusBuildFailed
 	f.buildErr["table-draft-7"] = &api.TableBuildError{Message: "boom", Type: "impossible"}
 
-	// Drift exits NON-ZERO, and the payload is emitted first: the report is what
-	// a caller reads, the exit code is what a CI gate branches on.
+	// Drift exits non-zero after the payload is emitted: a CI gate branches on
+	// the exit code, a caller reads the report.
 	out, _, err := runPipelineCLI(t, root, "pipeline", "status", "--json")
 	if err == nil {
 		t.Fatal("drift must exit non-zero")
@@ -576,25 +508,22 @@ func TestPipelineStatusReportsRemoteDriftAndOpenDrafts(t *testing.T) {
 			orders["comparedAgainst"])
 	}
 	draft := orders["draft"].(map[string]any)
-	// The verdict is the single most useful thing here, and it is the reason the
-	// draft is read by its OWN id: GET :id/draft carries no buildVerdict.
+	// The draft is read by its own id because GET :id/draft carries no
+	// buildVerdict.
 	if draft["verdict"] != api.BuildVerdictFailed {
 		t.Errorf("draft verdict = %v, want %s", draft["verdict"], api.BuildVerdictFailed)
 	}
 }
 
 // TestPipelineStatusReportsABrokenBinding: a bound id the feature no longer
-// holds is answered per table, and costs no further requests — the other
-// bindings are still worth reporting.
+// holds costs no further requests and exits non-zero (its drift could not be
+// judged), while every other binding is still reported.
 func TestPipelineStatusReportsABrokenBinding(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
 	delete(f.tables, "table-revenue")
 
-	// A binding that no longer resolves is a table whose drift COULD NOT be
-	// judged, which is not the same answer as no drift — so it exits non-zero
-	// while still reporting every other binding.
 	out, _, err := runPipelineCLI(t, root, "pipeline", "status", "--json")
 	if err == nil {
 		t.Fatal("a broken binding must exit non-zero")
@@ -621,9 +550,6 @@ func TestPipelineStatusReportsABrokenBinding(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusListsUnboundFilesAsWillCreate: a new .sql file is not drift
-// and not an error — it is a table a push would create, and saying so is the
-// difference between "keep editing" and "nothing is on the server yet".
 func TestPipelineStatusListsUnboundFilesAsWillCreate(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -643,12 +569,9 @@ func TestPipelineStatusListsUnboundFilesAsWillCreate(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusOnlyReportsSkippedFilesItMightHaveSynced: Skipped means "a
-// file you might have expected to be synced, and why it was not". In a folder
-// whose rule is "`.sql` and nothing else, silently", a .git/ directory and a
-// dot-file are not that — reporting them on every command is the noise the
-// silent rule exists to avoid, and it trains the reader past the line that does
-// matter: a `.sql` file that was skipped.
+// TestPipelineStatusOnlyReportsSkippedFilesItMightHaveSynced: Skipped lists only
+// files someone might have expected to sync; reporting .git/ and dot-files on
+// every command would train the reader past a skipped `.sql` file.
 func TestPipelineStatusOnlyReportsSkippedFilesItMightHaveSynced(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -662,8 +585,7 @@ func TestPipelineStatusOnlyReportsSkippedFilesItMightHaveSynced(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("SECRET=1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A .sql the walk cannot read as source: this one IS worth a line, because
-	// somebody put it there expecting it to sync.
+	// A .sql the walk cannot read as source: somebody expected it to sync.
 	if err := os.Symlink(filepath.Join(root, "orders.sql"), filepath.Join(root, "linked.sql")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
@@ -687,15 +609,14 @@ func TestPipelineStatusOnlyReportsSkippedFilesItMightHaveSynced(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusWorksSignedOut: the local half of a status is worth having
-// on a plane, and "not checked" must be distinguishable from "fine".
+// TestPipelineStatusWorksSignedOut: signed out, the local half is answered in
+// full and the exit is non-zero, because "could not look" must never read as
+// "nothing moved".
 func TestPipelineStatusWorksSignedOut(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	root := seedBoundFolder(t, f)
 	signOutFrom(t, f.URL())
 
-	// Signed out, the local half is still answered in full — and the exit is
-	// non-zero, because "I could not look" must never read as "nothing moved".
 	out, _, err := runPipelineCLI(t, root, "pipeline", "status", "--json")
 	if err == nil {
 		t.Fatal("an unchecked remote must exit non-zero")
@@ -709,7 +630,6 @@ func TestPipelineStatusWorksSignedOut(t *testing.T) {
 	if !strings.Contains(reason, "not signed in") {
 		t.Errorf("notCheckedReason = %q", reason)
 	}
-	// And the local half is genuinely there.
 	if payload["local"] == nil {
 		t.Error("the local diff was not reported")
 	}
@@ -718,20 +638,13 @@ func TestPipelineStatusWorksSignedOut(t *testing.T) {
 	}
 }
 
-// TestPipelinePushNamesOtherOrganizationsOnlyWhenUnbound: the cross-organization
-// wording belongs to ONE case — this folder has no entry here and names other
-// organizations instead.
-//
-// A folder that IS bound here and merely left "featureID" out has a line to add
-// the field to. Telling it "the entries there name X instead", and to add an
-// entry it already has, is the same species of wrong advice the
-// cross-organization wording was written to remove.
+// TestPipelinePushNamesOtherOrganizationsOnlyWhenUnbound: the "entries name
+// another organization" wording is only for a folder with no entry here; a
+// folder bound here but missing featureID must be told to add that field.
 func TestPipelinePushNamesOtherOrganizationsOnlyWhenUnbound(t *testing.T) {
 	seed := func(t *testing.T, f *fakePipelineInstance, bindHere bool) string {
 		manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: "Sales pipeline"}
 		if bindHere {
-			// Bound, with a table already — and no featureID, the field a
-			// hand-written entry is most likely to be missing.
 			manifest.SetBinding(f.Key(), wfdir.Binding{Tables: map[string]string{"orders.sql": "table-orders"}})
 		}
 		manifest.SetBinding(wfdir.InstanceKey{URL: f.URL(), TenantID: "ten-other"},
@@ -766,14 +679,9 @@ func TestPipelinePushNamesOtherOrganizationsOnlyWhenUnbound(t *testing.T) {
 	})
 }
 
-// TestPipelineStatusDegradesWhenTheOrganizationLookupFails: the same promise one
-// credential further along.
-//
-// Resolving the organization is a request, and a request can fail — a rotated
-// token, a 5xx, no network. The scenario is a CI job running `pipeline status
-// --json` as a pre-flight: it must still print the local diff plus a reason, and
-// still exit non-zero, because "I could not look" is not "nothing moved".
-// Aborting produced neither.
+// TestPipelineStatusDegradesWhenTheOrganizationLookupFails: a failed
+// organization lookup (rotated token, 5xx) must still print the local diff and
+// a reason, and exit non-zero, rather than abort.
 func TestPipelineStatusDegradesWhenTheOrganizationLookupFails(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -801,13 +709,9 @@ func TestPipelineStatusDegradesWhenTheOrganizationLookupFails(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusExitsZeroOnAFreshClone: .ronja/ is correctly never
-// committed, so a colleague who has just cloned the repo has no baseline for any
-// file — the normal way somebody joins a pipeline, and the state push's own
-// drift guard deliberately disarms for.
-//
-// Exiting non-zero there would mean a fresh checkout could not pass a gate until
-// it had pushed, which is the opposite of what the gate is for.
+// TestPipelineStatusExitsZeroOnAFreshClone: .ronja/ is never committed, so a
+// fresh git checkout has no baseline; exiting non-zero would mean it could not
+// pass a gate until it had pushed.
 func TestPipelineStatusExitsZeroOnAFreshClone(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -824,8 +728,7 @@ func TestPipelineStatusExitsZeroOnAFreshClone(t *testing.T) {
 	if remote["checked"] != true {
 		t.Fatalf("remote = %+v", remote)
 	}
-	// And it is reported honestly rather than as agreement: the exit code says
-	// nothing has moved, the payload says nothing was comparable.
+	// Reported as not comparable, not as agreement.
 	for _, table := range remote["tables"].([]any) {
 		if drift := table.(map[string]any)["drift"]; drift != driftNoBaseline {
 			t.Errorf("drift = %v, want %s", drift, driftNoBaseline)
@@ -833,9 +736,6 @@ func TestPipelineStatusExitsZeroOnAFreshClone(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusExitsZeroOnAFreshInit: a folder bound to a feature it has
-// never pushed to. Nothing is missing and nothing failed — there is simply
-// nothing over there yet.
 func TestPipelineStatusExitsZeroOnAFreshInit(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -859,10 +759,9 @@ func TestPipelineStatusExitsZeroOnAFreshInit(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusExitsNonZeroOnAnUnreadableRow: the other half of the
-// contract. A row that was READ and made no sense is not a row with nothing to
-// compare against, and reporting it as clean is how a gate goes green over
-// somebody's unsynced work.
+// TestPipelineStatusExitsNonZeroOnAnUnreadableRow: a row that could not be read
+// is not a row with nothing to compare against; reporting it clean would let a
+// gate go green over unsynced work.
 func TestPipelineStatusExitsNonZeroOnAnUnreadableRow(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -880,8 +779,6 @@ func TestPipelineStatusExitsNonZeroOnAnUnreadableRow(t *testing.T) {
 
 // --- discard ----------------------------------------------------------------
 
-// TestPipelineDiscardDropsStagedDrafts: discard operates on the sync loop's own
-// artifact and leaves the live tables and the local files exactly as they were.
 func TestPipelineDiscardDropsStagedDrafts(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -913,15 +810,14 @@ func TestPipelineDiscardDropsStagedDrafts(t *testing.T) {
 	if len(f.discarded) != 1 || f.discarded[0] != "table-draft-3" {
 		t.Errorf("discarded = %+v", f.discarded)
 	}
-	// The live table is untouched, and so is the local file.
 	if f.CodeOf("table-orders") != "SELECT * FROM raw" {
 		t.Errorf("the live table was changed: %q", f.CodeOf("table-orders"))
 	}
 	if readFile(t, root, "orders.sql") != "SELECT * FROM raw" {
 		t.Error("discard must not touch local files")
 	}
-	// The draft pointer goes; the CONTENT baseline stays, because it still
-	// describes what the server held when the draft was forked.
+	// The content baseline stays: it still describes what the server held when
+	// the draft was forked.
 	inst := pipelineStateOf(t, root, f.Key())
 	if inst.Tables["orders.sql"].DraftID != "" {
 		t.Errorf("the draft pointer survived: %+v", inst.Tables["orders.sql"])
@@ -932,9 +828,8 @@ func TestPipelineDiscardDropsStagedDrafts(t *testing.T) {
 }
 
 // TestPipelineDiscardTreatsAnUnreachableTableAsNoDraft: GET :id/draft answers
-// 404 when the TABLE is gone from reach (trashed, its feature trashed, no
-// access). There is nothing of the caller's left to discard, so it is the null
-// draft's outcome, not a refusal that wedges the folder.
+// 404 when the table itself is out of reach (trashed, no access); that is the
+// no-draft outcome, not a refusal that wedges the folder.
 func TestPipelineDiscardTreatsAnUnreachableTableAsNoDraft(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -970,8 +865,6 @@ func TestPipelineDiscardTreatsAnUnreachableTableAsNoDraft(t *testing.T) {
 	}
 }
 
-// TestPipelineDiscardReportsNothingStaged: "no draft at all" is a different
-// answer from "the drafts were discarded", and a caller has to be able to tell.
 func TestPipelineDiscardReportsNothingStaged(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -990,13 +883,9 @@ func TestPipelineDiscardReportsNothingStaged(t *testing.T) {
 	}
 }
 
-// TestPipelineDiscardNamesADocsSidecarForWhatItIs: the guard in front of a docs
-// sidecar has to be able to SEE the folder's sidecars.
-//
-// It was handed a nil set, so no argument could ever match it and every sidecar
-// path fell through to the shape check — which told the person that a file
-// sitting in their own folder "is not a docs file in this folder", and sent them
-// hunting a typo that was not there.
+// TestPipelineDiscardNamesADocsSidecarForWhatItIs: the sidecar guard must see
+// the folder's sidecars, or a real one is refused as "is not a docs file in this
+// folder".
 func TestPipelineDiscardNamesADocsSidecarForWhatItIs(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1013,8 +902,6 @@ func TestPipelineDiscardNamesADocsSidecarForWhatItIs(t *testing.T) {
 		t.Errorf("a sidecar that IS in this folder was refused for the wrong reason: %v", err)
 	}
 
-	// The other case keeps its own answer, which is the one that is true of it: a
-	// path that looks like a sidecar and is not there.
 	_, _, err = runPipelineCLI(t, root, "pipeline", "discard", wfdir.TableDocsPath("nope"), "--yes", "--json")
 	if err == nil {
 		t.Fatal("a docs path that is not in the folder must be refused by name")
@@ -1024,14 +911,10 @@ func TestPipelineDiscardNamesADocsSidecarForWhatItIs(t *testing.T) {
 	}
 }
 
-// TestPipelineDiscardRePointsTheBaselineWhenTheDraftIsAlreadyGone: the
-// DOCUMENTED normal case — somebody discarded the draft from the web UI — has to
-// leave exactly the baseline a discard here would have.
-//
-// Recording only the draft POINTER left inst.Files describing the vanished
-// draft's bytes, so the local file read as unchanged for ever: every signal went
-// green while the SQL had never reached the server, and the next push answered
-// "Up to date" with no draft anywhere.
+// TestPipelineDiscardRePointsTheBaselineWhenTheDraftIsAlreadyGone: a draft
+// discarded from the web UI must leave the baseline a local discard would; a
+// baseline still hashing the vanished draft makes the next push "Up to date"
+// with nothing on the server.
 func TestPipelineDiscardRePointsTheBaselineWhenTheDraftIsAlreadyGone(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1058,13 +941,9 @@ func TestPipelineDiscardRePointsTheBaselineWhenTheDraftIsAlreadyGone(t *testing.
 	if inst.Tables["orders.sql"].DraftID != "" {
 		t.Errorf("the draft pointer survived: %+v", inst.Tables["orders.sql"])
 	}
-	// The CONTENT baseline now describes the live table, which is the only row
-	// this file is synced with.
 	if inst.Files["orders.sql"].SHA256 != wfdir.HashString("SELECT * FROM raw") {
 		t.Fatalf("the content baseline still describes the vanished draft: %+v", inst.Files["orders.sql"])
 	}
-	// Which is the whole point: the next push re-stages instead of reporting a
-	// folder that is up to date with nothing on the server.
 	out, stderr, err = runPipelineCLI(t, root, "pipeline", "push", "--json")
 	if err != nil {
 		t.Fatalf("push after discard: %v\n%s", err, stderr)
@@ -1074,14 +953,9 @@ func TestPipelineDiscardRePointsTheBaselineWhenTheDraftIsAlreadyGone(t *testing.
 	}
 }
 
-// TestPipelineDiscardKeepsTheBookkeepingOfWhatItAlreadyDropped: one table's
-// failure is per-file data, and the baseline for the drafts that DID go is
-// written as they go.
-//
-// A run that aborted on the first failure had already deleted drafts server-side
-// and saved nothing, so those files kept both their draft pointer and their old
-// content baseline — the stale-baseline state above, arrived at from the other
-// direction.
+// TestPipelineDiscardKeepsTheBookkeepingOfWhatItAlreadyDropped: the baseline is
+// written per dropped draft, so a later table's failure cannot leave the already
+// deleted drafts with stale pointers and content baselines.
 func TestPipelineDiscardKeepsTheBookkeepingOfWhatItAlreadyDropped(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1123,15 +997,13 @@ func TestPipelineDiscardKeepsTheBookkeepingOfWhatItAlreadyDropped(t *testing.T) 
 	if inst.Files["orders.sql"].SHA256 != wfdir.HashString("SELECT * FROM raw") {
 		t.Errorf("the content baseline of the dropped draft was not re-pointed: %+v", inst.Files["orders.sql"])
 	}
-	// The one that failed is untouched, so a retry finds its draft where it was.
 	if inst.Tables["revenue.sql"].DraftID != "table-draft-4" {
 		t.Errorf("revenue.sql lost a draft that is still on the server: %+v", inst.Tables["revenue.sql"])
 	}
 }
 
-// TestPipelineDiscardFailsWhenTheBaselineCannotBeWritten: a baseline write that
-// fails IS the stale-baseline state — the drafts are gone and the folder still
-// describes them — so it exits non-zero rather than reporting a clean discard.
+// TestPipelineDiscardFailsWhenTheBaselineCannotBeWritten: a failed baseline
+// write leaves the folder describing drafts that are gone, so it exits non-zero.
 func TestPipelineDiscardFailsWhenTheBaselineCannotBeWritten(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores the directory mode this test depends on")
@@ -1159,8 +1031,8 @@ func TestPipelineDiscardFailsWhenTheBaselineCannotBeWritten(t *testing.T) {
 	}
 }
 
-// TestPipelineDiscardRequiresYesUnderJSON: --json says there is a program on the
-// other end, and a program handed a [y/N] prompt deadlocks.
+// TestPipelineDiscardRequiresYesUnderJSON: a program on the other end of --json
+// handed a [y/N] prompt deadlocks.
 func TestPipelineDiscardRequiresYesUnderJSON(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1181,11 +1053,10 @@ func TestPipelineDiscardRequiresYesUnderJSON(t *testing.T) {
 
 // --- the kind refusal matrix ------------------------------------------------
 
-// TestPipelineCommandsRefuseTheOtherFolderKinds: the folder types are
-// indistinguishable by shape, so LoadManifest's kind gate is the only thing
-// standing between `wf push` in a pipeline folder and a workflow made out of
-// SQL. wfdir tests the refusal; this pins that the COMMANDS actually route
-// through it, in both directions.
+// TestPipelineCommandsRefuseTheOtherFolderKinds: folder kinds are
+// indistinguishable by shape, so LoadManifest's kind gate alone stops `wf push`
+// in a pipeline folder making a workflow out of SQL; this pins that the commands
+// route through it.
 func TestPipelineCommandsRefuseTheOtherFolderKinds(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1222,8 +1093,7 @@ func TestPipelineCommandsRefuseTheOtherFolderKinds(t *testing.T) {
 			if err == nil {
 				t.Fatal("the wrong folder kind must be refused")
 			}
-			// Naming the command that WOULD work is the whole value: a wrong kind
-			// is almost always the right folder and the wrong verb.
+			// A wrong kind is almost always the right folder and the wrong verb.
 			if !strings.Contains(err.Error(), tc.wantCmd) {
 				t.Errorf("refusal should point at %q, got: %v", tc.wantCmd, err)
 			}
@@ -1231,19 +1101,14 @@ func TestPipelineCommandsRefuseTheOtherFolderKinds(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusReportsBothDriftLegs: push refuses when EITHER the live
-// table or your own draft has moved, and then says "run status to see the
-// detail" — so status has to be able to show both.
-//
-// It could not: it resolved the draft and reported only that row, which made the
-// live leg (a colleague committing while your draft sat open) invisible on the
-// one surface built to show it.
+// TestPipelineStatusReportsBothDriftLegs: push refuses when either the live
+// table or your own draft has moved and points at status, so status must show
+// both legs.
 func TestPipelineStatusReportsBothDriftLegs(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedBoundFolder(t, f)
-	// A draft holding exactly what this folder last wrote into it — leg (b) is
-	// clean, and it is recorded as such.
+	// The draft holds exactly what this folder last wrote into it.
 	f.AddDraft("table-orders", "table-draft-5", "SELECT * FROM raw")
 	writePipelineBaseline(t, root, f.Key(), "collection-1",
 		map[string]string{"orders.sql": "SELECT * FROM raw"},
@@ -1253,7 +1118,7 @@ func TestPipelineStatusReportsBothDriftLegs(t *testing.T) {
 			DraftSHA256: wfdir.HashString("SELECT * FROM raw"),
 			LiveSHA256:  wfdir.HashString("SELECT * FROM raw"),
 		}})
-	// …and a colleague's commit underneath it — leg (a) is not.
+	// A colleague's commit moves the live table underneath it.
 	f.tables["table-orders"].Code = "SELECT theirs FROM raw"
 
 	out, _, err := runPipelineCLI(t, root, "pipeline", "status", "--json")
@@ -1269,8 +1134,6 @@ func TestPipelineStatusReportsBothDriftLegs(t *testing.T) {
 	if orders == nil {
 		t.Fatal("orders.sql missing from the report")
 	}
-	// The row a push would WRITE TO is the draft, and it is unchanged. Reporting
-	// that as the whole answer is exactly the gap this fills.
 	if orders["drift"] != driftNone {
 		t.Errorf("draft drift = %v, want none", orders["drift"])
 	}
@@ -1282,9 +1145,8 @@ func TestPipelineStatusReportsBothDriftLegs(t *testing.T) {
 	}
 }
 
-// TestPipelineStatusOmitsTheLiveLegWithNoDraft: with no draft there is one row
-// and one answer, and repeating it under a second key would invite a caller to
-// treat two names for the same fact as two facts.
+// TestPipelineStatusOmitsTheLiveLegWithNoDraft: with no draft, liveDrift would
+// repeat drift under a second key, inviting a caller to read one fact as two.
 func TestPipelineStatusOmitsTheLiveLegWithNoDraft(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)

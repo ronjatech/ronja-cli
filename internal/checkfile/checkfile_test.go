@@ -6,10 +6,9 @@ import (
 	"testing"
 )
 
-// shorelinkFixture is the shape of the real Shorelink checks: names with spaces,
-// `=`, `+` and å/ä/ö; expressions with quoted literals, `<`, FILTER clauses, a
-// date literal and a row constructor; multi-sentence Swedish descriptions; and
-// a freshness watchdog.
+// shorelinkFixture has the shape of real customer checks: names with spaces,
+// `=`, `+` and å/ä/ö, quoted literals, FILTER clauses, a row constructor and
+// multi-sentence Swedish descriptions.
 const shorelinkFixture = `{
   "checks": [
     {
@@ -52,9 +51,6 @@ const shorelinkFixture = `{
 }
 `
 
-// TestShorelinkFixtureRoundTrips: parse → encode reproduces the file byte for
-// byte, so a clone of these checks is exactly what an author would have written,
-// and a re-parse is the same set.
 func TestShorelinkFixtureRoundTrips(t *testing.T) {
 	parsed, err := Parse([]byte(shorelinkFixture))
 	if err != nil {
@@ -82,8 +78,6 @@ func TestShorelinkFixtureRoundTrips(t *testing.T) {
 	}
 }
 
-// A live check equal to its entry matches, and each declared field that moves
-// is named by Differs; an undeclared field that moves is not a difference.
 func TestMatchesAndDiffersFollowTheDeclaredFields(t *testing.T) {
 	parsed, err := Parse([]byte(`{"checks":[{"name":"Unik rad per id","expression":"count(*) = count(distinct id)","severity":"fail"}]}`))
 	if err != nil {
@@ -112,9 +106,8 @@ func TestMatchesAndDiffersFollowTheDeclaredFields(t *testing.T) {
 	}
 }
 
-// The drift question survives the author changing which fields an entry
-// declares: a hash recorded through one declared set still recognises the same
-// live check after the entry grows a field.
+// A hash recorded through one declared field set must still recognise the same
+// live check after the entry declares another field.
 func TestUnmovedAcrossADeclaredSetChange(t *testing.T) {
 	before, _ := Parse([]byte(`{"checks":[{"name":"A","expression":"true"}]}`))
 	live := Live{Name: "A", Kind: KindExpression, Expression: "true", Severity: "warn", Enabled: true}

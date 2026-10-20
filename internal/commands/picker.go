@@ -11,33 +11,19 @@ import (
 	"golang.org/x/term"
 )
 
-// An arrow-key list picker, for the one command that has something to pick
-// between: `ronja profile use` with no name.
-//
-// The rule from stdin.go still holds and is if anything stricter here — never
-// prompt without a TTY. A picker that drew itself into a pipe would emit escape
-// sequences to a machine and then block forever on input nobody is typing,
-// which is the worst failure an agent can be handed. Without a terminal this
-// refuses immediately and names the non-interactive form.
-//
-// Rendering goes to STDERR, like every other piece of human narration in this
-// CLI, so a command's stdout stays exactly its output.
+// Never prompt without a TTY: a picker drawn into a pipe would block forever on
+// input nobody types, which to an agent is a hang. Rendering goes to stderr.
 
-// errPickerCancelled reports that the human backed out. Callers turn it into a
-// quiet exit rather than an error message: cancelling is a choice, not a fault.
+// errPickerCancelled is turned into a quiet exit by callers: cancelling is a
+// choice, not a fault.
 var errPickerCancelled = errors.New("cancelled")
 
-// pickerItem is one selectable row. Label is the value; Detail and Note are
-// alignment-padded context, and Note is where a warning like "(expired)" goes.
 type pickerItem struct {
 	Label  string
 	Detail string
 	Note   string
 }
 
-// keyAction is what one keypress means. Extracted so the decoding of terminal
-// input — which is where the fiddly cases live — is a pure function a test can
-// drive with byte slices instead of a pty.
 type keyAction int
 
 const (
@@ -48,33 +34,18 @@ const (
 	keyCancel
 )
 
-// decodeKey maps the FRONT of a read to an action, and reports how many bytes
-// it consumed so the caller can decode the rest.
-//
-// One read is not one keypress. Key repeat — holding an arrow down to scroll a
-// list, which is the most ordinary thing anyone does with a picker — delivers
-// several escape sequences in a single read, and so does typing quickly.
-// Decoding only the front of the buffer and discarding the remainder drops
-// every keypress but the first, so the cursor moves one row however long you
-// hold the key.
-//
-// Arrow keys arrive as a three-byte escape sequence (ESC [ A). A LONE escape is
-// the Escape key, and the two are only distinguishable by what follows — so a
-// one-byte ESC is treated as cancel, which is what pressing Escape means
-// anyway.
-//
-// Ctrl-C arrives as byte 0x03 rather than a signal: raw mode turns off ISIG, so
-// the terminal stops translating it. Handling it here is not an extra — it is
-// the ONLY thing standing between the user and a picker they cannot escape.
+// decodeKey maps the FRONT of a read to an action and reports the bytes used:
+// key repeat delivers several sequences in one read, and the caller must decode
+// them all. Raw mode turns off ISIG, so Ctrl-C arrives as 0x03 and this is the
+// only way out of the picker.
 func decodeKey(buf []byte) (keyAction, int) {
 	if len(buf) == 0 {
 		return keyNone, 0
 	}
 	if buf[0] == 27 && len(buf) >= 2 && buf[1] == '[' {
 		if len(buf) < 3 {
-			// A sequence split across reads. Consuming the whole remainder
-			// rather than stalling: the alternative is buffering across reads
-			// for a case terminals do not actually produce.
+			// Split across reads: consumed whole rather than buffered, since
+			// terminals do not produce it.
 			return keyNone, len(buf)
 		}
 		switch buf[2] {
@@ -102,11 +73,8 @@ func decodeKey(buf []byte) (keyAction, int) {
 	return keyNone, 1
 }
 
-// clampCursor moves the cursor and keeps it in range.
-//
-// Clamping rather than wrapping: with three profiles on screen, arrowing past
-// the end and landing back on the first is a good way to select something other
-// than what you were looking at.
+// clampCursor clamps rather than wraps, so arrowing past the end never lands on
+// a row you were not looking at.
 func clampCursor(cursor, delta, n int) int {
 	next := cursor + delta
 	if next < 0 {
@@ -118,10 +86,6 @@ func clampCursor(cursor, delta, n int) int {
 	return next
 }
 
-// pick runs the interactive picker and returns the chosen index.
-//
-// start is where the cursor begins, which callers set to whatever is current —
-// so enter alone is a no-op rather than a surprise.
 func pick(prompt string, items []pickerItem, start int) (int, error) {
 	if len(items) == 0 {
 		return 0, errors.New("nothing to choose from")
@@ -134,10 +98,8 @@ func pick(prompt string, items []pickerItem, start int) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("put the terminal in raw mode: %w", err)
 	}
-	// Restores on every ordinary exit INCLUDING cancel, which is why Ctrl-C is
-	// decoded as a key rather than left to a signal — a signal would kill the
-	// process with the terminal still raw, leaving the user's shell with no
-	// echo and no line editing.
+	// Restores on every exit including cancel; a signal would kill the process
+	// with the terminal still raw, which is why Ctrl-C is decoded as a key.
 	defer restore()
 
 	out := os.Stderr
@@ -157,10 +119,8 @@ func pick(prompt string, items []pickerItem, start int) (int, error) {
 			}
 			return 0, fmt.Errorf("read key: %w", err)
 		}
-		// Every key in the read, not just the first — see decodeKey. The
-		// redraw is deliberately OUTSIDE this loop: holding an arrow down
-		// delivers a burst, and redrawing per key would repaint the list
-		// several times to show one net movement.
+		// The redraw is deliberately outside this loop: a key-repeat burst
+		// would otherwise repaint once per key.
 		moved := false
 		for rest := buf[:n]; len(rest) > 0; {
 			action, used := decodeKey(rest)
@@ -190,14 +150,10 @@ func pick(prompt string, items []pickerItem, start int) (int, error) {
 const (
 	hideCursor = "\033[?25l"
 	showCursor = "\033[?25h"
-	// cursorUp and clearLine are the whole redraw mechanism: walk back over the
-	// rows just written and overwrite them in place, so the list does not
-	// scroll a new copy of itself on every keypress.
-	cursorUp  = "\033[A"
-	clearLine = "\r\033[K"
+	cursorUp   = "\033[A"
+	clearLine  = "\r\033[K"
 )
 
-// renderItems draws the list, overwriting the previous draw when redraw is set.
 func renderItems(out io.Writer, items []pickerItem, cursor int, redraw bool) {
 	if redraw {
 		for range items {
@@ -222,13 +178,8 @@ func renderItems(out io.Writer, items []pickerItem, cursor int, redraw bool) {
 	}
 }
 
-// padRight pads to a width counted in RUNES, not bytes.
-//
-// fmt's %-*s counts bytes, so an organization called "Ässä Oy" pads two columns
-// short and knocks every following column out of line. Rune count is not true
-// display width either — a CJK name occupies two columns per rune — but it is
-// right for the Latin-with-accents case that actually turns up in a customer
-// list, and wrong only cosmetically for the rest.
+// padRight counts runes, not bytes (fmt's %-*s), so "Ässä Oy" aligns. Runes
+// are not display width (CJK is two columns), but that is only cosmetic.
 func padRight(s string, width int) string {
 	if pad := width - utf8.RuneCountInString(s); pad > 0 {
 		return s + strings.Repeat(" ", pad)
@@ -236,10 +187,7 @@ func padRight(s string, width int) string {
 	return s
 }
 
-// makeRaw switches the terminal to raw mode and returns its restorer.
-//
-// A package var for the same reason isTerminal is one: the tests drive the
-// picker's decisions, not a pty.
+// makeRaw is a package var, like isTerminal, so tests need no pty.
 var makeRaw = func(f *os.File) (func(), error) {
 	state, err := term.MakeRaw(int(f.Fd()))
 	if err != nil {

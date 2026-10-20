@@ -8,47 +8,27 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// Noticing that the caller is standing in a workflow folder, and saying so.
-//
-// This exists because of a failure mode that is entirely ours. `ronja wf`
-// already does the loop people hand-roll over raw HTTP — it edits from a
-// folder, syncs a draft, runs it, polls to completion and prints the log — and
-// it manages the parameter declaration too. But nothing pointed at it. Someone
-// who read the HTTP guide first ended up escaping Python source into a JSON PUT
-// body on every edit, and hand-writing a poll loop four times, with the command
-// that does both sitting one word away.
-//
-// A capability nobody finds is a capability that does not exist, and the cost
-// of the fix is one line of output at the moment it is relevant: `ronja
-// context` is the handoff command, so it is where a reader is deciding what to
-// do next.
+// The note `ronja context` prints when the caller stands in a folder a CLI loop
+// drives, so the loop is found instead of hand-rolled over raw HTTP.
 
 // localWorkflow describes what the current directory looks like it holds.
 type localWorkflow struct {
 	// Root is the folder holding ronja.json, when there is one.
-	Root string
-	// Title comes from the manifest, so the line can name the workflow.
+	Root  string
 	Title string
-	// Bound reports whether the manifest records any instance binding yet — the
-	// difference between "cloned, keep editing" and "initialised, never pushed".
+	// Bound reports whether the manifest records any instance binding yet.
 	Bound bool
 	// LoosePython is set when there is no manifest but the directory holds
-	// Python. That is the `wf init` case, and the one where somebody is about
-	// to start doing it by hand.
+	// Python: the `wf init` case.
 	LoosePython string
-	// Kind is which folder loop this is — wfdir.KindWorkflow, KindDataApp or
-	// KindPipeline — or "" when there is a ronja.json we could not read as any
-	// of them.
-	//
-	// Load-bearing rather than cosmetic: the folder types are indistinguishable
-	// by shape, and pointing a pipeline folder at `wf` would name commands that
-	// LoadManifest's kind check then refuses.
+	// Kind is the folder's wfdir kind name, or "" when ronja.json reads as none
+	// of them. The kinds are indistinguishable by shape, so this decides which
+	// loop's commands the note names.
 	Kind string
 }
 
-// localWork inspects the working directory. Nil means there is nothing worth
-// saying, which is the common case and must stay silent — a context command
-// that editorialises about every directory is one people stop reading.
+// localWork inspects the working directory. Nil, the common case, prints
+// nothing.
 func localWork() *localWorkflow {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -56,24 +36,14 @@ func localWork() *localWorkflow {
 	}
 	if root, err := wfdir.FindRoot(cwd); err == nil {
 		found := &localWorkflow{Root: root}
-		// FindRoot only knows there is a ronja.json; which loop it belongs to
-		// is the manifest's `kind`, and LoadManifest refuses every other one. Ask
-		// for each in turn rather than parsing the file ourselves, so this
-		// stays honest if the refusal rules change.
-		//
-		// The set comes from wfdir's REGISTRY, never a literal list. It was a
-		// literal list of three, and the fourth kind was added without it: an
-		// automation folder then left Kind empty, and printLocalWork's fallback
-		// announced "this is a workflow folder" and recommended `ronja wf` —
-		// exactly the misrouting Kind.Command exists to prevent, in the one
-		// message a lost caller reads.
+		// Each kind from wfdir's registry is tried through LoadManifest, never a
+		// literal list or a local parse, so a new kind cannot be misrouted to
+		// `ronja wf`.
 		for _, k := range wfdir.AllKinds() {
 			if m, err := wfdir.LoadManifest(root, k); err == nil {
 				found.Kind = k.Name
 				found.Title = m.Title
-				// Either shape counts: a stack folder's bindings live in
-				// "stacks" and a legacy one's in "instances", and a folder that
-				// has migrated is no less bound for it.
+				// Either shape counts: stacks, or legacy instances.
 				found.Bound = len(m.Instances) > 0 || m.UsesStacks()
 				break
 			}
@@ -86,20 +56,13 @@ func localWork() *localWorkflow {
 	return nil
 }
 
-// firstPythonFile returns one .py file in dir, or "".
-//
-// Deliberately shallow — no recursion, no heuristics about what the file
-// contains. The signal is "somebody is writing Python here", and a directory
-// listing is enough to establish it. Guessing harder would produce the one
-// outcome worse than staying quiet: confidently telling a data scientist that
-// their unrelated notebook scratch folder is a Ronja workflow.
+// firstPythonFile returns one .py file in dir, preferring main.py, or an empty
+// string. Deliberately shallow: no recursion, no content heuristics.
 func firstPythonFile(dir string) string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return ""
 	}
-	// main.py first if it is there, since that is the entrypoint `wf init`
-	// would pick and naming it makes the suggestion concrete.
 	var fallback string
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".py" {
@@ -120,9 +83,6 @@ func (l *localWorkflow) payload() map[string]any {
 	if l.Root != "" {
 		out["root"] = l.Root
 		out["bound"] = l.Bound
-		// Which loop this folder belongs to, which the payload used to omit
-		// entirely — so a program reading this could see that there was a folder
-		// but not which commands drive it, the one thing the note exists to say.
 		if l.Kind != "" {
 			out["kind"] = l.Kind
 		}
@@ -136,10 +96,9 @@ func (l *localWorkflow) payload() map[string]any {
 	return out
 }
 
-// printLocalWork appends the folder note to `ronja context`.
-//
-// Placed at the very end, after the inlined /llms.txt, on purpose: llms.txt is
-// long, and the last thing on the page is the thing a reader acts on.
+// printLocalWork appends the folder note to `ronja context`, last on purpose:
+// after the long inlined /llms.txt, the last thing on the page is what a reader
+// acts on.
 func printLocalWork(l *localWorkflow) {
 	if l == nil {
 		return
@@ -147,10 +106,7 @@ func printLocalWork(l *localWorkflow) {
 	out := os.Stdout
 	fmt.Fprintf(out, "\n---\n\n## In this directory\n\n")
 
-	// The noun comes from the registry's Label, so a kind cannot be added and
-	// then described as a workflow. An UNREADABLE manifest (Kind "") keeps the
-	// old fallback: there is nothing better to call it, and the verb list below
-	// is the same one `wf init` would have offered.
+	// An unreadable manifest (Kind "") falls back to "workflow folder".
 	noun := "workflow folder"
 	if kind, ok := wfdir.KindByName(l.Kind); ok {
 		noun = kind.Label + " folder"
@@ -160,8 +116,6 @@ func printLocalWork(l *localWorkflow) {
 	case l.Root != "" && l.Title != "":
 		fmt.Fprintf(out, "This is the %s for %q (%s).\n\n", noun, l.Title, l.Root)
 	case l.Root != "":
-		// "a automation folder" — the article has to follow the Label now that
-		// it comes from the registry rather than from a literal beside it.
 		article := "a"
 		switch noun[0] {
 		case 'a', 'e', 'i', 'o', 'u':
@@ -180,9 +134,6 @@ func printLocalWork(l *localWorkflow) {
 		fmt.Fprintf(out, "    ronja pipeline status    local changes, table health, and drift\n")
 		fmt.Fprintf(out, "    ronja pipeline push      sync each changed .sql file and build it\n")
 		fmt.Fprintf(out, "    ronja pipeline publish   commit your drafts\n\n")
-		// The two things the raw-HTTP path makes people do by hand: the draft-id
-		// bookkeeping per edit cycle, and the poll-plus-truth-table that decides
-		// whether a build actually worked.
 		fmt.Fprintf(out, "One .sql file is one derived table; everything else in the folder is ignored.\n")
 		fmt.Fprintf(out, "`pipeline push` opens the draft, writes the SQL and its derived inputs, builds\n")
 		fmt.Fprintf(out, "it and reports the verdict with a schema diff and sample rows — so none of that\n")
@@ -198,9 +149,6 @@ func printLocalWork(l *localWorkflow) {
 	if l.Kind == wfdir.KindAutomation {
 		fmt.Fprintf(out, "    ronja automation status   what a push would change, and what moved\n")
 		fmt.Fprintf(out, "    ronja automation push     make each automation match its file\n\n")
-		// The two things worth knowing before the first edit, and neither is
-		// obvious from the verb list: there is no publish (nothing to commit),
-		// and a field a file leaves out is a field this folder does not manage.
 		fmt.Fprintf(out, "One .json file is one automation and its filename is the name; everything else\n")
 		fmt.Fprintf(out, "in the folder is ignored. There is no publish step — an automation has no draft\n")
 		fmt.Fprintf(out, "and no version history, so a push is the whole write. A field a file does not\n")
@@ -219,9 +167,6 @@ func printLocalWork(l *localWorkflow) {
 		fmt.Fprintf(out, "    ronja app push       sync the folder into your draft\n")
 		fmt.Fprintf(out, "    ronja app test       render it headlessly and report what was seen\n")
 		fmt.Fprintf(out, "    ronja app publish    take the draft live\n\n")
-		// The data-app equivalents of the two hand-rolled steps below: the
-		// allowlist is the one nobody expects, because nothing infers it from
-		// the code and an empty one publishes green.
 		fmt.Fprintf(out, "`app push` syncs the files AND the access block in ronja.json — the tables and\n")
 		fmt.Fprintf(out, "secrets the app may read, which nothing derives from your source. `app test`\n")
 		fmt.Fprintf(out, "renders the app in a headless browser and writes a screenshot plus a report of\n")
@@ -234,12 +179,8 @@ func printLocalWork(l *localWorkflow) {
 	}
 
 	if l.Kind != "" && l.Kind != wfdir.KindWorkflow {
-		// A kind the registry knows and this note has no verb list for yet.
-		// Saying nothing more is the honest answer, and it is the whole reason
-		// this branch exists: falling through to the `ronja wf` list below would
-		// hand the reader the commands for a DIFFERENT loop, which LoadManifest
-		// then refuses — the misrouting Kind.Command was introduced to stop,
-		// delivered in the one message a lost caller reads.
+		// A known kind with no verb list here: say nothing rather than fall
+		// through to `ronja wf` verbs that LoadManifest would refuse.
 		return
 	}
 
@@ -249,9 +190,6 @@ func printLocalWork(l *localWorkflow) {
 	fmt.Fprintf(out, "    ronja wf test        run the draft and report what happened\n")
 	fmt.Fprintf(out, "    ronja wf publish     take the draft live\n")
 	fmt.Fprintf(out, "    ronja wf run         run the live workflow and report what happened\n\n")
-	// The two things the raw-HTTP path makes people do by hand, named
-	// explicitly — they are the reason to prefer these commands, and neither is
-	// obvious from the verb list.
 	fmt.Fprintf(out, "`wf push` syncs the files AND the parameter declaration in ronja.json, and\n")
 	fmt.Fprintf(out, "`wf test` polls the run to completion and prints the log — so neither needs\n")
 	fmt.Fprintf(out, "a hand-written JSON body or a poll loop.\n")

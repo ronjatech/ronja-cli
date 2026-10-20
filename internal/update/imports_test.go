@@ -6,15 +6,10 @@ import (
 	"testing"
 )
 
-// The invariant: internal/api attaches `Authorization: Bearer <token>` to every
-// request it sends, so any path from this package to that one would put a live
-// Ronja credential one refactor away from being sent to github.com.
-//
-// Asserted over the TRANSITIVE dependency set rather than the direct imports,
-// because the way this would actually be lost is a helper added to some shared
-// package in between. `go list` is the only thing that knows the real closure;
-// a test that could not run it would be a test of nothing, so it skips rather
-// than passes silently.
+// internal/api attaches the Ronja bearer token to every request, so any path
+// from this package to it puts a credential one refactor from github.com.
+// Checked over the transitive closure, since a shared helper in between is how
+// it would be lost.
 func TestDoesNotImportTheAPIClient(t *testing.T) {
 	const forbidden = "github.com/ronjatech/ronja-cli/internal/api"
 

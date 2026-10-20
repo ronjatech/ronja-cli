@@ -1,14 +1,8 @@
 package api
 
-// Wire-shape coverage for the data-app file write's optimistic-concurrency
-// precondition, mirroring workflow_write_test.go's.
-//
-// The raw BODY is what is asserted rather than a decoded struct, because the
-// whole hazard is a *string collapsing to a string: that makes "no
-// precondition" and "assert the file does not exist yet" the same bytes, and no
-// decode of the sender's own type can see it. On this route that collapse is
-// not merely a wrong request — every legacy caller and every in-app agent write
-// would start asserting "must not exist" and 409 on its own file.
+// The raw BODY is asserted, not a decoded struct: a *string collapsing to a
+// string makes "no precondition" and "must not exist yet" the same bytes, and
+// every legacy write would 409 on its own file.
 
 import (
 	"context"
@@ -47,13 +41,8 @@ func TestPutDataAppFileEncodesThePreconditionsThreeStates(t *testing.T) {
 	}
 }
 
-// The DELETE's body is OPTIONAL and sends genuinely nothing when it has nothing
-// to say. That is not cosmetic: the previous shape of the route was bodyless,
-// and `{}` is a different request for a server that distinguishes an absent
-// field from a zero one — `{}` would decode to a nil pointer today, but the
-// route's contract is that an unconditional delete looks exactly like it always
-// did, and nothing about that should depend on how gt happens to decode an
-// empty object.
+// An unconditional DELETE sends no body at all, never `{}`, so it does not
+// depend on how gt decodes an empty object.
 func TestDeleteDataAppFileOmitsTheBodyEntirelyWithoutAPrecondition(t *testing.T) {
 	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	empty := ""
@@ -64,11 +53,8 @@ func TestDeleteDataAppFileOmitsTheBodyEntirelyWithoutAPrecondition(t *testing.T)
 	}{
 		{"without a precondition", nil, ""},
 		{"with a digest", &digest, `{"baseSha256":"` + digest + `"}`},
-		// Legal but never useful (asserting that what you are deleting does not
-		// exist), and it still has to reach the wire as an explicit empty
-		// string rather than being dropped by omitempty — one precondition
-		// vocabulary covers both verbs, and a client that builds the field the
-		// same way for either must not silently mean something different here.
+		// Never useful, but one precondition vocabulary covers both verbs, so
+		// the empty string must still reach the wire.
 		{"with the must-not-exist assertion", &empty, `{"baseSha256":""}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

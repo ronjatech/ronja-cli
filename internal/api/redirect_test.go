@@ -10,13 +10,10 @@ import (
 	"time"
 )
 
-// The property under test is one net/http does NOT give for free: it strips the
-// Authorization header on a redirect to a different HOSTNAME and on nothing
-// else, so a 302 to the same name on another PORT — or a downgrade from https
-// to http — forwards a 90-day PAT to whatever is listening there.
+// net/http strips Authorization only on a redirect to a different HOSTNAME, so
+// a 302 to another PORT, or an https→http downgrade, would forward the token.
 
-// recordingServer answers everything, remembering whether it was ever handed a
-// credential. Concurrency-safe because the redirect chain and the assertion run
+// recordingServer is locked because the redirect chain and the assertion run
 // on different goroutines.
 type recordingServer struct {
 	mu   sync.Mutex
@@ -51,9 +48,6 @@ func writeTestJSON(w http.ResponseWriter, body string) {
 	_, _ = w.Write([]byte(body))
 }
 
-// The regression: a same-host, different-PORT redirect. Go forwards the
-// credential across it, so the guard has to refuse the hop outright — and the
-// second server must never see a token.
 func TestRedirectToAnotherPortIsRefused(t *testing.T) {
 	elsewhere := newRecordingServer(t)
 	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -80,12 +74,8 @@ func TestRedirectToAnotherPortIsRefused(t *testing.T) {
 	}
 }
 
-// A redirect WITHIN the instance is ordinary — a trailing-slash canonicalisation
-// or a path rewrite in front of the app — and must still work, credential
-// included. A guard that refused these would break normal instances.
 func TestSameOriginRedirectIsFollowed(t *testing.T) {
-	// Guarded like recordingServer above: the handler runs on the server's
-	// goroutines, the assertions on this one.
+	// The handler runs on the server's goroutines, the assertions on this one.
 	var mu sync.Mutex
 	var seen []string
 	var authorized int
@@ -121,9 +111,6 @@ func TestSameOriginRedirectIsFollowed(t *testing.T) {
 	}
 }
 
-// The origin comparison, stated directly — including the one normalisation it
-// does make, so an instance URL written with its default port still matches the
-// implicit form a server redirects to.
 func TestRedirectGuardOrigins(t *testing.T) {
 	cases := []struct {
 		base, target string
@@ -133,7 +120,6 @@ func TestRedirectGuardOrigins(t *testing.T) {
 		{"https://app.ronja.tech:443", "https://app.ronja.tech/x", true},
 		{"http://localhost:8080", "http://localhost:8080/x", true},
 		{"https://APP.ronja.tech", "https://app.ronja.tech/x", true},
-		// The three that matter: another port, another scheme, another host.
 		{"http://localhost:8080", "http://localhost:9999/x", false},
 		{"https://app.ronja.tech", "http://app.ronja.tech/x", false},
 		{"https://app.ronja.tech", "https://evil.example/x", false},
@@ -151,8 +137,7 @@ func TestRedirectGuardOrigins(t *testing.T) {
 	}
 }
 
-// Supplying a CheckRedirect REPLACES net/http's default policy, and that policy
-// is the only thing that stops a redirect loop after ten hops. A guard checking
+// A CheckRedirect REPLACES net/http's default ten-hop limit, so a guard checking
 // origins alone would follow a same-origin loop forever.
 func TestSameOriginRedirectLoopStops(t *testing.T) {
 	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -170,9 +155,8 @@ func TestSameOriginRedirectLoopStops(t *testing.T) {
 	}
 }
 
-// The guard rides on the http.Client, and httpFor hands a long-deadline request
-// a shallow COPY of it. A copy that lost CheckRedirect would be a hole opened by
-// a timeout value.
+// httpFor hands a long-deadline request a shallow COPY of the client, which
+// must keep CheckRedirect.
 func TestHTTPForCopyKeepsTheRedirectGuard(t *testing.T) {
 	client := New("http://example.invalid", "")
 	copied := client.httpFor(clientTimeout + time.Second)

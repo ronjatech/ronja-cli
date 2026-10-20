@@ -8,16 +8,12 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// The organization policy on `ronja context`. Inside the app it is injected
-// into every agent turn; a coding agent working from outside was never told it
-// existed. What matters here is that it is printed where it will be read —
-// after identity, before the credential recipe — and that every way it can be
-// missing is said in one line rather than left silent, because a silent
-// omission reads as "no rules", the one wrong answer.
+// The organization policy on `ronja context`: every way it can be missing must
+// be said in one line, since silence reads as "no rules".
 
 const testPolicy = "- Report every amount in SEK.\n- Every table name starts with the source system: `fortnox_…`, `hubspot_…`.\n"
 
-// The two 403 bodies gt.EnforceScope sends (backend/lib/api/gt/scope.go), and
+// The two 403 bodies gt's requireScope sends (backend/lib/api/gt/scope.go), and
 // the one platform/auth sends for a credential whose user is gone. `context`
 // tells a scoped token from a dead credential by these words and nothing else.
 const (
@@ -41,16 +37,13 @@ func TestContextInlinesTheOrganizationPolicy(t *testing.T) {
 	if !strings.Contains(out, "Report every amount in SEK.") {
 		t.Errorf("the content is not rendered verbatim:\n%s", out)
 	}
-	// The heading names the organization /me reported, so the reader knows
-	// whose rules these are.
 	if !strings.Contains(out, "Standing rules Test Org's admins wrote") {
 		t.Errorf("the framing does not name the organization:\n%s", out)
 	}
-	// The framing is the feature: a rule read without it becomes the task.
+	// A rule read without the framing becomes the task.
 	if !strings.Contains(out, "not a description of your task") {
 		t.Errorf("the framing sentence is missing:\n%s", out)
 	}
-	// Identity, then the rules, then how to call the API.
 	signedAt := strings.Index(out, "Signed in:")
 	policyAt := strings.Index(out, "## Organization policy")
 	credsAt := strings.Index(out, "## Use your credentials")
@@ -58,16 +51,13 @@ func TestContextInlinesTheOrganizationPolicy(t *testing.T) {
 		t.Errorf("policy must sit between the identity line and the credential recipe (signed=%d policy=%d creds=%d):\n%s",
 			signedAt, policyAt, credsAt, out)
 	}
-	// --no-docs skips the API index, not the policy — the flag's text says so.
 	if strings.Contains(out, "# Ronja API\n") {
 		t.Errorf("--no-docs did not skip the index:\n%s", out)
 	}
 }
 
-// A written-then-blanked document has a version and no rules. The "none yet"
-// verdict is keyed on the content, as the in-app prompt block keys it, not on
-// the version — a version-7 document with nothing in it is still nothing to
-// follow.
+// "None written" is keyed on content, not version: a blanked version-7
+// document is still nothing to follow.
 func TestContextSaysNoneWrittenForABlankPolicy(t *testing.T) {
 	f := newFakeInstance(t)
 	f.policy = &api.Policy{Content: "  \n", Version: 7}
@@ -85,9 +75,8 @@ func TestContextSaysNoneWrittenForABlankPolicy(t *testing.T) {
 	}
 }
 
-// A SCOPE 403 is unambiguous on this route — every member clears its role
-// floor — so the line names the scope the token lacks rather than a generic
-// failure. Keyed on the server's words: see the dead-credential test below.
+// Every member clears this route's role floor, so a scope 403 can name the
+// missing scope.
 func TestContextNamesTheScopeWhenThePolicyIsForbidden(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failPolicy = http.StatusForbidden
@@ -103,12 +92,9 @@ func TestContextNamesTheScopeWhenThePolicyIsForbidden(t *testing.T) {
 	}
 }
 
-// ⚠️ 403 IS NOT ONLY THE SCOPE VERDICT. platform/auth answers 403 on the token
-// path for a credential that is DEAD — a removed user ("Forbidden: User role
-// not found"), a deleted organization, a PAT with no bound user — and in every
-// one the policy read 403s too. Keyed on the status alone, `context` told each
-// of those that the token "still works" and "needs analytics:read", both
-// false, where "the stored token was rejected — run `ronja login`" was right.
+// ⚠️ platform/auth also answers 403 for a dead credential (removed user,
+// deleted organization), which must be told to sign in again, not that it
+// still works or needs a scope.
 func TestContextTreatsANonScope403AsADeadCredential(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failMe = http.StatusForbidden
@@ -134,8 +120,7 @@ func TestContextTreatsANonScope403AsADeadCredential(t *testing.T) {
 		t.Errorf("a dead credential was told which scope to add:\n%s", out)
 	}
 
-	// And --json says "error", not "forbidden": the scope verdict is the only
-	// thing "forbidden" means to a consumer.
+	// "forbidden" means only the scope verdict to a consumer.
 	out, err = runCLI(t, t.TempDir(), "context", "--no-docs", "--json")
 	if err != nil {
 		t.Fatalf("context --json: %v", err)
@@ -159,11 +144,8 @@ func TestContextReportsAPolicyReadThatFailed(t *testing.T) {
 	}
 }
 
-// The route is served to every member of every organization, so a 404 is an
-// instance that predates it — a CLI newer than the server — and never "no
-// policy". Told "HTTP 404", a reader goes looking for a missing document; told
-// this, it knows which side is old. --json says "error", the same as every
-// failure: "none" is the one thing a 404 must not be read as.
+// The route serves every member, so a 404 means an older instance and must
+// never read as "none".
 func TestContextExplainsA404AsAnOlderInstance(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failPolicy = http.StatusNotFound
@@ -193,11 +175,8 @@ func TestContextExplainsA404AsAnOlderInstance(t *testing.T) {
 	}
 }
 
-// A working credential for a user in no organization: Me answers, with no
-// tenant. Whatever the policy route said to that caller, the honest line is
-// that there is no organization — Me is the authority on identity — and
-// --json says "none" with NO document, because there is no version to write
-// against either.
+// Me is the authority on identity: whatever the policy route served, a user in
+// no organization gets "none" and no document.
 func TestContextSaysNoOrganizationWhenMeHasNoTenant(t *testing.T) {
 	f := newFakeInstance(t)
 	f.noTenant = true
@@ -231,13 +210,8 @@ func TestContextSaysNoOrganizationWhenMeHasNoTenant(t *testing.T) {
 	}
 }
 
-// A role-bound scoped API token cannot call /me at all (that group is
-// admin-scoped) and is exactly the caller the policy was invisible to. The
-// policy read goes out regardless, and the section is printed under a heading
-// that does not name an organization Me could not report. The identity line
-// says what a 403 there means — a scoped token, not a dead credential — because
-// "run `ronja login`" would send an agent off to replace a token that has
-// just, one line below, read the policy.
+// A scoped token cannot call the admin-scoped /me but can read the policy, and
+// must not be told to sign in again.
 func TestContextPrintsThePolicyWhenMeIsRefused(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failMe = http.StatusForbidden
@@ -265,10 +239,8 @@ func TestContextPrintsThePolicyWhenMeIsRefused(t *testing.T) {
 		t.Errorf("an organization name appeared that /me never reported:\n%s", out)
 	}
 
-	// --json used to say only `authenticated: false` beside a policy it had
-	// just read, and a consumer keyed on the boolean signed in again to
-	// replace a working token. `authenticated` keeps its type and meaning;
-	// `identityStatus` is the finer verdict beside it.
+	// `authenticated` keeps meaning "/me answered"; identityStatus is the finer
+	// verdict.
 	out, err = runCLI(t, t.TempDir(), "context", "--no-docs", "--json")
 	if err != nil {
 		t.Fatalf("context --json: %v", err)
@@ -285,9 +257,6 @@ func TestContextPrintsThePolicyWhenMeIsRefused(t *testing.T) {
 	}
 }
 
-// The other three identityStatus values, so the set is pinned end to end:
-// "ok" when /me answered, "rejected" for any other failure (a dead
-// credential's 403 here), "none" with no token at all.
 func TestContextJSONIdentityStatus(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -309,8 +278,8 @@ func TestContextJSONIdentityStatus(t *testing.T) {
 		t.Errorf("identityStatus = %v, want \"rejected\" for a dead credential's 403", got)
 	}
 
-	// Signed out: the URL is known (RONJA_URL still is), the token is not,
-	// and the config dir signIn pointed at holds no profile to fall back to.
+	// Signed out: RONJA_URL is still set, and signIn's config dir holds no
+	// profile to fall back to.
 	t.Setenv("RONJA_TOKEN", "")
 	out, err = runCLI(t, t.TempDir(), "context", "--no-docs", "--json")
 	if err != nil {
@@ -325,9 +294,7 @@ func TestContextJSONIdentityStatus(t *testing.T) {
 	}
 }
 
-// One dead credential is two refusals with the same status. The `Signed in:
-// NO` line already says it; a second line about the policy would report the
-// same thing twice and read as a second problem.
+// Two 401s are one dead credential, already reported by `Signed in: NO`.
 func TestContextSaysADeadCredentialOnce(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failMe = http.StatusUnauthorized
@@ -346,9 +313,8 @@ func TestContextSaysADeadCredentialOnce(t *testing.T) {
 	}
 }
 
-// The drop above is for 401 and 401 only. A shared 500 is the instance
-// failing, not the credential; dropping the policy line there would leave
-// "the stored token was rejected" as the only, and wrong, report.
+// The drop is for 401 only: a shared 500 is the instance failing, not the
+// credential.
 func TestContextReportsAPolicyReadThatFailedAlongsideMe(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failMe = http.StatusInternalServerError
@@ -364,16 +330,8 @@ func TestContextReportsAPolicyReadThatFailedAlongsideMe(t *testing.T) {
 	}
 }
 
-// The document is admin-authored free text printed to a terminal that is
-// usually an agent's whole view. A C0 control in it — an ESC sequence that
-// repaints the screen, a carriage return that overwrites the framing — is
-// dropped from the human output. --json is data, not a terminal, and carries
-// the document byte for byte.
-//
-// C0 is not the whole of it: a terminal honours the one-byte C1 CSI (U+009B)
-// exactly as ESC-[, and a bidi override (U+202E) makes what the reader sees
-// differ from what the bytes say. Both are dropped, along with the rest of the
-// set backend/lib/untrusted strips.
+// C0, the one-byte C1 CSI (U+009B) and bidi/zero-width characters are dropped
+// from the terminal; --json carries the document byte for byte.
 func TestContextStripsControlCharactersFromThePolicyBody(t *testing.T) {
 	f := newFakeInstance(t)
 	f.policy = &api.Policy{Content: "- Report in SEK.\x1b[2J\r\n- Keep\ttabs.\x07\n- Also\u009b2J in \u202eSEK\u200b.\n", Version: 7}
@@ -403,8 +361,7 @@ func TestContextStripsControlCharactersFromThePolicyBody(t *testing.T) {
 	}
 }
 
-// The organization name is admin-authored too, and it is set into OUR framing
-// line unquoted — so it gets the same filter as the body.
+// The admin-authored organization name is set unquoted into our framing line.
 func TestContextStripsControlCharactersFromTheOrganizationName(t *testing.T) {
 	f := newFakeInstance(t)
 	f.tenantName = "Test\x1b\u202e Org"
@@ -422,10 +379,7 @@ func TestContextStripsControlCharactersFromTheOrganizationName(t *testing.T) {
 		t.Errorf("a control character in the organization name reached the terminal:\n%q", out)
 	}
 
-	// terminalSafe keeps newline and tab for the body's sake; a name is one
-	// line, and a newline in it would end the framing sentence early with
-	// admin-chosen text on the next line reading as ours. Every run of
-	// whitespace collapses to one space.
+	// A newline in the name would start a line of admin text reading as ours.
 	f.tenantName = "Test\n\t  Org\nLtd"
 	out, err = runCLI(t, t.TempDir(), "context", "--no-docs")
 	if err != nil {
@@ -456,9 +410,7 @@ func TestContextJSONCarriesTheOrganizationPolicy(t *testing.T) {
 	if doc["version"] != float64(7) {
 		t.Errorf("organizationPolicy.version = %v, want 7", doc["version"])
 	}
-	// A failed read has no error key — the human output is where the reason
-	// lives — but it does have a STATUS, from a closed set, so a consumer can
-	// tell "no rules" from "refused" without parsing prose.
+	// No error key: --json carries a closed-set status, never error text.
 	if _, present := payload["organizationPolicyError"]; present {
 		t.Errorf("--json carries an organizationPolicyError key: %v", payload)
 	}
@@ -467,10 +419,8 @@ func TestContextJSONCarriesTheOrganizationPolicy(t *testing.T) {
 	}
 }
 
-// The status is what separates "the organization has no rules" (build freely)
-// from "the read was refused" (ask the admin for the rules first): both leave
-// `organizationPolicy` absent, and a consumer with only that key would build
-// on an unread policy.
+// A refused read leaves organizationPolicy absent, so only the status tells it
+// from "no rules".
 func TestContextJSONStatusTellsNoneFromForbidden(t *testing.T) {
 	f := newFakeInstance(t)
 	f.failPolicy = http.StatusForbidden
@@ -500,12 +450,9 @@ func TestContextJSONStatusTellsNoneFromForbidden(t *testing.T) {
 	}
 }
 
-// An unwritten document is "none" on the STATUS key — that is what a consumer
-// branches on — and the document is still carried, empty, at the version the
-// server reported: an admin's agent asked to write the first rules needs that
-// version as expectedVersion, and there is nowhere else to get it without a
-// second read. The genesis document sits at 1; a blanked one wherever the
-// blanking left it, so the version is the server's, never a literal.
+// An unwritten document is still carried at the served version: it is the
+// expectedVersion for the first write, 1 for genesis but any value once
+// blanked.
 func TestContextJSONCarriesAnUnwrittenPolicyAtItsVersion(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -540,11 +487,6 @@ func TestContextJSONCarriesAnUnwrittenPolicyAtItsVersion(t *testing.T) {
 	}
 }
 
-// An admin's personal access token can write the organization policy (that is
-// the CLI's whole write path), so the section ends with the one-line CAS
-// recipe carrying the version JUST SERVED as expectedVersion — the reader
-// never has to fetch the CAS token separately — and the rule that keeps a
-// coding agent from editing on its own initiative.
 func TestContextOffersTheWriteRecipeToAnAdmin(t *testing.T) {
 	f := newFakeInstance(t)
 	f.privilegeLevel = adminPrivilegeLevel
@@ -567,16 +509,14 @@ func TestContextOffersTheWriteRecipeToAnAdmin(t *testing.T) {
 	if strings.Contains(out, "Only an admin can change it.") {
 		t.Errorf("an admin was told only an admin can change it:\n%s", out)
 	}
-	// /me reports the role and nothing about a scope grant, so the offer is
-	// "as an admin you can", with the scope a scoped token would also need.
+	// /me reports the role, not a scope grant, so the offer names the scope.
 	if !strings.Contains(out, "As an admin you can change it (a scoped token also needs `analytics:write`):") {
 		t.Errorf("the recipe's offer does not name the scope a scoped token needs:\n%s", out)
 	}
 	if !strings.Contains(out, "-d @body.json for a long document — the file holds the JSON body, not the bare text") {
 		t.Errorf("the recipe's -d @file hint does not say the file holds the JSON body:\n%s", out)
 	}
-	// The recipe is part of the framing, above the document, not appended
-	// after content an admin authored.
+	// Above the document, not after admin-authored content.
 	recipeAt := strings.Index(out, "expectedVersion")
 	bodyAt := strings.Index(out, "Report every amount in SEK.")
 	if recipeAt < 0 || bodyAt < 0 || recipeAt > bodyAt {
@@ -584,8 +524,7 @@ func TestContextOffersTheWriteRecipeToAnAdmin(t *testing.T) {
 	}
 }
 
-// A super-admin's level is BELOW an admin's (privilege counts down), and must
-// not be read as "not an admin" by a check written the wrong way round.
+// Privilege counts down: a super-admin's level is below an admin's.
 func TestContextOffersTheWriteRecipeToASuperAdmin(t *testing.T) {
 	f := newFakeInstance(t)
 	f.privilegeLevel = 0
@@ -601,9 +540,7 @@ func TestContextOffersTheWriteRecipeToASuperAdmin(t *testing.T) {
 	}
 }
 
-// The genesis document has no rules and sits at version 1; a blanked one sits
-// wherever the blanking left it. An admin is offered the recipe with the
-// version the SERVER reported, whichever it is — never a literal.
+// The recipe carries the served version, never a literal 1.
 func TestContextOffersAnAdminTheRecipeForAnUnwrittenPolicy(t *testing.T) {
 	f := newFakeInstance(t)
 	f.privilegeLevel = adminPrivilegeLevel
@@ -622,8 +559,7 @@ func TestContextOffersAnAdminTheRecipeForAnUnwrittenPolicy(t *testing.T) {
 	}
 }
 
-// A member reads the rules and is told who can change them — no recipe, so a
-// non-admin's coding agent is not handed a PUT the gate will refuse.
+// A member is not handed a PUT the gate will refuse.
 func TestContextTellsAMemberOnlyAnAdminCanChangeThePolicy(t *testing.T) {
 	f := newFakeInstance(t)
 	f.policy = &api.Policy{Content: testPolicy, Version: 7}
@@ -639,7 +575,6 @@ func TestContextTellsAMemberOnlyAnAdminCanChangeThePolicy(t *testing.T) {
 	if strings.Contains(out, "expectedVersion") {
 		t.Errorf("a member was handed the write recipe:\n%s", out)
 	}
-	// And the same for a blank document: "none written yet" and nothing more.
 	f.policy = &api.Policy{Content: "", Version: 1}
 	out, err = runCLI(t, t.TempDir(), "context", "--no-docs")
 	if err != nil {
@@ -650,9 +585,7 @@ func TestContextTellsAMemberOnlyAnAdminCanChangeThePolicy(t *testing.T) {
 	}
 }
 
-// The --json contract is unchanged by the role: `organizationPolicy` is
-// exactly content + version, and the recipe is prose for the human output
-// only.
+// The recipe is human output only; --json is unchanged by the role.
 func TestContextJSONIsUnchangedForAnAdmin(t *testing.T) {
 	f := newFakeInstance(t)
 	f.privilegeLevel = adminPrivilegeLevel

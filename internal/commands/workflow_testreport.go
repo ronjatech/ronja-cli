@@ -9,15 +9,6 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 )
 
-// The terminal report `ronja wf test` prints when it is not in --json mode:
-// the finished run, its steps, what it produced, and as much of its log as
-// --logs asks for.
-//
-// Its own file because it is all presentation — it decides nothing and touches
-// nothing — and keeping it apart from the command means the ordering of the
-// refusals in workflow_testcmd.go, which is the part with safety properties,
-// reads top to bottom without a page of Fprintf in the middle.
-
 func printTestReport(o *testOutcome, logsMode string) {
 	out := os.Stdout
 	run := o.Run
@@ -38,10 +29,8 @@ func printTestReport(o *testOutcome, logsMode string) {
 	if len(run.Steps) > 0 {
 		fmt.Fprintf(out, "\n  Steps\n")
 		for _, step := range run.Steps {
-			// "replayed" rather than the raw status for a journal hit: it and a
-			// continue_on_error skip both arrive as status "skipped", and on a
-			// resume the difference is the whole point — one step's work is
-			// already done, the other's never happened.
+			// A journal hit and a continue_on_error skip both arrive as
+			// "skipped"; on a resume one is done work, the other never ran.
 			label := step.Status
 			if step.Replayed {
 				label = "replayed"
@@ -69,8 +58,8 @@ func printTestReport(o *testOutcome, logsMode string) {
 			fmt.Fprintf(out, "    %s  %s, %d %s\n", table.DisplayName, table.WriteMode,
 				table.FileCount, plural(table.FileCount, "file"))
 		}
-		// A run adopted from the run LIST (adoptTimedOutRun, when the follow never
-		// replaced it) carries only its first 20 tables; say how many it wrote.
+		// A run adopted from the run list (adoptTimedOutRun) carries only its
+		// first 20 tables.
 		if more := run.RunTableOutputCount() - len(run.TableOutputs); more > 0 {
 			fmt.Fprintf(out, "    and %d more (ronja api /api/v2/workflow/run/%s/table-outputs)\n", more, run.ID)
 		}
@@ -79,102 +68,57 @@ func printTestReport(o *testOutcome, logsMode string) {
 	printRunLogs(out, run.Logs, logsMode)
 
 	switch {
-	// A live run says nothing here on purpose: the code is already published,
-	// and there is no next verb in the loop to name.
+	// A live run gets no next verb: the code is already published.
 	case run.Status == api.RunStatusDone && !o.Live:
 		fmt.Fprintf(out, "\n  Next: ronja wf publish\n")
-	// The same pause, said louder, because a live run is the one somebody is
-	// about to record as a verification — and a run that has not finished is not
-	// one. The exit code is still zero (nothing failed, see runVerdict), so this
-	// line is all that stands between a paused run and a green tick.
-	//
-	// WAITING and CONTINUED are the product's own words for these two states
-	// (docs-site/TERMINOLOGY.md), which bans "parked" and "resuming" for them
-	// precisely because both read as trouble: one as stuck, the other as this
-	// run still going. The engineering prose in these files still says "park" —
-	// that is internal vocabulary, and it is not what the reader sees.
+	// Louder for a live run, which somebody is about to record as a
+	// verification: the exit code is still zero (runVerdict), so this line is
+	// all that stands between an unfinished run and a green tick. "Waiting" and
+	// "Continued" are the product's words (docs-site/TERMINOLOGY.md).
 	case run.Status == api.RunStatusWaiting && o.Live:
 		fmt.Fprintf(out, "\n  WAITING:  the run has NOT finished — it is waiting on an agent, an approval or a\n")
 		fmt.Fprintf(out, "            timer, so this is NOT a completed verification.\n")
 		fmt.Fprintf(out, "            It resumes on its own: nothing failed, and there is nothing to re-run.\n")
 		fmt.Fprintf(out, "            Check on it later: ronja api /api/v2/workflow/run/%s\n", run.ID)
-	// A waiting run gets NEITHER of the two hints below, and both omissions are
-	// the point. The publish hint would invite taking code live on the strength
-	// of a run that has not finished; the resume hint would offer to continue a
-	// run that nothing has stopped. What it gets instead is the sentence that
-	// keeps somebody from re-running the work by hand: it is coming back on its
-	// own.
+	// Deliberately neither the publish nor the resume hint: the run has not
+	// finished, and nothing has stopped it.
 	case run.Status == api.RunStatusWaiting:
 		fmt.Fprintf(out, "\n  Waiting:  the run paused — a durable workflow waiting on an agent or a timer.\n")
 		fmt.Fprintf(out, "            It resumes on its own: nothing failed, and there is nothing to re-run.\n")
 		fmt.Fprintf(out, "            Check on it later: ronja api /api/v2/workflow/run/%s\n", run.ID)
-	// The wake latch, said louder, for the reason the pause is: a poll can land
-	// on this status and end there — the wait ended and the successor run was
-	// minted between two polls — and that is no more a finished verification
-	// than a pause is. Same zero exit, same reader about to record a green tick,
-	// so the same loud line has to stand in the way. What differs is why it is
-	// not finished: the work did not stop, it moved.
+	// The wake latch, louder for a live run for the same reason: a poll can end
+	// here when the successor was minted between two polls, and that is no
+	// finished verification either.
 	case run.Status == api.RunStatusResuming && o.Live:
 		fmt.Fprintf(out, "\n  CONTINUED: the run has NOT finished — the wait ended and the work continued in a\n")
 		fmt.Fprintf(out, "             NEWER run that is still executing, so this is NOT a completed verification.\n")
 		fmt.Fprintf(out, "             Nothing failed, and there is nothing to re-run: follow the newer run in Ronja.\n")
-	// The wake latch. This row is finished with — its successor carries the
-	// lineage from here — so the run id printed above is not the one to follow,
-	// which is the whole reason this says anything at all.
+	// The wake latch: the successor carries the lineage, so the run id printed
+	// above is not the one to follow.
 	case run.Status == api.RunStatusResuming:
 		fmt.Fprintf(out, "\n  Continued: the wait ended and the work continued in a NEWER run, so this one is\n")
 		fmt.Fprintf(out, "             finished with. Nothing failed; follow the newer run in Ronja.\n")
-	// EVERY failed run whose code never started, on any runtime, live or draft.
-	// The fact being reported is about the RUN — it died getting S3 credentials,
-	// or launching the container, before anything the author wrote was evaluated
-	// — and that is exactly as true of `wf run` against live and of a v1 draft as
-	// it is of a durable one. Gating it on the resume hint's conditions, as it
-	// was, meant a live run and a v1 run kept printing a bare error the author
-	// had no way to read as anything but their own bug.
-	//
-	// FIRST, so it wins over the resume hint below: "fix the code and push first
-	// if the failure was a bug" is advice about the author's files, and it is
-	// only honest once the author's files have been run.
+	// Every failed run whose code never started, on any runtime, live or
+	// draft. Before the resume hint, whose "fix the code" advice is only honest
+	// once the author's code has run.
 	case run.Status == api.RunStatusError && !userCodeRan(run):
 		printNothingRanNotice(out, run.Error, retryInvocation(o.Live))
-	// The hint is offered for a durable workflow OR for any failed run whose
-	// lineage actually has a journal — resume is not durable-only, and a
-	// standard-runtime workflow with explicitly-keyed steps has real work to
-	// skip. Gating on the runtime alone would hide the offer from exactly the
-	// authors who already took the trouble to write the keys.
-	// Offered for a DRAFT run only: `wf test --resume` continues a run of the
-	// draft, and a live failure has no draft to continue it from.
+	// Draft runs only (`wf test --resume` continues a draft run), for a durable
+	// workflow or any lineage with a journal: a standard-runtime workflow with
+	// explicitly keyed steps has work to skip too.
 	case run.Status == api.RunStatusError && !o.Live && (o.Durable || run.JournalEntries > 0):
 		printResumeHint(out, run.JournalEntries)
 	}
 }
 
-// userCodeRan reports whether the author's code reached the interpreter at all.
+// userCodeRan reports whether the author's code reached the interpreter. The
+// harness stamps processing_started_at just before exec(code), which also
+// compiles the entrypoint, so no stamp means nothing ran, syntax errors
+// included. That ping is best-effort, so steps, logs or a traceback each
+// outvote a missing stamp.
 //
-// processing_started_at is the primary signal, and it is a strong one: the
-// Python harness calls tools._report_run_started() immediately before
-// exec(code, ...) (infra, cmd/py-invoke/shared/execution.py), the entrypoint is
-// COMPILED inside that exec — its SyntaxError is caught after it — and the
-// workflow's own module imports run inside it too. So a NULL stamp means
-// nothing the author wrote was ever evaluated, syntax errors included.
-//
-// The other three are fallbacks, and they exist because that ping is
-// best-effort: it goes out on a background worker and is skipped outright on a
-// network failure, so a run that DID execute can arrive here unstamped. Steps,
-// captured logs and a Python traceback each prove execution on their own, so
-// any of them outvotes a missing stamp. The asymmetry is deliberate: wrongly
-// saying "nothing ran" hides a real bug from its author, which is worse than
-// the message this replaces.
-//
-// ⚠️ JournalEntries is deliberately NOT one of them, though it reads like the
-// obvious fourth. Every signal here has to be a fact about THIS run, and that
-// one is not: it counts what the resume LINEAGE has journaled, derived on read
-// (see api.RunResponse), so a `wf test --resume` inherits a non-zero count from
-// the runs before it. A resumed run that dies before its container starts —
-// exactly the S3-credential and container-launch failures this notice was
-// written for — then arrives with no stamp, no steps and no logs, and a journal
-// count from work that ran yesterday would vote yes and suppress the notice on
-// the very run that needs it.
+// ⚠️ JournalEntries must not be a signal: it counts the resume lineage, so a
+// resumed run that died before its container started would inherit a yes.
 func userCodeRan(run *api.RunResponse) bool {
 	return run.ProcessingStartedAt != nil ||
 		len(run.Steps) > 0 ||
@@ -182,9 +126,8 @@ func userCodeRan(run *api.RunResponse) bool {
 		looksLikeTraceback(run.Error)
 }
 
-// looksLikeTraceback reports an error that is a Python traceback. Only the
-// interpreter writes one, so it is evidence of execution that survives the ping
-// having been skipped.
+// looksLikeTraceback reports an error that is a Python traceback, which only
+// the interpreter writes.
 func looksLikeTraceback(err *string) bool {
 	if err == nil {
 		return false
@@ -193,32 +136,11 @@ func looksLikeTraceback(err *string) bool {
 		strings.Contains(*err, `File "`)
 }
 
-// printNothingRanNotice says that the failure happened before the author's code
-// was reached — the one thing that turns an infrastructure failure from a
-// puzzle about the folder into a re-run.
-//
-// It reports WHERE the run died, and nothing about WHOSE FAULT that is. The
-// notice used to add "That is not a bug in your files", and it was not entitled
-// to: userCodeRan answers whether the interpreter evaluated anything, which is a
-// fact about the run, not about blame — and the pre-exec path has at least one
-// author-caused member. A workflow whose ronja.json declares a package that does
-// not exist is refused before ExecV2 ever starts (manalysis fails the run with
-// "invalid pip packages: …"), and a declared package whose install fails lands
-// on the same never-executed path. Telling that author their files are innocent
-// sends them looking anywhere but at the one line they wrote wrong.
-//
-// The error's FIRST LINE only: the full message is already on the Error: line
-// above, and repeating it in full here would bury the sentence that matters.
-//
-// retry is the invocation to repeat, because this notice is now printed for a
-// LIVE run too and `ronja wf test` is not the command that produced one. A
-// re-run advice naming the wrong verb is the same class of untruth the notice
-// exists to remove.
+// printNothingRanNotice says the failure happened before the author's code was
+// reached. It says where the run died, never whose fault it is: a bad
+// pipPackages list in ronja.json also fails before exec. retry is the
+// invocation that produced the run.
 func printNothingRanNotice(out *os.File, runErr *string, retry string) {
-	// The sentence has to END either way. An instance that sent no error at all
-	// leaves nothing for the parenthetical, and the version without it used to
-	// stop mid-line — which reads as output the terminal cut off rather than as
-	// a message with nothing more to say.
 	reason := firstLine(runErr)
 	if reason != "" {
 		fmt.Fprintf(out, "\n  Nothing in your code ran — the run failed while Ronja was setting it up\n")
@@ -227,18 +149,13 @@ func printNothingRanNotice(out *os.File, runErr *string, retry string) {
 		fmt.Fprintf(out, "\n  Nothing in your code ran — the run failed while Ronja was setting it up.\n")
 	}
 	fmt.Fprintf(out, "  Run `%s` again; if it repeats, report it.\n", retry)
-	// The one pre-exec failure the author can act on, named exactly. The prefix
-	// is the backend's own wording for a package list it refused before starting
-	// the container, so matching on it points at the file that holds the list
-	// rather than leaving a re-run as the only advice on offer — a re-run of an
-	// unchanged package list fails identically every time.
+	// The backend's wording for a refused package list, which a re-run cannot
+	// fix.
 	if strings.HasPrefix(reason, "invalid pip packages") {
 		fmt.Fprintf(out, "  This one is about the folder's pipPackages — check them in ronja.json.\n")
 	}
 }
 
-// retryInvocation names the command that produced this run, which is the one
-// worth repeating.
 func retryInvocation(live bool) string {
 	if live {
 		return "ronja wf run"
@@ -246,7 +163,6 @@ func retryInvocation(live bool) string {
 	return "ronja wf test"
 }
 
-// firstLine is the leading line of a possibly-nil, possibly-multi-line message.
 func firstLine(s *string) string {
 	if s == nil {
 		return ""
@@ -255,17 +171,9 @@ func firstLine(s *string) string {
 	return strings.TrimSpace(line)
 }
 
-// printResumeHint offers the one thing a failed durable run makes possible:
-// fixing the code and continuing, rather than starting over.
-//
-// The count comes from the run response's journalEntries — the size of the
-// LINEAGE's journal, which the server derives on read and populates only for a
-// failed run. It is deliberately not len(Steps): steps are the observable
-// timeline (run spans), a different set from the journal, and printing one as
-// the other would be a confident wrong number in exactly the place somebody
-// decides whether to trust a resume to skip work. A zero prints no line at all
-// rather than "0 steps journaled", which reads as a fact about the journal when
-// it is equally the answer from an instance that does not send the field.
+// printResumeHint offers `wf test --resume`. The count is the lineage's
+// journalEntries, deliberately not len(Steps) (run spans, a different set); a
+// zero prints no count, since an instance that omits the field also sends zero.
 func printResumeHint(out *os.File, journaled int) {
 	fmt.Fprintf(out, "\n  Resume:   ronja wf test --resume\n")
 	if journaled > 0 {
@@ -275,15 +183,9 @@ func printResumeHint(out *os.File, journaled int) {
 	fmt.Fprintf(out, "            Fix the code and push first if the failure was a bug — a resume runs the CURRENT files.\n")
 }
 
-// describeRunStatus renders status and health together, saying what a degraded
-// run means rather than leaving a one-word label to carry it.
-//
-// The two durable-wait statuses are read off the STATUS and answered first,
-// before health is consulted at all. Partly because a parked run's health is
-// "waiting" too and repeating the word twice says nothing, but mostly because
-// each of them reads wrong on its own: a bare "waiting" reads as stuck, and a
-// bare "resuming" reads as this run still going — and both mistakes point at
-// re-running work that is either coming back by itself or already under way.
+// describeRunStatus renders status and health together. The two durable-wait
+// statuses are answered first: a bare "waiting" reads as stuck and a bare
+// "resuming" as still going, and both invite re-running the work.
 func describeRunStatus(run *api.RunResponse) string {
 	switch run.Status {
 	case api.RunStatusWaiting:

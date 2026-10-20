@@ -19,8 +19,6 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
-// The HEALTH-CHECK half of the pipeline loop: `checks/<stem>.json`.
-
 // --- the fake ---------------------------------------------------------------
 
 // fakeChecks is the fake instance's health-check state, modelled on
@@ -355,8 +353,7 @@ func managedOf(t *testing.T, root string, key wfdir.InstanceKey) map[string]wfdi
 
 // --- tests ------------------------------------------------------------------
 
-// Checks on a table whose SQL did not change are applied by a bare push — the
-// main case — and recorded per check; a re-push writes nothing.
+// The main case: checks on a table whose SQL did not change.
 func TestPipelineChecksPushCreatesThenReRunIsANoOp(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -876,11 +873,9 @@ func TestPipelineChecksCloneThenStatusShowsDrift(t *testing.T) {
 	}
 }
 
-// ORPHANS ARE DEFINED BY ROW. The app renames an owned check "a" → "B" while the
-// file renames its entry "a" → "b": the entry resolves (by folded name) to the
-// very row the folder owns, so that row is the entry's target and never an
-// orphan — a --prune must not silence it, and the push after must not flip it
-// back. Here the rename is drift on both sides, so nothing is written at all.
+// Orphans are defined by row: the app renames an owned check "a" → "B" while
+// the file renames "a" → "b", so the entry resolves to the owned row, which is
+// drift, never an orphan for --prune to silence.
 func TestPipelineChecksOrphanIsByRowNotByName(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
@@ -1267,10 +1262,8 @@ func TestPipelineChecksForbiddenDowngradeNamesAdmin(t *testing.T) {
 	}
 }
 
-// A checks file that cannot be read (a Problem) still OWNS what the lock
-// records for it: only its declared names are unavailable, since they cannot
-// be parsed. Dropping the recorded ids too let a deleted sibling's record
-// orphan — and a --prune silence — a check the broken file owns.
+// A broken file's recorded ids must still be claimed, or a deleted sibling's
+// record would orphan (and a --prune silence) a check the broken file owns.
 func TestChecksClaimKeepsABrokenFilesOwnedIDs(t *testing.T) {
 	inst := &wfdir.InstanceState{Checks: map[string]wfdir.ChecksState{
 		"checks/broken.json": {TableID: "table-gl", Managed: map[string]wfdir.LockCheckEntry{"unik": {CheckID: "tchk-owned"}}},

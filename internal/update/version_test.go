@@ -11,8 +11,7 @@ func TestCompare(t *testing.T) {
 		{"a newer minor", "v0.28.4", "v0.29.0", true, true},
 		{"the same version", "v0.28.4", "v0.28.4", false, true},
 		{"an older release", "v0.29.0", "v0.28.4", false, true},
-		// The one a lexical compare gets wrong, which is why this is not a
-		// string comparison.
+		// The one a lexical compare gets wrong.
 		{"double-digit patch", "v0.28.9", "v0.28.10", true, true},
 		{"a prerelease is behind its release", "v0.29.0-rc.1", "v0.29.0", true, true},
 		{"a release is ahead of its prerelease", "v0.29.0", "v0.29.0-rc.1", false, true},
@@ -25,17 +24,12 @@ func TestCompare(t *testing.T) {
 		{"too few components", "v0.28", "v0.29.0", false, false},
 		{"a non-numeric component", "v0.x.4", "v0.29.0", false, false},
 		{"build metadata", "v0.28.4+meta", "v0.29.0", false, false},
-		// Semver forbids a leading zero, so v0.01.0 is not a tag we could have
-		// published; accepting it would make it compare equal to v0.1.0 while
-		// printing as a different release.
 		{"a leading zero in the current version", "v0.01.0", "v0.29.0", false, false},
 		{"a leading zero in the latest version", "v0.28.4", "v0.029.0", false, false},
 		{"a bare zero component is fine", "v0.28.4", "v1.0.0", true, true},
 		{"an unparseable latest", "v0.28.4", "nightly", false, false},
 		{"an empty latest", "v0.28.4", "", false, false},
-		// A prerelease is printed to a terminal verbatim once ok is true, so
-		// the charset is part of the gate: a bidirectional override in a tag
-		// rewrites the notice line around it.
+		// The prerelease charset is a printing gate (see validPrerelease).
 		{"an ordinary prerelease", "v0.28.4", "v1.0.0-rc.1", true, true},
 		{"a bidi override in the prerelease", "v0.28.4", "v1.0.0-rc.1‮", false, false},
 		{"an empty prerelease", "v0.28.4", "v1.0.0-", false, false},

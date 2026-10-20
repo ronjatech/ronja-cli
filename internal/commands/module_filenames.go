@@ -36,8 +36,6 @@ func suggestModuleFilePath(path string) string {
 	return strings.Join(segs, "/") + ".py"
 }
 
-// refuseModuleFileNames is the push-side half: the first offending file, as an
-// error, before anything is written.
 func refuseModuleFileNames(files map[string]string) error {
 	for _, path := range sortedPaths(files) {
 		if problem := moduleFileNameProblem(path); problem != "" {

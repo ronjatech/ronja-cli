@@ -7,12 +7,9 @@ import (
 )
 
 // CreateSecretInput is the POST /secret body (rsecret.CreateInput server-side).
-//
-// Credentials is the one field that carries a secret value. It is held as a
-// RawMessage so the caller decides its exact bytes — a database blob read from a
-// file is sent as the object it was, numbers and all — and it is never part of
-// anything this package prints: the client has no logging, and an error carries
-// only the server's answer.
+// Credentials, the one field carrying a secret value, is a RawMessage so a blob
+// read from a file is sent byte for byte; nothing in this package prints it, and
+// an error carries only the server's answer.
 type CreateSecretInput struct {
 	FeatureID   string          `json:"featureID"`
 	Name        string          `json:"name"`
@@ -25,9 +22,8 @@ type CreateSecretInput struct {
 	Dialect     string          `json:"dialect,omitempty"`
 }
 
-// CreatedSecret is the metadata the create answers with. Deliberately narrow: the
-// server never returns a value, and decoding only what is reported keeps it
-// that way on this side too.
+// CreatedSecret is the metadata the create answers with. Deliberately narrow:
+// decoding no value field keeps a secret value out of this side too.
 type CreatedSecret struct {
 	ID         string  `json:"id"`
 	Name       string  `json:"name"`
@@ -44,32 +40,24 @@ func (c *Client) CreateSecret(ctx context.Context, in CreateSecretInput) (*Creat
 	return &out, nil
 }
 
-// OAuthInitiateInput is the POST /oauth/:service/initiate body.
-//
-// Scopes is a pointer for the server's reason: an ABSENT key replays the grant
-// the connection already holds (plus the service's own scopes), while a present
-// one REPLACES it with exactly the chosen set. nil is never sent.
+// OAuthInitiateInput is the POST /oauth/:service/initiate body. Scopes is a
+// pointer because an ABSENT key replays the connection's existing grant, while a
+// present one REPLACES it with exactly the chosen set.
 type OAuthInitiateInput struct {
 	FeatureID string    `json:"featureID,omitempty"`
 	Scopes    *[]string `json:"scopes,omitempty"`
 }
 
-// OAuthInitiate is what initiate answers.
-//
-// AuthURL carries the one-shot `state`; it is not a Ronja credential, but it
-// signs whoever completes it into THIS caller's secret, so a command shows it
-// only on stderr and never in --json.
-//
-// RequestedScopes is nil on a server older than the field — a caller must then
-// not judge "already connected" or a partial grant at all, since it cannot know
-// what was asked for.
+// OAuthInitiate is what initiate answers. AuthURL carries the one-shot `state`
+// and signs whoever completes it into THIS caller's secret, so a command shows it
+// only on stderr, never in --json. A nil RequestedScopes (an older server) means
+// a caller must not judge "already connected" or a partial grant at all.
 type OAuthInitiate struct {
 	AuthURL         string    `json:"authURL"`
 	SecretID        string    `json:"secretID"`
 	RequestedScopes *[]string `json:"requestedScopes"`
-	// URL is the secret's page in Ronja, where the person reads what is being
-	// connected and presses Continue to reach the provider. Empty from a server
-	// that predates it; the command then opens AuthURL as before.
+	// URL is the secret's page in Ronja, where the person presses Continue to
+	// reach the provider; empty from an older server, and the command then opens AuthURL.
 	URL string `json:"url"`
 }
 
@@ -83,13 +71,10 @@ func (c *Client) InitiateOAuth(ctx context.Context, service string, in OAuthInit
 	return &out, nil
 }
 
-// SecretStatus is the slice of GET /secret/:id a connect waits on. The route
-// never returns a value; decoding only these fields keeps that true here too.
-//
+// SecretStatus is the slice of GET /secret/:id a connect waits on.
 // GrantedScopes is written ONLY by the OAuth callback, so a change in it is a
-// completed consent. updatedAt is deliberately absent: an ordinary background
-// token refresh bumps it, and a wait keyed on it would report a sign-in that
-// never happened.
+// completed consent; updatedAt is deliberately absent because a background token
+// refresh bumps it, and a wait keyed on it would report a sign-in that never happened.
 type SecretStatus struct {
 	ID            string    `json:"id"`
 	Name          string    `json:"name"`
@@ -107,15 +92,13 @@ func (c *Client) GetSecretStatus(ctx context.Context, id string) (*SecretStatus,
 	return &out, nil
 }
 
-// IsTransient reports whether a poll failure is worth retrying — the same rule
-// the login poll uses (a dropped connection, a 429, a 5xx), exported for the
-// other handshakes' waits so there is one definition of "a blip".
+// IsTransient reports whether a poll failure is worth retrying (a dropped
+// connection, a 429, a 5xx): the login poll's rule, exported so every wait shares it.
 func IsTransient(err error) bool { return isTransient(err) }
 
 // CreatePendingSecretInput is the POST /secret/pending body
-// (rsecret.CreatePendingInput server-side). It has no credentials field at all:
-// the value is entered by a person on the secret's page in Ronja, and the
-// caller never holds it.
+// (rsecret.CreatePendingInput server-side). It has no credentials field: a person
+// enters the value on the secret's page in Ronja, and the caller never holds it.
 type CreatePendingSecretInput struct {
 	FeatureID   string          `json:"featureID"`
 	Name        string          `json:"name"`
@@ -127,11 +110,9 @@ type CreatePendingSecretInput struct {
 	Dialect     string          `json:"dialect,omitempty"`
 }
 
-// PendingSecret is what POST /secret/pending answers.
-//
-// URL is the secret's page, built and org-stamped by the server; a command
-// opens it as given and never builds one. Reused is true when the caller's
-// identical pending secret was returned rather than a new one created.
+// PendingSecret is what POST /secret/pending answers. URL is built and
+// org-stamped by the server, and a command opens it as given, never building one.
+// Reused is true when the caller's identical pending secret was returned.
 type PendingSecret struct {
 	Secret   CreatedSecret    `json:"secret"`
 	URL      string           `json:"url"`

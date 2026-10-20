@@ -9,17 +9,11 @@ import (
 	"strings"
 )
 
-// The server's own limits, mirrored from backend/resource/rworkflow/
-// store_files.go (validatePath) — and identical in backend/resource/rdataapp/
-// store_files.go, whose validatePath is a deliberate copy of the same rules, so
-// ONE grammar covers both kinds. They are duplicated rather than discovered
-// because the point is to tell the caller a file will be rejected BEFORE a
-// push spends a round-trip finding out — and to know, locally, which files in
-// a folder are even candidates for sync.
-//
-// Keeping them in step with the server is load-bearing; a rule that drifts
-// looser here means a confusing mid-push 400, and one that drifts stricter
-// means silently skipping a file the user expected to push.
+// The server's path limits, mirrored from validatePath in
+// backend/resource/rworkflow/store_files.go and backend/resource/rdataapp/store_files.go
+// so a rejected file is reported before a push. They must stay in step: looser
+// here means a mid-push 400, stricter means silently skipping a file the user
+// expected to push.
 const (
 	MaxPathLength = 256
 	MaxPathDepth  = 8
@@ -77,37 +71,20 @@ func ValidatePath(path string) error {
 // StructuralExclusion reports why a resource-relative path can never live in a
 // synced folder of this kind, or "" when it can.
 //
-// These are the rules Enumerate applies BY SHAPE, before the server's path
-// grammar gets a look in — and the server's grammar accepts every one of them
-// (`.` is an allowed segment character, so `.env` and `.config/x.py` are
-// perfectly legal workflow file paths server-side; so is `dist/app.js`). That
-// asymmetry is the whole reason this is a named, exported rule rather than an
-// inline condition: anything that lays files out on disk and then trusts a
-// baseline — clone, the post-publish baseline refresh — has to refuse a set
-// containing one of these, because the file would be written, never enumerated
-// again, and read as a LOCAL DELETION on the next status (and acted on by the
-// next push).
-//
-// Kind is a parameter for exactly that reason. A data app excludes node_modules/
-// and dist/ where a workflow does not, so "is this path syncable" has no
-// kind-free answer — and answering it with one Kind here and another in
-// Enumerate is the phantom-deletion bug above.
-//
-// Keep in step with Enumerate.
+// The server's path grammar accepts every path this excludes (`.env`,
+// `dist/app.js`), so anything that lays files out and then trusts a baseline
+// must refuse them: the file would be written, never enumerated again, and read
+// as a local deletion that the next push acts on. Kind is a parameter because
+// the answer differs per kind, and this must agree with Enumerate.
 func StructuralExclusion(path string, kind Kind) string {
 	if path == ManifestName {
 		return fmt.Sprintf("%s is the folder's own manifest", ManifestName)
 	}
 	if path == LockName {
-		// The lock is COMMITTED, so unlike .ronja/ it is a real file sitting in
-		// the walk's way — and a workflow or data app has no SyncExt, so without
-		// this line it is ordinary source and gets PUT into the customer's own
-		// resource. Three things then go wrong at once: the folder's machine
-		// state ships inside the workflow (and inside a data app's compiled
-		// bundle); a later clone writes the server's stale copy over the real
-		// lock file, which LoadLock then reads as authoritative — a clone
-		// inheriting another environment's ids; and the cloned folder reports
-		// `modified ronja.lock.json` for ever, because every push rewrites it.
+		// The lock is committed, so it sits in the walk; a workflow or data app
+		// has no SyncExt, and without this line the lock would be PUT into the
+		// customer's resource and a later clone would write the server's stale
+		// copy over the real one.
 		return fmt.Sprintf("%s is the folder's own recorded state", LockName)
 	}
 	if path == StateDirName || strings.HasPrefix(path, StateDirName+"/") {
@@ -129,24 +106,17 @@ func StructuralExclusion(path string, kind Kind) string {
 // Syncable reports whether a FILE path holds content a folder of this kind
 // sends. Case-insensitive, because `.SQL` is an ordinary thing to find in a repo
 // that has been through Windows.
-//
-// A kind with no SyncExt syncs everything the structural rules allow, which is
-// how workflows and data apps behave.
 func (k Kind) Syncable(path string) bool {
 	return k.SyncExt == "" || strings.EqualFold(filepath.Ext(path), k.SyncExt)
 }
 
 // NotSyncable reports why a FILE path is not one this kind syncs, or "" when it
-// is. It is StructuralExclusion plus the kind's own content rule (SyncExt).
+// is: StructuralExclusion plus the kind's SyncExt.
 //
-// The one predicate both the walk and the layout check apply — Enumerate for
-// every file it finds, CheckLocalPaths for every path it is about to write —
-// and they must answer identically. A file one keeps and the other drops leaves
-// a baseline claiming a path that no later walk returns: `status` invents a
-// deletion and the next push acts on it by deleting the file server-side.
-//
-// FILES only. A DIRECTORY is tested by StructuralExclusion alone: `staging/`
-// has no extension, and pruning it here would hide every .sql file beneath it.
+// Enumerate and CheckLocalPaths both apply it and must answer identically: a
+// file one keeps and the other drops becomes a phantom deletion the next push
+// performs server-side. FILES only: a directory is tested by StructuralExclusion
+// alone, since `staging/` has no extension and pruning it would hide its .sql files.
 func NotSyncable(path string, kind Kind) string {
 	if reason := StructuralExclusion(path, kind); reason != "" {
 		return reason
@@ -157,25 +127,16 @@ func NotSyncable(path string, kind Kind) string {
 	return ""
 }
 
-// isFolderMachinery reports whether a path is the CLI's own bookkeeping rather
-// than something the user authored. Excluded from Skipped reporting: the user
-// did not put ronja.json, ronja.lock.json or .ronja/ there expecting them to
-// sync, and naming them on every single command would be pure noise.
-//
-// It must list exactly what StructuralExclusion rules out as machinery — the
-// two answer the same question, one saying "never syncable" and the other
-// "and do not report it". A file in one and not the other is either pushed
-// into the customer's resource or named as their mistake on every command.
+// isFolderMachinery reports whether a path is the CLI's own bookkeeping, which
+// is excluded from Skipped reporting. It must list exactly what
+// StructuralExclusion rules out as machinery, or a file is either pushed into
+// the customer's resource or named as their mistake on every command.
 func isFolderMachinery(path string) bool {
 	return path == ManifestName || path == LockName ||
 		path == StateDirName || strings.HasPrefix(path, StateDirName+"/")
 }
 
 // Skipped is a local file that will never be synced, and why.
-//
-// Reported rather than silently dropped: a file the user believes is part of
-// the workflow and which the CLI quietly ignores is the worst kind of
-// surprise, and it is invisible in every other output.
 type Skipped struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason"`
@@ -185,37 +146,16 @@ type Skipped struct {
 type Enumeration struct {
 	// Files maps a syncable relative path to its sha256.
 	Files map[string]string
-	// Skipped lists everything the walk left out, sorted by path: path-invalid
-	// files, non-regular files, AND the structural exclusions (dot-files,
-	// dot-directories). A dot-DIRECTORY is reported once, by directory, rather
-	// than once per file inside it — .git would otherwise drown the report.
-	//
-	// The folder's own machinery (ronja.json, .ronja/) is the one thing NOT
-	// listed: it is the CLI's bookkeeping, not the user's mistake.
+	// Skipped lists everything the walk left out, sorted by path, except the
+	// folder's own machinery. An excluded directory is reported once, not per
+	// file, so .git does not drown the report.
 	Skipped []Skipped
 }
 
 // Enumerate walks a synced folder and hashes every file that could be pushed.
-//
-// Three classes of exclusion, in order:
-//
-//  1. The folder's own machinery: ronja.json, ronja.lock.json and .ronja/.
-//     Never syncable, and the only exclusion not reported as Skipped.
-//  2. Structural exclusions: dotfiles and dot-directories anywhere in the tree —
-//     .git above all, which is enormous, full of paths the server would reject,
-//     and never source — plus this Kind's SkipDirs (node_modules/, dist/ and
-//     build/ for a data app). Ruled out by DIRECTORY so a repo's whole object
-//     store, or a whole dependency tree, is skipped rather than walked and
-//     discarded file by file (and reported once, by directory).
-//  3. Anything else the server's path rules reject, which is reported as
-//     Skipped so the caller can say so.
-//
-// Every exclusion but the first is REPORTED. Silently dropping a file the
-// server would have accepted is what turns a clone into a folder whose baseline
-// lies: see StructuralExclusion and CheckLocalPaths.
-//
-// Symlinks are not followed (WalkDir does not follow them), so a link pointing
-// outside the folder cannot smuggle content into a push.
+// Every exclusion except the folder's own machinery is reported as Skipped.
+// Symlinks are not followed, so a link pointing outside the folder cannot
+// smuggle content into a push.
 func Enumerate(root string, kind Kind) (*Enumeration, error) {
 	out := &Enumeration{Files: map[string]string{}}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -229,14 +169,9 @@ func Enumerate(root string, kind Kind) (*Enumeration, error) {
 		if rel == "." {
 			return nil
 		}
-		// Always slash-separated: the wire format is a resource file path, not
-		// a local one, and this has to behave the same on Windows.
 		rel = filepath.ToSlash(rel)
 
 		if d.IsDir() {
-			// Directories are tested by the SAME rule as files, so a Kind's
-			// SkipDirs prunes the whole subtree here rather than rejecting its
-			// contents one by one below — and reports once, by directory.
 			if reason := StructuralExclusion(rel, kind); reason != "" {
 				if !isFolderMachinery(rel) {
 					out.Skipped = append(out.Skipped, Skipped{Path: rel + "/", Reason: reason})
@@ -245,10 +180,8 @@ func Enumerate(root string, kind Kind) (*Enumeration, error) {
 			}
 			return nil
 		}
-		// The name-based exclusions come out first, so a symlinked .env is ruled
-		// out by NAME rather than reported as "not a regular file" — and so a
-		// pipeline folder's node_modules/ or venv/ is ruled out by EXTENSION
-		// before anything is read off disk, which is the whole cost of the walk.
+		// Name-based exclusions first, so a symlinked .env is reported by name
+		// and a pipeline folder's venv/ is ruled out by extension before any read.
 		if reason := NotSyncable(rel, kind); reason != "" {
 			if !isFolderMachinery(rel) {
 				out.Skipped = append(out.Skipped, Skipped{Path: rel, Reason: reason})
@@ -256,12 +189,6 @@ func Enumerate(root string, kind Kind) (*Enumeration, error) {
 			return nil
 		}
 		if !d.Type().IsRegular() {
-			// A symlink, socket or device is not workflow source. REPORTED
-			// rather than dropped: a symlinked module is a perfectly ordinary
-			// thing to have in a repo, and one that vanishes from every push
-			// with no output anywhere is exactly the surprise Skipped exists
-			// for. (WalkDir does not follow links, so the target's content
-			// cannot be smuggled in either way.)
 			out.Skipped = append(out.Skipped, Skipped{Path: rel, Reason: "not a regular file"})
 			return nil
 		}
@@ -302,16 +229,8 @@ func (d Diff) Dirty() bool {
 // Total is how many paths differ.
 func (d Diff) Total() int { return len(d.Added) + len(d.Modified) + len(d.Deleted) }
 
-// DiffHashes compares a current set of hashes against a baseline.
-//
-// One function serves both comparisons the sync loop needs, because they are
-// the same question asked twice:
-//
-//   - LOCAL vs baseline — what have I changed since the last sync (what push
-//     would send).
-//   - REMOTE vs baseline — what has changed on the server since the last sync
-//     (drift: someone else's web-builder edit to the same per-user draft), which
-//     push must refuse to overwrite blindly.
+// DiffHashes compares a current set of hashes against a baseline; the sync loop
+// uses it for both local changes and remote drift.
 func DiffHashes(current, baseline map[string]string) Diff {
 	d := Diff{Added: []string{}, Modified: []string{}, Deleted: []string{}}
 	for path, hash := range current {
@@ -337,9 +256,8 @@ func DiffHashes(current, baseline map[string]string) Diff {
 }
 
 // WriteFile writes one workflow file into the folder, creating parent
-// directories as needed. The path is validated first: it arrives from the
-// server, and a row carrying a traversal path (legacy data, a future bug)
-// must not be able to write outside the folder.
+// directories as needed. The path comes from the server and is validated first,
+// so a row carrying a traversal path cannot write outside the folder.
 func WriteFile(root, path, content string) error {
 	if err := ValidatePath(path); err != nil {
 		return err
@@ -352,39 +270,14 @@ func WriteFile(root, path, content string) error {
 }
 
 // CheckLocalPaths reports whether a REMOTE file set can be laid out in a folder
-// without losing a file, and is meant to run before the first byte is written.
+// without losing a file, and must run before the first byte is written. A file
+// the baseline records but the walk never returns is read as a local deletion
+// that the next push performs server-side, so it refuses paths WriteFile
+// rejects, paths NotSyncable excludes (it must agree with Enumerate), and paths
+// differing only by case.
 //
-// It exists because the baseline is a promise: .ronja/state.json says "these
-// paths are on disk with these hashes", and every later command believes it. A
-// file the server has but the folder does not is read as a LOCAL DELETION —
-// status shows a phantom deleted entry, and a push acts on it by deleting the
-// file server-side. Losing the user's code to a folder that was wrong from the
-// moment it was created is not a warning-level event.
-//
-// Three ways a set cannot be laid out:
-//
-//   - A path WriteFile refuses (legacy rows, or a malicious one). Skipping it
-//     with a warning is what produced the phantom-deletion case above.
-//   - A path Enumerate excludes by NAME (NotSyncable): a dot-file or
-//     dot-directory ANYWHERE in it, the folder's own ronja.json /
-//     ronja.lock.json / .ronja/, one
-//     of this Kind's SkipDirs, or a file outside this Kind's SyncExt — a `.md`
-//     handed to a pipeline folder is written once and then invisible to every
-//     walk. The server's path grammar allows `.` in a segment, so
-//     `.env` and `.config/x.py` are legal workflow paths that clone would
-//     happily write — and `dist/app.js` is a legal data-app path — and that the
-//     walk would then never see again. Exactly the phantom-deletion shape above,
-//     just arrived at by naming rather than by refusal. This is why Kind is a
-//     parameter here and not only on Enumerate: the two must answer identically.
-//   - Paths differing only by case. "Main.py" and "main.py" are two distinct
-//     rows server-side and ONE file on macOS or Windows, so the second write
-//     silently destroys the first — and the baseline then claims both exist.
-//     Checked unconditionally rather than by probing the filesystem, so a clone
-//     behaves identically everywhere and a folder cloned on Linux does not
-//     become unusable the moment a colleague pulls it on a Mac.
-//
-// The remedy is not something the CLI can perform, so the error names the
-// offending paths and points at the web builder, which can rename them.
+// The case check is unconditional rather than a filesystem probe, so a folder
+// cloned on Linux stays usable on a case-insensitive Mac or Windows checkout.
 func CheckLocalPaths(paths []string, kind Kind) error {
 	var invalid []string
 	for _, p := range paths {
@@ -410,8 +303,7 @@ func CheckLocalPaths(paths []string, kind Kind) error {
 			kind.Label, len(excluded), strings.Join(excluded, "\n    "))
 	}
 
-	// Grouped by DISTINCT path, so a server that somehow returned the same path
-	// twice is not described as colliding with itself.
+	// Grouped by distinct path, so a path returned twice does not collide with itself.
 	byFold := map[string]map[string]bool{}
 	for _, p := range paths {
 		fold := strings.ToLower(p)

@@ -43,8 +43,6 @@ func TestLatestParsesTagAndAssets(t *testing.T) {
 	}
 }
 
-// The invariant this package exists to protect: a release lookup must never
-// carry the Ronja credential, so it carries no Authorization header at all.
 func TestLatestSendsNoCredential(t *testing.T) {
 	var auth, agent string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -86,8 +84,6 @@ func TestLatestErrors(t *testing.T) {
 	}
 }
 
-// A slow or black-holed mirror must end the lookup on the caller's deadline
-// rather than hold the command.
 func TestLatestRespectsDeadline(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -107,9 +103,8 @@ func TestLatestRespectsDeadline(t *testing.T) {
 	}
 }
 
-// A release description bigger than the cap is reported as being too big, not
-// as unparseable: reading exactly the cap and handing the truncated bytes to
-// the JSON parser blames the answer's shape for its size.
+// Too big, not unparseable: truncated bytes handed to the JSON parser would
+// blame the answer's shape for its size.
 func TestLatestRefusesAnOversizedBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Valid JSON throughout, so nothing but the size can fail it.
@@ -131,9 +126,8 @@ func TestLatestRefusesAnOversizedBody(t *testing.T) {
 	}
 }
 
-// The asset URL comes out of the release listing, and these bytes are about to
-// be written over the running executable — so a plaintext URL named by an https
-// listing is refused before the connection, not judged after it.
+// The asset URL comes from the listing and its bytes replace the executable, so
+// a plaintext URL named by an https listing is refused before connecting.
 func TestFetchRefusesAWeakerSchemeThanTheBase(t *testing.T) {
 	var asked bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -159,16 +153,13 @@ func TestFetchRefusesAWeakerSchemeThanTheBase(t *testing.T) {
 		t.Fatal("Download accepted an http asset URL from an https release")
 	}
 
-	// The same guard runs in the tests, where the base is the fake mirror: an
-	// http URL is fine there because that is what the release was read over.
+	// Against the fake http mirror the same guard allows http.
 	if _, err := Fetch(context.Background(), srv.URL, srv.URL, MaxChecksums); err != nil {
 		t.Errorf("Fetch from an http base: %v, want the same-scheme URL accepted", err)
 	}
 }
 
-// Both rules have to survive the hops, or they hold only until somebody
-// redirects: a server can answer an https request with a 302 to anywhere, and
-// net/http follows it by default.
+// Both rules must survive redirects, which net/http follows by default.
 func TestGuardRedirect(t *testing.T) {
 	hop := func(from, to string) (*http.Request, []*http.Request) {
 		origin, _ := http.NewRequest(http.MethodGet, from, nil)
@@ -184,9 +175,8 @@ func TestGuardRedirect(t *testing.T) {
 		{"https to another host of GitHub's", "https://github.com/a", "https://objects.githubusercontent.com/a", false},
 		{"http to http, which is the test mirror", "http://127.0.0.1:1/a", "http://127.0.0.1:1/b", false},
 		{"http upgraded to https", "http://github.com/a", "https://github.com/a", false},
-		// The hop the host rule exists for: a tampered release listing cannot
-		// name a foreign host directly (requireKnownHost), so it would name
-		// github.com and have that answer a 302 to its own.
+		// A tampered listing cannot name a foreign host directly, so it would
+		// name github.com and redirect.
 		{"https to somebody else's host", "https://github.com/a", "https://elsewhere.invalid/a", true},
 		{"a redirect off the test mirror", "http://127.0.0.1:1/a", "http://127.0.0.2:1/a", true},
 		// A subdomain of the release-asset domain is allowed whichever one
@@ -219,10 +209,8 @@ func TestGuardRedirect(t *testing.T) {
 	}
 }
 
-// The asset URL comes out of the release listing, so a listing that has been
-// tampered with can name any host it likes — and https does not help, because
-// a certificate for a host of the attacker's own choosing is free. The host is
-// therefore pinned before the connection.
+// https alone does not help: a certificate for the attacker's own host is free,
+// so the host is pinned before connecting.
 func TestFetchRefusesAForeignHost(t *testing.T) {
 	var asked bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -231,9 +219,6 @@ func TestFetchRefusesAForeignHost(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// The production base, against an https URL on a host that is not GitHub's.
-	// A different base than the target, which is what a real tampered listing
-	// looks like: the release was read from api.github.com and points elsewhere.
 	_, err := Fetch(context.Background(), DefaultBaseURL, "https://elsewhere.invalid/checksums.txt", MaxChecksums)
 	if err == nil {
 		t.Fatal("Fetch accepted an asset URL on a foreign host")
@@ -252,9 +237,8 @@ func TestFetchRefusesAForeignHost(t *testing.T) {
 		t.Error("the refused URL was fetched anyway")
 	}
 
-	// The hosts a real release names are allowed, and so is the base's own —
-	// which is what lets the same rule run against the fake mirror rather than
-	// being switched off under test.
+	// The base's own host is allowed, so the rule runs against the fake mirror
+	// rather than being switched off under test.
 	for _, ok := range []string{
 		"https://github.com/ronjatech/ronja-cli/releases/download/v1/a.tar.gz",
 		"https://objects.githubusercontent.com/a.tar.gz",
@@ -268,8 +252,7 @@ func TestFetchRefusesAForeignHost(t *testing.T) {
 	}
 }
 
-// A redirect that keeps the scheme and stays on the host is ordinary — the
-// mirror answers one for every asset — and must still be followed.
+// The mirror redirects for every asset.
 func TestFetchFollowsASameSchemeRedirect(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

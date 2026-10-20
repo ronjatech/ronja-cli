@@ -20,28 +20,9 @@ import (
 	"golang.org/x/term"
 )
 
-// Sign-in lives at the TOP LEVEL — `ronja login`, not `ronja login`.
-//
-// The CLI is a bootstrap, and this is the bootstrap act; burying it one level
-// down understates what the tool is for. It also matches the surface around it,
-// which was already flat: `context`, `env`, `api` and `query` are all
-// auth-adjacent and none of them is nested.
-//
-// `whoami` rather than `status` for the identity read. `ronja status` would
-// read as instance health, and this CLI already has a `status` that means
-// something else entirely (`wf status`, about a folder).
-
-// No command prints a token; `ronja token create` hands the mint to the browser.
-//
-// A command whose whole purpose is printing a live credential puts that
-// credential into a terminal scrollback, a CI log, or an agent transcript every
-// time it runs. Being able to READ the token and having it ECHOED are different
-// things, and only the second is a leak.
-//
-// Instead `ronja context` reports the credential FILE — its path, the JSON key
-// for this instance, and a substitution that pipes the value straight into an
-// Authorization header without it ever being printed. A caller that needs the
-// value has it; nothing routinely writes it down.
+// ⚠️ No command prints a token (it would land in scrollback, CI logs and agent
+// transcripts); `ronja context` reports the credential file instead, and
+// `ronja token create` hands the mint to the browser.
 
 func newLoginCmd() *cobra.Command {
 	var withToken bool
@@ -79,10 +60,8 @@ and for machines with no browser:
 
 			target := flagURL
 			if target == "" {
-				// Deliberately does NOT inherit the current profile's URL:
-				// logging in is how you choose an instance, so falling back to
-				// whatever was used last would silently re-authenticate the
-				// wrong one.
+				// Deliberately not the current profile's URL: logging in
+				// chooses an instance, and the last one may be the wrong one.
 				target = os.Getenv(config.EnvURL)
 			}
 			if target == "" {
@@ -93,10 +72,7 @@ and for machines with no browser:
 				return err
 			}
 
-			// Check the requested name BEFORE the browser dance. Everything
-			// after StartDevice mints a real 90-day credential, and discovering
-			// then that the name is unusable means reporting a problem the user
-			// could have been told about for free.
+			// Checked before anything is minted.
 			if flagProfile != "" {
 				if err := checkRequestedProfile(flagProfile, normalized); err != nil {
 					return err
@@ -117,7 +93,6 @@ and for machines with no browser:
 	return cmd
 }
 
-// loginWithDeviceFlow runs the browser handshake.
 func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) error {
 	client := api.New(baseURL, "")
 
@@ -126,15 +101,12 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 		return fmt.Errorf("start login against %s: %w", baseURL, err)
 	}
 
-	// Human-facing instructions go to STDERR, so that `--json` stdout stays a
-	// clean single object even while the flow is narrating progress.
+	// Stderr, so `--json` stdout stays one object.
 	out := os.Stderr
 	fmt.Fprintf(out, "\n  Your code: %s\n\n", start.UserCode)
 
-	// "spawned" rather than "opened": all we know is that the platform's URL
-	// handler started. Whether a browser window actually appeared is not
-	// something any of these helpers reports, so the prefilled URL is printed
-	// either way and the wording does not promise more than it knows.
+	// Only the URL handler's start is known, not that a browser appeared, so
+	// the prefilled URL is printed either way.
 	spawned := false
 	if !noBrowser {
 		spawned = openBrowser(start.VerificationURIComplete) == nil
@@ -160,19 +132,9 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 		return err
 	}
 
-	// PERSIST BEFORE VERIFYING. The server burns the single-use latch before
-	// it mints, and hands the plaintext over exactly once — so this token
-	// exists, is live, is full-access, and nobody but this process has ever
-	// seen it. If we called /me first and it failed (a blip, a rolling
-	// deploy), the token would be dropped on the floor: a live credential
-	// bound to the user, visible in Account -> Access tokens, that they cannot
-	// use and would have no idea how to reason about. Writing it to disk first
-	// means the worst case is a stored token plus a clear warning, which
-	// `ronja whoami` can then diagnose and `ronja logout` can clear.
-	//
-	// The organization is already known here — the poll response carries it —
-	// so the profile's IDENTITY is complete at this point and only its NAME
-	// waits on /me.
+	// ⚠️ Persist before verifying: the server hands the plaintext over exactly
+	// once, so a /me failure first would orphan a live credential. The poll
+	// response carries the organization; only the profile's name waits on /me.
 	name, provisional, declined, err := claimLogin(baseURL, token.TenantID, func(p *config.Profile) {
 		p.Token = token.Token
 		p.TokenID = token.TokenID
@@ -186,11 +148,8 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 
 	me, err := api.New(baseURL, token.Token).Me(ctx)
 	if err != nil {
-		// Stored but unverified: say so precisely rather than implying the
-		// login failed outright, because it did not.
+		// Stored but unverified, which is not a failed login.
 		if flagJSON {
-			// --json stdout stays exactly one object, and `verified:false` is
-			// the flag a caller branches on.
 			return emitJSON(map[string]any{
 				"url":            baseURL,
 				"profile":        name,
@@ -208,21 +167,9 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 		return nil
 	}
 
-	// Backfill the identity snapshot, and give the profile its real name now
-	// that the organization is known.
-	//
-	// A failure here DEGRADES rather than aborting, for the same reason the /me
-	// failure above does: by this point the token is already stored and working.
-	// Returning an error would exit non-zero with a message that reads like the
-	// login failed — most plausibly "timed out waiting for …config.json.lock",
-	// which says nothing about tokens at all — and the user's obvious next move
-	// is to run `ronja login` again, minting a second PAT and orphaning a
-	// perfectly good first one. The snapshot is cosmetic: it makes the
-	// credential file legible to a human, and `whoami` round-trips to /me
-	// for anything that matters.
-	//
-	// The FIRST write, which persists the token itself, must keep failing
-	// loudly — there the alternative is a live credential nobody has a copy of.
+	// A failure here only warns: the token is stored and working, and a
+	// non-zero exit would prompt a second login that orphans it. The first
+	// write, which persists the token, must keep failing loudly.
 	final, err := finishLogin(name, provisional, baseURL, me)
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
@@ -236,9 +183,8 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 }
 
 // checkRequestedProfile refuses an unusable --profile name before anything is
-// minted. Only the URL can be judged this early: whether the ORGANIZATION
-// matches is not knowable until the human has approved in the browser, and that
-// case is handled after the fact by claimLogin.
+// minted. Only the URL can be judged this early; an organization mismatch is
+// handled after approval by claimLogin.
 func checkRequestedProfile(name, instanceURL string) error {
 	if err := config.ValidateName(name); err != nil {
 		return err
@@ -254,15 +200,11 @@ func checkRequestedProfile(name, instanceURL string) error {
 	return nil
 }
 
-// claimLogin stores a freshly minted credential against its identity, in ONE
-// locked step: finding or allocating the name and writing the token cannot be
-// separated, or two concurrent logins both take the same free name and the
-// second silently evicts the first.
-//
-// It reports whether the profile was newly CREATED — meaning its name is still
-// provisional and may be improved once /me names the organization — and whether
-// a requested --profile name had to be DECLINED because a different
-// organization already holds it.
+// claimLogin stores a freshly minted credential in one locked step: allocating
+// the name and writing the token cannot be separated, or two concurrent logins
+// take the same free name and the second evicts the first. created means the
+// name is still provisional; declined means a different organization holds the
+// requested --profile name.
 func claimLogin(instanceURL, tenantID string, fill func(*config.Profile)) (name string, created, declined bool, err error) {
 	preferred := flagProfile
 	err = config.Update(func(f *config.File) error {
@@ -276,13 +218,10 @@ func claimLogin(instanceURL, tenantID string, fill func(*config.Profile)) (name 
 	return name, created, declined, err
 }
 
-// finishLogin backfills the identity snapshot and, for a profile whose name is
-// still provisional, renames it after the organization.
-//
-// It deliberately does NOT touch TenantID. That was set when the profile was
-// claimed and is half of its identity; rewriting it here from a second source
-// could move a profile into a slot another one already occupies, which is how
-// two logins end up fighting over one entry again.
+// finishLogin backfills the identity snapshot and, for a provisional name,
+// renames the profile after the organization. It never touches TenantID: that
+// is half the profile's identity, and rewriting it could collide with another
+// profile's slot.
 func finishLogin(name string, provisional bool, instanceURL string, me *api.Me) (string, error) {
 	final := name
 	err := config.Update(func(f *config.File) error {
@@ -295,9 +234,8 @@ func finishLogin(name string, provisional bool, instanceURL string, me *api.Me) 
 		if me.Tenant != nil {
 			p.TenantName = me.Tenant.Name
 		}
-		// Re-derived INSIDE this lock rather than passed in: another login can
-		// have taken the name since the first write, and allocating against a
-		// stale snapshot is the same lost-credential race one step later.
+		// Re-derived inside this lock: another login may have taken the name
+		// since the first write.
 		if provisional {
 			if better := f.AutoName(instanceURL, p.TenantName, name); better != name {
 				if err := f.Rename(name, better); err != nil {
@@ -312,13 +250,9 @@ func finishLogin(name string, provisional bool, instanceURL string, me *api.Me) 
 	return final, err
 }
 
-// loginWithToken stores a token supplied on stdin, verifying it FIRST.
-//
-// The opposite order from the device flow, deliberately: a pasted token is
-// re-pastable, so refusing to store one we could not use costs the caller
-// nothing and saves them a confusing failure on the next command. A
-// device-flow token is handed over exactly once and cannot be recovered, so
-// there it must be written down before anything else can go wrong.
+// loginWithToken stores a token supplied on stdin, verifying it first: the
+// opposite order from the device flow is safe because a pasted token can be
+// pasted again.
 func loginWithToken(ctx context.Context, baseURL string) error {
 	token, err := readTokenFromStdin()
 	if err != nil {
@@ -333,9 +267,6 @@ func loginWithToken(ctx context.Context, baseURL string) error {
 		return fmt.Errorf("verify token against %s: %w", baseURL, err)
 	}
 
-	// No poll response here, so /me is where the organization comes from — and
-	// it is known BEFORE the claim, which is why this path needs no rename
-	// afterwards.
 	tenantID := ""
 	if me.Tenant != nil {
 		tenantID = me.Tenant.ID
@@ -353,8 +284,6 @@ func loginWithToken(ctx context.Context, baseURL string) error {
 		return err
 	}
 	if created && flagProfile == "" {
-		// The organization was known at claim time, so improving the name is
-		// just the same rename, with nothing to wait for.
 		if final, err := finishLogin(name, true, baseURL, me); err == nil {
 			name = final
 		}
@@ -363,7 +292,6 @@ func loginWithToken(ctx context.Context, baseURL string) error {
 	return nil
 }
 
-// reportLogin is the shared success output for both login paths.
 func reportLogin(baseURL, profile string, me *api.Me, expiresAt string, declined bool) {
 	if flagJSON {
 		payload := statusPayload(baseURL, profile, me, false)
@@ -383,22 +311,17 @@ func reportLogin(baseURL, profile string, me *api.Me, expiresAt string, declined
 		fmt.Fprintf(os.Stderr, " (%s)", me.Tenant.Name)
 	}
 	fmt.Fprintf(os.Stderr, "\n  Profile %q — now current. Token stored in %s\n", profile, path)
-	// Say when it dies, at the moment it is created. A credential that stops
-	// working with no warning is the worst version of this.
 	if when := describeExpiry(expiresAt); when != "" {
 		fmt.Fprintf(os.Stderr, "  Expires %s — run `ronja login` again to renew.\n", when)
 	}
 
-	// A token with no organization reaches almost nothing. Better to say so at
-	// the moment it is created than to let every later command fail obscurely.
 	if me.Tenant == nil {
 		fmt.Fprintf(os.Stderr,
 			"\n  Note: this login has no organization. Most of the API needs one —\n"+
 				"  join or create one in the web app, then run `ronja login` again.\n")
 	}
 
-	// The requested name belonged to a different organization. Say where the
-	// credential actually went, and why: silently landing it elsewhere is how
+	// Said out loud: a credential silently landing under another name is how
 	// someone later runs a command against the wrong organization.
 	if declined {
 		fmt.Fprintf(os.Stderr,
@@ -410,18 +333,13 @@ func reportLogin(baseURL, profile string, me *api.Me, expiresAt string, declined
 			flagProfile, profile)
 	}
 
-	// Raised here rather than before the login: the moment someone has just
-	// replaced the credential is the moment the stale one is worth mentioning.
 	warnLegacyStore()
 
-	// The handoff. Without this line an agent has a working credential and no
-	// idea what to do with it; `ronja context` is the whole answer.
 	fmt.Fprintf(os.Stderr, "\n  Next: run `ronja context` for everything needed to call the API.\n\n")
 }
 
-// describeExpiry renders an RFC 3339 expiry as a date plus a day count, or ""
-// when there is no expiry to report. "2026-10-25 (in 90 days)" beats either
-// half alone: the date is what you diary, the count is what you react to.
+// describeExpiry renders an RFC 3339 expiry as a date plus a day count, or an
+// empty string when there is none.
 func describeExpiry(raw string) string {
 	if raw == "" {
 		return ""
@@ -467,9 +385,8 @@ Reports the selected profile. To see them all without contacting a server, use
 			me, err := api.New(resolved.URL, resolved.Token).Me(cmd.Context())
 			if err != nil {
 				if api.StatusOf(err) == 401 || api.StatusOf(err) == 403 {
-					// Point at whichever token actually failed: telling someone
-					// to log in again would not help if the credential came
-					// from the environment and will just override it anyway.
+					// Name the token that failed: logging in again does not help
+					// while an env token overrides the stored one.
 					if resolved.FromEnv {
 						return fmt.Errorf("the token in $%s was rejected by %s", config.EnvToken, resolved.URL)
 					}
@@ -478,18 +395,14 @@ Reports the selected profile. To see them all without contacting a server, use
 				return err
 			}
 
-			// Only meaningful for a stored login: an env-supplied token was
-			// never minted through us, so we know nothing about its lifetime.
+			// An env-supplied token's lifetime is unknown.
 			expiry := ""
 			if !resolved.FromEnv && resolved.Entry != nil {
 				expiry = resolved.Entry.TokenExpiry
 			}
 
-			// The credential file records an organization; the server has just
-			// stated one. They can only disagree if the file was hand-edited or
-			// the token was re-pointed — but if they do, every workflow-folder
-			// binding keyed on the recorded one is wrong, so say it out loud
-			// rather than letting it surface as a confusing 404 later.
+			// A recorded organization that disagrees with the server's breaks
+			// every workflow-folder binding keyed on it, so it is reported.
 			drifted := !resolved.FromEnv && resolved.Entry != nil &&
 				me.Tenant != nil && resolved.Entry.TenantID != "" &&
 				resolved.Entry.TenantID != me.Tenant.ID
@@ -534,16 +447,12 @@ Reports the selected profile. To see them all without contacting a server, use
 	}
 }
 
-// notSignedIn explains what to do, in terms of whichever selector the caller
-// actually used — telling someone who passed --profile to run `login --url` is
-// an instruction that does not fit the command they typed.
+// notSignedIn explains what to do in terms of the selector the caller used.
 func notSignedIn(resolved *config.Resolved) error {
 	if flagProfile != "" || os.Getenv(config.EnvProfile) != "" {
 		return fmt.Errorf("profile %q has no stored token — run `ronja login --url %s --profile %s`",
 			resolved.Profile, resolved.URL, resolved.Profile)
 	}
-	// On the default instance the --url is noise, and this is the very first
-	// message a new install produces — the shortest true command wins.
 	if resolved.URL == config.DefaultURL {
 		return errors.New("not signed in — run `ronja login`")
 	}
@@ -593,8 +502,6 @@ Account -> Access tokens if the token may have been exposed.`,
 				fmt.Fprintf(os.Stderr, "  Removed profile %q (%s)\n", resolved.Profile, resolved.URL)
 			}
 			if resolved.FromEnv {
-				// Otherwise the next command still works and it looks like
-				// logout silently failed.
 				fmt.Fprintf(os.Stderr, "  Note: $%s is still set, so the CLI remains authenticated.\n",
 					config.EnvToken)
 			}
@@ -603,7 +510,7 @@ Account -> Access tokens if the token may have been exposed.`,
 	}
 }
 
-// statusPayload is the --json shape shared by login and status.
+// statusPayload is the --json shape shared by login and whoami.
 func statusPayload(url, profile string, me *api.Me, fromEnv bool) map[string]any {
 	payload := map[string]any{
 		"url":           url,
@@ -625,10 +532,8 @@ func statusPayload(url, profile string, me *api.Me, fromEnv bool) map[string]any
 	return payload
 }
 
-// describeUser names the signed-in human. Email first because it is unique and
-// is what a person recognises; the composed first/last name is the fallback for
-// an account with none (an SSO user whose email the directory did not share),
-// and the opaque ID is the last resort so this never returns "".
+// describeUser names the signed-in human: email, else full name, else the ID,
+// so it is never empty.
 func describeUser(me *api.Me) string {
 	if me.User.Email != "" {
 		return me.User.Email
@@ -649,9 +554,8 @@ func clientName() string {
 	return "ronja-cli on " + host
 }
 
-// readTokenFromStdin accepts a token piped in, or prompts when attached to a
-// terminal. Prompting only on a TTY is what keeps the command safe to use in a
-// pipeline: a script that forgets to pipe anything gets EOF, not a hang.
+// readTokenFromStdin accepts a token piped in, or prompts on a terminal only, so
+// a script that pipes nothing gets EOF rather than a hang.
 func readTokenFromStdin() (string, error) {
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Fprint(os.Stderr, "Paste your access token: ")
@@ -674,21 +578,14 @@ func readTokenFromStdin() (string, error) {
 	return token, nil
 }
 
-// openBrowser is best-effort; every caller has a printed-URL fallback.
-//
-// A package var so a test can stand in for it: the handshakes' tests must pin
-// WHEN a browser opens (never for an already-held connection) and WHAT it is
-// handed, without spawning one.
+// openBrowser is best-effort; every caller has a printed-URL fallback. A
+// package var so tests can pin when and with what it is called.
 var openBrowser = openBrowserURL
 
-// openBrowserURL is openBrowser's real implementation.
-//
-// The URL arrives verbatim from whichever instance --url pointed at, and the
-// platform openers dispatch on SCHEME: `open` will happily hand a non-http URL
-// to whatever local application has registered that scheme, or open a path. So
-// the scheme is checked before anything is spawned. Host-matching is
-// deliberately NOT attempted — the approval page legitimately lives on the
-// frontend origin, which differs from the API origin in every real deployment.
+// openBrowserURL refuses any scheme but http(s): the URL comes from the server
+// and the platform openers dispatch on scheme to any registered local handler.
+// The host is deliberately not matched, since the approval page lives on the
+// frontend origin, not the API's.
 func openBrowserURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -713,10 +610,7 @@ func openBrowserURL(raw string) error {
 	if err := proc.Start(); err != nil {
 		return err
 	}
-	// A successful Start proves only that the helper SPAWNED — it says nothing
-	// about a browser appearing, which is why the caller still prints the URL.
-	// Reap it so it does not sit as a zombie for the several minutes a login
-	// can take.
+	// Reaped so it does not sit as a zombie for the length of a login.
 	go func() { _ = proc.Wait() }()
 	return nil
 }

@@ -43,12 +43,6 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 }
 
-// The sudo case: root writing into a directory that belongs to somebody else
-// leaves a root-owned cache in the user's own config directory, and every later
-// unprivileged run then fails to read or replace it — one privileged update
-// would kill the daily notice permanently. So the write is refused, and refused
-// by name — the daily check treats every save failure as "do not fetch", and the
-// name is what lets this test say WHICH failure it got.
 func TestSaveStateRefusesADirectoryOwnedBySomebodyElse(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no uid to compare — dirOwnerUID always declines here")
@@ -59,8 +53,7 @@ func TestSaveStateRefusesADirectoryOwnedBySomebodyElse(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("RONJA_CONFIG_DIR", dir)
 
-	// The directory is the test user's; only the effective uid is forced, which
-	// is exactly the shape of `sudo ronja update`.
+	// Only the effective uid is forced: the shape of `sudo ronja update`.
 	previous := Geteuid
 	Geteuid = func() int { return 0 }
 	t.Cleanup(func() { Geteuid = previous })
@@ -81,13 +74,7 @@ func TestSaveStateRefusesADirectoryOwnedBySomebodyElse(t *testing.T) {
 	}
 }
 
-// The same case one directory earlier. `sudo -E ronja update` keeps HOME and
-// XDG_CONFIG_HOME pointing at the user's own home, so on a machine that has
-// never run the CLI as root the config directory does not exist yet — and
-// MkdirAll would create it, root-owned, inside a home the user cannot
-// afterwards write. The owner question is asked of the nearest ancestor that
-// does exist, because that is the directory the new one inherits its place
-// from.
+// `sudo -E` with no config directory yet: MkdirAll would create it root-owned.
 func TestSaveStateRefusesToCreateADirectoryUnderSomebodyElsesHome(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no uid to compare — dirOwnerUID always declines here")
@@ -122,8 +109,6 @@ func TestLoadStateMissingIsZero(t *testing.T) {
 	}
 }
 
-// A cache is not worth failing a command over: a byte that got corrupted on
-// disk means "never checked", not "ronja is broken".
 func TestLoadStateCorruptIsZero(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("RONJA_CONFIG_DIR", dir)

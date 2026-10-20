@@ -21,12 +21,8 @@ func writeMigration(t *testing.T, dir, name, body string) {
 	}
 }
 
-// TestReadMigrationsIsVerbatim is the drift guard, seen from the client side.
-//
-// The server's ledger hash covers exactly the bytes it was sent. A reader that
-// trimmed — and the trailing newline every text editor writes is the obvious
-// temptation — would send different bytes from the ones a previous run applied,
-// and the server would correctly call that drift. On every migration. Forever.
+// The server's ledger hash covers exactly the bytes sent; trimming even the
+// trailing newline would report every applied migration as drifted.
 func TestReadMigrationsIsVerbatim(t *testing.T) {
 	dir := t.TempDir()
 	const body = "\nCREATE TABLE leads (id int);\n\n"
@@ -44,8 +40,6 @@ func TestReadMigrationsIsVerbatim(t *testing.T) {
 	}
 }
 
-// TestReadMigrationsNamesFromStem pins that the migration's ledger identity is
-// the filename, so what you see in a diff is what the ledger records.
 func TestReadMigrationsNamesFromStem(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "0001_leads.sql", "CREATE TABLE leads (id int);")
@@ -59,10 +53,8 @@ func TestReadMigrationsNamesFromStem(t *testing.T) {
 	}
 }
 
-// TestReadMigrationsOrdersLexically pins the ordering rule, INCLUDING the sharp
-// edge: 10_ sorts before 9_. That is why the convention is zero-padding, and a
-// "helpful" natural sort here would silently disagree with the order recorded in
-// the ledger by an earlier run.
+// 10_ sorts before 9_ on purpose: a natural sort would disagree with the order
+// an earlier run recorded in the ledger.
 func TestReadMigrationsOrdersLexically(t *testing.T) {
 	dir := t.TempDir()
 	for _, n := range []string{"9_c.sql", "10_b.sql", "0001_a.sql"} {
@@ -81,8 +73,6 @@ func TestReadMigrationsOrdersLexically(t *testing.T) {
 	}
 }
 
-// TestReadMigrationsIgnoresNonSQL confirms a README or a stray .bak in the
-// folder is not sent as a migration.
 func TestReadMigrationsIgnoresNonSQL(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "0001_leads.sql", "CREATE TABLE leads (id int);")
@@ -98,18 +88,14 @@ func TestReadMigrationsIgnoresNonSQL(t *testing.T) {
 	}
 }
 
-// TestReadMigrationsRefusesDuplicateStem: two files that would become the same
-// ledger name are refused rather than one silently winning. A duplicate name in
-// the ledger is exactly the state that makes drift detection ambiguous.
 func TestReadMigrationsRefusesDuplicateStem(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "0001_leads.sql", "CREATE TABLE a (i int);")
 	writeMigration(t, dir, "0001_leads.SQL", "CREATE TABLE b (i int);")
 
 	_, err := ReadMigrations(dir)
-	// On a case-insensitive filesystem the second write replaces the first and
-	// there is only one file, so this legitimately succeeds there. What must
-	// never happen is two migrations sharing a name.
+	// On a case-insensitive filesystem the second write replaces the first, so
+	// success is legitimate there; two migrations sharing a name is not.
 	if err == nil {
 		got, rerr := ReadMigrations(dir)
 		if rerr != nil {
@@ -125,10 +111,8 @@ func TestReadMigrationsRefusesDuplicateStem(t *testing.T) {
 	}
 }
 
-// TestReadMigrationsRefusesEmpty covers the two "nothing to do" states, which
-// must be errors rather than an empty set: an empty set sent to the server is a
-// no-op that reports success, so a typo'd --dir would look like "already up to
-// date".
+// An empty set sent to the server succeeds as a no-op, so a typo'd --dir would
+// read as "already up to date".
 func TestReadMigrationsRefusesEmpty(t *testing.T) {
 	t.Run("no folder", func(t *testing.T) {
 		if _, err := ReadMigrations(t.TempDir()); err == nil {
@@ -155,7 +139,6 @@ func TestReadMigrationsRefusesEmpty(t *testing.T) {
 // Binding
 // =============================================================================
 
-// TestBindingRoundTrip is the ordinary path: record once, read it back.
 func TestBindingRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	key := wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"}
@@ -181,8 +164,6 @@ func TestBindingRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBindingMissingFileIsEmpty: a folder that has never been pushed is a normal
-// state, not an error.
 func TestBindingMissingFileIsEmpty(t *testing.T) {
 	b, err := Load(t.TempDir())
 	if err != nil {
@@ -197,11 +178,8 @@ func TestBindingMissingFileIsEmpty(t *testing.T) {
 	}
 }
 
-// TestBindingIsPerOrganization is the reason the key carries the organization.
-//
-// A person in two organizations on one instance has two databases. Keyed by URL
-// alone, the second Save would overwrite the first, and the next push would send
-// one organization's database id under the other's token.
+// Keyed by URL alone, the second Save would overwrite the first, and the next
+// push would send one organization's database id under the other's token.
 func TestBindingIsPerOrganization(t *testing.T) {
 	dir := t.TempDir()
 	first := wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"}
@@ -233,8 +211,6 @@ func TestBindingIsPerOrganization(t *testing.T) {
 	}
 }
 
-// TestBindingResaveReplaces confirms re-pushing the same folder at a different
-// database replaces the entry rather than accumulating one beside it.
 func TestBindingResaveReplaces(t *testing.T) {
 	dir := t.TempDir()
 	key := wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"}
@@ -258,9 +234,6 @@ func TestBindingResaveReplaces(t *testing.T) {
 	}
 }
 
-// TestBindingAmbiguousWhenSignedOut: with the organization unknown and two bound
-// to one instance, there is no right answer, and picking one would be a coin
-// flip between two organizations' databases.
 func TestBindingAmbiguousWhenSignedOut(t *testing.T) {
 	dir := t.TempDir()
 	b, _ := Load(dir)
@@ -275,9 +248,6 @@ func TestBindingAmbiguousWhenSignedOut(t *testing.T) {
 	}
 }
 
-// TestBindingFileIsOwnerOnly: the binding is not a credential, but it names
-// infrastructure, and the state directory beside it holds things that are more
-// sensitive. Matching the credential store's mode costs nothing.
 func TestBindingFileIsOwnerOnly(t *testing.T) {
 	dir := t.TempDir()
 	b, _ := Load(dir)
@@ -293,11 +263,8 @@ func TestBindingFileIsOwnerOnly(t *testing.T) {
 	}
 }
 
-// TestBindingWritesGitignore: the binding names one person's organization and
-// database, which is not something to commit. .ronja/ excludes itself, and this
-// file can be the FIRST thing to create that directory in a folder with no
-// workflow in it — so it has to assert the ignore rather than assume the
-// workflow commands already did.
+// The binding can be the first file in .ronja/, so it cannot assume the
+// workflow commands already wrote the ignore.
 func TestBindingWritesGitignore(t *testing.T) {
 	dir := t.TempDir()
 	b, _ := Load(dir)

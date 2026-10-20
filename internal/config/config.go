@@ -1,26 +1,10 @@
-// Package config owns the CLI's on-disk credential store.
+// Package config owns the CLI's on-disk credential store: one PROFILE per
+// (instance URL, organization), because a token is bound to one organization.
+// A profile's name is a human handle; its identity is (URL, TenantID). See
+// cli/README.md → "Profiles".
 //
-// The unit of storage is a PROFILE: a name over one (instance URL,
-// organization) pair and the token that reaches it. Two facts force that shape
-// rather than the obvious "one token per host":
-//
-//   - A Ronja access token is HARD-BOUND to one organization. Token auth always
-//     carries the tenant recorded on the token row, and the only tenant-switch
-//     mechanism in the product (POST /api/v2/tenant/set) sets a browser COOKIE,
-//     which a token can neither see nor use. So a person who belongs to two
-//     organizations needs two tokens ON THE SAME URL — something a store keyed
-//     by URL alone cannot hold without silently evicting one of them.
-//   - Nothing else names an instance, so selecting one means retyping
-//     `--url https://…` forever, and "the default" drifts to whatever was
-//     logged into last.
-//
-// A profile's NAME is a handle for humans and is never load-bearing; its
-// IDENTITY is (URL, TenantID), which is what every lookup matches on.
-//
-// A plain 0600 file is deliberate over an OS keychain: the primary consumers
-// are agents, CI jobs and containers, where a keychain is either absent or
-// blocks on an interactive unlock prompt. Anything more sensitive should use
-// RONJA_TOKEN, which never touches disk.
+// A plain 0600 file is deliberate over an OS keychain: agents, CI jobs and
+// containers have no keychain or block on its unlock prompt.
 package config
 
 import (
@@ -36,10 +20,8 @@ import (
 	"strings"
 )
 
-// EnvURL and EnvToken override the stored configuration entirely. They exist so
-// an agent or CI job can authenticate without a login step and without writing
-// anything to disk. EnvProfile selects a stored profile by name, for a shell
-// that wants to pin one without passing --profile to every command.
+// EnvURL and EnvToken let an agent or CI job authenticate without a login or
+// anything on disk; EnvProfile selects a stored profile by name.
 const (
 	EnvURL     = "RONJA_URL"
 	EnvToken   = "RONJA_TOKEN"
@@ -47,48 +29,32 @@ const (
 	EnvConfig  = "RONJA_CONFIG_DIR"
 )
 
-// DefaultURL is where the CLI goes when nothing says otherwise — the hosted
-// Ronja instance.
-//
-// Production rather than a local backend, because the overwhelming majority of
-// people running this have no local backend at all, and a default they cannot
-// reach fails as "connection refused" rather than as anything that suggests
-// what to do. Working on Ronja itself is the rare case, and it is the one with
-// an obvious remedy: `--url localhost:8080` once, after which that login is a
-// profile like any other.
+// DefaultURL is the hosted instance, used when nothing says otherwise. Not a
+// local backend: almost nobody running the CLI has one, and "connection
+// refused" says nothing about what to do.
 const DefaultURL = "https://cloud.ronja.tech"
 
-// FileName is the credential store's basename. Named for what it holds rather
-// than how it is keyed — an earlier "hosts.json" stopped being true the moment
-// one host could carry several logins.
+// FileName is the credential store's basename.
 const FileName = "config.json"
 
 // Profile is one authenticated (instance, organization) pair.
 type Profile struct {
-	// URL and TenantID are the IDENTITY. A login matches an existing profile on
-	// both, which is what lets two organizations coexist on one instance.
+	// URL and TenantID are the identity a login matches on, so two
+	// organizations can coexist on one instance.
 	URL      string `json:"url"`
 	TenantID string `json:"tenantID,omitempty"`
 	Token    string `json:"token"`
-	// The rest is a snapshot captured at login, kept so the credential file is
-	// legible to a human (or an agent) opening it: "which token is this, whose
-	// is it, and when did it get here". It is deliberately NOT read back as a
-	// substitute for asking the server — `whoami` always round-trips to
-	// /me, because a role can change and a token can be revoked without
-	// anything on this machine noticing.
-	//
-	// TokenExpiry below is the one exception, and only because the server
-	// states it exactly once.
+	// The rest is a login-time snapshot that makes the file legible; it is never
+	// read back in place of asking the server (`whoami` always calls /me), since
+	// a role can change or a token be revoked unnoticed. TokenExpiry is the one
+	// exception.
 	TenantName string `json:"tenantName,omitempty"`
 	UserID     string `json:"userID,omitempty"`
 	UserEmail  string `json:"userEmail,omitempty"`
 	TokenID    string `json:"tokenID,omitempty"`
 	TokenName  string `json:"tokenName,omitempty"`
-	// TokenExpiry is RFC 3339, recorded at login. CLI-minted tokens are
-	// time-bounded, and the expiry is reported exactly once by the server — so
-	// if it is not kept here, nothing can tell the user their credential is
-	// about to stop working. Empty for a token supplied with --with-token,
-	// whose lifetime we were never told.
+	// TokenExpiry is RFC 3339, kept because the server reports it only once, at
+	// login. Empty for a --with-token credential, whose lifetime is unknown.
 	TokenExpiry string `json:"tokenExpiresAt,omitempty"`
 	LoggedIn    string `json:"loggedInAt,omitempty"`
 }
@@ -106,31 +72,20 @@ type File struct {
 type Resolved struct {
 	URL   string
 	Token string
-	// FromEnv reports that the token came from RONJA_TOKEN rather than the
-	// credential file. `logout` uses this to explain why clearing the file
-	// will not actually log the caller out.
+	// FromEnv reports that the token came from RONJA_TOKEN rather than the file.
 	FromEnv bool
-	// Profile is the name of the selected profile, or "" when none was. It can
-	// be set even when FromEnv is true: the profile still decided which URL to
-	// talk to, it just did not supply the credential.
+	// Profile is the selected profile's name, or empty. It can be set alongside
+	// FromEnv: the profile then chose the URL but not the credential.
 	Profile string
 	Entry   *Profile
-	// TenantID is the organization the credential reaches — and is deliberately
-	// EMPTY whenever FromEnv is true, however confidently the selected profile
-	// names one.
-	//
-	// An environment token and a profile are independent: `eval "$(ronja env)"`
-	// sets RONJA_TOKEN and RONJA_URL, and a later `ronja profile use other-org`
-	// in that same shell leaves a profile whose TenantID describes a DIFFERENT
-	// organization from the token in play. Trusting it there does not fail
-	// cleanly — `wf push` would match one organization's binding and send its
-	// workflow id under the other's token. Callers that need the tenant under
-	// an environment token must ask the server (see commands.resolveInstance).
+	// TenantID is the organization the credential reaches, and is deliberately
+	// empty whenever FromEnv is true: an environment token and the selected
+	// profile are independent, and trusting the profile's tenant would let
+	// `wf push` send one organization's workflow id under another's token.
+	// Callers needing it must ask the server (ensureTenant).
 	TenantID string
-	// TenantName is what the SERVER calls that organization, filled in by the
-	// one /me call ensureTenant already makes. Empty otherwise, including for
-	// every stored profile — those carry the name on Entry.TenantName, and this
-	// field exists precisely for the credential that has no entry to carry one.
+	// TenantName is the server's name for that organization, set only by
+	// ensureTenant's /me call; a stored profile carries it on Entry.TenantName.
 	TenantName string
 }
 
@@ -159,11 +114,8 @@ func NormalizeURL(raw string) (string, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", fmt.Errorf("invalid URL %q: scheme must be http or https", raw)
 	}
-	// Queries and fragments are never part of an instance's identity. The PATH
-	// is kept, because an instance can legitimately be served under a subpath
-	// — but strip a trailing /api or /api/v2, which is someone pasting an API
-	// URL rather than an instance root. Left in place, those produce silently
-	// doubled paths (".../api/api/v2/...") that 404 with no clue why.
+	// The path is kept (an instance may live under a subpath), minus a pasted
+	// trailing /api or /api/v2 that would otherwise double into ".../api/api/v2/…".
 	path := strings.TrimRight(u.Path, "/")
 	for _, suffix := range []string{"/api/v2", "/api"} {
 		if strings.HasSuffix(path, suffix) {
@@ -171,30 +123,21 @@ func NormalizeURL(raw string) (string, error) {
 			break
 		}
 	}
-	// Hostnames are case-insensitive, so "https://APP.ronja.tech" and
-	// "https://app.ronja.tech" are the same instance. Without folding the case
-	// they would be two credential-store keys, and a login under one spelling
-	// would look like "not signed in" under the other. The PATH is left alone —
-	// that half genuinely is case-sensitive.
+	// Fold the host's case so two spellings are one store key; the path is
+	// case-sensitive and left alone.
 	host := strings.ToLower(u.Host)
 	return strings.TrimRight(u.Scheme+"://"+host+path, "/"), nil
 }
 
-// isLoopbackAuthority reports whether a scheme-less URL names this machine, in
-// which case http rather than https is the right guess.
-//
-// The match is EXACT on the host. A prefix test ("does it start with
-// localhost") also accepts "localhost.evil.com", which is a perfectly
-// registerable domain — and would then be contacted in cleartext, with a bearer
-// token, because of a naming trick.
+// isLoopbackAuthority reports whether a scheme-less URL names this machine, so
+// http is the right guess. The host match is exact: a prefix test would accept
+// "localhost.evil.com" and send it a bearer token in cleartext.
 func isLoopbackAuthority(raw string) bool {
-	// Everything from the first path/query/fragment separator is not the host.
 	if i := strings.IndexAny(raw, "/?#"); i >= 0 {
 		raw = raw[:i]
 	}
 	host := raw
-	// Tolerates "localhost:8080" and "[::1]:8080"; a bare "::1" has too many
-	// colons to split, and is already the host.
+	// A bare "::1" fails to split and is already the host.
 	if h, _, err := net.SplitHostPort(raw); err == nil {
 		host = h
 	}
@@ -205,8 +148,7 @@ func isLoopbackAuthority(raw string) bool {
 	return false
 }
 
-// Dir is where the credential file lives. RONJA_CONFIG_DIR overrides it, which
-// is what lets tests and sandboxed agents stay off the real profile.
+// Dir is where the credential file lives; RONJA_CONFIG_DIR overrides it.
 func Dir() (string, error) {
 	if custom := os.Getenv(EnvConfig); custom != "" {
 		return custom, nil
@@ -227,8 +169,7 @@ func Path() (string, error) {
 	return filepath.Join(dir, FileName), nil
 }
 
-// Load reads the credential store. A missing file is not an error — it is a
-// first run.
+// Load reads the credential store; a missing file is an empty store.
 func Load() (*File, error) {
 	path, err := Path()
 	if err != nil {
@@ -251,11 +192,8 @@ func Load() (*File, error) {
 	return &f, nil
 }
 
-// Save writes the credential store with owner-only permissions.
-//
-// The write is atomic (temp file + rename) so an interrupted save cannot leave
-// a truncated file that the next run refuses to parse — losing a token to a
-// crash would be a bad way to learn about non-atomic writes.
+// Save writes the credential store 0600, atomically (temp file + rename), so a
+// crash cannot leave a truncated file that loses every token.
 func Save(f *File) error {
 	path, err := Path()
 	if err != nil {
@@ -287,10 +225,8 @@ func Save(f *File) error {
 		tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
-	// Without this, rename-for-atomicity only orders the metadata: the file
-	// name flips over instantly while its CONTENT is still in the page cache,
-	// so a power loss between the two leaves a zero-length config.json — the
-	// truncated file the temp-and-rename dance was supposed to rule out.
+	// Without the fsync, a power loss after the rename can leave a zero-length
+	// config.json: the rename orders metadata, not content.
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return fmt.Errorf("sync temp file: %w", err)
@@ -301,10 +237,8 @@ func Save(f *File) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
-	// And the rename itself is a directory operation, so the directory needs
-	// flushing too. Best-effort: opening a directory for sync is not portable
-	// (Windows refuses), and a failure here costs durability on a crash, not
-	// correctness — the data is already safely on disk by this point.
+	// Flush the directory for the rename's durability. Best-effort: Windows
+	// refuses to sync a directory, and the content is already on disk.
 	if d, err := os.Open(dir); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
@@ -312,13 +246,9 @@ func Save(f *File) error {
 	return nil
 }
 
-// Update runs a read-modify-write of the store under the lock, saving whatever
-// fn leaves behind. fn returning an error aborts the write entirely.
-//
-// The whole File is handed over rather than a narrow mutator per operation
-// because the interesting operations are not single writes: allocating a unique
-// profile name and storing under it is one indivisible decision, and so is
-// "rename this profile unless someone took the name while we were away".
+// Update runs a read-modify-write of the store under the lock; an error from fn
+// aborts the write. fn gets the whole File because choosing a free name and
+// taking it must be one indivisible step.
 func Update(fn func(f *File) error) error {
 	return withLock(func() error {
 		f, err := Load()
@@ -332,15 +262,11 @@ func Update(fn func(f *File) error) error {
 	})
 }
 
-// ErrNoProfile reports that the named profile does not exist. Callers match on
-// it to add "here is what does exist" to the message.
+// ErrNoProfile reports that the named profile does not exist.
 var ErrNoProfile = errors.New("no such profile")
 
-// AmbiguousURLError is returned when a URL alone does not pick out one profile.
-//
-// A type rather than a formatted string because the CANDIDATES are the useful
-// part: the caller prints them so the human can pick, instead of being told
-// only that their command was unclear.
+// AmbiguousURLError is returned when a URL alone does not pick out one profile;
+// it carries the candidates so the caller can list them.
 type AmbiguousURLError struct {
 	URL        string
 	Candidates []string
@@ -365,34 +291,13 @@ func (e *ProfileURLMismatchError) Error() string {
 }
 
 // Resolve layers flags, environment and file into the configuration for one
-// invocation.
+// invocation. RONJA_TOKEN, when set, always supplies the token.
 //
-// The token still comes from RONJA_TOKEN whenever it is set, ahead of anything
-// stored: an agent or CI job that sets it must never accidentally act as
-// whoever last ran `ronja login` on the machine.
-//
-// Profile selection obeys ONE invariant, which is more important than the order
-// of the rules below:
-//
-//	An explicitly named URL is a FILTER, never a fallback.
-//
-// If --url or RONJA_URL names an instance with no profile, the answer is "not
-// signed in TO THAT INSTANCE" — never "fall back to the current profile". The
-// alternative sends whatever token happens to be current to a host the user
-// deliberately named, which is exactly how a production credential ends up on a
-// staging box. The old URL-keyed store got this right by accident (a map miss
-// yielded no token); here it has to be deliberate.
-//
-// Ambiguity is likewise never resolved by picking: two profiles on one URL
-// differ by ORGANIZATION, and the gap between them is the gap between reading
-// test data and writing to a customer's.
-//
-// When a URL and a profile are both given and disagree, the more DELIBERATE one
-// wins — a typed flag over an exported variable — and only a conflict WITHIN one
-// layer is an error. Erroring on `--profile acme` in a shell that happens to
-// export RONJA_URL would punish the user for being specific; erroring on
-// `--profile acme --url elsewhere` is refusing to guess which half of a typed
-// command was meant.
+// An explicitly named URL is a FILTER, never a fallback: a URL with no profile
+// resolves to no token, never the current profile's, which would send that
+// credential to a host the user named. Two profiles on one URL differ by
+// organization, so ambiguity is refused rather than picked. A typed flag beats
+// an exported variable; a URL/profile conflict within one layer is an error.
 func Resolve(flagURL, flagProfile string) (*Resolved, error) {
 	f, err := Load()
 	if err != nil {
@@ -408,8 +313,7 @@ func Resolve(flagURL, flagProfile string) (*Resolved, error) {
 		name = strings.TrimSpace(os.Getenv(EnvProfile))
 	}
 
-	// Drop the weaker of two conflicting layers before either is used, so the
-	// checks below only ever see a coherent request.
+	// Drop the weaker of two conflicting layers before either is used.
 	if rawURL != "" && name != "" && urlFromFlag != nameFromFlag {
 		if nameFromFlag {
 			rawURL = ""
@@ -431,8 +335,6 @@ func Resolve(flagURL, flagProfile string) (*Resolved, error) {
 	case name != "":
 		p, ok := f.Profiles[name]
 		if !ok {
-			// Name what DOES exist. "No such profile" alone leaves the reader to
-			// run a second command to find out what they should have typed.
 			if names := f.Names(); len(names) > 0 {
 				return nil, fmt.Errorf("%w %q — stored profiles are: %s",
 					ErrNoProfile, name, strings.Join(names, ", "))
@@ -440,9 +342,6 @@ func Resolve(flagURL, flagProfile string) (*Resolved, error) {
 			return nil, fmt.Errorf("%w %q — there are none stored yet, run `ronja login`",
 				ErrNoProfile, name)
 		}
-		// Both named and disagreeing: refuse rather than silently ranking one
-		// above the other. Either answer would be a guess at which half of the
-		// command the user meant.
 		if wantURL != "" && wantURL != p.URL {
 			return nil, &ProfileURLMismatchError{Profile: name, ProfileURL: p.URL, RequestedURL: wantURL}
 		}
@@ -457,8 +356,7 @@ func Resolve(flagURL, flagProfile string) (*Resolved, error) {
 			chosenName = candidates[0]
 			chosen = f.Profiles[chosenName]
 		case contains(candidates, f.Current):
-			// Several match, but one of them is already the current profile —
-			// that is a real signal of intent, not a coin flip.
+			// Several match, but one is current: that counts as having chosen.
 			chosenName = f.Current
 			chosen = f.Profiles[chosenName]
 		default:
@@ -486,18 +384,14 @@ func Resolve(flagURL, flagProfile string) (*Resolved, error) {
 	if envToken := strings.TrimSpace(os.Getenv(EnvToken)); envToken != "" {
 		res.Token = envToken
 		res.FromEnv = true
-		// See Resolved.TenantID: the environment token and the profile are
-		// independent, so the profile's organization says nothing about which
-		// one this credential actually reaches.
+		// See Resolved.TenantID.
 		res.TenantID = ""
 	}
 	return res, nil
 }
 
-// NamesOn lists the profiles on one normalized URL, sorted. Sorted because the
-// result reaches both an error message and a single-candidate selection, and Go
-// randomises map iteration — an un-sorted version would pick a different
-// profile on different runs.
+// NamesOn lists the profiles on one normalized URL, sorted so every selection
+// over it is deterministic.
 func (f *File) NamesOn(url string) []string {
 	var out []string
 	for name, p := range f.Profiles {
@@ -519,13 +413,8 @@ func (f *File) Names() []string {
 	return out
 }
 
-// FindIdentity locates the profile for one (URL, organization) pair — the
-// IDENTITY match a login uses, so that re-authenticating updates the profile
-// you already have instead of minting a second one beside it.
-//
-// An empty tenantID is a legitimate identity of its own (a login by someone who
-// belongs to no organization yet), not a wildcard: it matches only other
-// org-less profiles on that URL.
+// FindIdentity locates the profile for one (URL, organization) pair. An empty
+// tenantID is an identity of its own (no organization yet), not a wildcard.
 func (f *File) FindIdentity(url, tenantID string) (string, *Profile) {
 	for _, name := range f.Names() {
 		if p := f.Profiles[name]; p != nil && p.URL == url && p.TenantID == tenantID {
@@ -536,26 +425,11 @@ func (f *File) FindIdentity(url, tenantID string) (string, *Profile) {
 }
 
 // ClaimProfile finds or creates the profile for one identity, returning its
-// name, the entry to fill in, and whether it was newly created. MUST be called
-// inside Update, because deciding the name and taking it is one indivisible
-// step (see Allocate).
-//
-// `created` is what tells a caller whether the name is still PROVISIONAL and
-// may be improved once the organization's name is known. Renaming without that
-// check would rename the profile an existing user deliberately chose, every
-// time they re-authenticate.
-//
-// Three behaviours, each load-bearing:
-//
-//   - An existing identity KEEPS ITS NAME. Re-authenticating updates the
-//     profile you already have; it never mints a second one beside it, and
-//     never renames the one your scripts refer to.
-//   - A free `preferred` name (from --profile) is used as given.
-//   - A `preferred` name already held by a DIFFERENT identity is NOT taken.
-//     The new credential lands under a derived name instead, and the caller
-//     reports that. Overwriting would evict a live token, and refusing outright
-//     would throw away one the server has already minted and shown to nobody —
-//     both worse than a slightly surprising name.
+// name, the entry to fill in, and whether it was created. It must run inside
+// Update. Only a created profile's name is provisional; an existing identity
+// keeps its name. A `preferred` name held by a different identity is not
+// taken: the credential lands under a derived name, since overwriting would
+// evict a live token and refusing would discard a freshly minted one.
 func (f *File) ClaimProfile(instanceURL, tenantID, preferred string) (string, *Profile, bool) {
 	if name, p := f.FindIdentity(instanceURL, tenantID); p != nil {
 		return name, p, false
@@ -572,9 +446,8 @@ func (f *File) ClaimProfile(instanceURL, tenantID, preferred string) (string, *P
 	return name, p, true
 }
 
-// Remove forgets one profile, re-pointing Current if it was the one removed. It
-// reports whether anything was actually stored, so `logout` can tell the
-// truth rather than always claiming success.
+// Remove forgets one profile, re-pointing Current if it was the one removed,
+// and reports whether it existed.
 func (f *File) Remove(name string) bool {
 	if _, ok := f.Profiles[name]; !ok {
 		return false
@@ -606,27 +479,14 @@ func (f *File) Rename(from, to string) error {
 	return nil
 }
 
-// pickCurrent chooses the fallback current profile once the previous one is
-// gone.
-//
-// Deterministically, which matters more than it looks: ranging over the map and
-// taking the first key promotes an ARBITRARY profile, because Go randomises map
-// iteration. On a laptop signed in to production and a local backend, one
-// `ronja logout` would leave the next command pointed at either — and the
-// difference between those two is the difference between reading test data and
-// writing to a customer's organization.
-//
-// Most-recent login is the best guess at intent; LoggedIn is RFC 3339 UTC, so a
-// string compare is a time compare. Ties, and profiles with no recorded login
-// (never empty in practice, but the file is user-editable), fall back to sorted
-// name order so the answer is at least stable.
+// pickCurrent chooses the fallback current profile, deterministically: a
+// random pick after `logout` could point the next command at production
+// instead of a local backend. The most recent login wins (LoggedIn is RFC 3339
+// UTC, so a string compare is a time compare).
 func (f *File) pickCurrent() string {
 	best, bestLogin := "", ""
-	// Two halves make this deterministic, and BOTH are load-bearing: Names() is
-	// sorted, and the comparison below is strictly greater. Together they mean a
-	// tie is won by the alphabetically first name, because a later profile with
-	// an equal stamp never displaces an earlier one. Ranging the map instead, or
-	// relaxing this to >=, silently reintroduces the coin flip.
+	// Sorted Names() plus a strict > make a tie go to the alphabetically first
+	// name; ranging the map or relaxing to >= reintroduces the coin flip.
 	for _, name := range f.Names() {
 		login := ""
 		if p := f.Profiles[name]; p != nil {

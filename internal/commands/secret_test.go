@@ -13,17 +13,14 @@ import (
 	"time"
 )
 
-// The `ronja secret create` tests. The property under test above all others is
-// that a value goes into exactly one request body and into NOTHING the command
-// prints — stdout, stderr or the error it returns (which run() prints) — so
-// every test that supplies a value supplies a sentinel and looks for it
-// everywhere.
+// A secret value goes into exactly one request body and into nothing the
+// command prints (stdout, stderr or the returned error), so every test that
+// supplies a value supplies a sentinel and looks for it everywhere.
 
 const secretSentinel = "sk-live-SENTINEL-7f3a9c-do-not-print"
 
-// secretFake is a Ronja serving POST /api/v2/secret and nothing else. Any other
-// request fails the test: this command makes one request, and a second one is a
-// regression whatever it is.
+// secretFake serves POST /api/v2/secret and fails the test on any other
+// request.
 type secretFake struct {
 	t      *testing.T
 	server *httptest.Server
@@ -32,7 +29,7 @@ type secretFake struct {
 	requests []string
 	bodies   [][]byte
 
-	// status and body replace the success answer, for the forwarded-error cases.
+	// status and body replace the success answer.
 	status int
 	body   string
 }
@@ -76,7 +73,6 @@ func (f *secretFake) serve(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// only returns the single request body, failing unless exactly one was sent.
 func (f *secretFake) only(t *testing.T) map[string]any {
 	t.Helper()
 	f.mu.Lock()
@@ -91,7 +87,6 @@ func (f *secretFake) only(t *testing.T) map[string]any {
 	return body
 }
 
-// sentinelCount is how many times the sentinel appears across every body sent.
 func (f *secretFake) sentinelCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -108,8 +103,6 @@ func (f *secretFake) requestCount() int {
 	return len(f.requests)
 }
 
-// runSecretCLI runs one invocation and returns stdout, stderr and the error
-// text run() would print (empty on success).
 func runSecretCLI(t *testing.T, args ...string) (stdout, stderr, errText string) {
 	t.Helper()
 	var err error
@@ -122,8 +115,6 @@ func runSecretCLI(t *testing.T, args ...string) (stdout, stderr, errText string)
 	return stdout, stderr, errText
 }
 
-// assertNoSentinel is the core assertion: the value is in none of the three
-// places the command can speak.
 func assertNoSentinel(t *testing.T, stdout, stderr, errText string) {
 	t.Helper()
 	for name, s := range map[string]string{"stdout": stdout, "stderr": stderr, "error": errText} {
@@ -133,8 +124,6 @@ func assertNoSentinel(t *testing.T, stdout, stderr, errText string) {
 	}
 }
 
-// withFakePassword makes the echo-off prompt answer with values in order, and
-// counts the prompts.
 func withFakePassword(t *testing.T, values ...string) *int {
 	t.Helper()
 	calls := 0
@@ -159,7 +148,6 @@ func credentialsOf(t *testing.T, body map[string]any) map[string]any {
 	return creds
 }
 
-// C1 — a prompted value reaches the body once and nothing printed.
 func TestSecretCreatePromptedValue(t *testing.T) {
 	f := newSecretFake(t)
 	withTerminalStdin(t)
@@ -199,7 +187,6 @@ func TestSecretCreatePromptedValue(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// C1 — a piped value, with its one trailing newline stripped.
 func TestSecretCreatePipedValue(t *testing.T) {
 	f := newSecretFake(t)
 	withStdin(t, secretSentinel+"\n")
@@ -222,7 +209,6 @@ func TestSecretCreatePipedValue(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// C1 — a --from-file value, and several fields as a JSON object.
 func TestSecretCreateFromFile(t *testing.T) {
 	f := newSecretFake(t)
 	withTerminalStdin(t) // a file wins over the terminal: no prompt
@@ -251,8 +237,8 @@ func TestSecretCreateFromFile(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// C1 — a database login from a file goes as the object it was, with the dialect
-// and no hosts or fields of the CLI's own.
+// A database login goes as the object it was, with the dialect and no hosts or
+// fields of the CLI's own.
 func TestSecretCreateDialectFromFile(t *testing.T) {
 	f := newSecretFake(t)
 	path := filepath.Join(t.TempDir(), "db.json")
@@ -284,8 +270,7 @@ func TestSecretCreateDialectFromFile(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// C1 — a server 400 is forwarded, and a body quoting the value still does not
-// put it on screen: the CLI scrubs every value from what it reports.
+// A server error body quoting the value is forwarded with every value scrubbed.
 func TestSecretCreateForwardsServerErrorWithoutTheValue(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -316,9 +301,8 @@ func TestSecretCreateForwardsServerErrorWithoutTheValue(t *testing.T) {
 	}
 }
 
-// A value with a quote or a backslash in it reaches a raw error body in its
-// JSON-escaped spelling, which is not the value's own bytes — so that spelling
-// is scrubbed too.
+// A value with a quote or backslash reaches a raw error body JSON-escaped, so
+// that spelling is scrubbed too.
 func TestSecretCreateRedactsTheJSONEscapedValue(t *testing.T) {
 	value := secretSentinel + `"quoted\path`
 	escaped, _ := json.Marshal(value)
@@ -335,10 +319,8 @@ func TestSecretCreateRedactsTheJSONEscapedValue(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// I1 — a database login's ordinary fields are the words of the server's own
-// refusal. Only a sensitive field's value is scrubbed, so "postgres" as a
-// username does not eat the dialect's name out of the message, while the
-// password in the same body still is.
+// Only a database login's sensitive fields are scrubbed, so "postgres" as a
+// username does not eat the dialect's name out of the server's refusal.
 func TestSecretCreateDialectRedactsOnlySensitiveFields(t *testing.T) {
 	const serverSays = "postgres credentials missing required fields: database (sslMode require)"
 	for _, tc := range []struct {
@@ -381,7 +363,7 @@ func TestSecretCreateDialectRedactsOnlySensitiveFields(t *testing.T) {
 	}
 }
 
-// C2 — the refusals, each before any request goes out.
+// Each refusal comes before any request goes out.
 func TestSecretCreateRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -418,10 +400,9 @@ func TestSecretCreateRefusals(t *testing.T) {
 		// go out unchecked — and, as raw bytes on the database path, unredacted.
 		{name: "a key given twice (API key)", stdin: ptr(`{"a":"` + secretSentinel + `","a":"y1234","b":"z1234"}`), args: []string{"--host", "h", "--field", "a", "--field", "b"}, want: `stdin names the field "a" twice — give each field once`},
 		{name: "a key given twice (database)", stdin: ptr(`{"host":"db","password":"` + secretSentinel + `","password":"other-1234"}`), args: []string{"--dialect", "postgres"}, want: `stdin names the field "password" twice — give each field once`},
-		// M1 — over the cap on stdin: the remedy is NOT --from-file, which has
-		// the same cap.
+		// The remedy is not --from-file, which has the same cap.
 		{name: "stdin over the cap", stdin: ptr(strings.Repeat("a", maxSecretInput+1)), args: []string{"--host", "h"}, want: "standard input carried more than 1 MiB, which no credential is — is that the right input?"},
-		// M4 — a host is matched against a request's bare hostname, so anything
+		// A host is matched against a request's bare hostname, so anything
 		// else would be stored and never match.
 		{name: "a URL as --host", stdin: ptr(secretSentinel), args: []string{"--host", "https://api.stripe.com/v1"}, want: `--host "https://api.stripe.com/v1" is not a host: pass the host only, e.g. api.stripe.com or *.example.com`},
 		{name: "a path in --host", stdin: ptr(secretSentinel), args: []string{"--host", "api.stripe.com/v1"}, want: "is not a host"},
@@ -468,8 +449,8 @@ func TestSecretCreateRefusals(t *testing.T) {
 	}
 }
 
-// C2 — there is no flag a value could be passed in. A flag is the one input
-// that is always in argv and usually in a shell history.
+// A flag is always in argv and usually in shell history, so no flag may carry a
+// value.
 func TestSecretCreateHasNoValueFlag(t *testing.T) {
 	cmd := newSecretCreateCmd()
 	for _, name := range []string{"value", "secret", "password", "token", "credentials", "api-key"} {
@@ -479,8 +460,6 @@ func TestSecretCreateHasNoValueFlag(t *testing.T) {
 	}
 }
 
-// C8 (part) — --json is metadata: it decodes, and nothing in it is named like
-// a value.
 func TestSecretCreateJSONIsMetadataOnly(t *testing.T) {
 	newSecretFake(t)
 	withStdin(t, secretSentinel)
@@ -505,8 +484,6 @@ func TestSecretCreateJSONIsMetadataOnly(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// assertNoForbiddenKeys walks a decoded JSON value for a key that names a
-// credential, at any depth.
 func assertNoForbiddenKeys(t *testing.T, v any) {
 	t.Helper()
 	switch x := v.(type) {
@@ -525,8 +502,6 @@ func assertNoForbiddenKeys(t *testing.T, v any) {
 	}
 }
 
-// A piped value ending in a Windows line ending loses exactly that, and
-// nothing else.
 func TestSecretCreateStripsOneCRLF(t *testing.T) {
 	f := newSecretFake(t)
 	withStdin(t, secretSentinel+"\r\n")
@@ -542,7 +517,6 @@ func TestSecretCreateStripsOneCRLF(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// M1 (the file half) — a file over the cap is refused, naming the file.
 func TestSecretCreateRefusesAnOversizedFile(t *testing.T) {
 	f := newSecretFake(t)
 	path := filepath.Join(t.TempDir(), "huge.txt")
@@ -559,7 +533,6 @@ func TestSecretCreateRefusesAnOversizedFile(t *testing.T) {
 	}
 }
 
-// M4 — a wildcard prefix is a host, and goes through as given.
 func TestSecretCreateAcceptsAWildcardHost(t *testing.T) {
 	f := newSecretFake(t)
 	withStdin(t, secretSentinel)
@@ -574,9 +547,8 @@ func TestSecretCreateAcceptsAWildcardHost(t *testing.T) {
 	}
 }
 
-// M2 — signed out, the command says so BEFORE it reads a value: a piped value
-// is left unread rather than swallowed by a command that was always going to
-// refuse.
+// Signed out, the command refuses before reading a value, so a piped value is
+// left unread rather than swallowed.
 func TestSecretCreateSignedOutReadsNoValue(t *testing.T) {
 	f := newSecretFake(t)
 	signOutFrom(t, f.server.URL)
@@ -596,8 +568,8 @@ func TestSecretCreateSignedOutReadsNoValue(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// M3 — Ctrl-C at the hidden prompt stops the command at once. The root context
-// owns SIGINT, so without this the prompt sat waiting for Enter.
+// The root context owns SIGINT, so Ctrl-C at the hidden prompt must stop the
+// command rather than wait for Enter.
 func TestSecretCreateCtrlCAtThePromptStops(t *testing.T) {
 	f := newSecretFake(t)
 	withTerminalStdin(t)
@@ -607,8 +579,8 @@ func TestSecretCreateCtrlCAtThePromptStops(t *testing.T) {
 	saved := readPassword
 	readPassword = func(int) ([]byte, error) {
 		close(entered)
-		// A person who never presses Enter. Bounded, so code that waits for
-		// the read fails this test rather than hanging it.
+		// Never presses Enter; bounded so code that waits for the read fails
+		// the test rather than hanging it.
 		select {
 		case <-release:
 		case <-time.After(3 * time.Second):
@@ -642,9 +614,8 @@ func TestSecretCreateCtrlCAtThePromptStops(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// M5 — one field given what looks like a several-field object is warned about,
-// and stored as given: a JSON value can be the real thing. The warning quotes
-// none of the content.
+// One field given an object is warned about but stored as given (a JSON value
+// can be the real thing), and the warning quotes none of the content.
 func TestSecretCreateWarnsOnAnObjectForOneField(t *testing.T) {
 	f := newSecretFake(t)
 	input := `{"apiKey":"` + secretSentinel + `"}`
@@ -664,8 +635,6 @@ func TestSecretCreateWarnsOnAnObjectForOneField(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// A request that timed out may still have landed, so the error says to look
-// before retrying — and is scrubbed like every other.
 func TestSecretCreateTimeoutSaysItMayHaveLanded(t *testing.T) {
 	f := newSecretFake(t)
 	failOnceWithATimeout(t, http.MethodPost, "/api/v2/secret")
@@ -682,8 +651,8 @@ func TestSecretCreateTimeoutSaysItMayHaveLanded(t *testing.T) {
 	assertNoSentinel(t, stdout, stderr, errText)
 }
 
-// Assert the wire schema, not only the builder, so both the direct and browser
-// paths must send every requested field as a required secret input.
+// Asserted on the wire, not the builder, so both the direct and browser paths
+// must send every requested field as a required secret input.
 func TestSecretCreateRequiredAPIKeyFields(t *testing.T) {
 	for _, inBrowser := range []bool{false, true} {
 		t.Run(map[bool]string{false: "direct", true: "browser"}[inBrowser], func(t *testing.T) {

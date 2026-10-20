@@ -1,13 +1,9 @@
 package api
 
 // A table's health checks: list, create and edit (silencing is an edit with
-// {"enabled": false}). Mirrored by hand from
-// backend/api/v2/feature/api_model_check_authoring.go (the write bodies and
-// TableCheckWriteResult) and backend/resource/rtablecheck/model.go (Check).
-//
-// There is no delete, here or anywhere over HTTP: only the in-app agent's
-// setTableChecks deletes a check. A pipeline push re-creates a check a chat
-// deleted if the folder's file still declares it.
+// {"enabled": false}). There is no delete over HTTP: only the in-app agent's
+// setTableChecks deletes one, and a pipeline push re-creates a deleted check its
+// folder still declares.
 
 import (
 	"context"
@@ -18,20 +14,18 @@ import (
 	"strings"
 )
 
-// Check kinds and severities, mirrored from rtablecheck.
+// Check kinds, mirrored from rtablecheck.
 const (
 	TableCheckKindExpression = "expression"
 	TableCheckKindFreshness  = "freshness"
 )
 
 // TableNotBuiltCode is the `code` on the 409 a check write gets when the table
-// has never built, so the expression could not be run — mirrored from
-// feature.tableNotBuiltCode. A pipeline defers the check until a publish builds
-// the table, rather than reporting it refused.
+// has never built (mirrors feature.tableNotBuiltCode); a pipeline defers the
+// check until a publish builds the table rather than reporting it refused.
 const TableNotBuiltCode = "table_not_built"
 
-// TableCheck is one check as rtablecheck.Check serves it, the fields the CLI
-// reads.
+// TableCheck is the fields of rtablecheck.Check the CLI reads.
 type TableCheck struct {
 	ID                      string `json:"id"`
 	TableID                 string `json:"tableID"`
@@ -71,8 +65,7 @@ type CreateTableCheckInput struct {
 	Expression            *string `json:"expression,omitempty"`
 	ExpectedIntervalHours *int    `json:"expectedIntervalHours,omitempty"`
 	Severity              *string `json:"severity,omitempty"`
-	// Enabled false creates the check silenced, in the same write. Omitted
-	// (nil) is enabled.
+	// Enabled false creates the check silenced; nil is enabled.
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
@@ -146,10 +139,9 @@ func ErrorMessageOf(err error) string {
 }
 
 // IsUnmatchedRoute reports a server that does not have the route at all: a 405,
-// or a 404 whose body is NOT JSON — the router's plain-text breadcrumb for an
-// unmatched /api path (backend/ronja/server.go apiNotFoundBody). A JSON 404 is a
-// handler's answer about the resource (a table the caller cannot read), and is
-// deliberately not this.
+// or a 404 whose body is NOT JSON (the router's breadcrumb, apiNotFoundBody in
+// backend/ronja/server.go). A JSON 404 is a handler's answer about the resource
+// and is deliberately not this.
 func IsUnmatchedRoute(err error) bool {
 	var apiErr *Error
 	if !errors.As(err, &apiErr) {

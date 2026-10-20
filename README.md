@@ -1538,6 +1538,17 @@ thing that stored the hash is entitled to raise it.
 
 `status` exits non-zero on drift, so it works as a CI gate without parsing.
 
+**Two limits, each counting what it is about.** The whole folder is always
+sent, and one request may carry up to 1000 migrations (past that the server
+refuses with "too many migrations in one request"). At most 40 of them may be
+*not yet applied*, because those run in one transaction under the database's
+lock; already-applied ones are only compared. Over 40, `push` is refused before
+anything runs and the error names the 40th pending migration — push the folder
+up to and including it, then the full folder. `status` prints the same as a
+note (when nothing has drifted) and still exits 0: it warns about the next
+push, the folder is not broken. Drift is refused first, naming every drifted
+file.
+
 ### The dev copy (`--env dev`) and `db promote`
 
 A managed database can have a **dev copy**: a separate Postgres database with
@@ -3152,7 +3163,8 @@ guide (`backend/lib/api/openapi/guides/workflow-dev.md`, served at
 push → publish. It shares the whole folder model with `wf` (same `ronja.json`,
 same `.ronja/` baseline, same per-instance bindings, same drift guard), and
 `ronja.json`'s `kind` is what keeps the two apart — running `wf push` in a
-data-app folder is refused rather than allowed to overwrite TSX with Python.
+data-app folder is refused rather than allowed to overwrite the app's source with
+Python.
 
 The HTTP loop this wraps is documented for agents in the `dataapp-dev` API guide
 (`backend/lib/api/openapi/guides/dataapp-dev.md`, served at
@@ -3191,9 +3203,8 @@ adding it to the `react` import line, a misspelt component, a `<Missing />` tag,
 a `import type { Foo }` used as a value — each used to bundle green and throw
 `ReferenceError` in the browser, and now comes back from `push` as
 `Compiles: NO` naming the file, the line and the identifier, plus the import to
-add when it is a React export. The escapes are the ones a type-checker would
-demand as well: reach a script-provided global as `window.X`, or introduce it
-with `declare const X: SomeType`.
+add when it is a React export. A global a `<script>` provides is not a mistake:
+reach it as a `window.X` member, which passes.
 
 And nothing static can promise that `Compiles: yes` renders anyway — the
 compiler does not check types, so a mistyped prop, a hook called after an early
@@ -3288,8 +3299,9 @@ are its helpers. To the CLI they are ordinary files: `push` sends them, `clone`
 brings them down, `status` diffs them, and nothing here parses them. The server
 builds and checks every function on every code write, so a bad one comes back as
 `Compiles: NO` naming the file. That check reads each function's literal
-`{{ ref('table-…') }}` refs, `env.db('secret-…')` ids and `{{secret::secret-….<field>}}`
-placeholders against the allowlists the push has just sent, which is one more
+`{{ ref('table-…') }}` refs, `env.metrics.query('table-…')` ids, `env.db('secret-…')` ids,
+`{{secret::secret-….<field>}}` placeholders, `env.codex('cdx-…')` ids and `workflow-…` ids against the allowlists the push has just sent,
+and a function that calls `env.ai.complete` against the app's `ai` capability, which is one more
 reason `access` goes first (see the push order below). `env.db` is also held
 to the app's `query_external` / `write_external` capabilities (which call needs
 which is *Ids, and what the app declares* in the skill), and those are checked when the
@@ -3519,8 +3531,8 @@ Push does things in an order that is the reverse of `wf` in one place and
 different in another, both deliberately:
 
 1. **Allowlists before files.** The compiler validates a secret reference
-   against `allowedSecretIDs` (and a server function's table refs and
-   `env.db` ids against both lists), so a file that arrives before its grant
+   against `allowedSecretIDs` (and a server function's table refs,
+   metric ids and `env.db` ids against their lists), so a file that arrives before its grant
    fails to compile for a reason that is nowhere in the file.
 2. **Entrypoint LAST**, where a workflow writes it first. A workflow leads with
    it because renaming one needs the new file to exist before the row can name

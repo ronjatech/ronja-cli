@@ -20,9 +20,8 @@ func TestChecksStem(t *testing.T) {
 	}
 }
 
-// TestLockChecksPreservesUnknownKeys: the sidecars reach both new nesting levels
-// of the committed lock — the checks file's entry and each managed check — and
-// a table rebind keeps nothing.
+// Unknown keys survive at both nesting levels (the file's entry and each
+// check); a table rebind keeps nothing.
 func TestLockChecksPreservesUnknownKeys(t *testing.T) {
 	root := t.TempDir()
 	body := `{"stacks":{"dev":{"checks":{"checks/gl.json":{"tableID":"table-gl","future":1,"managed":{"unik rad":{"checkID":"tcheck-1","liveSHA256":"abc","later":true}}}}}}}` + "\n"
@@ -70,9 +69,8 @@ func TestLockChecksPreservesUnknownKeys(t *testing.T) {
 	}
 }
 
-// TestLockChecksPathsAndDrop: a push finds a deleted checks file's record by
-// listing the stack's recorded paths, and drops the record once it owns nothing
-// still enabled — without touching another stack's.
+// A push finds a deleted checks file's record through the stack's recorded
+// paths and drops it once it owns nothing enabled, leaving other stacks alone.
 func TestLockChecksPathsAndDrop(t *testing.T) {
 	lock := &Lock{}
 	lock.SetChecksSeen("dev", "checks/b.json", "table-b", map[string]LockCheckEntry{"x": {CheckID: "c1"}})
@@ -96,8 +94,7 @@ func TestLockChecksPathsAndDrop(t *testing.T) {
 	}
 }
 
-// TestStateChecksRoundTrip: a LEGACY folder keeps its checks record in
-// .ronja/state.json, and it survives a save and a load intact.
+// A legacy folder keeps its checks record in .ronja/state.json.
 func TestStateChecksRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	key := InstanceKey{URL: "https://x.example", TenantID: "t1"}
