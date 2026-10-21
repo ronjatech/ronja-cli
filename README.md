@@ -3462,7 +3462,7 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
 |---|---|---|
 | `init` | writes the two files, optionally copying in a component you already have. Creates nothing server-side | `--from`, `--feature` (required), `--title` |
 | `clone` | copies an app's files down into a new folder, `access` included. Prefers your open draft over live. Creates nothing server-side | — |
-| `status` | local changes, remote lifecycle/draft, whether the draft compiles, allowlist differences, and drift. Read-only, works signed out for the local half | `--json` |
+| `status` | local changes, remote lifecycle/draft, whether the draft compiles, allowlist differences, drift, and how many updates Ronja recommends for the app. Read-only, works signed out for the local half | `--json` |
 | `fork` | copies one built-in kit file into the folder at the same path, so it shadows the kit's. Local only — changes nothing server-side, and never overwrites an existing file | `--json` |
 | `push` | ensures a draft, syncs allowlists then files, then compiles | `--no-validate`, `--force` |
 | `validate` | recompiles your draft and reports diagnostics | `--json` |
@@ -3476,6 +3476,17 @@ absent link is silent. Two details are specific to apps: `push` reports the
 **draft** it wrote to while `status` and `publish` report the **app** itself,
 and `status` only knows the link when it actually reached the server, so a
 signed-out or unbound status has no `URL:` line.
+
+**`status` names recommended updates, and they are optional.** When Ronja's apps
+have changed since the app was built, the Remote block carries one line,
+`N recommended updates (optional).`, followed by the two calls that act on it:
+`ronja api /api/v2/dataapp/<id>/updates` lists what changed and what to
+check, and `ronja api -X POST /api/v2/dataapp/<id>/rebuild` rebuilds the app as
+your draft, leaving the live app alone. Nothing is printed when nothing is
+recommended, for an app never published, when you cannot draft the app, or on an
+instance without the route; a failed check is one line and never fails `status`.
+`--json` carries it as `remote.updates` (`checked`, `count`, `notCheckedReason`).
+`ronja sync status` does not check.
 
 A draft is its own address. The server renders exactly the row a link names —
 it never swaps your open draft in for the live app — so after a push to a draft

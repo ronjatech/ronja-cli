@@ -144,6 +144,9 @@ type fakeAppInstance struct {
 	// first — the drift anchor `app push` reads. Nil for an app nobody has ever
 	// committed, which is the state the CLI resolves to the app's own id.
 	versions map[string][]api.DataApp
+	// updates is what GET :id/updates answers with. Nil leaves the route
+	// unserved, so it 404s the way an instance that predates it does.
+	updates *fakeUpdatesAnswer
 	// failCommit is the status POST :id/commit answers with; 0 is success. 400
 	// is the shape that matters — the server's needs-review rejection.
 	failCommit int
@@ -435,6 +438,17 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 		f.reviewRequested = append(f.reviewRequested, id)
 		writeJSON(w, nil)
 
+	case rest == "updates" && f.updates != nil:
+		if f.updates.Status != 0 {
+			http.Error(w, `{"error":"`+http.StatusText(f.updates.Status)+`"}`, f.updates.Status)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"count":   f.updates.Count,
+			"message": "Ronja's apps have changed since this app was built.",
+			"pending": []any{},
+		})
+
 	case rest == "files":
 		f.serveFileList(w, id)
 
@@ -488,6 +502,13 @@ type fakePreviewAnswer struct {
 	Body   []byte
 	// RetryAfter, when set, is sent as the header of the same name.
 	RetryAfter string
+}
+
+// fakeUpdatesAnswer is GET :id/updates: a non-zero Status refuses with it,
+// otherwise the route answers 200 with Count pending updates.
+type fakeUpdatesAnswer struct {
+	Status int
+	Count  int
 }
 
 // fakeBlob is one stored file: the row's storage key and its bytes.

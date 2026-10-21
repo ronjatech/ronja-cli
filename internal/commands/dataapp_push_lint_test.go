@@ -527,7 +527,7 @@ func TestFormatLintWarning(t *testing.T) {
 // because the CLI's split keys on its opening clause and the point of this
 // test is that the two stay in step: reword it on the server and this fails
 // here, not in a customer's terminal.
-const theMigrationAdvisory = `this app is spec 1, where styling is the author's job. Apps are spec 2 now: the theme and the Tailwind runtime are installed for you. Migrate with updateDataApp(specVersion: 2), or over HTTP with PUT /api/v2/dataapp/:id {"specVersion": 2} — the page renders identically, and the two import lines are then redundant but harmless.`
+const theMigrationAdvisory = `this app is spec 1, where styling is the author's job. Apps are spec 2 now: the theme and the Tailwind runtime are installed for you. Migrate with updateDataApp(specVersion: 2), or over HTTP with PUT /api/v2/dataapp/:id {"specVersion": 2} — the page looks the same apart from the brand font, and the two import lines are then redundant but harmless.`
 
 // TestPrintLintWarningsSplitsTheAdvisory pins the one line in this channel that
 // is NOT a defect.

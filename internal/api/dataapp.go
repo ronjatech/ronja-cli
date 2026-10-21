@@ -311,3 +311,21 @@ func (c *Client) ListDataAppFiles(ctx context.Context, id string) ([]DataAppFile
 	}
 	return out, nil
 }
+
+// DataAppUpdates is the subset of GET dataapp/:id/updates the CLI reads: how
+// many updates Ronja recommends for the app. Recommendations, not obligations:
+// nothing in the CLI acts on them.
+type DataAppUpdates struct {
+	Count int `json:"count"`
+}
+
+// GetDataAppUpdates reads a live app's recommended updates. 403 for a caller who
+// cannot draft the app, 404 for an id they cannot read and from an instance
+// that predates the route.
+func (c *Client) GetDataAppUpdates(ctx context.Context, id string) (*DataAppUpdates, error) {
+	var out DataAppUpdates
+	if err := c.Do(ctx, "GET", "dataapp/"+url.PathEscape(id)+"/updates", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

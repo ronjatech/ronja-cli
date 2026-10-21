@@ -32,7 +32,7 @@ const logsTailLines = 40
 // runPollInterval is how often a running workflow is re-read to BEGIN with.
 //
 // The web builder polls at 3s; 2.5s here is the same order, chosen so a short
-// run feels responsive without a long one (they can last an hour on dedicated
+// run feels responsive without a long one (they can last 4 hours on dedicated
 // compute) making thousands of requests. A package var rather than a const so
 // the tests can run the whole poll loop without sleeping through it.
 var runPollInterval = 2500 * time.Millisecond

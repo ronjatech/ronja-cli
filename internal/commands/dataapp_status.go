@@ -3,7 +3,9 @@ package commands
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
+	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
@@ -53,6 +55,7 @@ With --json, one object carrying all of the above.`,
 			if err != nil {
 				return err
 			}
+			addAppUpdates(cmd.Context(), resolved, report)
 
 			// The one line a row still on the old SQL escape handling earns,
 			// on STDERR in both modes: the report on stdout is a document a
@@ -201,6 +204,22 @@ type appRemoteReport struct {
 	// RemoteAccess is what the server currently grants, for context alongside
 	// the changes.
 	RemoteAccess string `json:"remoteAccess,omitempty"`
+	// Updates is absent whenever the human report says nothing about updates:
+	// the remote half was not checked, the app was never published, the
+	// command is not `app status`, or the server answered 403 (the caller
+	// cannot draft the app) or 404 (an instance without the route).
+	Updates *appUpdatesReport `json:"updates,omitempty"`
+	// liveID is the published app the binding names, "" when there is none.
+	liveID string
+}
+
+// appUpdatesReport is the app's recommended updates, with the same
+// checked / notCheckedReason split as appRemoteReport, so a failed read is not
+// mistaken for "count 0".
+type appUpdatesReport struct {
+	Checked          bool   `json:"checked"`
+	Count            int    `json:"count"`
+	NotCheckedReason string `json:"notCheckedReason,omitempty"`
 }
 
 func (r *appRemoteReport) note(format string, args ...any) {
@@ -276,6 +295,11 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 		out.SpecVersion = 1
 	}
 	out.RemoteAccess = describeAccess(target.Access())
+	if target.App.Lifecycle == api.LifecycleLive {
+		out.liveID = target.App.ID
+	} else {
+		out.liveID = target.App.ParentDataAppID
+	}
 
 	// The row a push would target: your draft if you have one, else the live app
 	// (which push would fork first).
@@ -314,6 +338,46 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 			baseline.SourceID, baseline.SourceLifecycle, row.ID, row.Lifecycle)
 	}
 	return out, pageURL
+}
+
+// addAppUpdates fills report.Remote.Updates for `app status` alone: the tree
+// commands share the report and never read it. It never fails the status:
+// updates are recommendations, so the worst a failed read earns is one line
+// saying it was not checked.
+func addAppUpdates(ctx context.Context, resolved *config.Resolved, report *appStatusReport) {
+	if report.Remote == nil || report.Remote.liveID == "" {
+		return
+	}
+	report.Remote.Updates = appUpdatesStatus(ctx, api.New(resolved.URL, resolved.Token), report.Remote.liveID)
+}
+
+func appUpdatesStatus(ctx context.Context, client *api.Client, liveID string) *appUpdatesReport {
+	updates, err := client.GetDataAppUpdates(ctx, liveID)
+	if err == nil {
+		return &appUpdatesReport{Checked: true, Count: updates.Count}
+	}
+	if status := api.StatusOf(err); status == http.StatusForbidden || status == http.StatusNotFound {
+		return nil
+	}
+	return &appUpdatesReport{NotCheckedReason: strings.Join(strings.Fields(err.Error()), " ")}
+}
+
+// printAppUpdates prints at most one line, and nothing when no update is
+// recommended.
+func printAppUpdates(out *os.File, liveID string, u *appUpdatesReport) {
+	switch {
+	case u == nil:
+	case u.NotCheckedReason != "":
+		fmt.Fprintf(out, "    could not check for recommended updates: %s\n", u.NotCheckedReason)
+	case u.Count > 0:
+		noun := "updates"
+		if u.Count == 1 {
+			noun = "update"
+		}
+		path := "/api/v2/dataapp/" + liveID
+		fmt.Fprintf(out, "    %d recommended %s (optional). See what to check: ronja api %s/updates · rebuild as a draft: ronja api -X POST %s/rebuild\n",
+			u.Count, noun, path, path)
+	}
 }
 
 func printAppStatus(r *appStatusReport) {
@@ -403,6 +467,7 @@ func printAppStatus(r *appStatusReport) {
 		if r.Remote.RemoteAccess != "" {
 			fmt.Fprintf(out, "    access:     %s\n", r.Remote.RemoteAccess)
 		}
+		printAppUpdates(out, r.Remote.liveID, r.Remote.Updates)
 	}
 
 	if len(r.Remote.AccessChanges) > 0 {
