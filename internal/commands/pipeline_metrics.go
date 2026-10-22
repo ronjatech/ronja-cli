@@ -599,11 +599,11 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 			liveBase = metricfile.RecipeSHA256(adopted.MetricRecipe)
 			adoptedRow = adopted
 		case api.StatusOf(err) == 403:
-			// Creating is admin-only; EDITING a metric that already exists is
-			// not — the whole draft-and-review path this file drives is open to a
-			// non-admin. So a push that refuses here is not a push that cannot
-			// run: it is one file that needs an admin once.
-			return refuse("creating the metric for %s in feature %s was refused (%v).\n    Creating a NEW metric needs an admin. Editing metrics that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin to create %q in that feature (or to run this one push), then push again",
+			// Creating needs an admin or a maintainer of the feature; EDITING a
+			// metric that already exists does not — the whole draft-and-review
+			// path this file drives is open to any member. So a push that refuses
+			// here is one file that needs one of them once.
+			return refuse("creating the metric for %s in feature %s was refused (%v).\n    Creating a NEW metric needs an admin or a maintainer of the feature. Editing metrics that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin or a maintainer of that feature to create %q (or to run this one push), then push again",
 				file.Path, f.Binding.FeatureID, err, file.Alias)
 		default:
 			return refuse("create the metric for %s in feature %s: %v", file.Path, f.Binding.FeatureID, err)

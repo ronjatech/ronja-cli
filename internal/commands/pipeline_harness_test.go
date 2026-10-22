@@ -110,7 +110,13 @@ type fakePipelineInstance struct {
 	// precondition on the write can.
 	stateAfterRead func()
 
-	privilegeLevel   int
+	privilegeLevel int
+	// maintains makes the caller a maintainer of every feature: a draft's
+	// canDecide reads true and a shared-feature commit is not refused.
+	maintains bool
+	// omitCanDecide models a server that predates canDecide: drafts come
+	// back without it.
+	omitCanDecide    bool
 	noFrontendOrigin bool
 	// failMe answers the organization lookup with a status instead of an
 	// identity; 0 is off. See the field of the same name on fakeInstance.
@@ -468,6 +474,10 @@ func (f *fakePipelineInstance) writeRowWithCatalog(w http.ResponseWriter, row *a
 	}
 	out := *row
 	out.Fields = f.columnCatalog(row.ID)
+	if !f.omitCanDecide {
+		decides := row.ShadowStatus == api.ShadowStatusDraft && (f.privilegeLevel <= 10 || f.maintains)
+		out.CanDecide = &decides
+	}
 	f.writeRow(w, &out)
 }
 
@@ -1071,7 +1081,7 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confi
 	// thirty review requests in production. Privilege levels count DOWN, so 10 is
 	// USR_ADMIN.
 	if feature := f.features[draft.FeatureID]; feature != nil &&
-		feature.Scope == scopeOrganization && f.privilegeLevel > 10 {
+		feature.Scope == scopeOrganization && f.privilegeLevel > 10 && !f.maintains {
 		http.Error(w, `{"error":"admin required to commit into a shared feature"}`, http.StatusBadRequest)
 		return
 	}

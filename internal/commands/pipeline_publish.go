@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
@@ -42,8 +43,9 @@ those; with no arguments, every file with a staged draft.
 What happens depends on the feature:
 
   your own feature      each draft is committed onto its table
-  a shared feature      an admin commits it, so the draft is submitted for
-                        review and you are told so
+  a shared feature      an admin or a maintainer of the feature commits it:
+                        as one, each draft is committed; otherwise it is
+                        submitted for review and you are told so
 
 --no-request-review turns the second case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
@@ -296,12 +298,13 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 	targets = orderPublishTargets(codec, local, targets)
 
 	// The route is decided UP FRONT from the two facts that decide it
-	// server-side — the feature's scope and the caller's role — rather than by
-	// trying a commit and reading the rejection prose. Matching on an error
-	// message is how a client silently starts doing the wrong thing the day
-	// somebody rewords it. Read ONCE for the whole run; both are properties of
-	// the feature and the caller, not of any one table.
-	routing := publishRouting{NoRequestReview: noRequestReview, OverwriteRemote: overwriteRemote}
+	// server-side — the feature's scope, read ONCE here for the whole run, and
+	// each draft's canDecide (an admin, or a maintainer of the feature), read
+	// off the draft's own GET per table — rather than by trying a commit and
+	// reading the rejection prose. Matching on an error message is how a client
+	// silently starts doing the wrong thing the day somebody rewords it.
+	routing := publishRouting{NoRequestReview: noRequestReview, OverwriteRemote: overwriteRemote,
+		callerAdmin: sync.OnceValues(func() (bool, error) { return callerIsAdmin(ctx, client) })}
 	if f.Binding.FeatureID != "" {
 		shared, err := featureIsShared(ctx, client, f.Binding.FeatureID)
 		if err != nil {
@@ -315,20 +318,6 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 				f.Binding.FeatureID, err)
 		} else {
 			routing.SharedFeature = shared
-		}
-	}
-	// The role is only asked for when it could change the route. Under
-	// --no-request-review there is no review branch to take, so the request would
-	// buy nothing.
-	if routing.SharedFeature && !noRequestReview {
-		admin, err := callerIsAdmin(ctx, client)
-		if err != nil {
-			// Fall through to the commit attempt: the 400 fallback below still
-			// catches the needs-review case, so an unreadable role costs an extra
-			// round trip rather than the command.
-			fmt.Fprintf(os.Stderr, "  Note: could not read your role (%v) — trying to commit.\n", err)
-		} else {
-			routing.ReviewUpFront = !admin
 		}
 	}
 
@@ -549,12 +538,12 @@ func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *
 			draft.ID, file.MetricID, file.Path)
 	}
 
-	if routing.ReviewUpFront {
+	if routing.reviewUpFront(staged) {
 		if err := client.RequestTableReview(ctx, draft.ID); err != nil {
 			return refuse("submit %s for review: %v", draft.ID, err)
 		}
 		out.Outcome = outcomeSubmittedForReview
-		out.Detail = "this feature is shared, so an admin commits changes to it"
+		out.Detail = "this feature is shared, so an admin or a maintainer of it commits changes to it"
 		return out
 	}
 
@@ -684,9 +673,6 @@ type publishRouting struct {
 	// is needed), but the 400 fallback stays armed, because the one thing we do
 	// know is that we cannot rule the shared case out.
 	ScopeUnknown bool
-	// ReviewUpFront is the decision taken from the facts: shared feature,
-	// non-admin caller, review requests allowed.
-	ReviewUpFront bool
 	// NoRequestReview turns every review route into an error, which is what CI
 	// wants when a merge is expected to land directly.
 	NoRequestReview bool
@@ -702,6 +688,33 @@ type publishRouting struct {
 	// commit's two refusals (400 needs-review, 409 moved) are decided in one
 	// place, from one value.
 	OverwriteRemote bool
+	// callerAdmin is the signed-in caller's admin role, read at most once per
+	// run and only for a draft without canDecide.
+	callerAdmin func() (bool, error)
+}
+
+// reviewUpFront is the decision taken from the facts: a shared feature, a
+// draft its caller may not commit (canDecide), and review requests allowed.
+//
+// A draft from a server too old to send canDecide routes on the role such a
+// server decides by (callerAdmin); a role that cannot be read commits, and the
+// commit's 400 still files the review.
+func (r publishRouting) reviewUpFront(staged *api.Table) bool {
+	if !r.SharedFeature || r.NoRequestReview {
+		return false
+	}
+	if staged != nil && staged.CanDecide != nil {
+		return !*staged.CanDecide
+	}
+	if r.callerAdmin == nil {
+		return true
+	}
+	admin, err := r.callerAdmin()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Note: could not read your role (%v) — trying to commit.\n", err)
+		return false
+	}
+	return !admin
 }
 
 func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec pipelineCodec, inst *wfdir.InstanceState,
@@ -816,21 +829,21 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 		fmt.Fprintf(os.Stderr, "  Warning: %s %s\n", path, warning)
 	}
 
-	if routing.ReviewUpFront {
+	if routing.reviewUpFront(staged) {
 		// Already filed. The server accepts a second request-review and the draft
 		// is not harmed by one, but reporting "submitted for review" to somebody
 		// who submitted it yesterday reads as progress that did not happen — the
 		// admin's inbox has had it all along.
 		if review != nil && review.SubmittedForReview {
 			out.Outcome = outcomeSubmittedForReview
-			out.Detail = "already submitted for review — an admin has it; nothing was re-sent"
+			out.Detail = "already submitted for review — an admin or a maintainer of the feature has it; nothing was re-sent"
 			return out
 		}
 		if err := client.RequestTableReview(ctx, draft.ID); err != nil {
 			return refuse("submit %s for review: %v", draft.ID, err)
 		}
 		out.Outcome = outcomeSubmittedForReview
-		out.Detail = "this feature is shared, so an admin commits changes to it"
+		out.Detail = "this feature is shared, so an admin or a maintainer of it commits changes to it"
 		return out
 	}
 

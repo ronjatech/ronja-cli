@@ -33,10 +33,12 @@ func newDataAppPublishCmd() *cobra.Command {
 What happens depends on the app's feature:
 
   your own feature        the draft is committed and goes live
-  a shared feature        an admin commits it, so the draft is submitted for
-                          review and you are told so
-  a shared feature, and   an admin approves the app itself, so it is submitted
-  never published yet     for approval and you are told so
+  a shared feature        an admin or a maintainer of the feature commits it:
+                          as one, the draft is committed; otherwise it is
+                          submitted for review and you are told so
+  a shared feature, and   an admin or a maintainer approves the app itself, so
+  never published yet     anyone else's is submitted for approval and you are
+                          told so
 
 --no-request-review turns the second case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
@@ -156,28 +158,25 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 	firstPublish := parent.ID == draft.ID
 
 	// For an EDIT draft the route is decided UP FRONT from the two facts that
-	// decide it server-side — the feature's scope and the caller's role — rather
-	// than by trying a commit and reading the rejection prose. Matching on an
-	// error message is how a client silently starts doing the wrong thing the day
-	// someone rewords it.
+	// decide it server-side — the feature's scope and the draft's canDecide (an
+	// admin, or a maintainer of the feature) — rather than by trying a commit
+	// and reading the rejection prose. Matching on an error message is how a
+	// client silently starts doing the wrong thing the day someone rewords it.
 	shared, err := featureIsShared(ctx, client, appFeatureID(parent))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not read the feature's scope (%v) — trying to commit.\n", err)
 	}
 	if !noRequestReview && shared && !firstPublish {
-		admin, err := callerIsAdmin(ctx, client)
+		commits, err := mayCommit(ctx, client, draft.CanDecide)
 		if err != nil {
-			// Fall through to the commit attempt: the 400 fallback below still
-			// catches the needs-review case, so an unreadable role costs an extra
-			// round trip rather than the command.
 			fmt.Fprintf(os.Stderr, "  Note: could not read your role (%v) — trying to commit.\n", err)
-		} else if !admin {
+		} else if !commits {
 			review, err := client.RequestDataAppReview(ctx, draft.ID)
 			if err != nil {
 				return nil, fmt.Errorf("submit %s for review: %w", draft.ID, err)
 			}
 			result.Outcome = outcomeSubmittedForReview
-			result.Detail = fmt.Sprintf("%q is in a shared feature, so an admin commits changes to it", parent.Name)
+			result.Detail = fmt.Sprintf("%q is in a shared feature, so an admin or a maintainer of it commits changes to it", parent.Name)
 			result.Audience = audienceOf(review)
 			return result, nil
 		}
@@ -193,7 +192,7 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 		// holds the draft content that is already on disk.
 		if outcome != nil && outcome.Proposed {
 			result.Outcome = outcomeSubmittedForReview
-			result.Detail = fmt.Sprintf("a new app in the shared feature %q needs an admin's approval, so it was submitted for one", parent.Name)
+			result.Detail = fmt.Sprintf("a new app in the shared feature %q needs the approval of an admin or a maintainer of it, so it was submitted for one", parent.Name)
 			return result, nil
 		}
 		result.Outcome = outcomePublished
@@ -207,7 +206,8 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 	}
 
 	// The race the up-front routing cannot close: the feature was shared, or the
-	// caller's role changed, between the read above and the commit. A first
+	// caller's role or grant changed, between the read above and the commit — or
+	// the organization disallows approving one's own draft. A first
 	// publish is excluded because request-review cannot express it — its refusal
 	// would replace the commit's real diagnostic with an unrelated one.
 	if noRequestReview || firstPublish || api.StatusOf(commitErr) != 400 {

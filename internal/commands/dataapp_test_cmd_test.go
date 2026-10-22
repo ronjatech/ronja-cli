@@ -213,7 +213,7 @@ func TestAppTestDefaultsIntoTheStateDirectory(t *testing.T) {
 // throw away an observation over the way it is stored. So the warning has to
 // survive being read: it names the consequence rather than the syscall, and it
 // is said again after the report, because on its own it lands before a render
-// that can take twenty seconds and then fills the terminal.
+// that can take up to forty seconds and then fills the terminal.
 func TestAppTestWarnsTwiceWhenItCannotIgnoreTheArtefacts(t *testing.T) {
 	f := newFakeAppInstance(t)
 	root, app := appTestFolder(t, f)
@@ -504,8 +504,14 @@ func TestAppTestRefusesAMalformedStepsFile(t *testing.T) {
 		body string
 		want string
 	}{
-		{"not JSON at all", `{ this is not json`, "must hold a JSON ARRAY"},
-		{"a bare object", `{"action":"click","text":"Refresh"}`, "must hold a JSON ARRAY"},
+		{"not JSON at all", `{ this is not json`, "read the interaction plan"},
+		{"not JSON, not an object", `this is not json`, "must hold a JSON array"},
+		{"a bare step object", `{"action":"click","text":"Refresh"}`, "single step object"},
+		{"a wrapper with no steps", `{"plan":[{"action":"screenshot"}]}`, `"plan"`},
+		{"a wrapper whose steps is not an array", `{"steps":{"action":"screenshot"}}`, "must be a JSON array"},
+		{"a wrapper with a mistyped step key", `{"steps":[{"action":"click","selctor":"#q"}]}`, "selctor"},
+		{"an empty wrapped plan", `{"steps":[]}`, "names no steps"},
+		{"two wrapped plans", `{"steps":[{"action":"screenshot"}]} {"steps":[]}`, "more than one JSON value"},
 		{"a mistyped key", `[{"action":"click","selctor":"#q"}]`, "selctor"},
 		{"an empty plan", `[]`, "names no steps"},
 	}
@@ -1151,5 +1157,247 @@ func TestAppTestRefusesASymlinkedDefaultOutDir(t *testing.T) {
 				t.Errorf("nothing may be written through the link (%v)", err)
 			}
 		})
+	}
+}
+
+// ── Viewport, the steps file's two shapes, the budget ───────────────────────
+
+// previewBody decodes one recorded wire body into its raw keys, so a test can
+// pin a json KEY rather than what the CLI's own mirror decodes it into.
+func previewBody(t *testing.T, f *fakeAppInstance, i int) map[string]json.RawMessage {
+	t.Helper()
+	if len(f.previewBodies) <= i {
+		t.Fatalf("expected at least %d preview calls, got %d", i+1, len(f.previewBodies))
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(f.previewBodies[i], &m); err != nil {
+		t.Fatalf("decode preview body: %v", err)
+	}
+	return m
+}
+
+// A WxH reaches the wire as an explicit `viewport`, never as a preset, and a
+// preset still travels as viewportPreset.
+func TestAppTestSendsACustomViewport(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, _ := appTestFolder(t, f)
+
+	if _, err := runCLI(t, root, "app", "test", "--viewport", "1280x2400", "--out-dir", t.TempDir()); err != nil {
+		t.Fatalf("app test: %v", err)
+	}
+	body := previewBody(t, f, 0)
+	if got := string(body["viewport"]); got != `{"width":1280,"height":2400}` {
+		t.Errorf("--viewport 1280x2400 should reach the wire as viewport {1280,2400}, got %s (body %s)", got, f.previewBodies[0])
+	}
+	if _, ok := body["viewportPreset"]; ok {
+		t.Errorf("a WxH must not also send a preset — the server refuses both: %s", f.previewBodies[0])
+	}
+
+	if _, err := runCLI(t, root, "app", "test", "--viewport", "mobile", "--out-dir", t.TempDir()); err != nil {
+		t.Fatalf("app test: %v", err)
+	}
+	body = previewBody(t, f, 1)
+	if got := string(body["viewportPreset"]); got != `"mobile"` {
+		t.Errorf("a preset should still travel as viewportPreset, got %s", f.previewBodies[1])
+	}
+	if _, ok := body["viewport"]; ok {
+		t.Errorf("a preset must not send an explicit viewport: %s", f.previewBodies[1])
+	}
+}
+
+// Malformed and out-of-range sizes are refused locally: the server would
+// refuse the range too, but a typo should cost no round trip.
+func TestAppTestRefusesABadCustomViewport(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, _ := appTestFolder(t, f)
+
+	for _, v := range []string{"9999x1", "abc", "1280x", "x800", "1280x800px", "-300x800", "239x800", "1280x2561", "1280 x 800"} {
+		t.Run(v, func(t *testing.T) {
+			_, err := runCLI(t, root, "app", "test", "--viewport", v, "--out-dir", t.TempDir())
+			if err == nil {
+				t.Fatalf("--viewport %q must be refused", v)
+			}
+			if !strings.Contains(err.Error(), "--viewport") {
+				t.Errorf("the refusal should name the flag, got: %v", err)
+			}
+		})
+	}
+	if f.previewCalls != 0 {
+		t.Errorf("a refusal should cost no round trip, got %d preview calls", f.previewCalls)
+	}
+}
+
+// An instance older than explicit sizes ignores the field and renders
+// desktop; its echo is how the CLI knows. An echo that matches — as WxH, or
+// as a preset of the same size — and an absent echo say nothing.
+func TestAppTestWarnsWhenACustomViewportWasNotApplied(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, app := appTestFolder(t, f)
+	answer := func(echo string) {
+		f.AnswerPreviewResult(api.PreviewResult{
+			Rendered: true, Viewport: echo, DataAppID: app.ID,
+			Ops: []api.PreviewOp{}, Errors: []api.PreviewRuntimeError{},
+			ConsoleErrors: []api.PreviewConsoleError{}, Screenshots: []api.PreviewScreenshot{},
+		})
+	}
+	run := func(viewport string) string {
+		var err error
+		stderr := captureStderr(t, func() {
+			_, err = runCLI(t, root, "app", "test", "--viewport", viewport, "--out-dir", t.TempDir())
+		})
+		if err != nil {
+			t.Fatalf("app test: %v", err)
+		}
+		return stderr
+	}
+	const warning = "this server does not support custom sizes; the frame is desktop"
+
+	answer("desktop")
+	if got := run("1280x2400"); !strings.Contains(got, warning) {
+		t.Errorf("an older server's desktop echo for a WxH request must be called out, got stderr:\n%s", got)
+	}
+	answer("1280x2400")
+	if got := run("1280x2400"); strings.Contains(got, "custom sizes") {
+		t.Errorf("a matching echo must not warn:\n%s", got)
+	}
+	answer("desktop")
+	if got := run("1280x800"); strings.Contains(got, "custom sizes") {
+		t.Errorf("a preset echo of the same size must not warn:\n%s", got)
+	}
+	answer("")
+	if got := run("1280x2400"); strings.Contains(got, "custom sizes") {
+		t.Errorf("an absent echo confirms nothing either way and must not warn:\n%s", got)
+	}
+}
+
+// The HTTP body's {"steps": [...]} is accepted as a steps file and sends the
+// identical plan the bare array does.
+func TestAppTestAcceptsTheStepsObject(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, _ := appTestFolder(t, f)
+	dir := t.TempDir()
+	plan := `[{"action":"click","text":"Refresh","timeoutMs":8000},{"action":"screenshot","selector":"#chart"}]`
+
+	bare := filepath.Join(dir, "bare.json")
+	wrapped := filepath.Join(dir, "wrapped.json")
+	if err := os.WriteFile(bare, []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wrapped, []byte(`{"steps": `+plan+`}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{bare, wrapped} {
+		if _, err := runCLI(t, root, "app", "test", "--out-dir", t.TempDir(), "--steps", p); err != nil {
+			t.Fatalf("app test --steps %s: %v", filepath.Base(p), err)
+		}
+	}
+	if len(f.previewBodies) != 2 {
+		t.Fatalf("expected two preview calls, got %d", len(f.previewBodies))
+	}
+	if string(f.previewBodies[0]) != string(f.previewBodies[1]) {
+		t.Errorf("the two shapes must send the identical request:\n  bare:    %s\n  wrapped: %s",
+			f.previewBodies[0], f.previewBodies[1])
+	}
+}
+
+// Any other key of the HTTP body is refused, naming the flag that carries it:
+// ignoring a `route` would render a different page from the one written down.
+func TestAppTestRefusesRequestKeysInTheStepsFile(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, _ := appTestFolder(t, f)
+	dir := t.TempDir()
+
+	for _, tc := range []struct{ key, value, flag string }{
+		{"route", `"#x"`, "--route"},
+		{"viewportPreset", `"mobile"`, "--viewport"},
+		{"viewport", `{"width":1280,"height":2400}`, "--viewport"},
+		{"timeoutMs", `40000`, "--timeout"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			plan := filepath.Join(dir, tc.key+".json")
+			body := `{"steps":[{"action":"screenshot"}],"` + tc.key + `":` + tc.value + `}`
+			if err := os.WriteFile(plan, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := runCLI(t, root, "app", "test", "--out-dir", dir, "--steps", plan)
+			if err == nil {
+				t.Fatalf("a steps file carrying %q must be refused", tc.key)
+			}
+			if !strings.Contains(err.Error(), tc.flag) {
+				t.Errorf("the refusal should name %s, got: %v", tc.flag, err)
+			}
+		})
+	}
+	if f.previewCalls != 0 {
+		t.Errorf("nothing should have been rendered; %d preview calls were made", f.previewCalls)
+	}
+}
+
+// With --steps and no --timeout the endpoint's ceiling is sent, because the
+// plan is carved out of the same budget the render settles in. An explicit
+// --timeout always wins, and a plain render keeps its own default.
+func TestAppTestStepsRaiseTheDefaultBudget(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, _ := appTestFolder(t, f)
+	plan := filepath.Join(t.TempDir(), "steps.json")
+	if err := os.WriteFile(plan, []byte(`[{"action":"screenshot"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runCLI(t, root, "app", "test", "--out-dir", t.TempDir(), "--steps", plan); err != nil {
+		t.Fatalf("app test: %v", err)
+	}
+	if _, err := runCLI(t, root, "app", "test", "--out-dir", t.TempDir(), "--steps", plan, "--timeout", "10s"); err != nil {
+		t.Fatalf("app test: %v", err)
+	}
+	if _, err := runCLI(t, root, "app", "test", "--out-dir", t.TempDir()); err != nil {
+		t.Fatalf("app test: %v", err)
+	}
+	for i, want := range []string{"40000", "10000", "20000"} {
+		if got := string(previewBody(t, f, i)["timeoutMs"]); got != want {
+			t.Errorf("call %d: timeoutMs = %s, want %s", i, got, want)
+		}
+	}
+}
+
+// A step skipped for budget prints one hint naming both knobs, and no number:
+// an older server clamps silently and echoes no applied budget.
+func TestAppTestHintsWhenAStepRanOutOfBudget(t *testing.T) {
+	f := newFakeAppInstance(t)
+	root, app := appTestFolder(t, f)
+	f.AnswerPreviewResult(api.PreviewResult{
+		Rendered: true, Viewport: "desktop", DataAppID: app.ID,
+		Ops: []api.PreviewOp{}, Errors: []api.PreviewRuntimeError{},
+		ConsoleErrors: []api.PreviewConsoleError{}, Screenshots: []api.PreviewScreenshot{},
+		Steps: []api.PreviewStepResult{
+			{Index: 0, Action: "click", OK: true},
+			{Index: 1, Action: "waitFor", Skipped: "budget"},
+			{Index: 2, Action: "screenshot", Skipped: "budget"},
+		},
+	})
+	plan := filepath.Join(t.TempDir(), "steps.json")
+	if err := os.WriteFile(plan, []byte(`[{"action":"click","text":"Go"},{"action":"waitFor","selector":"#x"},{"action":"screenshot"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var err error
+	stderr := captureStderr(t, func() {
+		_, err = runCLI(t, root, "app", "test", "--out-dir", t.TempDir(), "--steps", plan)
+	})
+	if err != nil {
+		t.Fatalf("app test: %v", err)
+	}
+	if n := strings.Count(stderr, "raise --timeout"); n != 1 {
+		t.Fatalf("expected exactly one budget hint, got %d in:\n%s", n, stderr)
+	}
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.Contains(line, "raise --timeout") {
+			if !strings.Contains(line, "timeoutMs") {
+				t.Errorf("the hint should name a step's timeoutMs too: %q", line)
+			}
+			if strings.ContainsAny(line, "0123456789") {
+				t.Errorf("the hint must carry no number: %q", line)
+			}
+		}
 	}
 }

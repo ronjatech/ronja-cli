@@ -30,8 +30,10 @@ What happens depends on the module:
 
   never published yet     the draft is published and the module becomes live
   a private feature       the draft is committed onto the live module
-  a shared feature        an admin commits it, so the draft is submitted for
-                          review and you are told so
+  a shared feature        an admin or a maintainer of the feature commits it:
+                          as one, the draft is committed; otherwise the commit
+                          is refused, the draft is submitted for review and
+                          you are told so
 
 --no-request-review turns the last case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
@@ -162,34 +164,13 @@ func runModulePublish(ctx context.Context, f *folder, opts publishOptions) (*mod
 		return result, nil
 	}
 
-	// A shared feature's commit is admin-only, and the route is decided UP FRONT
-	// from the two facts that decide it server-side — the feature scope and the
-	// caller's role — rather than by trying a commit and reading the rejection
-	// prose. Matching on an error message is how a client silently starts doing
-	// the wrong thing the day someone rewords it.
-	//
-	// The scope is read off the row the commit acts ON: the parent for an edit,
-	// the draft itself for a first publish. rmodule stamps featureScope on every
-	// row it reads, so neither costs a round trip.
+	// The commit is attempted first: no read says whether this caller may
+	// commit (an admin, or a maintainer of the feature), so the server's own
+	// refusal routes to review below. The scope is read off the row the commit
+	// acts ON: the parent for an edit, the draft itself for a first publish.
 	scoped := parent
 	if scoped == nil {
 		scoped = draft
-	}
-	if !opts.NoRequestReview && scoped.FeatureScope == scopeOrganization {
-		admin, err := callerIsAdmin(ctx, client)
-		if err != nil {
-			// Fall through to the commit attempt: the refusal below still catches
-			// the needs-review case, so an unreadable role costs an extra round
-			// trip rather than the command.
-			fmt.Fprintf(os.Stderr, "  Note: could not read your role (%v) — trying to commit.\n", err)
-		} else if !admin {
-			if err := client.RequestModuleReview(ctx, draft.ID); err != nil {
-				return nil, fmt.Errorf("submit %s for review: %w", draft.ID, err)
-			}
-			result.Outcome = outcomeSubmittedForReview
-			result.Detail = fmt.Sprintf("%q is in a shared feature, so an admin commits changes to it — a module edit reaches every workflow that imports it", scoped.Name)
-			return result, nil
-		}
 	}
 
 	outcome, commitErr := client.CommitModuleDraft(ctx, draft.ID, "")
@@ -207,8 +188,9 @@ func runModulePublish(ctx context.Context, f *folder, opts publishOptions) (*mod
 		return resolveModuleCommitConflict(ctx, client, f, parent, draft, result, opts, commitErr)
 	}
 
-	// The race the up-front routing cannot close: the feature became shared, or
-	// the caller's role changed, between the read above and the commit.
+	// The needs-review case: a shared feature whose commit the server refused
+	// with a 400 (not an admin or a maintainer of it, or self-approval
+	// disallowed).
 	if opts.NoRequestReview || scoped.FeatureScope != scopeOrganization || api.StatusOf(commitErr) != 400 {
 		return nil, fmt.Errorf("commit %s: %w", draft.ID, commitErr)
 	}

@@ -93,6 +93,10 @@ type DataApp struct {
 	// draft; null on every other row, and on a draft they have not submitted.
 	SubmittedForReviewAt *time.Time `json:"submittedForReviewAt"`
 	DrafterUserID        string     `json:"drafterUserID"`
+	// CanDecide is true on a draft the caller may commit themselves (an admin,
+	// or a maintainer of the feature that governs it); publish routes on it.
+	// The commit still applies the submitted-for-review and self-approval rules.
+	CanDecide *bool `json:"canDecide,omitempty"`
 	// BaseVersionID is what the DRAFT was forked from — and ⚠️ it does NOT mean
 	// what the identically-named field on Workflow means, which is why
 	// `app clone` resolves its anchor through dataAppCloneAnchor rather than

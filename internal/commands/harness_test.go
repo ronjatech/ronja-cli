@@ -293,6 +293,12 @@ type fakeInstance struct {
 	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
 	// ordinary user), mirroring sherlock's downward-counting scale.
 	privilegeLevel int
+	// maintains makes the caller a maintainer of every feature: a draft's
+	// canDecide reads true and a shared-feature commit is not refused.
+	maintains bool
+	// omitCanDecide models a server that predates canDecide: drafts come
+	// back without it.
+	omitCanDecide bool
 	// noFrontendOrigin models an instance with no configured frontend origin:
 	// every row comes back WITHOUT a `url`, which is omitempty server-side.
 	// This is the normal case on a plain dev box, so the silence it produces is
@@ -489,6 +495,10 @@ const fakeFrontendOrigin = "https://app.example.test"
 // url, deliberately — a fake holding the link on the row would hand it to every
 // route alike, and the first command to read one of those listings would pass a
 // test the real server fails.
+// decides is a draft's canDecide for the signed-in caller: an admin, or a
+// maintainer of its feature.
+func (f *fakeInstance) decides() bool { return f.privilegeLevel <= 10 || f.maintains }
+
 func (f *fakeInstance) writeRow(w http.ResponseWriter, wf *api.Workflow) {
 	if wf == nil {
 		writeJSON(w, nil)
@@ -778,7 +788,12 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, nil)
 			return
 		}
-		f.writeRow(w, f.workflows[draftID])
+		draft := *f.workflows[draftID]
+		if !f.omitCanDecide {
+			decides := f.decides()
+			draft.CanDecide = &decides
+		}
+		f.writeRow(w, &draft)
 
 	case strings.Contains(path, "/files/"):
 		// GET one file by path. Only the push's timed-out-PUT reconciliation

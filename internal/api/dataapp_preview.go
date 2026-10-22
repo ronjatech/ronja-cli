@@ -57,8 +57,14 @@ type PreviewRequest struct {
 	// refuses an unknown value locally: a typo that silently renders the wrong
 	// size answers a question nobody asked.
 	ViewportPreset string `json:"viewportPreset,omitempty"`
-	// TimeoutMs is the render budget, clamped server-side to the deployed
-	// harness's ceiling and never refused. Zero means "the server's default".
+	// Viewport is an explicit size, each side 240–2560; the server refuses it
+	// beside a ViewportPreset. An instance older than the field ignores it and
+	// renders desktop, which is why the CLI compares the echoed viewport with
+	// the size it asked for.
+	Viewport *PreviewViewport `json:"viewport,omitempty"`
+	// TimeoutMs is the render budget, clamped server-side to the endpoint's
+	// ceiling (40000 on a current instance, 20000 on an older one) and never
+	// refused. Zero means "the server's default".
 	TimeoutMs int `json:"timeoutMs,omitempty"`
 	// Steps is an optional interaction plan run after the app renders.
 	//
@@ -68,6 +74,12 @@ type PreviewRequest struct {
 	Steps []PreviewStep `json:"steps,omitempty"`
 }
 
+// PreviewViewport mirrors dataapp.PreviewViewportRequest.
+type PreviewViewport struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
 // PreviewStep is one requested interaction, mirroring tools.PreviewStepRequest.
 //
 // The grammar, and what each action needs:
@@ -75,7 +87,8 @@ type PreviewRequest struct {
 //	"click"      — selector (or text)
 //	"fill"       — selector + a NON-EMPTY value
 //	"waitFor"    — selector (or text); waits for VISIBLE, not merely present
-//	"screenshot" — nothing; captures a frame tagged phase "step-<n>"
+//	"screenshot" — nothing (the viewport), or selector (or text): that element,
+//	               scrolled into view; a frame tagged phase "step-<n>"
 //
 // Text is a SELECTOR shorthand (Playwright's text= engine), never a value alias
 // on fill.

@@ -178,6 +178,11 @@ type Table struct {
 	// off a GetTable answer. WaitForTableBuild owns the fallback for an older
 	// instance that does not send it at all.
 	BuildVerdict string `json:"buildVerdict,omitempty"`
+	// CanDecide is true on a draft the caller may commit themselves (an admin,
+	// or a maintainer of the feature that governs it), read off the single-row
+	// GET; publish routes on it. The commit still applies the
+	// submitted-for-review and self-approval rules.
+	CanDecide *bool `json:"canDecide,omitempty"`
 
 	// MetricRecipe is a metric's whole DEFINITION, in the canonical form the
 	// server stores: the version defaulted, `source` a real table id. Empty on

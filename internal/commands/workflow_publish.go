@@ -75,8 +75,9 @@ What happens depends on the workflow:
 
   never published yet     the draft is published and becomes live
   your own workflow       the draft is committed onto it
-  a shared workflow       an admin commits it, so the draft is submitted for
-                          review and you are told so
+  a shared workflow       an admin or a maintainer of its feature commits it:
+                          as one, the draft is committed; otherwise it is
+                          submitted for review and you are told so
 
 --no-request-review turns the last case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
@@ -205,23 +206,22 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 	}
 
 	// The route is decided UP FRONT from the two facts that decide it
-	// server-side — the parent's feature scope and the caller's role — rather
-	// than by trying a commit and reading the rejection prose. Matching on an
-	// error message is how a client silently starts doing the wrong thing the
-	// day someone rewords it.
+	// server-side — the parent's feature scope and the draft's canDecide (an
+	// admin, or a maintainer of the feature) — rather than by trying a commit
+	// and reading the rejection prose. Matching on an error message is how a
+	// client silently starts doing the wrong thing the day someone rewords it.
 	if !opts.NoRequestReview && parent.FeatureScope == scopeOrganization {
-		admin, err := callerIsAdmin(ctx, client)
+		commits, err := mayCommit(ctx, client, draft.CanDecide)
 		if err != nil {
 			// Fall through to the commit attempt: the 400 fallback below still
-			// catches the needs-review case, so an unreadable role costs an
-			// extra round trip rather than the command.
+			// catches the needs-review case.
 			fmt.Fprintf(os.Stderr, "  Note: could not read your role (%v) — trying to commit.\n", err)
-		} else if !admin {
+		} else if !commits {
 			if err := client.RequestWorkflowReview(ctx, draft.ID); err != nil {
 				return nil, fmt.Errorf("submit %s for review: %w", draft.ID, err)
 			}
 			result.Outcome = outcomeSubmittedForReview
-			result.Detail = fmt.Sprintf("%q is shared, so an admin commits changes to it", parent.Title)
+			result.Detail = fmt.Sprintf("%q is shared, so an admin or a maintainer of its feature commits changes to it", parent.Title)
 			return result, nil
 		}
 	}
@@ -250,7 +250,8 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 	}
 
 	// The race the up-front routing cannot close: the feature was shared, or
-	// the caller's role changed, between the read above and the commit. A 400
+	// the caller's role or grant changed, between the read above and the
+	// commit — or the organization disallows approving one's own draft. A 400
 	// on an org-scoped parent is the server's needs-review rejection.
 	if opts.NoRequestReview || parent.FeatureScope != scopeOrganization || api.StatusOf(commitErr) != 400 {
 		return nil, fmt.Errorf("commit %s: %w", draft.ID, commitErr)
@@ -363,21 +364,6 @@ func resolveDraft(ctx context.Context, client *api.Client, f *folder, noun strin
 			noun, wf.ID)
 	}
 	return wf, draft, nil
-}
-
-// callerIsAdmin reports whether the signed-in user may commit a draft onto a
-// shared workflow. Privilege levels count DOWN (USR_ADMIN is 10), mirroring
-// sherlock.RoleAllowed.
-func callerIsAdmin(ctx context.Context, client *api.Client) (bool, error) {
-	me, err := client.Me(ctx)
-	if err != nil {
-		return false, err
-	}
-	if me.Role == nil {
-		return false, nil
-	}
-	const usrAdmin = 10
-	return me.Role.PrivilegeLevel <= usrAdmin, nil
 }
 
 // warnIfDirty says so when the folder holds changes the draft does not.
@@ -500,4 +486,28 @@ func printPublishReport(r *publishResult) {
 	if r.Outcome == outcomePublished {
 		fmt.Fprintf(out, "\n  Next: ronja wf run\n")
 	}
+}
+
+// mayCommit is whether the caller may commit a shared draft themselves: the
+// draft's canDecide, or, from a server too old to send it, the role check such
+// a server decides by (an admin).
+func mayCommit(ctx context.Context, client *api.Client, canDecide *bool) (bool, error) {
+	if canDecide != nil {
+		return *canDecide, nil
+	}
+	return callerIsAdmin(ctx, client)
+}
+
+// callerIsAdmin reports whether the signed-in user holds the admin role.
+// Privilege levels count DOWN (USR_ADMIN is 10), mirroring sherlock.RoleAllowed.
+func callerIsAdmin(ctx context.Context, client *api.Client) (bool, error) {
+	me, err := client.Me(ctx)
+	if err != nil {
+		return false, err
+	}
+	if me.Role == nil {
+		return false, nil
+	}
+	const usrAdmin = 10
+	return me.Role.PrivilegeLevel <= usrAdmin, nil
 }

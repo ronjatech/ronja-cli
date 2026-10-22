@@ -1076,12 +1076,12 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 					path, f.Binding.FeatureID, why)
 			}
 			// The other one, and it is about WHO you are rather than what you
-			// sent. Creating a table is admin-only by design (POST
-			// /feature/model); EDITING the tables that exist is not — the whole
-			// draft-and-review path this folder drives is open to a non-admin. So
-			// a push that refuses here is not a push that cannot run: it is one
-			// file that needs an admin once.
-			return refuse("creating the table for %s in feature %s was refused (%v).\n    Creating a NEW table needs an admin. Editing tables that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin to create %q in that feature (or to run this one push), then add its id to \"tables\" in %s and push again",
+			// sent. Creating a table (POST /feature/model) needs an admin or a
+			// maintainer of the feature; EDITING
+			// the tables that exist is not — the whole draft-and-review path this
+			// folder drives is open to any member. So a push that refuses here is
+			// one file that needs one of them once.
+			return refuse("creating the table for %s in feature %s was refused (%v).\n    Creating a NEW table needs an admin or a maintainer of the feature. Editing tables that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin or a maintainer of that feature to create %q (or to run this one push), then add its id to \"tables\" in %s and push again",
 				path, f.Binding.FeatureID, err, name, wfdir.ManifestName)
 		default:
 			// A name already taken in the target feature, which the generic

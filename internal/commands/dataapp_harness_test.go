@@ -3,6 +3,7 @@ package commands
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,6 +48,12 @@ type fakeAppInstance struct {
 	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
 	// ordinary user), mirroring sherlock's downward-counting scale.
 	privilegeLevel int
+	// maintains makes the caller a maintainer of every feature: a draft's
+	// canDecide reads true and a shared-feature commit is not refused.
+	maintains bool
+	// omitCanDecide models a server that predates canDecide: drafts come
+	// back without it.
+	omitCanDecide bool
 	// failMe answers the organization lookup with a status instead of an
 	// identity; 0 is off. See the field of the same name on fakeInstance.
 	failMe int
@@ -71,6 +78,9 @@ type fakeAppInstance struct {
 	// which row id it was addressed to.
 	previewRequests []api.PreviewRequest
 	previewTargets  []string
+	// previewBodies is each call's body as it crossed the wire, for the tests
+	// that pin a json KEY rather than what the mirror decodes it into.
+	previewBodies [][]byte
 
 	// blobs backs the two-call frame fetch: GET /feature/file/:id for the row,
 	// then GET /file/download/:key for the bytes. Keyed by FILE ID.
@@ -402,7 +412,12 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, nil)
 			return
 		}
-		f.writeRow(w, f.apps[draftID])
+		draft := *f.apps[draftID]
+		if !f.omitCanDecide {
+			decides := f.privilegeLevel <= 10 || f.maintains
+			draft.CanDecide = &decides
+		}
+		f.writeRow(w, &draft)
 
 	case rest == "checkout":
 		f.checkouts++
@@ -552,8 +567,15 @@ func (f *fakeAppInstance) AddFileBlob(fileID, key string, data []byte) {
 }
 
 func (f *fakeAppInstance) servePreview(w http.ResponseWriter, r *http.Request, id string) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		f.t.Fatalf("read preview body: %v", err)
+	}
+	f.previewBodies = append(f.previewBodies, raw)
 	var in api.PreviewRequest
-	decodeBody(f.t, r, &in)
+	if err := json.Unmarshal(raw, &in); err != nil {
+		f.t.Fatalf("decode preview body: %v", err)
+	}
 	f.previewRequests = append(f.previewRequests, in)
 	f.previewTargets = append(f.previewTargets, id)
 

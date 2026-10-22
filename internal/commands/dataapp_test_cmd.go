@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
@@ -43,12 +45,33 @@ const (
 	viewportMobile  = "mobile"
 )
 
+// viewportPresetSizes is what each preset renders at, so an echoed preset name
+// can be compared with a WxH this command asked for.
+var viewportPresetSizes = map[string]api.PreviewViewport{
+	viewportDesktop: {Width: 1280, Height: 800},
+	viewportMobile:  {Width: 390, Height: 844},
+}
+
+// The range of one side of a --viewport WxH, mirroring the server's own
+// refusal (and the render harness's clamp). Checked locally so a typo costs no
+// round trip.
+const (
+	viewportMinSide = 240
+	viewportMaxSide = 2560
+)
+
+// appTestStepsTimeout is the render budget sent with --steps when --timeout is
+// not given: the endpoint's ceiling. A step plan is carved out of the same
+// budget the render settles in, so the plain-render default starves both.
+const appTestStepsTimeout = 40 * time.Second
+
 // The busy-retry schedule. Package vars, like runPollInterval, so the tests can
 // exercise the whole retry path without sleeping through it.
 var (
 	// previewBusyRetryDelay is used when the 429 named no Retry-After. Sized
-	// against a render (up to ~20s), since the usual cause of a busy answer is
-	// the tenant's concurrency slots being held by renders about to finish.
+	// against a typical render (15 s by default, 40 s at most), since the usual
+	// cause of a busy answer is the tenant's concurrency slots being held by
+	// renders about to finish.
 	previewBusyRetryDelay = 15 * time.Second
 	// previewBusyRetryCap bounds what a Retry-After can ask for. A server is
 	// entitled to name an interval; it is not entitled to park an interactive
@@ -86,7 +109,13 @@ report saying why the harness stopped waiting.
 
   ronja app test
   ronja app test --route '#/orders' --viewport mobile
-  ronja app test --out-dir ./preview   # anywhere you like, this folder included
+  ronja app test --viewport 1280x2400   # a tall frame, to see below the fold
+  ronja app test --out-dir ./preview    # anywhere you like, this folder included
+
+--viewport is desktop (1280x800, the default), mobile (390x844), or WxH with
+each side 240–2560. --route puts the hash in the URL before the app's first
+script runs, as a real deep link does, so the app must read location.hash at
+mount; no hashchange fires for it.
 
 This is PERCEPTION, NOT A PASS/FAIL GATE. There is no verdict field and this
 command exits zero whenever the harness ran, errors and all — what it saw is
@@ -109,9 +138,27 @@ given, the folder itself included.
   screenshot-1.png   every captured frame, in capture order
   screenshot.png     the representative frame, also written under this name
 
---steps runs an interaction plan after the render, from a JSON file:
+--steps runs an interaction plan after the render, from a JSON file holding
+either a bare array of steps or the same {"steps": [...]} object the HTTP
+endpoint takes (with "steps" as its only key — route, viewport and timeout are
+flags):
 
   [{"action": "click", "text": "Refresh"}, {"action": "screenshot"}]
+
+  click / waitFor   selector or text; waitFor waits for the element to be VISIBLE
+  fill              selector (or text) and a non-empty value
+  screenshot        nothing for the viewport, or a selector (or text) to capture
+                    that element, scrolled into view
+
+A step's own "timeoutMs" (default 5000, max 10000) is how long it waits for its
+element. Every step shares the render budget: with --steps and no --timeout,
+40s is sent (the endpoint's ceiling). A step reported skipped "budget" never
+ran; raise --timeout or that step's timeoutMs.
+
+"text" is Playwright's text= engine: a case-insensitive SUBSTRING, matched
+against the FIRST element in document order, so "Orders" can hit a heading
+before the tab you meant. Prefer an id ("#orders-tab"),
+"role=tab[name=\"Orders\"]", or the exact form "text=\"Orders\"".
 
 ⚠️ --steps REQUIRES AN ADMINISTRATOR and EXECUTES FOR REAL, with the same
 authority a viewer of this app has. A click runs the app's own code: it can
@@ -123,23 +170,24 @@ note and warning goes to stderr either way.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runAppTest(cmd.Context(), appTestOptions{
-				Route:        route,
-				StepsFile:    stepsFile,
-				Viewport:     viewport,
-				Timeout:      timeout,
-				OutDir:       outDir,
-				FailOnErrors: failOnErrors,
+				Route:         route,
+				StepsFile:     stepsFile,
+				Viewport:      viewport,
+				Timeout:       timeout,
+				TimeoutChosen: cmd.Flags().Changed("timeout"),
+				OutDir:        outDir,
+				FailOnErrors:  failOnErrors,
 			})
 		},
 	}
 	cmd.Flags().StringVar(&route, "route", "",
 		"in-app hash route to open, e.g. '#/orders' (default: the app's own default route)")
 	cmd.Flags().StringVar(&stepsFile, "steps", "",
-		"JSON file holding an interaction plan to run after the render (admin only; the steps really execute)")
+		"JSON file holding an interaction plan to run after the render: a steps array, or {\"steps\": [...]} (admin only; the steps really execute)")
 	cmd.Flags().StringVar(&viewport, "viewport", viewportDesktop,
-		"render size: desktop or mobile")
+		"render size: desktop, mobile, or WxH (each side 240-2560), e.g. 1280x2400")
 	cmd.Flags().DurationVar(&timeout, "timeout", 20*time.Second,
-		"render budget (0 leaves it to the server; the harness clamps it either way)")
+		"render budget, steps included (default 40s with --steps; 0 leaves it to the server; the server clamps it either way)")
 	cmd.Flags().StringVar(&outDir, "out-dir", "",
 		"directory to write report.json and the screenshots into (default: .ronja/test inside the app folder, which is never synced)")
 	cmd.Flags().BoolVar(&failOnErrors, "fail-on-errors", false,
@@ -148,12 +196,15 @@ note and warning goes to stderr either way.`,
 }
 
 type appTestOptions struct {
-	Route        string
-	StepsFile    string
-	Viewport     string
-	Timeout      time.Duration
-	OutDir       string
-	FailOnErrors bool
+	Route     string
+	StepsFile string
+	Viewport  string
+	Timeout   time.Duration
+	// TimeoutChosen is whether --timeout was given at all, which is what decides
+	// whether --steps may raise the default.
+	TimeoutChosen bool
+	OutDir        string
+	FailOnErrors  bool
 }
 
 // appTestResult is the --json surface.
@@ -173,9 +224,9 @@ type appTestResult struct {
 func runAppTest(ctx context.Context, opts appTestOptions) error {
 	// Everything local first, so a typo costs no round trip and does not even
 	// need a credential.
-	if opts.Viewport != viewportDesktop && opts.Viewport != viewportMobile {
-		return fmt.Errorf("--viewport must be %s or %s (got %q) — the server resolves an unknown preset to desktop rather than failing, so a typo would silently answer a question about the wrong layout",
-			viewportDesktop, viewportMobile, opts.Viewport)
+	preset, size, err := parseAppTestViewport(opts.Viewport)
+	if err != nil {
+		return err
 	}
 	if opts.Timeout < 0 {
 		return fmt.Errorf("--timeout cannot be negative (got %s) — pass 0 to leave the render budget to the server", opts.Timeout)
@@ -183,6 +234,10 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	steps, err := loadPreviewSteps(opts.StepsFile)
 	if err != nil {
 		return err
+	}
+	timeout := opts.Timeout
+	if len(steps) > 0 && !opts.TimeoutChosen {
+		timeout = appTestStepsTimeout
 	}
 
 	resolved, err := resolveInstance()
@@ -202,7 +257,7 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	// for real. It is also the last local check, so it keeps this command's own
 	// contract: a folder that cannot be written to costs no round trip, and a
 	// non-zero exit still means nothing about the app was observed. The narration
-	// now lands before the render's 20-second wait rather than after it, which is
+	// now lands before the render's wait rather than after it, which is
 	// where a reader is actually looking.
 	out, err := resolveAppTestOutDir(opts.OutDir, f.Root)
 	if err != nil {
@@ -235,8 +290,9 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 
 	req := api.PreviewRequest{
 		Route:          opts.Route,
-		ViewportPreset: opts.Viewport,
-		TimeoutMs:      int(opts.Timeout / time.Millisecond),
+		ViewportPreset: preset,
+		Viewport:       size,
+		TimeoutMs:      int(timeout / time.Millisecond),
 		Steps:          steps,
 	}
 	outcome, err := previewWithOneRetry(ctx, client, target.FilesRow().ID, req)
@@ -269,8 +325,11 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	} else {
 		printAppTestReport(result, files)
 	}
+	// Both on stderr, so a --json caller is told as well.
+	warnIfViewportNotApplied(size, result.Viewport)
+	hintIfStepsRanOutOfBudget(result.Steps)
 	// Said again, last, because it is now said first: the ignore warning is
-	// printed before a render that takes up to twenty seconds and then fills the
+	// printed before a render that can take tens of seconds and then fills the
 	// terminal, and one line that far up the scrollback is one nobody reads. The
 	// files it is about have only just been written.
 	out.WarnIfNotIgnored()
@@ -369,6 +428,131 @@ func previewBusyWait(retryAfter time.Duration) time.Duration {
 	return wait
 }
 
+// stepsFileKeyFlags names the flag that carries each other field of the HTTP
+// request body. Such a key in a steps file is REFUSED, never honoured and
+// never ignored: honouring it would give the file a second say over what the
+// command line says, and ignoring a `route` would render a different page
+// from the one its author wrote down.
+var stepsFileKeyFlags = map[string]string{
+	"route":          "--route",
+	"viewportPreset": "--viewport",
+	"viewport":       "--viewport",
+	"timeoutMs":      "--timeout",
+}
+
+// unwrapStepsObject returns the array inside a {"steps": [...]} steps file,
+// refusing an object with any other key, or with none.
+func unwrapStepsObject(path string, obj []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(obj))
+	if err := dec.Decode(&fields); err != nil {
+		return nil, fmt.Errorf("read the interaction plan in %s: %w", path, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("%s holds more than one JSON value — an interaction plan is a SINGLE array of steps (or one {\"steps\": [...]} object), and everything after the first would have been silently ignored", path)
+	}
+	if _, isStep := fields["action"]; isStep {
+		return nil, fmt.Errorf("%s holds a single step object — an interaction plan is an ARRAY of steps, or {\"steps\": [...]}", path)
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if k == "steps" {
+			continue
+		}
+		if flag, ok := stepsFileKeyFlags[k]; ok {
+			return nil, fmt.Errorf("%s sets %q — a steps file carries only \"steps\"; pass %s on the command line instead", path, k, flag)
+		}
+		return nil, fmt.Errorf("%s has the key %q — a steps file is a JSON array of steps, or an object whose only key is \"steps\"", path, k)
+	}
+	inner, ok := fields["steps"]
+	if !ok {
+		return nil, fmt.Errorf("%s is an object with no \"steps\" key — an interaction plan is a JSON array of steps, or {\"steps\": [...]}", path)
+	}
+	inner = bytes.TrimSpace(inner)
+	if len(inner) == 0 || inner[0] != '[' {
+		return nil, fmt.Errorf("%s: \"steps\" must be a JSON array of steps", path)
+	}
+	return inner, nil
+}
+
+// parseAppTestViewport reads --viewport: a preset name, sent as
+// viewportPreset, or WxH, sent as an explicit viewport. Exactly one of the two
+// results is set.
+func parseAppTestViewport(v string) (preset string, size *api.PreviewViewport, err error) {
+	if v == viewportDesktop || v == viewportMobile {
+		return v, nil, nil
+	}
+	w, h, ok := parseWxH(v)
+	if !ok {
+		return "", nil, fmt.Errorf("--viewport must be %s, %s or WxH such as 1280x2400 (got %q) — the server resolves an unknown preset to desktop rather than failing, so a typo would silently answer a question about the wrong layout",
+			viewportDesktop, viewportMobile, v)
+	}
+	if w < viewportMinSide || w > viewportMaxSide || h < viewportMinSide || h > viewportMaxSide {
+		return "", nil, fmt.Errorf("--viewport %s is out of range: each side must be %d–%d px", v, viewportMinSide, viewportMaxSide)
+	}
+	return "", &api.PreviewViewport{Width: w, Height: h}, nil
+}
+
+// parseWxH reads "<digits>x<digits>" and nothing else: no sign, no spaces,
+// no units.
+func parseWxH(v string) (w, h int, ok bool) {
+	ws, hs, found := strings.Cut(v, "x")
+	if !found {
+		return 0, 0, false
+	}
+	w, okW := parseSide(ws)
+	h, okH := parseSide(hs)
+	return w, h, okW && okH
+}
+
+func parseSide(s string) (int, bool) {
+	if s == "" || len(s) > 5 {
+		return 0, false
+	}
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n, true
+}
+
+// warnIfViewportNotApplied says so when a WxH was asked for and the harness
+// confirmed a different size — an instance older than explicit sizes ignores
+// the field and renders desktop. An absent echo says nothing either way (the
+// harness confirmed nothing), so it is not a warning.
+func warnIfViewportNotApplied(asked *api.PreviewViewport, echoed string) {
+	if asked == nil || echoed == "" {
+		return
+	}
+	if echoed == fmt.Sprintf("%dx%d", asked.Width, asked.Height) {
+		return
+	}
+	if preset, ok := viewportPresetSizes[echoed]; ok && preset == *asked {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  warning: --viewport %dx%d: this server does not support custom sizes; the frame is %s.\n",
+		asked.Width, asked.Height, displayLine(echoed))
+}
+
+// hintIfStepsRanOutOfBudget prints one line when any step was skipped for
+// budget. No number in it: an older server clamps silently and echoes no
+// applied budget, so any figure named here could be one it would not grant.
+func hintIfStepsRanOutOfBudget(steps []api.PreviewStepResult) {
+	for _, s := range steps {
+		if s.Skipped == "budget" {
+			fmt.Fprintf(os.Stderr, "  hint: a step was skipped because the render budget ran out — raise --timeout, or that step's timeoutMs.\n")
+			return
+		}
+	}
+}
+
 // loadPreviewSteps reads an interaction plan, or returns nil when --steps was
 // not given.
 //
@@ -385,23 +569,35 @@ func loadPreviewSteps(path string) ([]api.PreviewStep, error) {
 		return nil, fmt.Errorf("read the interaction plan: %w", err)
 	}
 	trimmed := bytes.TrimSpace(raw)
+	example := `[{"action": "click", "text": "Refresh"}, {"action": "screenshot"}]`
 	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("%s is empty — an interaction plan is a JSON array of steps, e.g.\n    [{\"action\": \"click\", \"text\": \"Refresh\"}, {\"action\": \"screenshot\"}]", path)
+		return nil, fmt.Errorf("%s is empty — an interaction plan is a JSON array of steps, or {\"steps\": [...]}, e.g.\n    %s", path, example)
 	}
-	// Checked before decoding so the common mistake — a single step object, or a
-	// wrapper like {"steps": [...]} — is named rather than reported as a type
-	// error against a field nobody wrote.
-	if trimmed[0] != '[' {
-		return nil, fmt.Errorf("%s must hold a JSON ARRAY of steps at the top level, e.g.\n    [{\"action\": \"click\", \"text\": \"Refresh\"}, {\"action\": \"screenshot\"}]", path)
+	// Two shapes, one plan. The bare array is what this flag has always read;
+	// the {"steps": [...]} object is the HTTP request body the guide shows,
+	// and a person copying it from there meant exactly the same plan. Checked
+	// before decoding so any other shape is named rather than reported as a
+	// type error against a field nobody wrote.
+	stepsJSON := trimmed
+	switch trimmed[0] {
+	case '[':
+	case '{':
+		inner, err := unwrapStepsObject(path, trimmed)
+		if err != nil {
+			return nil, err
+		}
+		stepsJSON = inner
+	default:
+		return nil, fmt.Errorf("%s must hold a JSON array of steps, or {\"steps\": [...]}, e.g.\n    %s", path, example)
 	}
 
 	var steps []api.PreviewStep
-	dec := json.NewDecoder(bytes.NewReader(trimmed))
-	// Strict, deliberately. The step grammar is four actions and four fields, and
-	// a mistyped key is the failure this catches: decoded leniently, `"selctor"`
-	// becomes a click with no selector, which the harness reports as a step that
-	// could not find its target — i.e. as a fact about the APP. A refusal naming
-	// the key is a better answer than a plausible wrong one.
+	dec := json.NewDecoder(bytes.NewReader(stepsJSON))
+	// Strict, deliberately. The step grammar is four actions and five fields,
+	// and a mistyped key is the failure this catches: decoded leniently,
+	// `"selctor"` becomes a click with no selector, which the harness reports
+	// as a step that could not find its target — i.e. as a fact about the APP.
+	// A refusal naming the key is a better answer than a plausible wrong one.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&steps); err != nil {
 		return nil, fmt.Errorf("read the interaction plan in %s: %w", path, err)
@@ -411,7 +607,7 @@ func loadPreviewSteps(path string) ([]api.PreviewStep, error) {
 	// is strict about keys: for a plan whose steps really execute, a refusal
 	// naming the problem beats running a plausible subset of what was written.
 	if dec.More() {
-		return nil, fmt.Errorf("%s holds more than one JSON value — an interaction plan is a SINGLE array of steps, and everything after the first would have been silently ignored", path)
+		return nil, fmt.Errorf("%s holds more than one JSON value — an interaction plan is a SINGLE array of steps (or one {\"steps\": [...]} object), and everything after the first would have been silently ignored", path)
 	}
 	if len(steps) == 0 {
 		return nil, fmt.Errorf("%s names no steps — drop --steps to render the app without interacting with it", path)

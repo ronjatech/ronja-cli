@@ -386,7 +386,7 @@ func printModuleStatus(r *moduleStatusReport) {
 				fmt.Fprintf(out, "    drafter: %s\n", d.DrafterUserID)
 			}
 			if d.SubmittedForReviewAt != "" {
-				fmt.Fprintf(out, "    submitted for review: %s (an admin commits it)\n", d.SubmittedForReviewAt)
+				fmt.Fprintf(out, "    submitted for review: %s (an admin or a maintainer of the feature commits it)\n", d.SubmittedForReviewAt)
 			}
 		} else if r.Remote.Lifecycle == api.LifecycleLive {
 			fmt.Fprintf(out, "    draft: none (a push would open one)\n")

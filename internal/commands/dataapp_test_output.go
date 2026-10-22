@@ -97,7 +97,7 @@ func resolveAppTestOutDir(named, root string) (appTestOutDir, error) {
 //
 // The warning is about tenant pixels and tenant query results sitting
 // un-ignored in somebody's repository, and it is raised BEFORE a render that
-// can take twenty seconds and then prints a screenful — so on its own it is a
+// can take up to forty seconds and then prints a screenful — so on its own it is a
 // line nobody sees. Repeating it costs one line and lands where the reader is,
 // beside the paths that were just written.
 func (o appTestOutDir) WarnIfNotIgnored() {

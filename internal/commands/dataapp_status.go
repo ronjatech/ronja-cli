@@ -458,7 +458,7 @@ func printAppStatus(r *appStatusReport) {
 				fmt.Fprintf(out, "    compiles:   yes (ready to publish)\n")
 			}
 			if r.Remote.Draft.SubmittedForReviewAt != "" {
-				fmt.Fprintf(out, "    submitted for review: %s (an admin commits it)\n",
+				fmt.Fprintf(out, "    submitted for review: %s (an admin or a maintainer of the feature commits it)\n",
 					r.Remote.Draft.SubmittedForReviewAt)
 			}
 		} else if r.Remote.Lifecycle == api.LifecycleLive {

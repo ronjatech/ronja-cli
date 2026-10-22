@@ -407,6 +407,17 @@ func (f *fakeInstance) serveModuleCommit(w http.ResponseWriter, r *http.Request,
 		http.Error(w, `{"error":"row is not a draft"}`, http.StatusBadRequest)
 		return
 	}
+	// rmodule's commit bar (RequireCommitIn): in a shared feature, an admin or a
+	// maintainer of it. Its refusal is a 400, the status publish reads as the
+	// needs-review case.
+	scoped := draft
+	if parent := m.rows[draft.ParentModuleID]; parent != nil {
+		scoped = parent
+	}
+	if scoped.FeatureScope == scopeOrganization && !f.decides() {
+		http.Error(w, `{"error":"committing a module draft requires the admin role"}`, http.StatusBadRequest)
+		return
+	}
 
 	if draft.ParentModuleID == "" {
 		// The first publish of a brand-new module: it becomes live IN PLACE.

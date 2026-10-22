@@ -2720,8 +2720,8 @@ not obvious enough to lose by accident:
   you. That is **two refusals with two messages**, not one: *no baseline at all*
   is a copy taken from git and the remedy is a fresh `clone`, while *a baseline
   naming another row* is the review path — `publish` on a shared workflow
-  submits the draft and returns without re-anchoring, so once an admin commits
-  it the folder names a draft that is gone and holds files that are usually
+  submits the draft and returns without re-anchoring, so once an admin or a
+  maintainer commits it the folder names a draft that is gone and holds files that are usually
   exactly what went live. Telling that author to re-clone a perfectly good
   folder is what the split exists to stop.
 - **Then the legacy approval gate**, refused with the same wording `test` uses
@@ -3379,7 +3379,7 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   `secret-` / `workflow-` / `agent-` literals, and registers what it finds.
   Neither path is the gate, though. The **actual** enforcement is server-side:
   `ValidateDataAppScope` at checkout and `ValidateAllowlistRefsLive` at publish,
-  plus admin-only commit for a shared app. `ronja.json` declares what the app
+  plus the commit bar for a shared app (an admin or a maintainer of its feature). `ronja.json` declares what the app
   should be allowed; the server decides what it is.
 - **Every file write but the icon's recompiles the whole bundle.** A push of N
   code files is N esbuild compiles and N bundle uploads, so it takes a few
@@ -3561,8 +3561,28 @@ before the first request rather than half-way through a sync.
 ```bash
 ronja app test
 ronja app test --route '#/orders' --viewport mobile --out-dir ./preview
+ronja app test --viewport 1280x2400        # a tall frame, to see below the fold
 ronja app test --steps steps.json          # admin only; the steps really execute
 ```
+
+`--viewport` is `desktop` (1280x800, the default), `mobile` (390x844) or `WxH`,
+each side 240–2560. A preset is sent as `viewportPreset` and a size as
+`viewport`; a malformed or out-of-range size is refused locally. An instance
+older than explicit sizes ignores the field and renders desktop, so when the
+viewport the harness echoes differs from the size you asked for, the CLI warns:
+"this server does not support custom sizes; the frame is desktop". No echo
+confirms nothing either way, and prints nothing.
+
+`--route` reaches the app the way a real deep link does: the hash is in
+`location.hash` from document start and no `hashchange` fires for it, so the app
+must read it at mount.
+
+`--timeout` is the whole render budget, steps included, and the server clamps it
+to 40s. With `--steps` and no `--timeout` the CLI sends 40s, because a step plan
+is carved out of the same budget the page settles in; a plain render keeps 20s.
+A step reported skipped `"budget"` never ran, and the CLI prints one hint: raise
+`--timeout`, or that step's `timeoutMs`. It names no number, since an older
+server clamps lower and says nothing about it.
 
 Renders what is ON THE SERVER (your own open draft when you have one, the same
 substitution `/embed` makes) through `POST /dataapp/:id/preview`, and writes
@@ -3638,10 +3658,33 @@ retrying would add load to the thing it was just told is at capacity.
 narrowly scoped token, `admin:write` on top of the role — and executes for real,
 with the same authority a viewer of the app has: a click runs the app's own code
 and can dispatch workflows and Agents, upload files, and call external systems.
-The plan is a JSON array in a file you name — nothing is ever synthesised — and
-it is decoded **strictly**: a mistyped key decoded leniently becomes a click with
-no selector, which the harness then reports as a fact about the *app*, and a file
-holding two JSON values is refused rather than half-run.
+The plan is a file you name — nothing is ever synthesised — holding either a
+bare JSON array of steps or the HTTP body's `{"steps": [...]}` object. In the
+object form `steps` must be the ONLY key: `route`, `viewportPreset`/`viewport`
+and `timeoutMs` are refused with the flag that carries them (`--route`,
+`--viewport`, `--timeout`), because honouring them would give the file a second
+say over the command line and ignoring a `route` would render a different page
+from the one written down. Both shapes are decoded **strictly**: a mistyped key
+decoded leniently becomes a click with no selector, which the harness then
+reports as a fact about the *app*, and a file holding two JSON values is refused
+rather than half-run.
+
+```json
+[
+  {"action": "click", "selector": "role=tab[name=\"Orders\"]"},
+  {"action": "waitFor", "selector": "#orders-table", "timeoutMs": 8000},
+  {"action": "screenshot", "selector": "#orders-chart"}
+]
+```
+
+`click` and `waitFor` take a `selector` or `text`; `fill` a `selector` (or
+`text`) and a non-empty `value`; `screenshot` nothing (the viewport) or a selector (that
+element, scrolled into view — its own scroller still clips it). A step's
+`timeoutMs` (default 5000, max 10000) is how long it waits for its element.
+⚠️ `text` is Playwright's `text=` engine: a case-insensitive **substring**
+matched against the **first** element in document order, so `"Orders"` can hit
+a heading before the tab. Prefer `#id`, `role=tab[name="…"]`, or `text="…"` for
+an exact match.
 
 `domText` and console message bodies reach `report.json` but are never printed to
 the terminal: they are the app's own rendered content (tenant rows, whatever an
@@ -4569,10 +4612,11 @@ touches checks: they are never on a draft.
 ### Publishing, and why there is no `run`
 
 `publish` decides its route **up front** from the two server facts that decide it
-server-side — the feature's scope and your role, read once for the run — rather
-than by trying a commit and reading the rejection prose. Shared feature +
-non-admin → `request-review`, outcome `submitted_for_review`; otherwise commit,
-outcome `published`. `--no-request-review` turns the review route into an error,
+server-side — the feature's scope, read once for the run, and each draft's
+`canDecide` (an admin, or a maintainer of the feature), read off the draft's own
+GET — rather than by trying a commit and reading the rejection prose. Shared
+feature + `canDecide` false → `request-review`, outcome `submitted_for_review`;
+otherwise commit, outcome `published`. `--no-request-review` turns the review route into an error,
 which is what CI wants when a merge is expected to land directly. A commit
 refused with a **400** on a *shared* feature falls back to a review request (the
 race the up-front read cannot close); a 400 on a private one does not, because a
@@ -5070,7 +5114,7 @@ written.
 | `status` | local changes, remote state, drift |
 | `validate` | check the folder **locally**; nothing is sent |
 | `push` | sync the folder into the module's draft |
-| `publish` | commit the draft, or — for an admin's shared-feature draft — submit it for review. A pending **proposal** is already with the admins, so it is reported rather than sent again |
+| `publish` | commit the draft, or — in a shared feature, for anyone but an admin or a maintainer of it — submit it for review. A pending **proposal** is already with the admins, so it is reported rather than sent again |
 | `discard` | throw the draft away (`--delete-module` for one never published) |
 
 ⚠️ **`publish` on a pending proposal calls nothing.** A shared-feature create
@@ -5237,9 +5281,10 @@ of sending a request that would be refused.
 
 ### Publishing says what it did not change
 
-A shared-feature module's commit is admin-only — a module edit fans out to every
-workflow that imports it, so it gets at least the review a single workflow edit
-gets — and a non-admin's `publish` submits the draft for review and *says so*.
+A shared-feature module's commit takes an admin or a maintainer of the feature —
+a module edit fans out to every workflow that imports it, so it gets at least the
+review a single workflow edit gets. `publish` attempts the commit and, when the
+server refuses it with a 400, submits the draft for review and *says so*.
 Reporting "published" there is the kind of lie people discover a week later,
 after republishing three consumers against a version that does not exist.
 
@@ -5869,8 +5914,8 @@ the verdict is unchanged, and there is deliberately no "run `ronja app push` to
 see them" hint: after apply the folder is up to date, so a re-push writes
 nothing and prints nothing.
 
-**It publishes with `--no-request-review`.** `publishRouting` sends a non-admin
-caller on a shared feature to `request-review`, and `runPipelinePublish` counts
+**It publishes with `--no-request-review`.** `publishRouting` sends a caller who
+may not commit a shared feature's draft (`canDecide` false) to `request-review`, and `runPipelinePublish` counts
 only `refused`/`conflict` as failed — so `submitted_for_review` returns a nil
 error and reads as success. A naive apply from a CI credential would file one
 review request per folder and exit 0 saying "published". Apply fails instead, and
