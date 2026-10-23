@@ -73,7 +73,7 @@ production without either overwriting the other's binding.`,
 	mod.AddCommand(
 		newModuleInitCmd(), newModuleCloneCmd(), newModuleStatusCmd(),
 		newModuleValidateCmd(), newModulePushCmd(), newModulePublishCmd(),
-		newModuleDiscardCmd(),
+		newModuleDiscardCmd(), newPullCmd(wfdir.ModuleKind),
 	)
 	addStackFlag(mod)
 	return mod
@@ -338,5 +338,5 @@ func refreshModuleBaselineFromLive(ctx context.Context, client *api.Client, f *f
 	if anchor != anchorOnLive {
 		return nil
 	}
-	return reanchorOnLive(ctx, moduleHeadReader(client), f, liveID)
+	return reanchorTitleAndHead(ctx, moduleHeadReader(client), f, liveID, live.Title)
 }

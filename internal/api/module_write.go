@@ -38,6 +38,10 @@ type CreateModuleInput struct {
 	Name        string `json:"name"`
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
+	// Managed is the repository address this create claims, in the create's own
+	// transaction (backend resource/rmanaged). Nil — no key — for a folder that
+	// has no folder id, which is every create a legacy folder makes.
+	Managed *ManagedClaimInput `json:"managed,omitempty"`
 }
 
 // ModulePatch is the body of PUT /module/:id, mirroring the subset of

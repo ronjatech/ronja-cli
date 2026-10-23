@@ -103,6 +103,27 @@ const (
 	// and the distinction is the point rather than an omission — see
 	// markerlessKinds.
 	KindNote = "note"
+	// KindDataApp, KindMCPServer and KindFeature are the three reference kinds
+	// an automation's `references` carries beyond the ones a marker resolves.
+	// Marker-less like `note`: an automation names them in a structured field
+	// the CLI resolves before sending, so no source grammar is involved.
+	//
+	// KindDataApp is also what an ADDRESS dependency on an app folder declares
+	// (see wfdir.Dependency.From), so an automation referencing an app the same
+	// repository manages names it by address rather than by id.
+	KindDataApp   = "dataapp"
+	KindMCPServer = "mcpserver"
+	KindFeature   = "feature"
+	// KindFolder is a FOLDER WRITE SCOPE: a path in the organization's file
+	// system that a workflow writes files into (`{{ file('/exports',
+	// 'write') }}`, `tools.saveFile(…, folder='/exports')`). Marker-less, and
+	// unlike every other kind it names a PATH rather than a row, so it is only
+	// ever declared as a write-capable data source ("write": true) whose per-stack
+	// bind is that path: a folder is owned by no feature, every deployment in the
+	// organization shares it, and the write gate admits a write into it only for
+	// a stack that binds it on purpose. Nothing resolves through it — the code
+	// keeps the path it was written with.
+	KindFolder = "folder"
 )
 
 // markerlessKinds are the dependency kinds an alias may declare that NO source
@@ -135,7 +156,17 @@ const (
 // now, which is exactly why it is worth naming the moment they stop.
 //
 // ⚠️ A kind here is NOT in IDPrefixes() — see the note there.
-var markerlessKinds = []string{KindNote}
+var markerlessKinds = []string{KindNote, KindDataApp, KindMCPServer, KindFeature, KindFolder}
+
+// pathKinds are the dependency kinds whose value is a PATH rather than a row
+// id, so they have no id prefix and IsResourceID answers false for every value.
+// That is safe only because nothing resolves through one: a folder dependency
+// is declared as a write scope and its bind is read by the write gate alone,
+// never substituted into source or sent as an id.
+var pathKinds = map[string]bool{KindFolder: true}
+
+// IsPathKind reports whether a kind's value is a path rather than an id.
+func IsPathKind(kind string) bool { return pathKinds[kind] }
 
 // Family is one alias-eligible marker family: the verb it is spelled with, the
 // dependency kind its first argument names, and how many quoted arguments it
@@ -283,6 +314,13 @@ var idPrefixes = map[string][]string{
 	KindWorkflow: {"workflow-"},
 	KindModule:   {"module-"},
 	KindNote:     {"note-", "skill-"},
+	// rscheduledjob.ValidateReferenceKind: "kind=dataapp requires a data_app-
+	// prefix", "kind=mcpserver requires a mcpsrv- prefix", "kind=feature
+	// requires a collection- or col- prefix" (rrn.IsFeature: `col-` is the
+	// legacy prefix, still carried by existing rows).
+	KindDataApp:   {"data_app-"},
+	KindMCPServer: {"mcpsrv-"},
+	KindFeature:   {"collection-", "col-"},
 }
 
 // IsResourceID reports whether arg already names a row of that kind, and is
@@ -454,9 +492,17 @@ func Scan(content string) []Occurrence {
 // two-arity family — a secret's field name, and nothing else today — is never
 // passed and never substituted.
 func Rewrite(content string, sub func(Occurrence) (string, error)) (string, error) {
+	return splice(content, scan(content), sub)
+}
+
+// splice is the one substitution loop Rewrite and RewriteWrites share: each
+// occurrence's first argument becomes what sub returns for it, an unchanged one
+// is not spliced at all, and a source with nothing substituted comes back as
+// the caller's own string — the no-op is a no-op by construction.
+func splice(content string, occurrences []Occurrence, sub func(Occurrence) (string, error)) (string, error) {
 	var b strings.Builder
 	last := 0
-	for _, o := range scan(content) {
+	for _, o := range occurrences {
 		replacement, err := sub(o)
 		if err != nil {
 			return "", err

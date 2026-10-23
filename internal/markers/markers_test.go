@@ -228,11 +228,12 @@ func TestIsResourceID(t *testing.T) {
 // beside them by hand.
 func TestKindsMatchTheFamilyTable(t *testing.T) {
 	got := strings.Join(Kinds(), ",")
-	if want := "agent,codex,mailbox,module,note,secret,table,workflow"; got != want {
+	if want := "agent,codex,dataapp,feature,folder,mailbox,mcpserver,module,note,secret,table,workflow"; got != want {
 		t.Errorf("Kinds() = %s, want %s", got, want)
 	}
 	for _, kind := range Kinds() {
-		if len(idPrefixes[kind]) == 0 {
+		// A PATH kind (a folder write scope) has no id at all; see pathKinds.
+		if len(idPrefixes[kind]) == 0 && !IsPathKind(kind) {
 			t.Errorf("kind %q has no id prefix — IsResourceID would read every id of that kind as an alias", kind)
 		}
 	}
@@ -263,7 +264,7 @@ func TestMarkerKindsPartitionKinds(t *testing.T) {
 	if got := strings.Join(MarkerKinds(), ","); got != "agent,codex,mailbox,module,secret,table,workflow" {
 		t.Errorf("MarkerKinds() = %s", got)
 	}
-	if got := strings.Join(MarkerlessKinds(), ","); got != "note" {
+	if got := strings.Join(MarkerlessKinds(), ","); got != "dataapp,feature,folder,mcpserver,note" {
 		t.Errorf("MarkerlessKinds() = %s", got)
 	}
 	seen := map[string]int{}
@@ -306,7 +307,7 @@ func TestMarkerlessKindsHaveNoPattern(t *testing.T) {
 				t.Errorf("%q is declared marker-less but the %s family claims it — one of the two is wrong", kind, f.Family)
 			}
 		}
-		if len(idPrefixes[kind]) == 0 {
+		if len(idPrefixes[kind]) == 0 && !IsPathKind(kind) {
 			t.Errorf("marker-less kind %q has no id prefix, so nothing can tell one of its ids from an alias", kind)
 		}
 	}
@@ -333,7 +334,7 @@ func TestIDPrefixesExcludesMarkerlessKinds(t *testing.T) {
 	// The kinds that DO have a marker are all still there; the exclusion must
 	// not have been applied to the wrong side of the list.
 	for kind, prefixes := range idPrefixes {
-		if kind == KindNote {
+		if slices.Contains(markerlessKinds, kind) {
 			continue
 		}
 		for _, want := range prefixes {
@@ -384,5 +385,24 @@ func TestScanReadsBothQuoteAlternatives(t *testing.T) {
 				t.Errorf("Rewrite(%q) = %q, want the argument replaced whole", c.content, out)
 			}
 		})
+	}
+}
+
+// JavaScript keeps every marker inside a string literal, in either quote style
+// around the marker's own quotes. The whole-text scan reads a .js file exactly
+// as it reads Python — it is advisory; the server decides on esbuild's view.
+func TestScanFindsMarkersInsideJavaScriptStrings(t *testing.T) {
+	src := "export async function main(params, env) {\n" +
+		"  const rows = await env.tables.query(`SELECT * FROM {{ ref('orders') }}`)\n" +
+		"  const db = env.db(\"{{ secret('secret-1') }}\")\n" +
+		"  const key = env.secrets.get('{{ secret(\"acme_api\") }}', 'token')\n" +
+		"  await env.tables.append(\"{{ write('table-out') }}\", rows.rows)\n" +
+		"}\n"
+	var got []string
+	for _, o := range Scan(src) {
+		got = append(got, o.Family.Verb+":"+o.Arg)
+	}
+	if want := []string{"ref:orders", "secret:secret-1", "secret:acme_api"}; !slices.Equal(got, want) {
+		t.Errorf("Scan = %v, want %v", got, want)
 	}
 }

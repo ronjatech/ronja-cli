@@ -34,6 +34,10 @@ import (
 //     commit — a fake that modelled one would let a CLI that invented a
 //     lifecycle pass.
 type fakeAutomationInstance struct {
+	// managed is the server-side state behind an adopted folder
+	// (managed_harness_test.go).
+	managed *fakeManaged
+
 	t  *testing.T
 	mu sync.Mutex
 
@@ -59,6 +63,12 @@ type fakeAutomationInstance struct {
 	// error — the non-transactional shape §5.4 is about, where the schedule lands
 	// and the references do not.
 	halfApply map[string]bool
+	// afterGet, when set, runs once (f.mu held) after the next GET of one
+	// automation has answered — an edit made in the web app between a read and
+	// the request that follows it.
+	afterGet func(f *fakeAutomationInstance, id string)
+	// afterList is afterGet for the next listing of a feature's automations.
+	afterList func(f *fakeAutomationInstance)
 
 	// --- what the fake was asked to do ---------------------------------------
 	created  []api.CreateAutomationInput
@@ -89,9 +99,24 @@ func newFakeAutomationInstance(t *testing.T) *fakeAutomationInstance {
 		halfApply:      map[string]bool{},
 		privilegeLevel: 50,
 	}
+	f.managed = newFakeManaged(t, f.probeRow)
+	f.managed.setRowFeature = func(_, id, feature string) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.rows[id].FeatureID = feature
+	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
+}
+
+// probeRow is the automation fake's half of fakeManaged. An automation has no
+// draft: every row is a live root.
+func (f *fakeAutomationInstance) probeRow(kind, id string) fakeRowFacts {
+	if row := f.rows[id]; kind == "automation" && row != nil {
+		return fakeRowFacts{Exists: true, FeatureID: row.FeatureID, Root: true, Name: row.Name, Lifecycle: "live"}
+	}
+	return fakeRowFacts{}
 }
 
 func (f *fakeAutomationInstance) URL() string { return f.server.URL }
@@ -172,6 +197,9 @@ func (f *fakeAutomationInstance) serve(w http.ResponseWriter, r *http.Request) {
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
 	f.mu.Unlock()
 
+	if f.managed.serve(w, r) {
+		return
+	}
 	if r.URL.Path == "/api/v2/authentication/me" {
 		if f.failMe != 0 {
 			http.Error(w, `{"error":"no"}`, f.failMe)
@@ -227,6 +255,10 @@ func (f *fakeAutomationInstance) serveList(w http.ResponseWriter, r *http.Reques
 		total = f.totalOverride
 	}
 	writeJSON(w, map[string]any{"token": "", "total": total, "result": result})
+	if after := f.afterList; after != nil {
+		f.afterList = nil
+		after(f)
+	}
 }
 
 func (f *fakeAutomationInstance) serveGet(w http.ResponseWriter, id string) {
@@ -239,7 +271,15 @@ func (f *fakeAutomationInstance) serveGet(w http.ResponseWriter, id string) {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}
-	writeJSON(w, f.view(row))
+	// GET :jobID carries `managedBy` (backend/api/v2/workspace/
+	// api_scheduled_jobs.go, the single-row GET).
+	view := f.view(row)
+	view.ManagedBy = f.managed.managedBy("automation", row.ID, "")
+	writeJSON(w, view)
+	if after := f.afterGet; after != nil {
+		f.afterGet = nil
+		after(f, id)
+	}
 }
 
 func (f *fakeAutomationInstance) serveCreate(w http.ResponseWriter, r *http.Request) {
@@ -305,6 +345,13 @@ func (f *fakeAutomationInstance) serveCreate(w http.ResponseWriter, r *http.Requ
 	}
 	row.Normalize()
 	f.rows[row.ID] = row
+	// The claim, in Create's transaction (rscheduledjob.Create +
+	// rmanaged.ClaimCreatedTx): a refused claim rolls the create back.
+	if status, body := f.managed.createClaim("automation", in.FeatureID, row.ID, in.Managed); status != 0 {
+		delete(f.rows, row.ID)
+		writeCreateRefusal(w, status, body)
+		return
+	}
 	writeJSON(w, f.view(row))
 }
 

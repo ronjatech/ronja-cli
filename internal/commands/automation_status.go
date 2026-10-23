@@ -94,6 +94,8 @@ func automationStatusReportAt(ctx context.Context, root string, resolved *config
 	}
 	// Reported, never refused — see folder.noteAliases.
 	f.noteAliases()
+	// The address declarations, in memory only — see pipelineStatusReportAt.
+	addresses, addressErr := f.resolveAddresses()
 
 	report := &automationStatusReport{
 		Root:        f.Root,
@@ -124,6 +126,11 @@ func automationStatusReportAt(ctx context.Context, root string, resolved *config
 		}
 	}
 	report.Orphans = automationOrphans(f.Binding, local)
+	if addressErr != nil {
+		report.AddressProblem = addressErr.Error()
+	} else {
+		report.Moved, report.Removed = addresses.Moves, addresses.Removals
+	}
 
 	report.Remote = automationRemoteStatus(ctx, resolved, f, parsed, local)
 	return report, nil
@@ -156,8 +163,14 @@ type automationStatusReport struct {
 	// Orphans are paths this folder's lock still binds and the folder no longer
 	// holds. A push REFUSES on these unless --prune is given, because a bad
 	// rebase must not silently stop a live automation.
-	Orphans []string                `json:"orphans,omitempty"`
-	Remote  *automationRemoteReport `json:"remote"`
+	Orphans []string `json:"orphans,omitempty"`
+	// Moved, Removed and AddressProblem are pipelineStatusReport's: what this
+	// folder's `moved` / `removed` would do to this stack, pending until a push
+	// writes it, or why they cannot be applied as they stand.
+	Moved          []addressMove           `json:"moved,omitempty"`
+	Removed        []addressRemoval        `json:"removed,omitempty"`
+	AddressProblem string                  `json:"addressProblem,omitempty"`
+	Remote         *automationRemoteReport `json:"remote"`
 }
 
 type automationFileProblem struct {
@@ -337,7 +350,7 @@ func automationRemoteStatus(ctx context.Context, resolved *config.Resolved, f *f
 		// report every aliased reference as a change on every run, which is the
 		// permanent-drift failure the codec exists to prevent.
 		resolvedFile := *file
-		if err := resolveAutomationRefs(&resolvedFile, f.Codec, f.Stack); err != nil {
+		if err := resolveAutomationRefs(&resolvedFile, f.Codec, f.Stack, f.Binding.FeatureID); err != nil {
 			report.Problem = fmt.Sprintf("this file's references do not resolve, so nothing here says what a push would change:\n    %v", err)
 			out.Automations = append(out.Automations, report)
 			continue
@@ -347,7 +360,7 @@ func automationRemoteStatus(ctx context.Context, resolved *config.Resolved, f *f
 			out.Automations = append(out.Automations, report)
 			continue
 		}
-		report.Changes, _ = automationDelta(automationNameFor(path), &resolvedFile, row)
+		report.Changes, _ = automationDelta(&resolvedFile, row)
 		out.Automations = append(out.Automations, report)
 	}
 
@@ -419,15 +432,17 @@ func printAutomationStatus(r *automationStatusReport) {
 		fmt.Fprintf(out, "    creates  %s\n", path)
 	}
 	for _, path := range r.Orphans {
-		fmt.Fprintf(out, "    orphan   %s — bound to an automation and gone from this folder; a push refuses until it is back or --prune is given\n", path)
+		fmt.Fprintf(out, "    orphan   %s — bound to an automation and gone from this folder; a push refuses until it is back, a \"moved\" or \"removed\" entry in %s says what happened, or --prune deletes it\n", path, wfdir.ManifestName)
 	}
+	printAddressStatus(out, r.Moved, r.Removed, nil, r.AddressProblem)
 	for _, p := range r.Problems {
 		fmt.Fprintf(out, "    refused  %s — %s\n", p.Path, p.Problem)
 	}
 	for _, s := range r.Skipped {
 		fmt.Fprintf(out, "    skipped  %s — %s\n", s.Path, s.Reason)
 	}
-	if len(r.WillCreate) == 0 && len(r.Orphans) == 0 && len(r.Problems) == 0 && len(r.Skipped) == 0 {
+	if len(r.WillCreate) == 0 && len(r.Orphans) == 0 && len(r.Problems) == 0 && len(r.Skipped) == 0 &&
+		len(r.Moved) == 0 && len(r.Removed) == 0 && r.AddressProblem == "" {
 		fmt.Fprintf(out, "    every file is bound to an automation\n")
 	}
 

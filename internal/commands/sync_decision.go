@@ -89,15 +89,34 @@ const (
 	// fires over the WHOLE folder rather than the pushed subset.
 	syncReasonCyclicDependency = "cyclic_dependency"
 	// syncReasonOrphanedFile — a file bound to a live row is gone from the
-	// folder. The push refuses rather than deleting, and apply never passes
-	// --prune, so for a tree command it is simply never-green.
+	// folder, and no `moved` or `removed` entry in ronja.json says what happened
+	// to it: rename detection. For tables, metrics and automations alike. Apply
+	// never infers a rename or a delete from a missing file, so for a tree
+	// command it is never-green until one of the two is declared.
 	syncReasonOrphanedFile = "orphaned_file"
+	// syncReasonAddressConflict — the folder's `moved` / `removed` declarations
+	// cannot be applied to this stack as they stand: a moved-from file still on
+	// disk, a removed file still on disk, both ends of a move already bound, or
+	// `moved` in a manifest that does not declare the format version that means
+	// it. See folder.resolveAddresses.
+	syncReasonAddressConflict = "address_conflict"
 	// syncReasonMissingEntrypoint — the manifest names an entrypoint the folder
 	// does not hold, which is what a renamed .py (or App.tsx) with an unedited
 	// ronja.json looks like. A WHOLE-FOLDER refusal both draft kinds make before
 	// their first byte, and one no create-vs-update answer can reach: the folder
-	// is bound, so its only decision is `update`.
+	// is bound, so its only decision is `update`. A module folder without its
+	// __init__.py is the same refusal: that file is what makes the folder a
+	// package, the module's counterpart of an entrypoint, and its push leads
+	// with it for the same reason.
 	syncReasonMissingEntrypoint = "missing_entrypoint"
+	// syncReasonModuleMarker — a module file carries a Ronja marker, which the
+	// server refuses at save: modules are marker-free. `module push` refuses it
+	// before its first byte (refuseModuleMarkers), so a preview must too.
+	syncReasonModuleMarker = "module_marker"
+	// syncReasonNoModuleName — a module folder with nothing bound would CREATE a
+	// module, and its manifest declares no package name to create it under. The
+	// create's own local refusal (moduleNoNameError), as a decision.
+	syncReasonNoModuleName = "no_module_name"
 	// syncReasonNoFeature is sync_edges.go's, reused verbatim: "this folder
 	// names no feature" is the same fact whether a validate needs one or a
 	// create does.
@@ -110,22 +129,27 @@ const (
 // applyAction is what a push would DO to one creation unit, decided from the
 // manifest, the lock and the files on disk with no request.
 //
-// ⚠️ There is deliberately no `no-op`. It is local for a PIPELINE file (the
-// committed SQL against the lock's fingerprint) and NOT local for a workflow or
-// a data app, whose files are compared against a listing of the caller's own
-// draft. A uniform `no-op` would be a promise only one kind could keep, and the
-// one thing worse than a dry-run that says less than it knows is one that says
-// more.
+// ⚠️ The decision has no `no-op`: it is made locally, and whether a bound row
+// already holds the folder is a read. A DRY RUN makes that read — through the
+// same comparison apply makes (liveHoldsFolder for a workflow, data-app or
+// module folder; each push's own skip for a pipeline or automation file, see
+// sync_apply_dryrun.go) — and reports such a unit as applyActionUnchanged;
+// nothing else does, and apply never acts on it.
 type applyAction string
 
 const (
 	// applyActionCreate — nothing is bound here, so a push MAKES a row. This is
 	// the action a create gate counts, and it is counted per creation unit: per
-	// FILE for a pipeline and an automation, per FOLDER for a workflow and a
-	// data app.
+	// FILE for a pipeline and an automation, per FOLDER for a workflow, a data
+	// app and a module.
 	applyActionCreate applyAction = "create"
 	// applyActionUpdate — a row is bound and a push writes to it.
 	applyActionUpdate applyAction = "update"
+	// applyActionUnchanged — a DRY RUN's answer for an update apply would send
+	// nothing for, as read when the dry run ran: a workflow, data app or module
+	// whose live row already holds the folder, or a pipeline or automation file
+	// whose push would skip it.
+	applyActionUnchanged applyAction = "unchanged"
 	// applyActionUnanchored — a row is bound, and the folder has no anchor to
 	// compare it against.
 	//
@@ -149,6 +173,14 @@ const (
 	// applyActionRefuse — a push cannot proceed on this unit, and Reason says
 	// why in the tree commands' vocabulary.
 	applyActionRefuse applyAction = "refuse"
+	// applyActionMove and applyActionRemove are the units a folder's ADDRESS
+	// declarations produce: an address re-keyed by a `moved` entry, and one a
+	// `removed` entry stops managing. Neither writes to a row — a move changes
+	// only the lock's key, and a removal deletes nothing — so neither is ever a
+	// create a gate counts. They are listed beside the units, not decided like
+	// them; see folder.resolveAddresses.
+	applyActionMove   applyAction = "move"
+	applyActionRemove applyAction = "remove"
 )
 
 // applyDecision is what a push would attempt for ONE CREATION UNIT.
@@ -161,7 +193,8 @@ const (
 // in a live organization from a run that promised to create nothing.
 type applyDecision struct {
 	// Path is the folder-relative file this decision is about, and is EMPTY for
-	// a workflow or a data app, whose creation unit is the folder itself.
+	// a workflow, a data app or a module, whose creation unit is the folder
+	// itself.
 	Path string
 	// ID is the row already bound to this unit, empty for a create.
 	ID string
@@ -276,9 +309,26 @@ func describeKeyForApply(key wfdir.InstanceKey) string {
 // loops pass nil by hand, so this is the same call all four loops were already
 // making.
 func decideApplyBind(f *folder, files map[string]string) (report aliasReport, reason, detail string) {
+	if f.Kind.Name == wfdir.KindModule {
+		// The one loop that runs no alias pre-flight: a module is marker-free, so
+		// a `dependencies` block there resolves nothing and `module push` never
+		// reads it. Refusing it as unresolved_bind would be a refusal the push
+		// does not make — and `ronja bind`, the remedy, refuses a module folder.
+		// Said as the same note `module status` gives, and nothing more.
+		if note := moduleInertDependenciesNote(f.Manifest); note != "" {
+			report.Warnings = append(report.Warnings, note)
+		}
+		return report, "", ""
+	}
 	report = checkAliases(f.Manifest, f.selection(), f.Codec, files,
 		folderStems(f.Kind, files), folderFieldRefs(f.Kind, f.Root, files))
 	if err := report.err(); err != nil {
+		// An unresolved ADDRESS is its own outcome — "apply that folder first"
+		// or "the two stacks point at different targets" — not a missing bind,
+		// so a folder whose only refusals are address ones reports that reason.
+		if len(report.Address) > 0 && len(report.Address) == len(report.Refusals) {
+			return report, report.Address[0].Reason, err.Error()
+		}
 		return report, syncReasonUnresolvedBind, err.Error()
 	}
 	return report, "", ""
@@ -314,6 +364,20 @@ func decideApplyBind(f *folder, files map[string]string) (report aliasReport, re
 func decideApplyPushPreflight(f *folder, files map[string]string) (reason, detail string) {
 	switch f.Kind.Name {
 	case wfdir.KindPipeline:
+		// RENAME DETECTION, first: a table or metric this stack binds whose file
+		// is gone, with no `moved` or `removed` declaring what happened. The
+		// single-folder push only NOTES it (the classic pattern); a tree apply
+		// refuses, because the two things it could do instead — create the new
+		// file's row beside the old one, or carry on and leave the old one
+		// orphaned — are exactly what an address declaration exists to prevent.
+		// After resolveAddresses, so a declared move is never reported.
+		gone, err := f.goneAddresses()
+		if err != nil {
+			return syncReasonUnreadable, err.Error()
+		}
+		if len(gone) > 0 {
+			return syncReasonOrphanedFile, goneRefusal(gone)
+		}
 		// The order is runPipelinePush's: the cycle over the WHOLE folder, then
 		// the positional refs over what is actually being SENT — a positional ref
 		// in a file this run would not push cannot mis-resolve anything, and
@@ -337,8 +401,12 @@ func decideApplyPushPreflight(f *folder, files map[string]string) (reason, detai
 	case wfdir.KindAutomation:
 		// A file that left the folder is not an automation a push deletes, and
 		// apply never passes --prune, so this is always the refusal.
-		if orphans := automationOrphans(f.Binding, files); len(orphans) > 0 {
-			return syncReasonOrphanedFile, automationOrphanError(orphans).Error()
+		gone, err := f.goneAddresses()
+		if err != nil {
+			return syncReasonUnreadable, err.Error()
+		}
+		if len(gone) > 0 {
+			return syncReasonOrphanedFile, automationOrphanError(gone).Error()
 		}
 		// Step 5, which is NOT step 4's create refusal: a folder that creates
 		// nothing can be bound and featureless at once, and the loop refuses it
@@ -349,6 +417,16 @@ func decideApplyPushPreflight(f *folder, files map[string]string) (reason, detai
 	case wfdir.KindDataApp:
 		if err := refuseMissingAppEntrypoint(f, files); err != nil {
 			return syncReasonMissingEntrypoint, err.Error()
+		}
+	case wfdir.KindModule:
+		// runModulePush's two whole-folder local guards, in its order, by its
+		// own functions. Without this arm a module folder fell to the workflow
+		// one below and was refused for lacking a `main.py` it never declared.
+		if err := refuseMissingModuleInit(f, files); err != nil {
+			return syncReasonMissingEntrypoint, err.Error()
+		}
+		if err := refuseModuleMarkers(files); err != nil {
+			return syncReasonModuleMarker, err.Error()
 		}
 	default:
 		// The workflow kind. Its own whole-folder guard, and the one a folder-grain
@@ -366,8 +444,8 @@ func decideApplyPushPreflight(f *folder, files map[string]string) (reason, detai
 // applyDecisionsFor yields one decision per creation unit in one folder.
 //
 // paths are the folder-relative files a push is acting on, in the order it will
-// act on them; they are IGNORED for a workflow and a data app, which have one
-// creation unit each however many files they hold.
+// act on them; they are IGNORED for a workflow, a data app and a module, which
+// have one creation unit each however many files they hold.
 func applyDecisionsFor(f *folder, paths []string) []applyDecision {
 	switch f.Kind.Name {
 	case wfdir.KindPipeline:
@@ -384,6 +462,11 @@ func applyDecisionsFor(f *folder, paths []string) []applyDecision {
 		return out
 	case wfdir.KindDataApp:
 		return []applyDecision{appApplyDecision(f)}
+	case wfdir.KindModule:
+		// One creation unit, like the other two draft kinds — and its own arm:
+		// the workflow decision below would read Binding.WorkflowID, which a
+		// module folder never sets, and call every bound module a create.
+		return []applyDecision{moduleApplyDecision(f)}
 	default:
 		return []applyDecision{workflowApplyDecision(f)}
 	}
@@ -399,6 +482,61 @@ func pipelineApplyDecision(f *folder, path string) applyDecision {
 	d.Action, d.noRow = applyActionCreate, true
 	if f.Binding.FeatureID == "" {
 		return refusedDecision(d, syncReasonNoFeature, pipelineNoFeatureError(f, path))
+	}
+	return d
+}
+
+// pipelineMetricDecisions is the METRIC half of a pipeline folder's creation
+// units: one decision per `metrics/<stem>.json` file, beside the .sql files'
+// own.
+//
+// ⚠️ A METRIC IS A ROW A PUSH CAN CREATE, and leaving it out of the units was a
+// hole in the one property `sync apply` is built around: the units used to come
+// from the .sql files alone, the metric pass ran later in the same push, and
+// nothing on that path asked the create gate — so an apply without
+// --allow-create created metrics, never listed them in the dry-run and never
+// counted them. The identity is resolveMetricIdentities' answer, which is the
+// same one pushOneMetric acts on, so a unit this calls `update` is one the push
+// updates and one it calls `create` is one the push would create.
+//
+// A file the push would REFUSE as it stands (it does not parse, it is a
+// directory) contributes no unit: it creates nothing, and the refusal is the
+// push's own, per file, exactly as an unparseable automation declaration is
+// left to its loop — see decideApplyPushPreflight on what stays outside it.
+//
+// It is apply's alone, and deliberately not folded into applyDecisionsFor:
+// runPipelinePush reads that for its .sql files and refuses on the first unit
+// it cannot create, and a classic single-folder push of a featureless folder
+// must keep reporting its metrics exactly as it did.
+func pipelineMetricDecisions(f *folder) ([]applyDecision, error) {
+	files, err := readMetricFiles(f.Root)
+	if err != nil {
+		return nil, err
+	}
+	files = resolveMetricIdentities(f, f.live(f.State.For(f.Key)), files)
+	out := make([]applyDecision, 0, len(files))
+	for _, file := range files {
+		if file.Problem != "" {
+			continue
+		}
+		out = append(out, pipelineMetricApplyDecision(f, file))
+	}
+	return out, nil
+}
+
+// pipelineMetricApplyDecision is one metric file's answer, on the .sql file's
+// terms: a bound id is an update, no id is a create, and a create with no
+// feature to land in is refused.
+func pipelineMetricApplyDecision(f *folder, file pipelineMetricFile) applyDecision {
+	d := applyDecision{Path: file.Path, ID: file.MetricID}
+	if d.ID != "" {
+		d.Action = applyActionUpdate
+		return d
+	}
+	d.Action, d.noRow = applyActionCreate, true
+	if f.Binding.FeatureID == "" {
+		return refusedDecision(d, syncReasonNoFeature, fmt.Errorf("%s has no metric yet and this folder names no feature, so there is nowhere to create one.\n  %s, or start from `ronja pipeline init --feature <id>` or `ronja pipeline clone <feature-id>`",
+			file.Path, f.featureAdvice()))
 	}
 	return d
 }
@@ -499,6 +637,27 @@ func appApplyDecision(f *folder) applyDecision {
 	d.Action, d.noRow = applyActionCreate, true
 	if f.Binding.FeatureID == "" {
 		return refusedDecision(d, syncReasonNoFeature, appNoFeatureError(f))
+	}
+	return d
+}
+
+// moduleApplyDecision is a module folder's answer: one creation unit, forked on
+// Binding.ModuleID — the value inspectModuleTarget branches on. A create needs
+// a feature (moduleFeatureIDFor's own refusal, asked for rather than copied)
+// and a package name (resolveModulePushTarget's), both local.
+func moduleApplyDecision(f *folder) applyDecision {
+	d := applyDecision{ID: f.Binding.ModuleID}
+	if d.ID != "" {
+		d.Action = applyActionUpdate
+		return d
+	}
+	d.Action, d.noRow = applyActionCreate, true
+	if f.Binding.FeatureID == "" {
+		_, err := moduleFeatureIDFor(f, nil)
+		return refusedDecision(d, syncReasonNoFeature, err)
+	}
+	if err := moduleNoNameError(f); err != nil {
+		return refusedDecision(d, syncReasonNoModuleName, err)
 	}
 	return d
 }

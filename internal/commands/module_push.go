@@ -59,7 +59,7 @@ Publishing is a separate step:
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.ModuleKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.ModuleKind)
 			if err != nil {
 				return err
 			}
@@ -67,7 +67,9 @@ Publishing is a separate step:
 			// The report is emitted even on failure: a push that stopped halfway
 			// has already written files, and "which ones" is the first thing
 			// anyone needs to know.
+			printManagedNotices(f.notices)
 			if result != nil {
+				result.ManagedInGit = f.notices
 				if flagJSON {
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
@@ -86,6 +88,13 @@ Publishing is a separate step:
 
 type modulePushOptions struct {
 	Force bool
+	// LiveFirst is pushOptions.LiveFirst for a module: compare the folder
+	// against the LIVE module before anything is checked out, and when the live
+	// module already holds it — files, package name and title — return UpToDate
+	// having written nothing: no checkout, no file write, no metadata patch.
+	// `sync apply` sets it and nothing else does; a single-folder `module push`
+	// still checks a draft out. See moduleNothingLiveHolds.
+	LiveFirst bool
 }
 
 // modulePushResult is the --json shape and the human renderer's input, so the
@@ -113,6 +122,11 @@ type modulePushResult struct {
 	// UpToDate reports a push that had nothing to do: the folder, the draft and
 	// the baseline already agree, so not one byte was written.
 	UpToDate bool `json:"upToDate"`
+	// DraftPreexisted is pushResult.DraftPreexisted for a module — `sync
+	// apply`'s half of the up-to-date question, out of the --json payload for
+	// the same reason. Under LiveFirst an up-to-date push carrying it names a
+	// draft (or an unpublished module) holding what live does not.
+	DraftPreexisted bool `json:"-"`
 	// DraftUnderReview reports that the draft written to has already been
 	// submitted for admin review — the push changed what someone is reviewing.
 	DraftUnderReview bool `json:"draftUnderReview"`
@@ -142,6 +156,9 @@ type modulePushResult struct {
 	// Target names the instance and organization this push landed in, so a
 	// mistake is visible where it happens rather than only from a later status.
 	Target string `json:"target,omitempty"`
+	// ManagedInGit is the module's `managedBy`, when a repository folder other
+	// than this one deploys it (managed_notice.go).
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 // runModulePush is the whole state machine, kept out of the cobra closure so it
@@ -150,6 +167,16 @@ type modulePushResult struct {
 // It returns (result, err): a non-nil result with a non-nil error is the
 // partial-push case, and both halves matter.
 func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*modulePushResult, error) {
+	result, err := runModulePushOnce(ctx, f, opts)
+	if adoptedOnCreate(err) {
+		// See runPush: the create adopted the row that won this address, and the
+		// push runs once more as the update it now is.
+		return runModulePushOnce(ctx, f, opts)
+	}
+	return result, err
+}
+
+func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (*modulePushResult, error) {
 	client := newClient(f.Resolved.URL, f.Resolved.Token)
 	result := &modulePushResult{
 		ModuleID: f.Binding.ModuleID,
@@ -172,9 +199,8 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 	// it the reconcile below would try to DELETE the server's seeded copy, which
 	// the server refuses — so the push would create the module and then fail on
 	// a deletion the author never asked for, leaving a row nobody meant to make.
-	if _, ok := local[moduleInitFile]; !ok {
-		return nil, fmt.Errorf("this folder has no %s, and a module is a Python package — `import %s` would not resolve without one.\n  Create it (an empty file is fine); the server refuses to delete it, so a push cannot reconcile a folder that is missing it",
-			moduleInitFile, moduleName(f))
+	if err := refuseMissingModuleInit(f, local); err != nil {
+		return nil, err
 	}
 	// The ONE content rule a module save has, refused HERE rather than mid-push.
 	// The server refuses a marker one file at a time, so without this the push
@@ -209,12 +235,48 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 		return nil, err
 	}
 
+	// 2b. `sync apply` only: does the LIVE module already hold this folder?
+	// Then there is nothing to deploy, and the push ends here having written
+	// nothing — before the checkout that would leave a draft identical to live
+	// behind, and that the next apply would find pre-existing and publish.
+	var liveFiles map[string]string
+	if opts.LiveFirst {
+		done, read, err := moduleNothingLiveHolds(ctx, client, f, existing, local, result)
+		if done {
+			return result, err
+		}
+		if err != nil {
+			return nil, err
+		}
+		liveFiles = read
+	}
+
 	// 3. Resolve the row to write to — the first step that changes anything.
+	// Whether a draft was already open is recorded BEFORE the resolution, which
+	// is what destroys the answer — see the same line in runPush.
+	result.DraftPreexisted = existing.Row() != nil
 	target, createdRow, err := resolveModulePushTarget(ctx, client, f, featureID, existing, result)
 	if err != nil {
 		return nil, err
 	}
 	result.DraftID = target.ID
+	// Every refusal from here to the first write goes through refuseUnwritten:
+	// under LiveFirst, a draft THIS push checked out is discarded rather than
+	// left behind. See discardUnwrittenCheckout.
+	//
+	// ownCheckout is asked at the refusal, not here — see the same lines in
+	// runPush: the checkout is get-or-create, so a draft the same user opened
+	// after the inspection comes back looking like this run's, and only a
+	// draft that still holds what live held (moduleDraftCopiesLive) is
+	// discarded.
+	var draftFiles map[string]string
+	ownCheckout := func() bool {
+		return opts.LiveFirst && !result.Created && !result.DraftPreexisted &&
+			moduleDraftCopiesLive(existing.Module, target, liveFiles, draftFiles)
+	}
+	refuseUnwritten := func(err error) (*modulePushResult, error) {
+		return nil, discardUnwrittenCheckout(ctx, ownCheckout(), target.ID, "module", client.DiscardModuleDraft, err)
+	}
 	// The IDENTITY row — the one that actually holds this module's name and
 	// title, and the only one PUT /module/:id will patch. It is `target` only
 	// while the module is unpublished, where the row IS the module.
@@ -248,9 +310,10 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 	// seconds earlier.
 	files, err := client.ListModuleFiles(ctx, target.ID)
 	if err != nil {
-		return nil, fmt.Errorf("read files of %s: %w", target.ID, err)
+		return refuseUnwritten(fmt.Errorf("read files of %s: %w", target.ID, err))
 	}
 	remoteFiles := moduleContentByPath(files)
+	draftFiles = remoteFiles
 
 	// The drift GUARD is what a fresh create skips, and only that: nothing on
 	// the server is older than this push, so there is nothing anyone could have
@@ -258,12 +321,26 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 	baselineClean := false
 	preconditions := filePreconditions{}
 	head := headAgreement{}
+	// writeTitle is the title leg's answer; a push that CREATED the module sent
+	// the title in the create and has nothing to decide.
+	writeTitle := true
 	if !result.Created {
 		head = readHeadAgreement(ctx, moduleHeadReader(client), f, existing.Module.IdentityID(),
 			existing.AnchoredDraft())
-		verdict, err := checkModuleDrift(f, identity, remoteFiles, opts.Force, head)
+		verdict, err := checkModuleDrift(f, identity, remoteFiles, local, opts.Force, head)
 		if err != nil {
-			return nil, err
+			return refuseUnwritten(err)
+		}
+		// The TITLE's own leg (name_attr.go's titleLeg), against the committed
+		// applied title as well as the local baseline: moduleMetadataDriftOf
+		// checks it only against a LOCAL baseline, so a fresh checkout patched
+		// the title blind. A module's title is patched on its IDENTITY row (the
+		// live module), so that is the row the leg holds to the rule.
+		// The head anchor can NEVER vouch for it: a live module's title is
+		// patched IN PLACE (rmodule.Update), which files no version, so the
+		// head does not move.
+		if writeTitle, err = titleLeg(f, "module", nil, titledRow{ID: identity.ID, Title: identity.Title}, false, opts.Force); err != nil {
+			return refuseUnwritten(err)
 		}
 		baselineClean = verdict.BaselineClean
 		// Server-side preconditions are armed EXACTLY where the drift guard
@@ -286,7 +363,18 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 	// the very content it was forcing past. Shared with the workflow loop
 	// verbatim (acknowledgedRemote), because the rule is the same rule.
 	landed := acknowledgedRemote(f.State.For(f.Key), remoteFiles, local, result.Created)
+	// metadataLanded: a metadata patch was accepted, so the draft no longer
+	// holds only a copy of live even when no file was written.
+	metadataLanded := false
 	stop := func(err error) (*modulePushResult, error) {
+		// A stop before anything landed is still a refusal before the first
+		// write, and an apply discards the draft it checked out — see the same
+		// lines in runPush, including why not after a timeout.
+		if len(result.Pushed) == 0 && len(result.Deleted) == 0 && !metadataLanded && !api.IsTimeout(err) && ownCheckout() {
+			err = discardUnwrittenCheckout(ctx, true, target.ID, "module", client.DiscardModuleDraft, err)
+			result.Error = err.Error()
+			return result, err
+		}
 		result.Error = err.Error()
 		saveModuleBaseline(f, target, identity, landed)
 		return result, err
@@ -316,6 +404,9 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 	// only at the first publish — reported as deferred rather than silently
 	// dropped.
 	patch, deferred := moduleMetadataPatchFor(f, existing, target)
+	if !writeTitle {
+		patch.Title = ""
+	}
 	result.MetadataDeferred = deferred
 	if deferred != "" {
 		fmt.Fprintf(os.Stderr, "  Note: %s\n", deferred)
@@ -342,6 +433,7 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 		// step 6b is what moves it, and it mirrors its own patch onto `target`
 		// when the server accepts it. Mirroring here as well would claim a write
 		// that has not happened, and the baseline records both rows.
+		metadataLanded = true
 		applyModulePatch(identity, patch)
 		if updated != nil {
 			identity.Name, identity.Title = updated.Name, updated.Title
@@ -362,6 +454,9 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 	// case: this is one extra round trip on the push that changes a title, and
 	// none at all on the pushes after it.
 	draftPatch := moduleDraftMetadataPatchFor(f, target)
+	if !writeTitle {
+		draftPatch.Title = ""
+	}
 	if !draftPatch.Empty() {
 		// Addressed by the PARENT's id: DraftEdit is get-or-create-then-patch on
 		// the live module, and the draft it resolves is the one `target` names.
@@ -370,6 +465,7 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 			return stop(fmt.Errorf("update %s on the open draft of %s: %w",
 				describeModulePatch(draftPatch), target.ParentModuleID, err))
 		}
+		metadataLanded = true
 		applyModulePatch(target, draftPatch)
 		if patched != nil {
 			// The row's updatedAt moved, and the baseline records it from
@@ -416,6 +512,83 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 		return result, err
 	}
 	return result, anchorAfterPush(f, head, opts.Force)
+}
+
+// moduleNothingLiveHolds is runModulePush's LiveFirst leg, the module twin of
+// pushNothingLiveHolds — whose comment carries the reasoning for both: why it
+// is asked whether or not a draft is open (here that draft may also be a
+// COLLEAGUE's, a module having one), why no drift guard runs, and what the two
+// anchors record instead. It answers false, touching nothing, for an unbound
+// folder, an unpublished module (it has no live row; it awaits its publish) and
+// a live module that differs.
+func moduleNothingLiveHolds(ctx context.Context, client *api.Client, f *folder, existing existingModuleTarget, local map[string]string, result *modulePushResult) (done bool, liveFiles map[string]string, err error) {
+	live := existing.Module
+	if live == nil {
+		return false, nil, nil
+	}
+	done, liveFiles, err = nothingLiveHolds(ctx, f, liveDraftKindRow{ID: live.ID, Lifecycle: live.Lifecycle, Title: live.Title},
+		func(ctx context.Context) (map[string]string, error) {
+			files, err := client.ListModuleFiles(ctx, live.ID)
+			return moduleContentByPath(files), err
+		},
+		func(liveFiles map[string]string) bool { return moduleRowHoldsFolder(f, live, liveFiles, local) },
+		moduleHeadReader(client))
+	if done {
+		result.UpToDate = true
+	}
+	return done, liveFiles, err
+}
+
+// moduleDraftCopiesLive is workflowDraftCopiesLive for a module: the same
+// files, name and title — what a checkout copies. False whenever either
+// listing is missing, so a draft nobody could compare is kept.
+func moduleDraftCopiesLive(live, draft *api.Module, liveFiles, draftFiles map[string]string) bool {
+	if live == nil || draft == nil || liveFiles == nil || draftFiles == nil {
+		return false
+	}
+	return filesAgree(liveFiles, draftFiles) && draft.Name == live.Name && draft.Title == live.Title
+}
+
+// moduleRowHoldsFolder reports that a push of this folder onto `row` — or onto
+// a fresh checkout of it, which copies its files, name and title — would write
+// NOTHING, by runModulePush's own write rule: putModuleFiles / deleteModuleFiles
+// write exactly when the file sets differ (filesAgree), and the two metadata
+// patches are moduleMetadataPatch against that row, with the title dropped
+// where titleLeg would not write it (it compares trimmed).
+//
+// ⚠️ Parity is the whole contract, for the reason workflowRowHoldsFolder gives:
+// anything the push learns to write has to be added here in the same change, or
+// an apply leaves a draft identical to live behind and the next one publishes it.
+func moduleRowHoldsFolder(f *folder, row *api.Module, remote, local map[string]string) bool {
+	if !filesAgree(remote, local) {
+		return false
+	}
+	patch := moduleMetadataPatch(f.Manifest, row)
+	if f.Manifest.Title != "" && sameName(row.Title, f.Manifest.Title) {
+		patch.Title = ""
+	}
+	return patch.Empty()
+}
+
+// refuseMissingModuleInit is the push's whole-folder guard on the package's own
+// file, in one place: `module push` refuses with it before its first byte, and
+// `sync apply`'s preflight reports the same sentence for a dry-run.
+func refuseMissingModuleInit(f *folder, local map[string]string) error {
+	if _, ok := local[moduleInitFile]; ok {
+		return nil
+	}
+	return fmt.Errorf("this folder has no %s, and a module is a Python package — `import %s` would not resolve without one.\n  Create it (an empty file is fine); the server refuses to delete it, so a push cannot reconcile a folder that is missing it",
+		moduleInitFile, moduleName(f))
+}
+
+// moduleNoNameError is the create's refusal for a manifest with no package
+// name, or nil — shared by resolveModulePushTarget and moduleApplyDecision.
+func moduleNoNameError(f *folder) error {
+	if f.Manifest.Name != "" {
+		return nil
+	}
+	return fmt.Errorf("%s declares no \"name\", and a module cannot be created without one — it is the identifier a workflow writes after `import`. Add it, or recreate the folder with `ronja module init <name> --feature <id>`",
+		wfdir.ManifestPath(f.Root))
 }
 
 // moduleName is the package name this folder means, for a message. The
@@ -498,6 +671,7 @@ func inspectModuleTarget(ctx context.Context, client *api.Client, f *folder) (ex
 	if err := refuseUnclonableModule(mod); err != nil {
 		return existingModuleTarget{}, err
 	}
+	f.noteManagedBy(wfdir.ManagedModule, mod.IdentityID(), mod.ManagedBy)
 	if moduleIsUnpublished(mod) {
 		// The binding names the module itself — a parentless draft or a proposal.
 		// Asking for a draft OF it is not a thing.
@@ -521,9 +695,8 @@ func inspectModuleTarget(ctx context.Context, client *api.Client, f *folder) (ex
 // live-name uniqueness index.
 func resolveModulePushTarget(ctx context.Context, client *api.Client, f *folder, featureID string, existing existingModuleTarget, result *modulePushResult) (target, created *api.Module, err error) {
 	if existing.Module == nil {
-		if f.Manifest.Name == "" {
-			return nil, nil, fmt.Errorf("%s declares no \"name\", and a module cannot be created without one — it is the identifier a workflow writes after `import`. Add it, or recreate the folder with `ronja module init <name> --feature <id>`",
-				wfdir.ManifestPath(f.Root))
+		if err := moduleNoNameError(f); err != nil {
+			return nil, nil, err
 		}
 		// A first push is the one path here that WRITES a binding, so this is
 		// where the organization has to be authoritative rather than adopted from
@@ -538,8 +711,15 @@ func resolveModulePushTarget(ctx context.Context, client *api.Client, f *folder,
 			FeatureID: featureID,
 			Name:      f.Manifest.Name,
 			Title:     f.Manifest.Title,
+			Managed:   f.managedClaim(""),
 		})
 		if err != nil {
+			if _, adopted, refusal := f.adoptOnAddressClaimed(ctx, "", err); adopted {
+				if refusal != nil {
+					return nil, nil, refusal
+				}
+				return nil, nil, errAdoptedOnCreate
+			}
 			return nil, nil, fmt.Errorf("create module %q in feature %s: %w", f.Manifest.Name, featureID, err)
 		}
 		// Recorded IMMEDIATELY, before any file is written: the module now
@@ -547,6 +727,11 @@ func resolveModulePushTarget(ctx context.Context, client *api.Client, f *folder,
 		// orphan the next push could not find and would create again — where
 		// "again" means a 409 on the package name, for ever.
 		f.recordBinding(wfdir.Binding{ModuleID: created.ID, FeatureID: featureID})
+		// The created module holds the declared title — recorded in the same
+		// write as the binding, as the title this folder agrees with.
+		if f.Manifest.Title != "" {
+			f.Lock.SetAppliedTitle(f.Stack, created.Title)
+		}
 		// A module that has just been created has never been versioned, and an
 		// unversioned row IS its own head — the same fallback
 		// api.ModuleHeadVersionID resolves and the same one rmodule's commit CAS
@@ -620,25 +805,39 @@ func resolveModulePushTarget(ctx context.Context, client *api.Client, f *folder,
 // inconsistency: the files come from the row the push writes to (the draft),
 // and `identity` is the row whose metadata a push would change (the live one,
 // or the module itself while it is unpublished). See moduleIdentityRow.
-func checkModuleDrift(f *folder, identity *api.Module, remote map[string]string, force bool, head headAgreement) (driftVerdict, error) {
+func checkModuleDrift(f *folder, identity *api.Module, remote, local map[string]string, force bool, head headAgreement) (driftVerdict, error) {
 	baseline := f.State.For(f.Key)
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
 		remoteHashes[path] = wfdir.HashString(content)
 	}
 	drift := wfdir.DiffHashes(remoteHashes, baseline.Hashes())
+	// Live equals desired is never drift — see live_equals_desired.go.
+	//
+	// Only against a BASELINE: with none, every remote file reads as added, and
+	// excusing them here would walk a fresh checkout past the head anchor on its
+	// files alone. That case has its own leg below, which asks the metadata too.
+	excused := 0
+	if baseline != nil {
+		drift, excused = excuseAgreedFiles(drift, remote, local)
+	}
 	meta := moduleMetadataDriftOf(baseline, identity, f.Manifest)
 	if !drift.Dirty() && len(meta) == 0 {
 		// Bypassed still tracks --force here, even though nothing needed
 		// bypassing: it is what suppresses the per-file preconditions, and
 		// --force means "overwrite the remote with what I have" whether or not
 		// the baseline happened to be clean when this check ran.
-		return driftVerdict{BaselineClean: baseline != nil, Bypassed: force, Preconditions: baseline.Hashes()}, nil
+		return driftVerdict{BaselineClean: baseline != nil && excused == 0, Bypassed: force, Preconditions: baseline.Hashes()}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s that changed on the server since your last sync.\n",
 			describeDrifted(drift, meta))
 		return driftVerdict{Bypassed: true}, nil
+	}
+	if baseline == nil && filesAgree(remote, local) && moduleMetadataPatch(f.Manifest, identity).Empty() {
+		// LIVE EQUALS DESIRED with no baseline: see checkDrift's copy.
+		noteLiveEqualsDesired(identity.ID)
+		return driftVerdict{HeadVouched: true, Preconditions: remoteHashes}, nil
 	}
 	if baseline == nil {
 		// A first push that died between recording the binding and writing the
@@ -671,7 +870,7 @@ func checkModuleDrift(f *folder, identity *api.Module, remote map[string]string,
 		}
 		if head.Moved() {
 			return driftVerdict{}, refuseHeadMoved("module", f.Binding.ModuleID, head,
-				"`ronja module clone "+f.Binding.ModuleID+"`")
+				"`ronja module clone "+f.Binding.ModuleID+"`", f.pullHint("  "))
 		}
 		// The anchor agreed about the LIVE row and still could not vouch, which
 		// leaves exactly one cause: a draft over the live row was already open
@@ -685,11 +884,11 @@ func checkModuleDrift(f *folder, identity *api.Module, remote map[string]string,
 			return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and module %s already has an open draft there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  A module has ONE draft, so it may be a colleague's: look at it first. `ronja module discard` throws it away and pushes onto the live version, and push --force overwrites it",
 				f.Resolved.URL, f.Binding.ModuleID, wfdir.LockName)
 		}
-		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the module already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the module into a fresh folder to get one, or push --force to overwrite the remote files with what you have here",
-			f.Resolved.URL, len(remote))
+		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the module already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the module into a fresh folder to get one, or push --force to overwrite the remote files with what you have here%s",
+			f.Resolved.URL, len(remote), f.pullHint("  "))
 	}
-	return driftVerdict{}, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja module status` to see the detail, or push --force to overwrite",
-		driftSummary(drift, meta))
+	return driftVerdict{}, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja module status` to see the detail, or push --force to overwrite%s",
+		driftSummary(drift, meta), f.pullHint("  "))
 }
 
 // moduleMetadataDriftOf reports the metadata this push would overwrite.
@@ -713,10 +912,15 @@ func moduleMetadataDriftOf(baseline *wfdir.InstanceState, identity *api.Module, 
 		return nil
 	}
 	var out []metadataDrift
-	if m.Title != "" && baseline.Title != "" && identity.Title != baseline.Title {
+	// The row already holding what the manifest declares is NOT drift, however
+	// far it moved from the baseline: the push would write nothing there (the
+	// patch is empty for that field), so there is nothing to overwrite. This was
+	// the one metadata leg asking only "did it move" — the workflow's asks it of
+	// the patch, which already leaves agreeing fields out.
+	if m.Title != "" && baseline.Title != "" && identity.Title != baseline.Title && identity.Title != m.Title {
 		out = append(out, metadataDrift{Field: "title", Baseline: baseline.Title, Remote: identity.Title})
 	}
-	if m.Name != "" && baseline.Name != "" && identity.Name != baseline.Name {
+	if m.Name != "" && baseline.Name != "" && identity.Name != baseline.Name && identity.Name != m.Name {
 		out = append(out, metadataDrift{Field: "package name", Baseline: baseline.Name, Remote: identity.Name})
 	}
 	return out

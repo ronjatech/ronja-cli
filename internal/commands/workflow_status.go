@@ -90,6 +90,7 @@ func workflowStatusReportAt(ctx context.Context, root string, resolved *config.R
 	f.noteAliases()
 
 	report := &statusReport{
+		opened:            f,
 		Root:              f.Root,
 		URL:               resolved.URL,
 		Title:             f.Manifest.Title,
@@ -108,12 +109,13 @@ func workflowStatusReportAt(ctx context.Context, root string, resolved *config.R
 		FeatureID:         f.Binding.FeatureID,
 	}
 
-	enumeration, err := wfdir.Enumerate(f.Root, wfdir.WorkflowKind)
+	enumeration, err := wfdir.Enumerate(f.Root, f.Kind)
 	if err != nil {
 		return nil, err
 	}
 	baseline := f.State.For(f.Key)
 	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
+	report.Rebound = f.reboundSinceBaseline()
 	report.Skipped = enumeration.Skipped
 	if baseline != nil {
 		report.Baseline = &baselineReport{
@@ -124,6 +126,7 @@ func workflowStatusReportAt(ctx context.Context, root string, resolved *config.R
 	}
 
 	report.Remote, report.WorkflowURL = remoteStatus(ctx, resolved, f)
+	report.Rebound = append(report.Rebound, report.Remote.rebound...)
 	return report, nil
 }
 
@@ -170,11 +173,18 @@ type statusReport struct {
 	// url under another name is a shape change to something scripts parse. A
 	// caller that wants the page reads it off the API response the CLI got it
 	// from (`ronja api /api/v2/workflow/<id> --jq .url`).
-	WorkflowURL string          `json:"-"`
-	Local       wfdir.Diff      `json:"local"`
-	Skipped     []wfdir.Skipped `json:"skipped,omitempty"`
-	Baseline    *baselineReport `json:"baseline,omitempty"`
-	Remote      *remoteReport   `json:"remote"`
+	WorkflowURL string     `json:"-"`
+	Local       wfdir.Diff `json:"local"`
+	// Rebound is each binding re-pointed in ronja.json since the last sync
+	// that a file uses — a local change the next push deploys (see
+	// folder.reboundSinceBaseline).
+	Rebound  []reboundAlias  `json:"rebound,omitempty"`
+	Skipped  []wfdir.Skipped `json:"skipped,omitempty"`
+	Baseline *baselineReport `json:"baseline,omitempty"`
+	Remote   *remoteReport   `json:"remote"`
+	// opened is the folder the report was computed from, for `sync status`
+	// to ask more of without opening it again.
+	opened *folder
 }
 
 type baselineReport struct {
@@ -250,6 +260,10 @@ type remoteReport struct {
 	// ⚠️ Additive only: `ronja wf status` reads nothing from it and its exit code
 	// is unchanged. It exists for folderVerdict.
 	TargetUnknown bool `json:"targetUnknown,omitempty"`
+	// rebound is a re-pointed binding the drift above would otherwise have
+	// read as a change made in Ronja (folder.unrecordedRebind); the report
+	// lists it with the local changes.
+	rebound []reboundAlias
 	// Runtime is set only when the folder and the row disagree about the
 	// workflow's runtime generation — i.e. only when a push would upgrade it, or
 	// would be REFUSED for declaring the lower one. Absent otherwise, including
@@ -397,15 +411,16 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 	out.ComparedAgainst = &comparedReport{ID: target.ID, Lifecycle: target.Lifecycle}
 	out.SQLSemanticsNotice = sqlSemanticsNotice(sqlSemanticsSubject(target.Title, target.ID), target.SQLSemantics)
 	baseline := f.State.For(f.Key)
-	drift := wfdir.DiffHashes(hashFiles(f.Codec, files), baseline.Hashes())
+	drift := wfdir.DiffHashes(hashFiles(f.baselineCodec(), files), baseline.Hashes())
 	out.Drift = &drift
+	out.rebound = f.unrecordedRebind(out.Drift, contentByPath(f.Codec, files))
 	// Reported only for a folder that manages parameters: for one that does not,
 	// the row's declaration is not the folder's business and flagging a
 	// difference would be advising a change push deliberately will not make.
-	if f.Manifest.ManagesParameters() && !sameParameters(f.Manifest.DeclaredParameters(), target.Parameters) {
+	if f.Manifest.ManagesParameters() && !sameParameters(f.wireParameters(), target.Parameters) {
 		out.Parameters = &parameterReport{
 			Local:  describeParameters(f.Manifest.DeclaredParameters()),
-			Remote: describeParameters(target.Parameters),
+			Remote: describeParameters(f.Codec.parametersToDisk(target.Parameters)),
 		}
 	}
 	// Same rule for the declared calendar, compared on the EFFECTIVE value: a
@@ -439,6 +454,11 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 			Remote:  target.RuntimeVersion,
 			Refused: refused,
 		}
+	}
+	// The language is fixed at create, so a folder of the other language is one
+	// every push refuses (checkLanguageDrift): said here, before the push does.
+	if err := checkLanguageDrift(f, target); err != nil {
+		out.note("%s", err.Error())
 	}
 	switch {
 	case baseline == nil:
@@ -499,14 +519,7 @@ func printStatus(r *statusReport) {
 	printResourceURL(out, statusKeyWidth, r.WorkflowURL)
 
 	fmt.Fprintf(out, "\n  Local changes\n")
-	if !r.Local.Dirty() {
-		fmt.Fprintf(out, "    clean (%d file(s) match the last sync)\n", r.Local.Unchanged)
-	} else {
-		printPathList(out, "new", r.Local.Added)
-		printPathList(out, "modified", r.Local.Modified)
-		printPathList(out, "deleted", r.Local.Deleted)
-		fmt.Fprintf(out, "    %d unchanged\n", r.Local.Unchanged)
-	}
+	printLocalChanges(out, r.Local, r.Rebound)
 	for _, s := range r.Skipped {
 		fmt.Fprintf(out, "    skipped  %s — %s\n", s.Path, s.Reason)
 	}
@@ -570,6 +583,26 @@ func printStatus(r *statusReport) {
 	for _, note := range r.Remote.DriftNotes {
 		fmt.Fprintf(out, "    note: %s\n", note)
 	}
+}
+
+// printLocalChanges is the "Local changes" block of a workflow or data-app
+// status: the files, then each re-pointed binding a file uses.
+func printLocalChanges(out *os.File, local wfdir.Diff, rebound []reboundAlias) {
+	if !local.Dirty() && len(rebound) == 0 {
+		fmt.Fprintf(out, "    clean (%d file(s) match the last sync)\n", local.Unchanged)
+		return
+	}
+	printPathList(out, "new", local.Added)
+	printPathList(out, "modified", local.Modified)
+	printPathList(out, "deleted", local.Deleted)
+	for _, r := range rebound {
+		if r.Refused != "" {
+			fmt.Fprintf(out, "    %-9s %s — an older CLI recorded the last sync without its bindings, so a push refuses it as a change made in Ronja: %s\n", "rebound", r.describe(), r.Refused)
+			continue
+		}
+		fmt.Fprintf(out, "    %-9s %s — a local change, which the next push deploys\n", "rebound", r.describe())
+	}
+	fmt.Fprintf(out, "    %d unchanged\n", local.Unchanged)
 }
 
 func printPathList(out *os.File, label string, paths []string) {

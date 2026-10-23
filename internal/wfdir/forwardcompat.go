@@ -187,6 +187,34 @@ func (u unknownKeys) ensureLeading(key string) unknownKeys {
 	return u
 }
 
+// ensureAfter returns a copy whose key order puts key straight after anchor,
+// when the object this sidecar was read from did not carry key at all. The same
+// no-op rules as ensureLeading: a key the file already had keeps its recorded
+// place, and an object built in code marshals in struct order. An anchor the
+// file lacks leaves key to go on the end, as any new key does.
+func (u unknownKeys) ensureAfter(key, anchor string) unknownKeys {
+	if len(u.order) == 0 {
+		return u
+	}
+	at := -1
+	for i, existing := range u.order {
+		if existing == key {
+			return u
+		}
+		if existing == anchor {
+			at = i
+		}
+	}
+	if at < 0 {
+		return u
+	}
+	order := make([]string, 0, len(u.order)+1)
+	order = append(order, u.order[:at+1]...)
+	order = append(order, key)
+	u.order = append(order, u.order[at+1:]...)
+	return u
+}
+
 // dropObjectKey removes one key from a marshalled object, preserving the order
 // of the rest.
 //

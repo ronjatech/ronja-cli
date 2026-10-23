@@ -343,3 +343,24 @@ func TestTagsFingerprintFollowsTheFoldedSet(t *testing.T) {
 		t.Error("two different sets share a fingerprint")
 	}
 }
+
+// TestParseNameIsOptionalAndTrimmed: absent is unmanaged, present is trimmed,
+// empty is refused, and none of it moves the definition's fingerprint.
+func TestParseNameIsOptionalAndTrimmed(t *testing.T) {
+	bare, err := Parse([]byte(`{"recipe":{"source":"orders"}}`))
+	if err != nil || bare.Name != nil {
+		t.Fatalf("absent: %v %v", bare.Name, err)
+	}
+	named, err := Parse([]byte(`{"recipe":{"source":"orders"},"name":"  Average order value "}`))
+	if err != nil || named.Name == nil || *named.Name != "Average order value" {
+		t.Fatalf("present: %v %v", named.Name, err)
+	}
+	if _, err := Parse([]byte(`{"recipe":{"source":"orders"},"name":"  "}`)); err == nil {
+		t.Error("an empty name was accepted")
+	}
+	resolvedBare, _ := bare.Resolve("table-1")
+	resolvedNamed, _ := named.Resolve("table-1")
+	if Fingerprint(resolvedBare, bare.Description, bare.ReportingTimezone) != Fingerprint(resolvedNamed, named.Description, named.ReportingTimezone) {
+		t.Error("a name moved the definition fingerprint")
+	}
+}

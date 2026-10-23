@@ -134,10 +134,16 @@ type syncEdgeReport struct {
 	Where string `json:"where,omitempty"`
 	// Verdict is one of the four words above — the contract.
 	Verdict string `json:"verdict"`
-	// Reason is a sync* constant, set ONLY for not_checked. Detail is prose and
-	// may be reworded; Reason may not.
+	// Reason is a sync* constant, set for not_checked and for an unresolved
+	// ADDRESS dependency (address_unresolved, address_stack_mismatch, …).
+	// Detail is prose and may be reworded; Reason may not.
 	Reason string `json:"reason,omitempty"`
-	Detail string `json:"detail,omitempty"`
+	// From and Address are set on an edge declared BY ADDRESS: the folder that
+	// manages the target and its key there. A table read this way is also a
+	// build-ordering edge between the two folders.
+	From    string `json:"from,omitempty"`
+	Address string `json:"address,omitempty"`
+	Detail  string `json:"detail,omitempty"`
 	// Unused marks a declared data-app grant that no file in the folder
 	// mentions. Advisory: a dead grant is wider access than the app needs, not a
 	// broken edge, so it never moves a verdict.
@@ -243,6 +249,15 @@ func (c *edgeChecker) lookup(ctx context.Context, kind, id string) edgeOutcome {
 		// which is `unknown` for the folder and exit 2 for the tree — a verdict
 		// nothing the reader does can clear.
 		_, err = c.client.GetNote(ctx, id)
+	case markers.KindModule:
+		_, err = c.client.GetModule(ctx, id)
+	case markers.KindDataApp:
+		// The three automation reference kinds beyond the marker ones.
+		_, err = c.client.GetDataApp(ctx, id)
+	case markers.KindMCPServer:
+		_, err = c.client.GetMCPServer(ctx, id)
+	case markers.KindFeature:
+		_, err = c.client.GetFeature(ctx, id)
 	default:
 		// A kind this build has no read for. Reached only if markers grows a
 		// family and this switch is not extended — which is exactly when saying
@@ -305,13 +320,41 @@ func (c *edgeChecker) apply(ctx context.Context, edges []syncEdgeReport) []syncE
 func dependencyEdges(m *wfdir.Manifest, aliases aliasReport) []syncEdgeReport {
 	names := m.AliasNames()
 	out := make([]syncEdgeReport, 0, len(aliases.Refusals))
+	address := map[string]bool{}
+	for _, r := range aliases.Address {
+		address[r.Detail] = true
+		dep := m.Dependencies[r.Alias]
+		out = append(out, syncEdgeReport{
+			Kind: dep.Kind, Ref: r.Alias, Where: wfdir.ManifestName + " → dependencies." + r.Alias,
+			From: dep.From, Address: dep.Address,
+			Verdict: edgeUnresolved, Reason: r.Reason, Detail: r.Detail,
+		})
+	}
 	for _, refusal := range aliases.Refusals {
+		if address[refusal] {
+			continue
+		}
 		out = append(out, syncEdgeReport{
 			Kind:    "dependency",
 			Ref:     aliasNamedIn(refusal, names),
 			Where:   wfdir.ManifestName,
 			Verdict: edgeUnresolved,
 			Detail:  refusal,
+		})
+	}
+	return out
+}
+
+// addressDependencyEdges are the folder's RESOLVED address dependencies, one
+// edge each, left undecided so the checker asks the instance whether the row
+// the claim names still resolves.
+func addressDependencyEdges(f *folder) []syncEdgeReport {
+	var out []syncEdgeReport
+	for _, e := range f.addressEdges {
+		dep := f.Manifest.Dependencies[e.Alias]
+		out = append(out, syncEdgeReport{
+			Kind: e.Kind, Ref: e.Alias, ID: e.ID, Where: wfdir.ManifestName + " → dependencies." + e.Alias,
+			From: dep.From, Address: dep.Address,
 		})
 	}
 	return out

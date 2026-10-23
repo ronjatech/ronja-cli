@@ -1,10 +1,10 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -39,71 +39,93 @@ func newSyncApplyCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "apply",
 		Short: "Deploy every folder beneath a directory",
-		Long: `Deploy every folder beneath a directory.
+		Long: `Deploy every folder beneath a directory: each folder's own push and its
+publish, against the stack you name, so what comes out is LIVE.
 
-Finds every ronja.json under --dir and, for each one, runs that folder's own
-push AND its publish against the stack you name — so what comes out is LIVE,
-not a repository of staged drafts.
+  ronja sync apply --stack prod --dry-run   # what would change; writes nothing
+  ronja sync apply --stack prod             # deploy it
 
-Folders are deployed in PATH ORDER, which the report names. That is for
-determinism and diffable CI logs and nothing else: a derived table's draft
-always builds against its inputs' LIVE data, and a commit cascades server-side,
-so a folder deployed "too early" self-heals on the next run rather than landing
-something wrong.
+It only updates rows that exist; --allow-create also makes the new ones, after
+saying how many. --dir picks the tree (default: here).
 
-UPDATE-ONLY, and that is the safety property this command is built around. It
-refuses anything that does not already exist:
+ORDER. Folders deploy in dependency order, which the report names: modules;
+pipelines, a folder whose table another reads by address before the one that
+reads it; every new workflow another names by address, created before any
+workflow's code is written; then the workflows' code, data apps and
+automations — path order within each. Under --allow-create a folder may name
+by address a row this same run creates: it resolves once that row exists,
+which is what stands a new stack up in one apply. A loop of table reads
+between pipeline folders is refused.
 
-  create           this file (or this folder) has no row behind it yet, so a
-                   push would MAKE one. There is no delete verb to undo that,
-                   and a CI runner that discards its working tree loses the ids
-                   and creates again on the next run
+WRITE CHECK. In a folder with a folder id, every write is checked against the
+stack's feature first. Code, an app's codex grant or an agent automation's
+table or feature reference that would write outside that feature through
+anything the stack does not bind as a write source is refused
+writes_outside_target before it is written. A workflow or saved agent it would
+RUN outside that feature — a {{ workflow }} or {{ agent }} marker, an app's
+allowed workflows or agents, an automation's action or workflow reference — is
+refused runs_outside_target unless a "run": true dependency binds it in that
+stack. A module folder pushed into a feature the run's other folders do not
+deploy to is warned about (shared_module): it publishes the organization's one
+module.
+
+UPDATE-ONLY is the safety property this command is built around. It refuses,
+per creation unit (each .sql file, metrics/*.json and automation file; the
+whole folder for a workflow, data app or module — the grain the lock records):
+
+  create           no row behind it yet, so a push would MAKE one. There is no
+                   delete verb to undo that, and a CI runner that discards its
+                   working tree loses the ids and creates again next run
   unanchored       an automation this folder is bound to that it has never
-                   recorded agreeing with. Both of its guards are then off: the
-                   write would overwrite whatever moved on the server, and would
-                   turn the automation back on if somebody had paused it
+                   recorded agreeing with. A write would overwrite whatever
+                   moved on the server, and turn it back on if somebody paused it
   manifest_rewrite acting here would REWRITE a committed ronja.json. Migration
-                   is a per-folder act somebody watches, never a side effect of
-                   deploying thirty folders
+                   is a per-folder act somebody watches
 
-Each of those is refused PER CREATION UNIT — per file for a pipeline and an
-automation, per folder for a workflow and a data app — because that is the grain
-the lock discriminates at. Push the folder on its own to resolve one.
+Push the folder on its own to resolve one. --allow-create lifts only the first:
+before making anything it names how many ROWS (not folders — a merge adding
+one file to thirty folders is thirty rows), in which organization AND in which
+features, since a commit can redirect a create by editing one ronja.json.
 
---allow-create opts into the first of them, and only the first: it names how many
-ROWS it is about to make, in which organization AND in which features, before it
-makes any of them. Rows rather than folders, because they are different numbers —
-a merge that adds one file to each of thirty folders is thirty rows — and volume
-is the failure mode. The features because every create resolves its destination
-from a committed ronja.json, so a merge can redirect one without changing
-anything else the line would print. The other two refusals stand whatever it
-says.
+There is no --force and no --overwrite-remote. Where apply refuses on drift,
+run the folder's own command (` + "`ronja pipeline publish --overwrite-remote`" + ` and
+friends) while looking at that folder — or, in a folder that keeps its records
+in Ronja, ` + "`ronja <kind> pull`" + `, which takes the server's version into the folder
+to be committed, after which apply writes nothing.
 
-There is no --force and no --overwrite-remote. Where apply refuses on drift, the
-escape is the folder's own command (` + "`ronja pipeline publish --overwrite-remote`" + `
-and friends), run by somebody who is looking at that one folder.
+RENAMES. It never deletes, and never infers a rename. Declare one in the
+folder's ronja.json — "moved": [{"from": "orders.sql", "to":
+"sales_orders.sql"}] keeps the same row under the new file, "removed":
+["old.sql"] stops managing a row and leaves it in place — and each stack
+applies it when it is applied. A bound file that is gone with neither
+declaration is refused (orphaned_file), where the per-folder push only notes
+it.
 
-It never deletes. A file removed from a folder leaves its row alone, exactly as
-the per-folder push does.
+PUBLISHING passes --no-request-review, so a credential that may not commit
+FAILS instead of filing a review request in every folder — and a draft that
+did end up submitted for review is reported as NOT deployed.
 
-Publishing passes --no-request-review, so a credential that may not commit FAILS
-instead of filing a review request in every folder — and a draft that did end up
-submitted for review is reported as NOT deployed.
-
-A folder that refuses does not stop the run: every folder is attempted, every
-one is reported, and the exit code is the tree's answer:
+EXIT CODE. A folder that refuses does not stop the run: every folder is
+attempted and reported, and the exit code is the tree's answer:
 
   0   every folder was deployed (or had nothing to deploy)
   1   checked, and something was refused or did not land
   2   could not tell — a folder was skipped, a manifest would not load, the
       credential is dead, the walk found no folders at all, or a write went out
-      and the instance never answered (which is not the same as a refusal: a
-      commit that timed out may well have landed, so look before re-running)
+      and the instance never answered (a commit that timed out may well have
+      landed, so look before re-running)
 
---dry-run prints, per creation unit, what apply would ATTEMPT, off the same
-decision apply then executes. It deliberately does NOT promise a clean remote:
-that is a read whose answer can move between the dry-run and the apply, and
-promising it is what makes a dry-run a liar.`,
+--DRY-RUN prints, per creation unit, what apply would ATTEMPT, off the same
+decision apply then executes, and sends no write; declared moves and removals
+are units too. It also makes apply's comparison with what is live, reading
+only: a unit apply would send nothing for is "unchanged" — an adopted workflow,
+data app or module whose live row holds the folder, and each of a pipeline
+folder's tables, metrics, docs files and checks files, and each automation,
+that its push would skip. A unit the apply would refuse is "refuse", and its
+folder refused. A unit that could not be compared stays "update" and says why.
+A folder whose lock names a row Ronja holds no claim for says how many claims
+apply records (no row changes for them). Every answer is as of the dry run's
+reads: the organization can move before the apply.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// resolveInstance, NOT config.Resolve: unlike `status` and `check`,
@@ -153,14 +175,35 @@ type syncApplyReport struct {
 	AllowCreate bool `json:"allowCreate,omitempty"`
 	// Order names the order the folders were deployed in, because a CI log that
 	// does not say so leaves the reader guessing whether a failure was an
-	// ordering problem. Always "path" today; see the command's own help.
+	// ordering problem. "dependency" (see sync_apply_order.go): modules, then
+	// pipelines in build order, then every workflow created before any
+	// workflow's code is written, then data apps, then automations — path
+	// order within each.
 	Order string `json:"order"`
+	// Sequence is the folders' paths in the order they ran — Folders stays in
+	// path order, so two runs of one tree diff line for line. A folder an
+	// interrupt kept from running is not in it.
+	Sequence []string `json:"sequence"`
 	// Verdict is the tree's answer — applied, refused or unknown — carrying the
 	// same word as the exit code, because exit codes do not survive a wrapper
 	// script.
-	Verdict string                  `json:"verdict"`
-	Folders []syncApplyFolderReport `json:"folders"`
-	Summary syncApplySummary        `json:"summary"`
+	Verdict string `json:"verdict"`
+	// Warnings are about the RUN, not one folder's verdict: true, loud, and not
+	// a refusal — today only shared_module (sharedModuleWarnings). Absent when
+	// there are none.
+	Warnings []syncApplyWarning      `json:"warnings,omitempty"`
+	Folders  []syncApplyFolderReport `json:"folders"`
+	Summary  syncApplySummary        `json:"summary"`
+	// LocksRewritten are the ADOPTED folders whose ronja.lock.json this run
+	// changed. They keep their records in Ronja, so the lock is a local cache
+	// of them: a deploy never needs it, and a stale one is overruled by Ronja's
+	// record — so a merge conflict in it is settled by taking either side and
+	// running `sync apply`, which rewrites it (until then the dry run and
+	// status read the side taken). It is still committed: a fresh checkout's
+	// `sync apply --dry-run` and `sync status` compare against it (BL-e7b3).
+	// Said once, so a reader of `git status` after a deploy is not left
+	// guessing. Absent when there are none.
+	LocksRewritten []string `json:"locksRewritten,omitempty"`
 }
 
 // syncApplyFolderReport is one folder's line.
@@ -184,23 +227,40 @@ type syncApplyFolderReport struct {
 	// which every push loop prints and which a tree run would otherwise
 	// swallow.
 	Notes []string `json:"notes,omitempty"`
+	// Claims is how many rows this folder's lock names that the server holds
+	// no claim for — the records apply writes in Ronja before anything else
+	// (the lazy backfill), which change no row. In a dry run only.
+	Claims int `json:"claims,omitempty"`
+}
+
+// syncApplyWarning is one run-level warning: a stable reason (machine
+// contract, add never rename), the folder it is about and prose beside it.
+type syncApplyWarning struct {
+	Reason string `json:"reason"`
+	Path   string `json:"path"`
+	Detail string `json:"detail"`
 }
 
 // syncApplyUnitReport is one creation unit's decision — the value apply acts on
 // and the value --dry-run prints, never two derivations of it.
 type syncApplyUnitReport struct {
-	// Path is the folder-relative file, EMPTY for a workflow or a data app,
-	// whose creation unit is the folder itself.
+	// Path is the folder-relative file, EMPTY for a workflow, a data app or a
+	// module, whose creation unit is the folder itself.
 	Path string `json:"path,omitempty"`
 	// ID is the row already bound to this unit, empty for a create.
 	ID string `json:"id,omitempty"`
-	// Action is applyAction: create, update, unanchored or refuse.
+	// To is where a `move` unit's address goes; Path is where it was.
+	To string `json:"to,omitempty"`
+	// Action is applyAction: create, update, unanchored or refuse — or move or
+	// remove, for the units a folder's address declarations re-key or stop
+	// managing on this stack.
 	//
-	// ⚠️ There is deliberately no `no-op`. It is knowable locally for a pipeline
-	// file and NOT for a workflow or a data app, whose files are compared
-	// against a listing of the caller's own draft — so a unit apply may find
-	// unchanged is reported as `update`, which is what apply will ATTEMPT. A
-	// uniform `no-op` would be a promise only one kind could keep.
+	// `unchanged` appears only in a dry run (applyActionUnchanged), for a unit
+	// apply would send nothing for: an adopted workflow, data app or module whose
+	// live row already holds the folder, or a pipeline or automation file its
+	// push would skip (sync_apply_dryrun.go). A dry run of a pipeline folder also
+	// lists its docs and checks files as units, compared the same way. A unit
+	// that could not be compared stays `update`, with Detail saying why.
 	Action string `json:"action"`
 	Reason string `json:"reason,omitempty"`
 	Detail string `json:"detail,omitempty"`
@@ -235,15 +295,10 @@ type syncApplySummary struct {
 	// field, a run that made four rows and refused a fifth would have to claim
 	// either four creation units or five created rows, and both are false.
 	Created int `json:"created,omitempty"`
+	// Claims is the folders' Claims summed: in a dry run, the records in Ronja
+	// the apply would write for rows it does not otherwise change.
+	Claims int `json:"claims,omitempty"`
 }
-
-// The three verdicts a folder gets from apply.
-//
-// `applied` and `refused` are apply's spellings of `sync status`'s clean and
-// drifted, on the precedent `sync check` already set with `broken`: one rank,
-// one exit code, a word that is true about what THIS command did. "Drifted" is
-// a claim about content moving on the server and says nothing about a deploy.
-const ()
 
 // exitError turns the tree verdict into the process exit code, on the same
 // three-valued contract as `sync status`.
@@ -292,6 +347,9 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", dir, err)
 	}
+	// A folder in no git work tree may name by address only folders of this
+	// tree (addressBoundary).
+	ctx = withAddressWalkRoot(ctx, base)
 
 	// Resolved ONCE, before the loop — see syncStatusTree, where the reason is
 	// that a lazy lookup would leave folder one compared on URL alone and folder
@@ -311,7 +369,8 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 		Stack:       flagStack,
 		DryRun:      flagSyncDryRun,
 		AllowCreate: flagSyncAllowCreate,
-		Order:       "path",
+		Order:       applyOrderDependency,
+		Sequence:    []string{},
 		Folders:     []syncApplyFolderReport{},
 	}
 
@@ -336,14 +395,7 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 			interrupted = true
 			break
 		}
-		plan := planOneFolder(ctx, folder, resolved, key)
-		// Counted only for the folders that will actually RUN. A folder held back
-		// by an unanchored anchor or an unresolved bind creates nothing whatever
-		// the flag says, and including it would overstate the promise.
-		if plan.f != nil {
-			creating += plan.creates
-		}
-		planned = append(planned, plan)
+		planned = append(planned, planOneFolder(ctx, folder, resolved, key))
 	}
 	// The folders the walk found and the plan never reached. They are `unknown`
 	// for the same reason a folder ruled out before it loaded is: nothing here
@@ -353,6 +405,22 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 			Path: found[i].Rel, Root: found[i].Root, Kind: found[i].Kind.Name,
 			Units: []syncApplyUnitReport{},
 		}})
+	}
+	// The deferred addresses, and the order: a folder waiting on a row this run
+	// does not deploy is refused, and the folders run in dependency order (see
+	// sync_apply_order.go), a pipeline read loop refused — after which the
+	// deferrals are asked again, since a refused pipeline holds no rows.
+	resolveDeferredAddresses(planned)
+	modules, pipelines, workflows, apps, automations, rest := applySequence(planned)
+	resolveDeferredAddresses(planned)
+	noteUnmanagedFolders(planned)
+	// Counted only for the folders that will actually RUN. A folder held back
+	// by an unanchored anchor or an unresolved bind creates nothing whatever
+	// the flag says, and including it would overstate the promise.
+	for i := range planned {
+		if planned[i].f != nil {
+			creating += planned[i].creates
+		}
 	}
 	// NAMED BEFORE THE FIRST WRITE, on stderr so it survives --json. Rows rather
 	// than folders, because they are different numbers: Tables and Automations
@@ -386,20 +454,76 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 
 	verdicts := make([]string, 0, len(found))
 	created := 0
-	for i := range planned {
+	// IN-RUN RESOLUTION: every row a folder holds once it has run (or once pass
+	// one has created it) answers the addresses later folders deferred.
+	overlay := newAddressOverlay()
+	runCtx := withAddressOverlay(ctx, overlay)
+	run := func(i int) {
+		plan := &planned[i]
 		if ctx.Err() != nil {
 			// ⚠️ FINISH THE REPORT. A tree interrupted 20 folders into 30 is
 			// precisely the state that needs one — some of it is live and some of
 			// it is not — and returning an error instead prints nothing at all,
 			// --json included. The rest are `unknown` because they were never
 			// attempted, which is a different answer from refused.
-			markApplyInterrupted(planned[i:])
-		} else {
-			runPlannedFolder(ctx, &planned[i])
-			created += planned[i].created
+			if plan.created > 0 && plan.line.Verdict == "" {
+				// Pass one made its row; its code was never written.
+				plan.line.Verdict, plan.line.Reason = verdictUnknown, syncReasonInterrupted
+				plan.line.Detail = "its row was created before any code was written, and the run was interrupted before its code was — the next apply finishes it"
+			}
+			markApplyInterrupted(planned[i : i+1])
+			return
 		}
+		report.Sequence = append(report.Sequence, plan.line.Path)
+		if plan.f != nil && len(plan.pending) > 0 && !flagSyncDryRun {
+			// The rows it waited on exist now: resolve them in memory, and the
+			// folder's own loop re-runs its pre-flight over the result.
+			plan.f.resolveAddressDependencies(runCtx)
+		}
+		adopted := plan.f != nil && plan.f.adoptedHere()
+		lockBefore, _ := os.ReadFile(wfdir.LockPath(plan.line.Root))
+		runPlannedFolder(runCtx, plan)
+		if !flagSyncDryRun {
+			overlay.recordFolder(plan.f)
+			if lockAfter, err := os.ReadFile(wfdir.LockPath(plan.line.Root)); adopted && err == nil && !bytes.Equal(lockBefore, lockAfter) {
+				report.LocksRewritten = append(report.LocksRewritten, plan.line.Path)
+			}
+		}
+	}
+	for _, i := range modules {
+		run(i)
+	}
+	for _, i := range pipelines {
+		run(i)
+	}
+	// PASS ONE: every workflow another workflow names by address that does not
+	// exist yet, created and claimed before any workflow's code is written.
+	if !flagSyncDryRun {
+		chosen := passOne(planned, workflows, overlay)
+		for _, i := range workflows {
+			if ctx.Err() != nil {
+				break
+			}
+			if !chosen[i] {
+				continue
+			}
+			createWorkflowFirst(runCtx, &planned[i])
+			overlay.recordFolder(planned[i].f)
+		}
+	}
+	// PASS TWO, then what names a workflow.
+	for _, group := range [][]int{workflows, apps, automations, rest} {
+		for _, i := range group {
+			run(i)
+		}
+	}
+	// After the run, so each warning can say whether its module changes in it.
+	report.Warnings = sharedModuleWarnings(planned)
+	for i := range planned {
 		report.Folders = append(report.Folders, planned[i].line)
 		verdicts = append(verdicts, planned[i].line.Verdict)
+		// Pass one's creates and the push's, summed once per folder.
+		created += planned[i].created
 	}
 
 	report.Summary = summarizeApply(report.Folders)
@@ -464,12 +588,6 @@ func describeCreateDestinations(planned []plannedFolder) string {
 	return "Into features " + strings.Join(parts, ", ") + "."
 }
 
-// plannedFolder is one folder's answer BEFORE anything is written: the line as
-// far as it can be filled in locally, and — only when the folder is cleared to
-// run — the opened folder to run it on.
-//
-// The plan/execute split exists for --allow-create, whose promise is a number
-// for the WHOLE TREE. See syncApplyTree.
 type plannedFolder struct {
 	line syncApplyFolderReport
 	// f is non-nil ONLY when every local gate cleared. A nil f is the whole of
@@ -484,6 +602,17 @@ type plannedFolder struct {
 	// which is the whole difference between the plan and the history.
 	created   int
 	decisions []applyDecision
+	// addresses is what the folder's `moved` / `removed` did to this stack, in
+	// memory, at plan time — reported with the outcome.
+	addresses *addressOutcome
+	// pending are the address dependencies deferred to a row this run deploys
+	// (deferrablePending); pendingDetail is the refusal they would otherwise
+	// have been, for the folder resolveDeferredAddresses cannot keep.
+	pending       []addressPending
+	pendingDetail string
+	// settled reports the folder's managed state was settled already — by
+	// pass one, before its create.
+	settled bool
 }
 
 // markApplyInterrupted finishes the lines of folders the run never got to.
@@ -559,6 +688,11 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 	// declined to.
 	f, err := openFolderForStatusAt(ctx, folder.Root, resolved, folder.Kind)
 	if err != nil {
+		// An ADOPTED folder whose server state refuses it: a definite
+		// answer about this folder, under its own reason.
+		if r, ok := asManagedRefusal(err); ok {
+			return refuse(r.Reason, "%s", r.Detail)
+		}
 		return unknown(syncReasonFolderRefused, "%s", err.Error())
 	}
 	// The three refusals openFolder makes that openFolderForStatusAt does not,
@@ -571,6 +705,13 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 	if f.BindingErr != nil {
 		return unknown(syncReasonFolderRefused, "%s", f.BindingErr.Error())
 	}
+	if err := f.requireAdoptedStackFeature(); err != nil {
+		r, _ := asManagedRefusal(err)
+		return refuse(r.Reason, "%s", r.Detail)
+	}
+	// The write gate's notes go on this folder's line (Notes), not to stderr
+	// as a single-folder command prints them.
+	f.gateNotesCollected = true
 	// The NO-FLAG half of the one-stack-many-folders rule, and slice 2's
 	// selection rule verbatim: an unambiguous (url, organization) match selects,
 	// and otherwise --stack is required. Without it a folder belonging to another
@@ -584,16 +725,61 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 	if readErr != nil {
 		return unknown(syncReasonUnreadable, "%s", readErr.Error())
 	}
+	// The ADDRESS declarations, before anything reads the binding: a `moved`
+	// entry re-keys this stack's recorded row to its new file, so the units
+	// below see an update where they would otherwise see a create beside an
+	// orphan. IN MEMORY: the execute pass pushes on this same *folder, and its
+	// push is what writes the re-key back — a dry-run never does.
+	addresses, err := f.resolveAddresses()
+	if err != nil {
+		// A folder that could not be read is not a declaration to fix.
+		if reason := addressFailureReason(err); reason == syncReasonUnreadable {
+			return unknown(reason, "%s", err.Error())
+		}
+		return refuse(syncReasonAddressConflict, "%s", err.Error())
+	}
+	for _, m := range addresses.Moves {
+		line.Units = append(line.Units, syncApplyUnitReport{
+			Path: m.From, To: m.To, ID: m.ID, Action: string(applyActionMove),
+			Detail: fmt.Sprintf("the %s's address moves from %s to %s; the %s itself, its name included, is not changed by the move", m.Kind, m.From, m.To, m.Kind),
+		})
+	}
+	for _, r := range addresses.Removals {
+		line.Units = append(line.Units, syncApplyUnitReport{
+			Path: r.Path, ID: r.ID, Action: string(applyActionRemove),
+			Detail: fmt.Sprintf("this folder stops managing the %s; it is left exactly as it is — nothing is deleted", r.Kind),
+		})
+	}
+	plan.addresses = addresses
 	// The alias pre-flight, exactly as each push loop runs it, with its WARNINGS
 	// kept: they are not a refusal, every loop prints them, and a tree run that
 	// dropped them would be the one place a dead binding goes unmentioned.
 	aliases, bindReason, bindDetail := decideApplyBind(f, files)
 	line.Notes = append(line.Notes, aliases.Warnings...)
 	if bindReason != "" {
-		return refuse(bindReason, "%s", bindDetail)
+		// Under --allow-create, an address another folder has no claim at YET
+		// is deferred, not refused: if this run deploys that folder, the row
+		// exists by the time this one runs (resolveDeferredAddresses decides,
+		// once every folder is planned). Without the flag nothing is created,
+		// so the refusal stands as it always has — and so does any other.
+		pending, ok := deferrablePending(f, aliases)
+		if !ok || !flagSyncAllowCreate {
+			return refuse(bindReason, "%s", bindDetail)
+		}
+		plan.pending, plan.pendingDetail = pending, bindDetail
 	}
 
 	plan.decisions = applyDecisionsFor(f, sortedPaths(files))
+	if f.Kind.Name == wfdir.KindPipeline {
+		// The METRIC files are creation units too — see pipelineMetricDecisions.
+		// After the .sql files, the order the push itself runs them in.
+		metrics, err := pipelineMetricDecisions(f)
+		if err != nil {
+			return unknown(syncReasonUnreadable, "%s", err.Error())
+		}
+		plan.decisions = append(plan.decisions, metrics...)
+	}
+	relieveAnchorlessAtDesired(ctx, f, files, plan.decisions)
 	for _, d := range plan.decisions {
 		line.Units = append(line.Units, syncApplyUnitReport{
 			Path: d.Path, ID: d.ID, Action: string(d.Action), Reason: d.Reason, Detail: d.Detail,
@@ -602,6 +788,7 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 			plan.creates++
 		}
 	}
+	markManagedUnits(f, line.Units)
 	// The loops' own LOCAL guards, BEFORE apply's gate — the order they really run
 	// in, and the reason they are here at all: each fires before the loop's first
 	// byte, so a dry-run that skipped them reported `applied` for a folder the
@@ -612,6 +799,17 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 	}
 	if reason, detail := syncApplyGate(f, plan.decisions, flagSyncAllowCreate); reason != "" {
 		return refuse(reason, "%s", detail)
+	}
+	// The WRITE GATE for a row this run would CREATE, here and not only inside
+	// the push: the create is the first thing written, and a folder whose code
+	// writes outside this stack's feature must not leave an empty, claimed row
+	// behind on its way to being refused. Every other write is gated by the
+	// push itself, before its first byte (write_gate.go).
+	if reason, detail := planWriteGate(ctx, f, files, plan.decisions); reason != "" {
+		if reason == syncReasonWritesOutsideTarget || reason == syncReasonRunsOutsideTarget {
+			return refuse(reason, "%s", detail)
+		}
+		return unknown(reason, "%s", detail)
 	}
 	// Cleared. A non-nil f from here on is what the execute pass reads.
 	plan.f = f
@@ -633,18 +831,55 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 	}
 	if flagSyncDryRun {
 		line.Verdict = verdictApplied
+		line.Claims = len(plan.f.managedBackfill())
 		line.Detail = describeAttempt(plan.f.Kind, plan.decisions)
+		describeAgainstLive(ctx, plan)
+		// What the plan-time gate admitted outside the stack's feature is
+		// said in a preview too: it is what the apply will do.
+		line.Notes = append(line.Notes, plan.f.gateNotes...)
 		return
 	}
-	detail, created, reviewed, notes, err := applyFolder(ctx, plan.f)
+	// An ADOPTED folder settles its server state first — moves, removals and
+	// the lazy claims (applyManaged) — and writes back a lock the server
+	// disagreed with. A refusal here stops this folder before anything is
+	// pushed. (Once: pass one settles a folder before creating its row.)
+	if !settlePlanned(ctx, plan) {
+		return
+	}
+	var adopted map[string]string
+	detail, created, reviewed, notes, err := applyFolder(ctx, plan.f, &adopted)
 	// Counted whatever the verdict: a push that made two rows and then failed on
 	// the third made two rows, and a run that reported none would be the report
-	// contradicting the organization.
-	plan.created = created
+	// contradicting the organization. ADDED to what pass one made.
+	plan.created += created
+	// A create unit the push resolved by ADOPTING an existing row is not a row
+	// this run made, and not one still to make: it is an update of a row that
+	// was there all along. Relabelled before the summary is taken, so Creates
+	// does not count it as a row left behind.
+	for i := range line.Units {
+		if id, ok := adopted[line.Units[i].Path]; ok && line.Units[i].Action == string(applyActionCreate) {
+			line.Units[i].Action = string(applyActionUpdate)
+			line.Units[i].ID = id
+			line.Units[i].Detail = "adopted the metric already holding this file's name and definition (" + id + ") rather than creating one"
+		}
+	}
 	// Appended whatever the verdict too, beside the alias pre-flight's: a lint
 	// warning describes files that landed, which is true whether or not the
-	// publish after them did.
+	// publish after them did. So are the write gate's notes on binds it
+	// admitted outside the stack's feature.
 	line.Notes = append(line.Notes, notes...)
+	line.Notes = append(line.Notes, plan.f.gateNotes...)
+	// What the address declarations did, once the push has WRITTEN it: the
+	// units list is only printed by a dry-run, and a lock re-keyed by a real
+	// apply is a change to a committed file somebody has to commit.
+	if a := plan.addresses; a != nil && a.saved {
+		for _, m := range a.Moves {
+			line.Notes = append(line.Notes, fmt.Sprintf("moved %s → %s (%s %s) in %s — commit it", m.From, m.To, m.Kind, m.ID, plan.f.addressRecordFile()))
+		}
+		for _, r := range a.Removals {
+			line.Notes = append(line.Notes, fmt.Sprintf("%s (%s %s) is no longer managed here and was left as it is — commit %s", r.Path, r.Kind, r.ID, plan.f.addressRecordFile()))
+		}
+	}
 	// An instance's refusal of a workflow runtime gets the way out that `wf push`
 	// prints under it (runtimeRefusalHint) — as a NOTE, so Detail stays the
 	// one-line refusal a --json reader keys on.
@@ -662,6 +897,22 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 		// genuinely unknown, and the folders after this one already say
 		// `interrupted` — see markApplyInterrupted.
 		unknown(syncReasonInterrupted, "%s", err.Error())
+	case err != nil && isManagedRefusal(plan.f, err):
+		// A create the server's state refused (a tombstone or an unreadable
+		// row holding the address): its own outcome, with its remedy.
+		r, _ := managedRefusalOf(plan.f, err)
+		detail := r.Detail
+		if (r.Reason == syncReasonWritesOutsideTarget || r.Reason == syncReasonRunsOutsideTarget) && plan.f.managed != nil && plan.f.managed.wroteRecords {
+			// The gate refused inside the push, AFTER settle had written this
+			// folder's records — so "nothing was written" would not be true.
+			detail = strings.TrimSuffix(detail, " Nothing was written") +
+				" No row was written; only this folder's records in Ronja (its moved, removed or newly claimed addresses) were settled before the check"
+		}
+		if _, direct := asManagedRefusal(err); direct {
+			refuse(r.Reason, "%s", detail)
+		} else {
+			refuse(r.Reason, "%s: %s", err.Error(), detail)
+		}
 	case errors.As(err, &tagsErr):
 		// The SQL was published and a metric's tag half did not apply — asked
 		// before the checks, which it may carry too. Split as the checks are: a
@@ -710,6 +961,17 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 		refuse(syncReasonSubmittedForReview, "%s", detail)
 	default:
 		line.Verdict, line.Detail = verdictApplied, detail
+	}
+	// The change is live; its anchor not being on the server is this folder's
+	// one remaining problem, and the next apply's drift guard would read a
+	// stale baseline without it — so a deploy that was otherwise clean says so.
+	// (Every lock save recorded its anchor as it went; this only reports.)
+	if st := plan.f.managed; st != nil && st.anchorErr != nil && line.Verdict == verdictApplied {
+		reason := syncReasonAnchorNotRecorded
+		if r, ok := asManagedRefusal(st.anchorErr); ok {
+			reason = r.Reason
+		}
+		refuse(reason, "%s; but %v", line.Detail, st.anchorErr)
 	}
 }
 
@@ -840,7 +1102,7 @@ func wouldCreateRefusal(f *folder, creates []string) (reason, detail string) {
 }
 
 // applyUnitName is what one creation unit is CALLED in a refusal: the file for
-// the two per-file kinds, and the folder itself for the two that have one unit.
+// the two per-file kinds, and the folder itself for the three that have one unit.
 func applyUnitName(f *folder, d applyDecision) string {
 	if d.Path != "" {
 		return d.Path
@@ -881,7 +1143,7 @@ func describeAttempt(kind wfdir.Kind, decisions []applyDecision) string {
 	if updates == 0 {
 		return fmt.Sprintf("would create %d new %s (--allow-create)", creates, plural(creates, "row"))
 	}
-	out := fmt.Sprintf("would %s %d bound %s (whether each has changed is the server's answer, not this one)",
+	out := fmt.Sprintf("would %s whichever of its %d bound %s differ from what is live (a dry run does not compare them)",
 		verb, updates, plural(updates, "thing"))
 	if creates > 0 {
 		out += fmt.Sprintf(", and create %d new %s (--allow-create)", creates, plural(creates, "row"))
@@ -889,9 +1151,68 @@ func describeAttempt(kind wfdir.Kind, decisions []applyDecision) string {
 	return out
 }
 
+// describeAgainstLive sharpens a dry run's line for an adopted workflow,
+// data-app or module folder whose one unit is an update: it reads the live row and makes
+// the comparison apply makes first (liveHoldsFolder), so the line says what
+// apply would do rather than what it would attempt — nothing, when live
+// already holds the folder, and a push and publish when it does not. Reads
+// only. A read that fails leaves the line as describeAttempt wrote it.
+func describeAgainstLive(ctx context.Context, plan *plannedFolder) {
+	line, f := &plan.line, plan.f
+	switch f.Kind.Name {
+	case wfdir.KindWorkflow, wfdir.KindDataApp, wfdir.KindModule:
+	case wfdir.KindPipeline, wfdir.KindAutomation:
+		// Per FILE, classic and adopted folders alike: apply runs both kinds
+		// LiveFirst either way. Not while an address waits on another folder of
+		// the run, whose row does not exist yet.
+		if len(plan.pending) > 0 {
+			return
+		}
+		if f.Kind.Name == wfdir.KindPipeline {
+			comparePipelineUnits(ctx, plan)
+		} else {
+			compareAutomationUnits(ctx, plan)
+		}
+		if !refuseCompared(f.Kind, line) {
+			line.Detail = describeCompared(f.Kind, line.Units, line.Claims)
+		}
+		return
+	default:
+		return
+	}
+	// An adopted folder only: a classic one (no folder id) previews exactly as
+	// it always did.
+	if !f.adoptedHere() || len(plan.pending) > 0 || len(line.Units) != 1 || line.Units[0].Action != string(applyActionUpdate) {
+		return
+	}
+	held, refusal, err := compareWithLive(ctx, f, true)
+	switch {
+	case err != nil:
+		return
+	case refusal != nil:
+		// The apply's own drift guard, asked before its checkout: the folder is
+		// refused, in the words the apply would refuse it in.
+		refuseUnit(&line.Units[0], syncReasonNotDeployed, "refused by apply's drift guard before its checkout — the folder's line says why")
+		line.Verdict, line.Reason, line.Detail = verdictRefused, syncReasonNotDeployed, refusal.Error()
+		return
+	case held:
+		line.Units[0].Action = string(applyActionUnchanged)
+		line.Detail = fmt.Sprintf("nothing to push or publish: the live %s already holds this folder", f.Kind.Label)
+	default:
+		line.Detail = fmt.Sprintf("would push and publish the %s: the live one differs from this folder", f.Kind.Label)
+	}
+	if records := claimsRecorded(line.Claims); len(records) > 0 {
+		line.Detail += "; apply " + joinAnd(records)
+	}
+}
+
+// applyNothingToPush is a folder's line when its push had nothing to push and
+// nothing staged awaited a publish: the apply wrote nothing for it.
+const applyNothingToPush = "nothing to push"
+
 // applyFolder runs one folder's own push and then its own publish.
 //
-// ⚠️ PUSH ALONE IS NOT A DEPLOY. Three of the four kinds stage a DRAFT and every
+// ⚠️ PUSH ALONE IS NOT A DEPLOY. Every kind but one stages a DRAFT and every
 // push report ends `Next: ronja … publish`; an apply that stopped there would
 // leave a repository of unpublished drafts and print success.
 //
@@ -899,7 +1220,7 @@ func describeAttempt(kind wfdir.Kind, decisions []applyDecision) string {
 // directly, so "apply publishes" must not be read as "everything goes through a
 // reviewable draft" — for automations there is nothing to review.
 //
-// `reviewed` reports that a draft was submitted for admin review rather than
+// `reviewed` reports that a draft was submitted for review rather than
 // committed. It is returned SEPARATELY from err because the loops return nil for
 // it, deliberately (it is a real outcome for a person standing in the folder),
 // and apply is the caller for which it is a failure to deploy.
@@ -923,22 +1244,39 @@ func describeAttempt(kind wfdir.Kind, decisions []applyDecision) string {
 //
 //   - pipeline: the files the baseline records a draft id for (pipelineStagedDrafts),
 //     the same set the publish itself would target;
-//   - workflow / data app: a draft that PRE-EXISTED this push and holds something
-//     the live row does not (draftAwaitsPublish). "Is a draft open" cannot answer
-//     it — resolvePushTarget checks one out on the way past — and "did it
-//     pre-exist" cannot answer it alone either, because the draft an earlier
-//     up-to-date apply left behind pre-exists the next one and is identical to
-//     live;
+//   - workflow / data app / module: a draft that PRE-EXISTED this push
+//     (draftAwaitsPublish). The push runs with LiveFirst, so a folder the live
+//     row already holds returns before any checkout — no draft, no write, and
+//     nothing to publish — and a draft that pre-exists an up-to-date push is
+//     then one holding what live does not. "Is a draft open" could not answer
+//     it, since a push that goes on checks one out on the way past;
 //   - automation: nothing at all. That loop writes production directly, so there
 //     is no publish here to skip.
-func applyFolder(ctx context.Context, f *folder) (detail string, created int, reviewed bool, notes []string, err error) {
+//
+// adopted, when not nil, receives the creation units the push resolved by
+// adopting a row that already existed (path → id), so the report can say so
+// rather than list them as rows still to create.
+func applyFolder(ctx context.Context, f *folder, adopted *map[string]string) (detail string, created int, reviewed bool, notes []string, err error) {
 	switch f.Kind.Name {
 	case wfdir.KindPipeline:
-		push, pushErr := runPipelinePush(ctx, f, nil, pipelinePushOptions{})
+		// NoCreate is the create gate a SECOND time, on the path that actually
+		// creates. The plan above refused every folder holding a create unit
+		// unless --allow-create was passed, and this is what keeps that true if
+		// the two ever disagree: a metric used to be created here, in the push's
+		// last pass, with no unit in the plan and no question asked.
+		//
+		// LiveFirst leaves a table its live row already holds alone, which is
+		// what keeps a FRESH checkout — every CI run, with no local baseline to
+		// say which files changed — from re-staging and re-publishing every
+		// table in the folder on every run.
+		push, pushErr := runPipelinePush(ctx, f, nil, pipelinePushOptions{NoCreate: !flagSyncAllowCreate, LiveFirst: true})
 		// COUNTED EVEN ON THE ERROR PATH. A push that made two tables and then
 		// failed on the third made two tables, and a report that said none would
 		// send the reader looking for rows that are already there.
 		created = countPipelineCreates(push)
+		if adopted != nil {
+			*adopted = adoptedPipelineMetrics(push)
+		}
 		// ⚠️ THE HEALTH-CHECK LEG DOES NOT HOLD THE SQL HOSTAGE. A push whose ONLY
 		// problems are its checks (typed by runPipelinePush from its own tally)
 		// still publishes: checks are ungoverned and advisory — "a failing check
@@ -970,9 +1308,28 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// no-argument selection is this same list, and an empty one returns
 		// `Nothing` before it makes a single request.
 		if pushErr == nil && push.UpToDate && len(pipelineStagedDrafts(pipelineBaseline(f))) == 0 {
-			return "nothing to push", created, false, notes, nil
+			return applyNothingToPush, created, false, notes, nil
 		}
 		pushed := countPipelinePushed(push)
+		// A folder that BUILDS nothing — only docs sidecars, which write straight
+		// to the live row — has nothing a publish could commit, and
+		// runPipelinePublish refuses such a folder outright ("run push first"),
+		// which here would refuse a deploy that landed whole.
+		if buildsNothing, err := pipelineBuildsNothing(f); err != nil {
+			return "", created, false, notes, err
+		} else if buildsNothing {
+			documented := 0
+			for _, d := range push.Docs {
+				if d.Outcome == docsOutcomeWritten {
+					documented++
+				}
+			}
+			detail := fmt.Sprintf("documented %d %s; this folder builds no table or metric, so there is nothing to publish", documented, plural(documented, "table"))
+			if err := checksNotAppliedAfter(detail, nil, pushChecks, nil); err != nil {
+				return "", created, false, notes, err
+			}
+			return detail, created, false, notes, nil
+		}
 		published, pubErr := runPipelinePublish(ctx, f, nil, true, false)
 		// The same split on the publish leg: every commit landed and only the
 		// checks applied after them did not.
@@ -1007,7 +1364,7 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// the loop is one comparison per file.
 		for _, file := range published.Files {
 			if file.Outcome == outcomeSubmittedForReview {
-				return fmt.Sprintf("%s was submitted for admin review rather than committed, so this folder is NOT live", file.Path), created, true, notes, nil
+				return fmt.Sprintf("%s was submitted for review by an admin or a maintainer of the feature rather than committed, so this folder is NOT live", file.Path), created, true, notes, nil
 			}
 		}
 		// COUNTED BY OUTCOME, not by the length of the list. published.Files holds
@@ -1032,13 +1389,16 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 
 	case wfdir.KindAutomation:
 		// No draft, no publish: this loop writes production directly.
-		push, pushErr := runAutomationPush(ctx, f, automationPushOptions{})
+		// RequireAnchor on an adopted folder: an anchorless unit the plan let
+		// through (relieveAnchorlessAtDesired) is decided again on the row the
+		// push reads — the plan's read is not the write's.
+		push, pushErr := runAutomationPush(ctx, f, automationPushOptions{RequireAnchor: f.managed != nil})
 		created, written := countAutomationWrites(push)
 		if pushErr != nil {
 			return "", created, false, notes, pushErr
 		}
 		if push.UpToDate {
-			return "nothing to push", created, false, notes, nil
+			return applyNothingToPush, created, false, notes, nil
 		}
 		// WRITTEN, not enumerated. push.Files carries one entry per file including
 		// the `unchanged` ones, and "wrote 9 automations" about a run that wrote
@@ -1046,7 +1406,7 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		return fmt.Sprintf("wrote %d %s", written, plural(written, "automation")), created, false, notes, nil
 
 	case wfdir.KindDataApp:
-		push, pushErr := runAppPush(ctx, f, appPushOptions{Validate: true})
+		push, pushErr := runAppPush(ctx, f, appPushOptions{Validate: true, LiveFirst: true, Apply: true})
 		if push != nil && push.Created {
 			created = 1
 		}
@@ -1065,14 +1425,8 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		if pushErr != nil {
 			return "", created, false, notes, pushErr
 		}
-		if push.UpToDate {
-			staged, err := appDraftAwaitsPublish(ctx, f, push)
-			if err != nil {
-				return "", created, false, notes, err
-			}
-			if !staged {
-				return "nothing to push", created, false, notes, nil
-			}
+		if push.UpToDate && !draftAwaitsPublish(push.DraftID, push.DraftPreexisted) {
+			return applyNothingToPush, created, false, notes, nil
 		}
 		published, pubErr := runAppPublish(ctx, f, true)
 		if pubErr != nil {
@@ -1086,12 +1440,39 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		// that is exactly the run apply makes, and without this scan it would report
 		// `applied` for an app that only became somebody's proposal.
 		if published.Outcome == outcomeSubmittedForReview {
-			return "the draft was submitted for admin review rather than committed, so this folder is NOT live", created, true, notes, nil
+			return "the draft was submitted for review by an admin or a maintainer of the feature rather than committed, so this folder is NOT live", created, true, notes, nil
+		}
+		return published.Detail, created, false, notes, nil
+
+	case wfdir.KindModule:
+		// The workflow arm's shape on the module loop — its own arm, because the
+		// `default:` below runs the WORKFLOW push. There is no validate to run: a
+		// module is marker-free, and the push's local guards are its whole check.
+		push, pushErr := runModulePush(ctx, f, modulePushOptions{LiveFirst: true})
+		if push != nil && push.Created {
+			created = 1
+		}
+		if pushErr != nil {
+			return "", created, false, notes, pushErr
+		}
+		if push.UpToDate && !draftAwaitsPublish(push.DraftID, push.DraftPreexisted) {
+			return applyNothingToPush, created, false, notes, nil
+		}
+		published, pubErr := runModulePublish(ctx, f, publishOptions{NoRequestReview: true})
+		if pubErr != nil {
+			return "", created, false, notes, pubErr
+		}
+		// ⚠️ REACHABLE without any review routing at all: a module created in a
+		// SHARED feature is born a proposal, and `module publish` reports that
+		// as submitted for review with a nil error — an admin approves it, and
+		// until then no workflow can import it. Not live, so not applied.
+		if published.Outcome == outcomeSubmittedForReview {
+			return "the module is a proposal awaiting an admin or a maintainer of the feature rather than committed, so this folder is NOT live", created, true, notes, nil
 		}
 		return published.Detail, created, false, notes, nil
 
 	default:
-		push, pushErr := runPush(ctx, f, pushOptions{Validate: true})
+		push, pushErr := runPush(ctx, f, pushOptions{Validate: true, LiveFirst: true, Apply: true})
 		if push != nil && push.Created {
 			created = 1
 		}
@@ -1101,94 +1482,65 @@ func applyFolder(ctx context.Context, f *folder) (detail string, created int, re
 		if pushErr != nil {
 			return "", created, false, notes, pushErr
 		}
-		if push.UpToDate {
-			staged, err := workflowDraftAwaitsPublish(ctx, f, push)
-			if err != nil {
-				return "", created, false, notes, err
-			}
-			if !staged {
-				return "nothing to push", created, false, notes, nil
-			}
+		if push.UpToDate && !draftAwaitsPublish(push.DraftID, push.DraftPreexisted) {
+			return applyNothingToPush, created, false, notes, nil
 		}
 		published, pubErr := runPublish(ctx, f, publishOptions{NoRequestReview: true})
 		if pubErr != nil {
 			return "", created, false, notes, pubErr
 		}
 		if published.Outcome == outcomeSubmittedForReview {
-			return "the draft was submitted for admin review rather than committed, so this folder is NOT live", created, true, notes, nil
+			return "the draft was submitted for review by an admin or a maintainer of the feature rather than committed, so this folder is NOT live", created, true, notes, nil
 		}
 		return published.Detail, created, false, notes, nil
 	}
 }
 
-// workflowDraftAwaitsPublish and appDraftAwaitsPublish answer the ONE question
+// draftAwaitsPublish answers the ONE question
 // applyFolder's up-to-date branch turns on: is there a draft here holding
-// something the live row does not?
+// something the live row does not? On the apply path that is now exactly "did a
+// draft pre-exist this push", and the reason is the LiveFirst option, not this
+// function:
 //
-// Three legs, and each rules out a different way of getting it wrong:
+//   - a folder the LIVE row already holds — files and metadata — never reaches
+//     a checkout: the push returns up to date with no DraftID, so nothing is
+//     published and nothing is left behind — which is what closed BL-d513;
+//   - so an up-to-date push that DID resolve a draft is one where live differs
+//     from the folder. A draft this push checked out would then have been
+//     written to, and the push would not be up to date — leaving the draft an
+//     earlier run (or the author's own `push`) left open, which holds the
+//     folder while live does not: its publish never landed. Publishing it is
+//     the deploy, whatever the difference is — files, a title, an entrypoint,
+//     a declared calendar, an access grant. The old files-only comparison
+//     missed the metadata ones;
+//   - a PARENTLESS draft pre-exists by construction (DraftID == the binding's
+//     id) and has no live row at all: it awaits publication by definition.
 //
-//   - a draft THIS push checked out is a copy of live by construction, and the
-//     push wrote nothing to it. Publishing it commits an identical draft and
-//     mints an empty version, which is the regression the skip exists to
-//     prevent — so this leg is the one that keeps an unchanged repository from
-//     growing a version per folder per run. It is also what keeps the common
-//     case free: no request is made at all;
-//   - a PARENTLESS draft is not a copy of anything. It is a resource an earlier
-//     run created and never published, so there is no live row to compare it
-//     against and nothing to compare — it awaits publication by definition.
-//     Skipping it left a workflow created under --allow-create unpublished for
-//     ever, since every later run is up to date;
-//   - anything else is a draft an earlier run (or the author's own `push`) left
-//     open, and only its CONTENT says whether its publish ever landed. That
-//     costs two listings, and only on a folder that has one lying about.
+// ⚠️ PRE-EXISTENCE ALONE IS SOUND ONLY BECAUSE LiveFirst ASKS LIVE WHETHER OR
+// NOT A DRAFT IS OPEN. A single-folder `push` still checks a draft out (it is the
+// classic check-out gesture `wf test` runs against) and
+// one that wrote nothing leaves a copy of live behind; were the live comparison
+// made only when no draft is open, that copy would arrive here pre-existing and
+// up to date, and publishing it would mint an empty version on every apply
+// after a classic push. That leg is mutation-tested by
+// TestSyncApplyAfterAClassicPushThatWroteNothingMintsNoVersion.
 //
-// The content comparison is here because resolvePushTarget checks a draft out
-// before it knows whether it has anything to write, so an up-to-date apply
-// leaves one behind that pre-exists the NEXT run. See BL-d513: fix that and this
-// can gate on pre-existence alone.
+// The pre-existence leg itself is, honestly, unreachable on the apply path
+// today: mutating it out leaves the suite green, because an up-to-date push
+// over a draft it checked out ITSELF needs workflowRowHoldsFolder (or its
+// app and module twins) to call live different while the push then writes nothing
+// to a copy of it — a parity break. It is kept because it is what the gate
+// means, and because under a parity break it turns this run's empty publish
+// into a leftover draft.
 //
-// ⚠️ FILES ONLY, which is the honest edge of the claim. A push whose only change
-// was METADATA — a title, an entrypoint, the declared calendar — and whose
-// publish then failed leaves a draft whose files match live, and this answers
-// no. That is the pre-existing behaviour for that folder rather than a new hole,
-// and the remedy is the same one every refusal here names: publish the folder on
-// its own.
-func workflowDraftAwaitsPublish(ctx context.Context, f *folder, push *pushResult) (bool, error) {
-	if push == nil || push.DraftID == "" || !push.DraftPreexisted {
-		return false, nil
-	}
-	if push.DraftID == push.WorkflowID {
-		return true, nil
-	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
-	draft, err := client.ListWorkflowFiles(ctx, push.DraftID)
-	if err != nil {
-		return false, fmt.Errorf("read the files of draft %s to find out whether it still needs publishing: %w", push.DraftID, err)
-	}
-	live, err := client.ListWorkflowFiles(ctx, push.WorkflowID)
-	if err != nil {
-		return false, fmt.Errorf("read the files of %s to find out whether its draft still needs publishing: %w", push.WorkflowID, err)
-	}
-	return !maps.Equal(contentByPath(f.Codec, draft), contentByPath(f.Codec, live)), nil
-}
-
-func appDraftAwaitsPublish(ctx context.Context, f *folder, push *appPushResult) (bool, error) {
-	if push == nil || push.DraftID == "" || !push.DraftPreexisted {
-		return false, nil
-	}
-	if push.DraftID == push.DataAppID {
-		return true, nil
-	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
-	draft, err := client.ListDataAppFiles(ctx, push.DraftID)
-	if err != nil {
-		return false, fmt.Errorf("read the files of draft %s to find out whether it still needs publishing: %w", push.DraftID, err)
-	}
-	live, err := client.ListDataAppFiles(ctx, push.DataAppID)
-	if err != nil {
-		return false, fmt.Errorf("read the files of %s to find out whether its draft still needs publishing: %w", push.DataAppID, err)
-	}
-	return !maps.Equal(appContentByPath(f.Codec, draft), appContentByPath(f.Codec, live)), nil
+// One function for the three draft kinds, which differ only in their result
+// type. For a module — which has ONE draft, so a pre-existing one may be a
+// colleague's — LiveFirst already returned for a live module holding the
+// folder, so an up-to-date push that reached a draft wrote to nothing because
+// that draft already holds the folder, which live does not: publishing it is
+// the deploy.
+func draftAwaitsPublish(draftID string, preexisted bool) bool {
+	return draftID != "" && preexisted
 }
 
 // countPipelineCreates / countPipelinePushed read the loop's OWN per-file flags
@@ -1204,7 +1556,51 @@ func countPipelineCreates(push *pipelinePushResult) int {
 			n++
 		}
 	}
+	// A metric is a row too, and a run that made one and reported none would
+	// be the summary contradicting the organization. An ADOPTED one was not
+	// made by this run — an earlier push made it and lost the recording — and
+	// counting it would be the summary contradicting the organization the other
+	// way. (A table reconciled after a timed-out create IS counted: that create
+	// was this run's, and it committed.)
+	for _, metric := range push.Metrics {
+		if metric.Created && !metric.Adopted {
+			n++
+		}
+	}
 	return n
+}
+
+// adoptedPipelineMetrics lists the metric files whose create this push resolved
+// by ADOPTING the metric already holding the name — creation units the plan
+// counted, with a row behind them after all.
+func adoptedPipelineMetrics(push *pipelinePushResult) map[string]string {
+	if push == nil {
+		return nil
+	}
+	var out map[string]string
+	for _, metric := range push.Metrics {
+		if metric.Adopted {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[metric.Path] = metric.MetricID
+		}
+	}
+	return out
+}
+
+// pipelineBuildsNothing reports a pipeline folder with no table and no metric
+// file — the case runPipelinePublish refuses as "nothing to publish", which
+// for a folder of docs sidecars alone is every run.
+func pipelineBuildsNothing(f *folder) (bool, error) {
+	if len(f.Binding.Tables) > 0 {
+		return false, nil
+	}
+	metrics, err := readMetricFiles(f.Root)
+	if err != nil {
+		return false, err
+	}
+	return len(metrics) == 0, nil
 }
 
 func countPipelinePushed(push *pipelinePushResult) int {
@@ -1259,6 +1655,7 @@ func summarizeApply(folders []syncApplyFolderReport) syncApplySummary {
 		default:
 			summary.Unknown++
 		}
+		summary.Claims += f.Claims
 		for _, unit := range f.Units {
 			if unit.Action == string(applyActionCreate) {
 				// FILES, not folders. See syncApplySummary.Creates.
@@ -1299,6 +1696,9 @@ func printSyncApply(r *syncApplyReport) {
 	if r.DryRun {
 		fmt.Fprintf(out, "  DRY RUN — nothing was written.\n")
 	}
+	for _, w := range r.Warnings {
+		fmt.Fprintf(out, "\n  WARNING (%s): %s\n    %s\n", w.Reason, w.Path, indentContinuation(w.Detail, "      "))
+	}
 
 	if len(r.Folders) == 0 {
 		fmt.Fprintf(out, "\n  No %s found under this directory.\n", wfdir.ManifestName)
@@ -1306,7 +1706,18 @@ func printSyncApply(r *syncApplyReport) {
 	}
 
 	fmt.Fprintf(out, "\n  %d %s, in %s order\n", len(r.Folders), plural(len(r.Folders), "folder"), r.Order)
-	for _, f := range r.Folders {
+	listed := r.Folders
+	if len(r.Sequence) == len(r.Folders) {
+		byPath := map[string]syncApplyFolderReport{}
+		for _, f := range r.Folders {
+			byPath[f.Path] = f
+		}
+		listed = make([]syncApplyFolderReport, 0, len(r.Sequence))
+		for _, path := range r.Sequence {
+			listed = append(listed, byPath[path])
+		}
+	}
+	for _, f := range listed {
 		if f.Kind != "" {
 			fmt.Fprintf(out, "    %s (%s)\n", f.Path, f.Kind)
 			continue
@@ -1322,7 +1733,7 @@ func printSyncApply(r *syncApplyReport) {
 	for _, f := range r.Folders {
 		fmt.Fprintf(out, "    %-8s %s\n", f.Verdict, f.Path)
 		if f.Detail != "" {
-			fmt.Fprintf(out, "             %s\n", f.Detail)
+			fmt.Fprintf(out, "             %s\n", indentContinuation(f.Detail, "             "))
 		}
 		// Only in a dry-run: after a real apply the per-unit decisions are the
 		// INPUT to what happened, and printing them beside the outcome invites
@@ -1333,12 +1744,27 @@ func printSyncApply(r *syncApplyReport) {
 			}
 		}
 		for _, note := range f.Notes {
-			fmt.Fprintf(out, "             note       %s\n", note)
+			fmt.Fprintf(out, "             note       %s\n", indentContinuation(note, "                          "))
 		}
 	}
 
-	fmt.Fprintf(out, "\n  %s — %d applied, %d refused, %d not deployable\n",
-		r.Verdict, r.Summary.Applied, r.Summary.Refused, r.Summary.Unknown)
+	if r.DryRun {
+		// Conditional, all of it: nothing was applied or refused yet.
+		fmt.Fprintf(out, "\n  %s — %d would apply, %d would be refused, %d not deployable\n",
+			dryRunVerdict(r.Verdict), r.Summary.Applied, r.Summary.Refused, r.Summary.Unknown)
+	} else {
+		fmt.Fprintf(out, "\n  %s — %d applied, %d refused, %d not deployable\n",
+			r.Verdict, r.Summary.Applied, r.Summary.Refused, r.Summary.Unknown)
+	}
+	if n := len(r.LocksRewritten); n > 0 {
+		sort.Strings(r.LocksRewritten)
+		fmt.Fprintf(out, "  %s changed in %d adopted %s (%s). %s records in Ronja, so a deploy never needs it, but a fresh checkout's `sync apply --dry-run` and `sync status` compare against it: commit it. If it conflicts in a merge, take either side, then run `ronja sync apply`: it rewrites the lock from Ronja, and until it does, the dry run and status read the side you took — which can name a deployed .sql file as never deployed, or plan rows as adopt.\n",
+			wfdir.LockName, n, plural(n, "folder"), strings.Join(r.LocksRewritten, ", "), agree(n, "That folder keeps its", "Those folders keep their"))
+	}
+	if n := r.Summary.Claims; n > 0 && r.DryRun {
+		fmt.Fprintf(out, "  %d %s would be recorded in Ronja for rows a lock names and Ronja has no record of; no row changes for %s.\n",
+			n, plural(n, "claim"), agree(n, "it", "them"))
+	}
 	// The create line says what actually HAPPENED to those units, and the two
 	// answers are opposites: under --allow-create the rows were made, and printing
 	// "which apply refuses" underneath a run that made thirty of them would be the
@@ -1374,13 +1800,32 @@ func printSyncApply(r *syncApplyReport) {
 }
 
 // applyUnitLabel names one unit in the dry-run listing: the file for the two
-// per-file kinds, the kind itself for the two with one unit each.
+// per-file kinds, the kind itself for the three with one unit each.
 func applyUnitLabel(unit syncApplyUnitReport, kind string) string {
+	if unit.To != "" {
+		return unit.Path + " → " + unit.To
+	}
 	if unit.Path != "" {
 		return unit.Path
+	}
+	if k, ok := wfdir.KindByName(kind); ok {
+		return "the " + k.Label
 	}
 	if kind != "" {
 		return "the " + kind
 	}
 	return "this folder"
+}
+
+// dryRunVerdict is the tree's verdict word in a dry run's summary line, where
+// nothing has happened yet: "would apply", "would be refused". unknown stays
+// as it is — it is already an answer about what could be told.
+func dryRunVerdict(verdict string) string {
+	switch verdict {
+	case verdictApplied:
+		return "would apply"
+	case verdictRefused:
+		return "would be refused"
+	}
+	return verdict
 }

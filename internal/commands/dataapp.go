@@ -90,6 +90,7 @@ production without either overwriting the other's binding.`,
 		newDataAppInitCmd(), newDataAppCloneCmd(), newDataAppStatusCmd(),
 		newDataAppForkCmd(), newDataAppPushCmd(), newDataAppValidateCmd(),
 		newDataAppTestCmd(), newDataAppPublishCmd(), newDataAppDiscardCmd(),
+		newPullCmd(wfdir.DataAppKind),
 	)
 	addStackFlag(app)
 	return app
@@ -323,6 +324,7 @@ func inspectAppRow(ctx context.Context, client *api.Client, f *folder) (appTarge
 	if err := refuseUnworkableApp(app); err != nil {
 		return appTarget{}, err
 	}
+	f.noteManagedBy(wfdir.ManagedDataApp, app.IdentityID(), app.ManagedBy)
 	return appTarget{App: app}, nil
 }
 
@@ -386,6 +388,8 @@ func baselineFromApp(codec aliasCodec, source *api.DataApp, files []api.DataAppF
 		Entrypoint:        source.Entrypoint,
 		Access:            baselineAccess(source),
 		Files:             map[string]wfdir.FileState{},
+		Aliases:           codec.baselineAliases(),
+		AliasesRecorded:   true,
 	}
 	for _, f := range files {
 		inst.Files[f.Path] = wfdir.FileState{
@@ -399,14 +403,15 @@ func baselineFromApp(codec aliasCodec, source *api.DataApp, files []api.DataAppF
 // baselineFromAppLocal is baselineFromApp for content the CLI just WROTE rather
 // than read back: after a push, the server holds exactly the bytes we sent.
 //
-// It takes NO codec, and that is the invariant rather than an omission: `files`
-// is the folder's own content, already in disk form, and the baseline is a
-// fingerprint of exactly that.
+// The codec is applied to NOTHING, and that is the invariant: `files` is the
+// folder's own content, already in disk form, and the baseline is a
+// fingerprint of exactly that. It is only recorded (Aliases) — see
+// baselineFromLocal.
 //
 // Per-file UpdatedAt is left empty — the field is diagnostics only (drift is
 // decided on the hash), and inventing timestamps we did not receive would be
 // worse than saying nothing.
-func baselineFromAppLocal(source *api.DataApp, files map[string]string) *wfdir.InstanceState {
+func baselineFromAppLocal(codec aliasCodec, source *api.DataApp, files map[string]string) *wfdir.InstanceState {
 	inst := &wfdir.InstanceState{
 		SourceID:          source.ID,
 		SourceLifecycle:   source.Lifecycle,
@@ -415,6 +420,8 @@ func baselineFromAppLocal(source *api.DataApp, files map[string]string) *wfdir.I
 		Entrypoint:        source.Entrypoint,
 		Access:            baselineAccess(source),
 		Files:             map[string]wfdir.FileState{},
+		Aliases:           codec.baselineAliases(),
+		AliasesRecorded:   true,
 	}
 	for path, content := range files {
 		inst.Files[path] = wfdir.FileState{SHA256: wfdir.HashString(content)}

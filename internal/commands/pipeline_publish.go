@@ -78,14 +78,16 @@ folder has local changes that are not in the drafts.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.PipelineKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.PipelineKind)
 			if err != nil {
 				return err
 			}
 			result, err := runPipelinePublish(cmd.Context(), f, args, noRequestReview, overwriteRemote)
 			// Emitted even on failure, exactly like push: a refusal that carries a
 			// result is one the caller has to be able to READ.
+			printManagedNotices(f.notices)
 			if result != nil {
+				result.ManagedInGit = f.notices
 				if flagJSON {
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
@@ -120,6 +122,9 @@ type pipelinePublishResult struct {
 	// different answer from a publish that refused everything it found.
 	Nothing bool   `json:"nothing"`
 	Error   string `json:"error,omitempty"`
+	// ManagedInGit is every table or metric this command read whose `managedBy` names a
+	// repository folder other than this one (managed_notice.go).
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 // pipelinePublishedMetric is what happened to one metric file's draft.
@@ -221,6 +226,18 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 		return nil, fmt.Errorf("nothing to publish — this folder has no tables or metrics on %s yet; run `ronja pipeline push` first",
 			f.Resolved.URL)
 	}
+
+	// The ADDRESS declarations, before anything reads a path: a file renamed with
+	// a `moved` entry since the push that staged its draft is the same table at
+	// its new path, and without this the draft would be published under the old
+	// one and the lock left naming a file that is gone. Refused exactly as a
+	// push refuses them, since what they cannot resolve is which row a path is.
+	// In memory, like `status`; written back below only once there is something
+	// to publish, because that is when a publish writes the lock at all.
+	if _, err := f.resolveAddresses(); err != nil {
+		return nil, err
+	}
+	f.noteAddresses()
 
 	// A dirty folder is a WARNING, not a refusal: publishing the drafts as they
 	// stand is a perfectly reasonable thing to want. But it is also the one way
@@ -342,6 +359,12 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 				}
 			}
 		}
+	}
+
+	// The re-keyed addresses, written before the first commit: the drafts below
+	// are recorded under their NEW paths, and a commit is irreversible.
+	if err := f.saveAddresses(); err != nil {
+		return nil, fmt.Errorf("record the moved addresses in %s: %w", f.addressRecordFile(), err)
 	}
 
 	failed, checksFailed := 0, 0
@@ -524,6 +547,8 @@ func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *
 	if err != nil {
 		return refuse("read draft %s: %v", draft.ID, err)
 	}
+	// A draft's single-row GET answers its ROOT's claim.
+	f.noteTableManagedBy(staged)
 	switch staged.BuildVerdict {
 	case api.BuildVerdictFailed, api.BuildVerdictFailedStale:
 		reason := ""
@@ -549,7 +574,7 @@ func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *
 
 	commitErr := client.CommitTableDraft(ctx, draft.ID, "")
 	if why, taken := api.AsNameTaken(commitErr); taken {
-		return refuse("committing %s was refused — the name your draft would publish is taken:\n      %s\n    Nothing was committed and your draft is intact. A metric and a table share one namespace inside a feature; rename one of the two in the web app, then publish again",
+		return refuse("committing %s was refused — the name your draft would publish is taken:\n      %s\n    Nothing was committed and your draft is intact. A metric and a table share one namespace inside a feature; change this file's \"name\" (if it has one) and push again, or rename the other one in the web app, then publish again",
 			file.MetricID, why)
 	}
 	if commitErr != nil && api.StatusOf(commitErr) == api.StatusConflict {
@@ -638,6 +663,12 @@ func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *
 		declared = ""
 	}
 	f.live(inst).setMetricSeen(file.Path, file.MetricID, metricfile.RecipeSHA256(live.MetricRecipe), declared)
+	// The NAME's agreement, read off the ROW: the commit landed the draft's name,
+	// and when that is the one this file declares, it is the name this folder now
+	// agrees the metric has.
+	if file.File.Name != nil && sameName(live.Name, *file.File.Name) {
+		f.live(inst).setMetricName(file.Path, file.MetricID, live.Name)
+	}
 
 	// THE ONE GOVERNANCE CONSEQUENCE A METRIC HAS AND A TABLE DOES NOT.
 	// Committing a definition change re-fingerprints the metric, and a metric
@@ -762,6 +793,8 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 	if err != nil {
 		return refuse("read draft %s: %v", draft.ID, err)
 	}
+	// A draft's single-row GET answers its ROOT's claim.
+	f.noteTableManagedBy(staged)
 	switch staged.BuildVerdict {
 	case api.BuildVerdictFailed, api.BuildVerdictFailedStale:
 		reason := ""
@@ -862,11 +895,11 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 	// the author to `discard` or `--overwrite-remote` — neither of which frees a
 	// name, and one of which throws away a colleague's version to no purpose.
 	if why, taken := api.AsNameTaken(commitErr); taken {
-		// The fix is in the web app, not in this folder: `push` sends a name on
-		// CREATE only, so renaming the .sql file does not rename the table — it
-		// unbinds the file and the next push creates a second one beside it.
-		return refuse("committing %s was refused — the name your draft would publish is taken:\n      %s\n    Nothing was committed and your draft is intact. Rename one of the two tables in the web app, then publish again",
-			out.TableID, why)
+		// Renaming the .sql FILE is not the fix: the file's path is its identity,
+		// so that unbinds it and the next push creates a second table beside the
+		// first. The name is the `-- @name` header's, or the other table's.
+		return refuse("committing %s was refused — the name your draft would publish is taken:\n      %s\n    Nothing was committed and your draft is intact. Change this file's `%s` (if it has one) and push again, or rename the other table in the web app, then publish again",
+			out.TableID, why, tabledocs.NamePrefix)
 	}
 	if commitErr != nil && api.StatusOf(commitErr) == api.StatusConflict {
 		// The one refusal that is about somebody else's work rather than about
@@ -1041,6 +1074,16 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 	// Only meaningful where the row could be read; the liveErr branch below never
 	// consults it.
 	landed := docsLanded(docs, live)
+	// The NAME's agreement, on the same rule as the rest: the commit landed the
+	// draft's name on the live row, and when that is the name this file
+	// declares, it is now the name this folder agrees the table has. Read off
+	// the ROW, never assumed from the push — a draft somebody renamed after the
+	// push would otherwise be recorded as this folder's own.
+	if liveErr == nil {
+		if declared, _ := tabledocs.ParseName(local[path]); declared != nil && sameName(live.Name, *declared) {
+			f.live(inst).setTableName(path, out.TableID, live.Name)
+		}
+	}
 	if documented && liveErr == nil && !landed {
 		fmt.Fprintf(os.Stderr, "  Note: %s was published, but %s does not hold the documentation this file declares — its prose never landed (a push can report that as `documentation NOT written`). The file is left as unsynced so the next `ronja pipeline push` sends it again.\n",
 			path, out.TableID)

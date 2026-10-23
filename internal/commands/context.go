@@ -33,9 +33,10 @@ func newContextCmd() *cobra.Command {
 
 Intended to be the second thing an agent runs, after 'ronja login'. It
 reports which instance you are signed in to and as whom, the organization's
-policy (the standing rules its admins wrote for how work here is done), how
-to authenticate, and then inlines the instance's own API index (/llms.txt) —
-so from here on you can work over plain HTTP and never touch this CLI again.
+policy (the standing rules its admins wrote for how work here is done) and
+your own, how to authenticate, and then inlines the instance's own API index
+(/llms.txt) — so from here on you can work over plain HTTP and never touch
+this CLI again.
 
 The token is never printed. This shows how to LOAD it instead —
 'eval "$(ronja env)"' puts it in $RONJA_TOKEN without displaying it — and
@@ -57,6 +58,8 @@ reports the credential file for callers that are not a POSIX shell.`,
 			// two; each goroutine writes only its own pair.
 			var policy *api.Policy
 			var policyErr error
+			var applied *api.AppliedPolicy
+			var appliedErr error
 			if resolved.Token != "" {
 				var wg sync.WaitGroup
 				wg.Add(2)
@@ -66,7 +69,7 @@ reports the credential file for callers that are not a POSIX shell.`,
 				}()
 				go func() {
 					defer wg.Done()
-					policy, policyErr = client.OrgPolicy(cmd.Context())
+					policy, policyErr, applied, appliedErr = readPolicies(cmd.Context(), client)
 				}()
 				wg.Wait()
 			}
@@ -86,13 +89,13 @@ reports the credential file for callers that are not a POSIX shell.`,
 
 			here := localWork()
 			if flagJSON {
-				payload := contextPayload(resolved, me, authErr, policy, policyErr, llms)
+				payload := contextPayload(resolved, me, authErr, policy, policyErr, applied, appliedErr, llms)
 				if here != nil {
 					payload["localWorkflow"] = here.payload()
 				}
 				return emitJSON(payload)
 			}
-			printContext(resolved, me, authErr, policy, policyErr, llms, !noDocs)
+			printContext(resolved, me, authErr, policy, policyErr, applied, appliedErr, llms, !noDocs)
 			printLocalWork(here)
 			return nil
 		},
@@ -135,7 +138,7 @@ func identityStatus(resolved *config.Resolved, me *api.Me, authErr error) string
 	return "rejected"
 }
 
-func contextPayload(resolved *config.Resolved, me *api.Me, authErr error, policy *api.Policy, policyErr error, llms string) map[string]any {
+func contextPayload(resolved *config.Resolved, me *api.Me, authErr error, policy *api.Policy, policyErr error, applied *api.AppliedPolicy, appliedErr error, llms string) map[string]any {
 	docs := map[string]string{}
 	for _, d := range docPaths {
 		docs[strings.TrimPrefix(d.path, "/")] = resolved.URL + d.path
@@ -176,18 +179,49 @@ func contextPayload(resolved *config.Resolved, me *api.Me, authErr error, policy
 			payload["role"] = me.Role.Name
 		}
 	}
-	// The document is carried whenever served, an empty one included: its
-	// version is the CAS token for the first write. organizationPolicyStatus
-	// is the closed-set verdict a consumer keys on, never error text.
+	// The document is carried whenever served, an empty one included.
+	// organizationPolicyStatus is the closed-set verdict a consumer keys on,
+	// never error text. Its version is carried only beside the whole document,
+	// where it is the CAS token for the next write. Beside the general part it
+	// is dropped (isGeneralPart instead): content, verbatim, is that part's CAS
+	// token on PUT /policy/org/part, and a whole-document PUT of it at the
+	// version would drop every section.
 	if status := policyStatus(me, policy, policyErr); status != "" {
 		payload["organizationPolicyStatus"] = status
 	}
 	if policy != nil && !noOrganization(me) {
-		doc := map[string]any{"content": policy.Content, "version": policy.Version}
+		doc := map[string]any{"content": policy.Content}
+		if policy.GeneralPart {
+			doc["isGeneralPart"] = true
+		} else {
+			doc["version"] = policy.Version
+		}
 		if policy.UpdatedAt != "" {
 			doc["updatedAt"] = policy.UpdatedAt
 		}
 		payload["organizationPolicy"] = doc
+	}
+	if status := propertyPoliciesStatus(me, applied, appliedErr); status != "" {
+		payload["propertyPoliciesStatus"] = status
+	}
+	if applied != nil && !noOrganization(me) {
+		list := make([]map[string]any, 0, len(applied.Sections))
+		for _, sec := range applied.Sections {
+			list = append(list, map[string]any{
+				"propertyKey":   sec.PropertyKey,
+				"valueKey":      sec.ValueKey,
+				"propertyLabel": sec.PropertyLabel,
+				"valueLabel":    sec.ValueLabel,
+				"content":       sec.Content,
+				"because":       sec.Because,
+			})
+		}
+		payload["propertyPolicies"] = list
+	}
+	// No status key of its own: it rides on the property-policy read, whose
+	// failures propertyPoliciesStatus already names, so absent means none.
+	if own := ownPolicy(me, applied); own != nil {
+		payload["ownPolicy"] = map[string]any{"content": own.Content, "version": own.Version}
 	}
 	if llms != "" {
 		payload["llmsText"] = llms
@@ -197,7 +231,7 @@ func contextPayload(resolved *config.Resolved, me *api.Me, authErr error, policy
 
 // docsWanted distinguishes "the index was skipped" from "the index could not be
 // fetched".
-func printContext(resolved *config.Resolved, me *api.Me, authErr error, policy *api.Policy, policyErr error, llms string, docsWanted bool) {
+func printContext(resolved *config.Resolved, me *api.Me, authErr error, policy *api.Policy, policyErr error, applied *api.AppliedPolicy, appliedErr error, llms string, docsWanted bool) {
 	out := os.Stdout
 
 	fmt.Fprintf(out, "# Ronja API access\n\n")
@@ -229,6 +263,8 @@ func printContext(resolved *config.Resolved, me *api.Me, authErr error, policy *
 	// Before the credential recipe, so the rules are read before the first
 	// request is composed.
 	printOrganizationPolicy(out, me, authErr, policy, policyErr)
+	printPropertyPolicies(out, me, authErr, applied, appliedErr)
+	printOwnPolicy(out, me, applied)
 
 	// Named apart from the "## Authentication" section in the inlined llms.txt.
 	fmt.Fprintf(out, "\n## Use your credentials\n\n")

@@ -702,10 +702,10 @@ func TestFormatVersionSpellingsAllReachTheGate(t *testing.T) {
 		value   string
 		wantErr string
 	}{
-		{name: "integer", value: `4`, wantErr: "format version 4"},
-		{name: "trailing zero", value: `4.0`, wantErr: "format version 4.0"},
-		{name: "exponent", value: `4e1`, wantErr: "format version 4e1"},
-		{name: "fractional", value: `3.5`, wantErr: "format version 3.5"},
+		{name: "integer", value: `8`, wantErr: "format version 8"},
+		{name: "trailing zero", value: `8.0`, wantErr: "format version 8.0"},
+		{name: "exponent", value: `5e1`, wantErr: "format version 5e1"},
+		{name: "fractional", value: `7.5`, wantErr: "format version 7.5"},
 		{name: "past float range", value: `1e999`, wantErr: "format version 1e999"},
 		// Not a number at all: refused on its own terms rather than ignored,
 		// because what the reader needs to know is that this file's format could
@@ -719,6 +719,10 @@ func TestFormatVersionSpellingsAllReachTheGate(t *testing.T) {
 		{name: "one, spelled long", value: `1.0`, wantErr: "formatVersion"},
 		{name: "two, spelled long", value: `2.0`, wantErr: "formatVersion"},
 		{name: "three, spelled long", value: `3.0`, wantErr: "formatVersion"},
+		{name: "four, spelled long", value: `4.0`, wantErr: "formatVersion"},
+		{name: "five, spelled long", value: `5.0`, wantErr: "formatVersion"},
+		{name: "six, spelled long", value: `6.0`, wantErr: "formatVersion"},
+		{name: "seven, spelled long", value: `7.0`, wantErr: "formatVersion"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

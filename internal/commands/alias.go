@@ -1,8 +1,11 @@
 package commands
 
 import (
+	"cmp"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -36,6 +39,13 @@ type aliasCodec struct {
 	// name it refuses.
 	toID    map[aliasKey]string
 	toAlias map[aliasKey]string
+	// writeToID and writeToAlias are the same two directions for the
+	// `{{ write(...) }}` marker, which no family covers (see markers/writes.go):
+	// only a dependency declared "write" (a write-capable data source) or
+	// "output" (the folder's own output, by name) resolves there. Keyed by name
+	// alone — a write target is always a table.
+	writeToID    map[string]string
+	writeToAlias map[string]string
 }
 
 // aliasKey is one (dependency kind, name) pair — see aliasCodec's fields.
@@ -82,9 +92,264 @@ func newAliasCodec(deps map[string]wfdir.Dependency, bind map[string]string) ali
 		if _, taken := c.toAlias[reverse]; !taken {
 			c.toAlias[reverse] = alias
 		}
+		if (dep.Write || dep.Output) && dep.Kind == markers.KindTable {
+			if c.writeToID == nil {
+				c.writeToID, c.writeToAlias = map[string]string{}, map[string]string{}
+			}
+			c.writeToID[alias] = bind[alias]
+			if _, taken := c.writeToAlias[bind[alias]]; !taken {
+				c.writeToAlias[bind[alias]] = alias
+			}
+		}
 	}
 	return c
 }
+
+// baselineAliases is what a baseline records of this codec (see
+// wfdir.InstanceState.Aliases): nil for a codec that resolves nothing.
+func (c aliasCodec) baselineAliases() map[string]wfdir.BaselineAlias {
+	if len(c.toID) == 0 {
+		return nil
+	}
+	out := make(map[string]wfdir.BaselineAlias, len(c.toID))
+	for key, id := range c.toID {
+		_, write := c.writeToID[key.name]
+		out[key.name] = wfdir.BaselineAlias{Kind: key.kind, ID: id, Write: write}
+	}
+	return out
+}
+
+// codecOfBaseline rebuilds the codec a baseline's aliases describe.
+func codecOfBaseline(aliases map[string]wfdir.BaselineAlias) aliasCodec {
+	deps := make(map[string]wfdir.Dependency, len(aliases))
+	bind := make(map[string]string, len(aliases))
+	for alias, a := range aliases {
+		deps[alias] = wfdir.Dependency{Kind: a.Kind, Write: a.Write}
+		bind[alias] = a.ID
+	}
+	return newAliasCodec(deps, bind)
+}
+
+// baselineCodec is the codec the folder's local baseline was taken under —
+// the one the remote is rendered through when it is compared with that
+// baseline (the drift guard, its preconditions, status's "changed on the
+// server since the last sync"). A binding re-pointed in ronja.json since is a
+// LOCAL change, which the push deploys, and never reads as the server's file
+// having moved (reboundSinceBaseline names it). A baseline that recorded
+// resolving no alias compares the remote as stored; one an older CLI wrote
+// records nothing and compares through the folder's current codec, as before
+// the record existed.
+func (f *folder) baselineCodec() aliasCodec {
+	if b := f.State.For(f.Key); b != nil && !b.AliasesUnrecorded() {
+		return codecOfBaseline(b.Aliases)
+	}
+	return f.Codec
+}
+
+// reboundAlias is one binding re-pointed in ronja.json since the folder's
+// baseline was taken: a LOCAL change, which the next push or apply deploys.
+// From is "" for an alias the baseline did not resolve, To "" for one the
+// stack no longer binds.
+type reboundAlias struct {
+	Alias string `json:"alias"`
+	Kind  string `json:"kind"`
+	From  string `json:"from,omitempty"`
+	To    string `json:"to,omitempty"`
+	// Refused is set when the push refuses this rebind: the last sync was
+	// recorded by an older CLI, which did not note its bindings, so the
+	// server's untouched file reads as a change made in Ronja
+	// (reboundUnrecorded). It holds the way past (reboundWayPast).
+	Refused string `json:"refused,omitempty"`
+}
+
+// describe is the change in one phrase, as status and the tree verdict say it.
+func (r reboundAlias) describe() string {
+	switch {
+	case r.From == "":
+		return fmt.Sprintf("binding `%s` added (%s)", r.Alias, r.To)
+	case r.To == "":
+		return fmt.Sprintf("binding `%s` removed (it was %s)", r.Alias, r.From)
+	}
+	return fmt.Sprintf("binding `%s` re-pointed from %s to %s", r.Alias, r.From, r.To)
+}
+
+// reboundSinceBaseline names each alias a file of the folder uses whose
+// binding differs from the one the baseline was taken under. The server still
+// holds the old id there, so the folder is not in step with it, though no file
+// changed on either side — and the drift line, which compares through the
+// baseline's aliases (baselineCodec), rightly says nothing about it. Nil for a
+// baseline that records nothing (an older CLI's), which cannot say what moved.
+//
+// The folder's files are read only when a binding did change; one that cannot
+// be read keeps every changed binding, since nothing then shows it unused.
+func (f *folder) reboundSinceBaseline() []reboundAlias {
+	b := f.State.For(f.Key)
+	if b == nil || b.AliasesUnrecorded() {
+		return nil
+	}
+	now := f.Codec.baselineAliases()
+	var changed []reboundAlias
+	for _, alias := range sortedKeysOf(b.Aliases, now) {
+		was, is := b.Aliases[alias], now[alias]
+		if was.ID == is.ID && was.Kind == is.Kind {
+			continue
+		}
+		// An address, or an unbound output, whose lookup was owed and got no
+		// answer resolves to nothing here without having been re-pointed — the
+		// rest of the report says why (lookupMissed). An unbound output written
+		// by name resolves to nothing as its true state, and is reported.
+		if is.ID == "" && f.lookupMissed(alias) {
+			continue
+		}
+		changed = append(changed, reboundAlias{Alias: alias, Kind: cmp.Or(is.Kind, was.Kind), From: was.ID, To: is.ID})
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+	files, _, err := readLocalFiles(f.Root, f.Kind)
+	if err != nil {
+		return changed
+	}
+	used := aliasesUsedInFiles(f.Manifest, files)
+	return slices.DeleteFunc(changed, func(r reboundAlias) bool { return !used[aliasKey{kind: r.Kind, name: r.Alias}] })
+}
+
+// unrecordedRebind is status's half of reboundUnrecorded: over a baseline an
+// older CLI wrote, when the drift is only a binding re-pointed in ronja.json,
+// those files leave the drift — nothing changed in Ronja, and `pull` would
+// write the old id back into the folder and lose the rebind — and the
+// bindings are returned, each carrying the way past the push's refusal.
+// remote is in the folder's current aliases.
+func (f *folder) unrecordedRebind(drift *wfdir.Diff, remote map[string]string) []reboundAlias {
+	if !f.State.For(f.Key).AliasesUnrecorded() || drift == nil || !drift.Dirty() {
+		return nil
+	}
+	local, _, err := readLocalFiles(f.Root, f.Kind)
+	if err != nil {
+		return nil
+	}
+	out := f.reboundUnrecorded(*drift, remote, local)
+	if len(out) == 0 {
+		return nil
+	}
+	drift.Unchanged += len(drift.Modified)
+	drift.Modified = []string{}
+	for i := range out {
+		out[i].Refused = reboundWayPast(f)
+	}
+	return out
+}
+
+// reboundWayPast is how to get a rebind past the drift guard over an older
+// CLI's baseline: take a baseline that records the binding — `pull` in an
+// adopted folder, a push in a classic one, which writes nothing while the row
+// holds the folder — then re-point it.
+func reboundWayPast(f *folder) string {
+	record := f.Kind.Command + " pull"
+	if !f.adoptedHere() {
+		record = f.Kind.Command + " push"
+	}
+	return fmt.Sprintf("put the binding back in ronja.json, run `%s`, then re-point it", record)
+}
+
+// reboundUnrecorded explains a drift refusal over a baseline that records no
+// aliases — one an older CLI wrote — when all that moved is a binding
+// re-pointed in ronja.json. The live row still holds the old id, which the
+// folder's current aliases cannot turn back into the alias, so its untouched
+// file reads as changed in Ronja; nothing here knows the old binding to say
+// otherwise. It is inferred from the files instead: each changed file's
+// markers, set against the folder's own, must differ only where the folder
+// names an alias and the remote an id, one id per alias — and the remote
+// rendered through those ids must hash to the baseline exactly. Nil when any
+// of that fails, when a file was added or removed there, and for a baseline
+// that records its aliases (baselineCodec compares through them).
+//
+// remote is in the folder's current aliases, local in disk form.
+func (f *folder) reboundUnrecorded(drift wfdir.Diff, remote, local map[string]string) []reboundAlias {
+	b := f.State.For(f.Key)
+	if !b.AliasesUnrecorded() || len(drift.Added)+len(drift.Deleted) > 0 || len(drift.Modified) == 0 {
+		return nil
+	}
+	old := map[string]string{}
+	for _, path := range drift.Modified {
+		l, onLocal := local[path]
+		r, onRemote := remote[path]
+		if !onLocal || !onRemote || !inferBindings(f.Manifest, markers.Scan(l), markers.Scan(r), old) ||
+			!inferBindings(f.Manifest, markers.ScanWrites(l), markers.ScanWrites(r), old) {
+			return nil
+		}
+	}
+	deps := make(map[string]wfdir.Dependency, len(old))
+	for alias := range old {
+		deps[alias] = f.Manifest.Dependencies[alias]
+	}
+	then := newAliasCodec(deps, old)
+	baseline := b.Hashes()
+	for _, path := range drift.Modified {
+		if wfdir.HashString(then.toDisk(remote[path])) != baseline[path] {
+			return nil
+		}
+	}
+	now := f.Codec.baselineAliases()
+	var out []reboundAlias
+	for _, alias := range slices.Sorted(maps.Keys(old)) {
+		if old[alias] != now[alias].ID {
+			out = append(out, reboundAlias{Alias: alias, Kind: deps[alias].Kind, From: old[alias], To: now[alias].ID})
+		}
+	}
+	return out
+}
+
+// inferBindings sets one file's markers in the folder (local) against the same
+// file's in the remote, in order, and records in old the id the remote holds
+// wherever the folder names a declared alias. False when the two differ in
+// any other way: a different count or kind of marker, a remote naming an
+// alias, or one alias standing for two ids.
+func inferBindings(m *wfdir.Manifest, local, remote []markers.Occurrence, old map[string]string) bool {
+	if len(local) != len(remote) {
+		return false
+	}
+	for i, l := range local {
+		r := remote[i]
+		if l.Family.Kind != r.Family.Kind {
+			return false
+		}
+		if l.Arg == r.Arg {
+			continue
+		}
+		dep, declared := m.Dependencies[l.Arg]
+		if !declared || l.Positional || dep.Kind != l.Family.Kind {
+			return false
+		}
+		if l.Family == markers.WriteFamily && !dep.Write && !dep.Output {
+			return false
+		}
+		if _, alias := m.Dependencies[r.Arg]; alias {
+			return false
+		}
+		if id, seen := old[l.Arg]; seen && id != r.Arg {
+			return false
+		}
+		old[l.Arg] = r.Arg
+	}
+	return true
+}
+
+// sortedKeysOf is the union of two alias maps' names, sorted.
+func sortedKeysOf(a, b map[string]wfdir.BaselineAlias) []string {
+	seen := map[string]bool{}
+	for k := range a {
+		seen[k] = true
+	}
+	for k := range b {
+		seen[k] = true
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
+// identity reports a codec that resolves nothing, so the disk and wire forms
+// of every file are the same bytes.
+func (c aliasCodec) identity() bool { return len(c.toID) == 0 && len(c.writeToID) == 0 }
 
 // resolve answers one (kind, name) pair directly, for a caller resolving a
 // structured FIELD rather than a marker in source.
@@ -104,7 +369,9 @@ func (c aliasCodec) resolve(kind, name string) (string, bool) {
 // server refuses it, loudly, on every marker family, and that refusal is older
 // and better-aimed than anything invented here — it knows whether the row
 // exists, whether the caller can reach it, and what the id was meant to be.
-func (c aliasCodec) toWire(content string) string { return c.rewrite(content, c.toID) }
+func (c aliasCodec) toWire(content string) string {
+	return c.rewriteWrites(c.rewrite(content, c.toID), c.writeToID)
+}
 
 // toDisk replaces ids with the aliases this folder knows them by, in content
 // that came FROM the server.
@@ -113,7 +380,30 @@ func (c aliasCodec) toWire(content string) string { return c.rewrite(content, c.
 // bound to one id: without that refusal this direction has no single answer, and
 // a remote read would land in the folder under whichever of the two names won a
 // map iteration.
-func (c aliasCodec) toDisk(content string) string { return c.rewrite(content, c.toAlias) }
+func (c aliasCodec) toDisk(content string) string {
+	return c.rewriteWrites(c.rewrite(content, c.toAlias), c.writeToAlias)
+}
+
+// rewriteWrites substitutes the declared write targets and outputs inside
+// `{{ write(...) }}` markers. Empty table, identity — the property that keeps
+// every folder declaring neither byte-identical.
+func (c aliasCodec) rewriteWrites(content string, table map[string]string) string {
+	if len(table) == 0 {
+		return content
+	}
+	out, err := markers.RewriteWrites(content, func(o markers.Occurrence) string {
+		if sub, ok := table[o.Arg]; ok {
+			return sub
+		}
+		return o.Arg
+	})
+	if err != nil {
+		// Only a replacement carrying a quote or a brace errs, and an id or a
+		// validated alias never does; leave the content as it was.
+		return content
+	}
+	return out
+}
 
 // rewrite is the shared half of both directions.
 //
@@ -130,6 +420,69 @@ func (c aliasCodec) rewrite(content string, table map[aliasKey]string) string {
 		}
 		return o.Arg
 	})
+}
+
+// parametersToWire resolves the aliases in each select parameter's
+// optionsQuery, the one SQL a workflow carries outside its files. The server
+// binds a `{{ ref }}` there exactly as in a file (rworkflow's dead-reference
+// scan reads parameters[N].optionsQuery), so a folder that writes its tables by
+// alias in its source has to be able to write them the same way here — and a
+// read has to come back in that spelling, or the parameters drift for ever.
+//
+// It returns a copy and never touches the caller's slice: the manifest's
+// declaration is DISK form and stays that way (see this file's invariant). Nil
+// stays nil — "declares none" and "does not manage parameters" are different
+// states upstream.
+func (c aliasCodec) parametersToWire(params []api.WorkflowParameter) []api.WorkflowParameter {
+	return c.rewriteParameters(params, c.toID)
+}
+
+// parametersToDisk is parametersToWire's inverse, for parameters read FROM the
+// server — a clone, an import, and every comparison of a row against what the
+// folder declares.
+func (c aliasCodec) parametersToDisk(params []api.WorkflowParameter) []api.WorkflowParameter {
+	return c.rewriteParameters(params, c.toAlias)
+}
+
+func (c aliasCodec) rewriteParameters(params []api.WorkflowParameter, table map[aliasKey]string) []api.WorkflowParameter {
+	if params == nil {
+		return nil
+	}
+	out := append([]api.WorkflowParameter{}, params...)
+	for i := range out {
+		if out[i].OptionsQuery != "" {
+			out[i].OptionsQuery = c.rewrite(out[i].OptionsQuery, table)
+		}
+	}
+	return out
+}
+
+// optionsQuerySources lists each declared select parameter's optionsQuery as a
+// pseudo-file, keyed the way the server names the position
+// ("parameters[N].optionsQuery"), so the alias pre-flight reads it beside the
+// folder's files: an alias used only there is not dead config, a bound id
+// written there literally is the same permanent drift as in a file, and a bare
+// table name there is the same handle-resolution trap.
+func optionsQuerySources(m *wfdir.Manifest) map[string]string {
+	if !m.ManagesParameters() {
+		return nil
+	}
+	var out map[string]string
+	for i, p := range m.DeclaredParameters() {
+		if p.OptionsQuery == "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[fmt.Sprintf("%s → parameters[%d].optionsQuery", wfdir.ManifestName, i)] = p.OptionsQuery
+	}
+	return out
+}
+
+// wireParameters is the folder's declared parameters as a request carries them.
+func (f *folder) wireParameters() []api.WorkflowParameter {
+	return f.Codec.parametersToWire(f.Manifest.DeclaredParameters())
 }
 
 // rewriteMarkers applies sub to every alias-eligible marker argument, leaving a
@@ -300,6 +653,11 @@ func (c aliasCodec) bindTargets() map[string]string {
 	}
 	return out
 }
+
+// writeBindTargets is bindTargets for the ids a declared write target or
+// output is bound to — the ids a `{{ write(...) }}` marker must not spell
+// literally.
+func (c aliasCodec) writeBindTargets() map[string]string { return c.writeToAlias }
 
 // pipelineCodec is aliasCodec plus the names a PIPELINE folder's own files
 // claim, and it is the one place the alias layer is more than an edge
@@ -591,6 +949,10 @@ func (c pipelineCodec) folderUpstreams(code string) []string {
 type aliasReport struct {
 	// Refusals are the states a push must not proceed from.
 	Refusals []string
+	// Address are the unresolved ADDRESS dependencies among the refusals, with
+	// their reason codes, so a tree report can say which of the address
+	// outcomes it was rather than only the sentence.
+	Address []addressRefusal
 	// Warnings are dead config: true, worth saying, and no reason to stop.
 	Warnings []string
 }
@@ -640,6 +1002,13 @@ type fieldRef struct {
 // folder has: see fieldRef above and folderFieldRefs, which derives them.
 func checkAliases(m *wfdir.Manifest, sel wfdir.Selection, codec aliasCodec, files map[string]string, stems []string, fields []fieldRef) aliasReport {
 	var out aliasReport
+	// A workflow's select parameters carry SQL too; read them as the files are.
+	if extra := optionsQuerySources(m); len(extra) > 0 {
+		merged := make(map[string]string, len(files)+len(extra))
+		maps.Copy(merged, files)
+		maps.Copy(merged, extra)
+		files = merged
+	}
 	where, fix := describeBindSite(sel)
 
 	// The DECLARATION rules this build can never have written: `dependencies`
@@ -664,6 +1033,13 @@ func checkAliases(m *wfdir.Manifest, sel wfdir.Selection, codec aliasCodec, file
 	// commented-out code — which is exactly the property markers.Scan's doc asks
 	// a caller to have before it turns an unresolvable name into an error.
 	for _, alias := range m.AliasNames() {
+		dep := m.Dependencies[alias]
+		// An ADDRESS dependency is answered by the other folder's claim, never by
+		// a bind — see address_deps.go — and an OUTPUT is legal unbound: its name
+		// is what the run writes.
+		if dep.ByAddress() || dep.Output {
+			continue
+		}
 		// Key PRESENT is enough, even with an empty value: a bind of "" is
 		// CheckBind's refusal to make ("not a table id"), and two messages about
 		// one broken line is how a reader learns to skim them.
@@ -673,6 +1049,12 @@ func checkAliases(m *wfdir.Manifest, sel wfdir.Selection, codec aliasCodec, file
 		out.Refusals = append(out.Refusals, fmt.Sprintf(
 			"%s declares the dependency %q and %s binds nothing to it — an alias only resolves to the id THIS organization uses for it, and there is none. %s, or drop it from \"dependencies\"",
 			wfdir.ManifestName, alias, where, fix))
+	}
+
+	// Every ADDRESS dependency must have resolved for this stack.
+	for _, r := range addressRefusals(m, sel) {
+		out.Address = append(out.Address, r)
+		out.Refusals = append(out.Refusals, r.Detail)
 	}
 
 	// A declared alias that collides with a sibling's stem. The file wins, so the
@@ -760,12 +1142,31 @@ func misusedAliases(m *wfdir.Manifest, files map[string]string) []string {
 					path, o.Marker, wfdir.ManifestName, o.Arg, dep.Kind, o.Family.Kind, o.Arg, o.Family.Kind, deadMarkerNote))
 				continue
 			}
-			if o.Family.Kind != markers.KindSecret {
+			// A secret alias this folder DECLARES (of the right kind) resolves —
+			// or, unbound, is refused by the "declared and bound nothing" leg —
+			// so it is not the unresolvable argument this leg exists for.
+			if _, declared := m.Dependencies[o.Arg]; declared || o.Family.Kind != markers.KindSecret {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
 				"%s writes %q, and %q is neither a secret id nor a secret %s declares — and a secret is the one marker the server SOFT-FAILS into a warning instead of refusing the save, so this would push green and run with nothing bound. Declare it (\"%s\": {\"kind\": \"secret\"}) and bind it, or write the secret's id%s",
 				path, o.Marker, o.Arg, wfdir.ManifestName, o.Arg, deadMarkerNote))
+		}
+		// A `{{ write(...) }}` naming a dependency that is NOT declared written:
+		// the codec resolves write markers only for "write" and "output", so the
+		// name would go out as the name of a NEW table the run creates in the
+		// stack's feature — the declared row is never written, and the push is
+		// green.
+		seenWrite := map[string]bool{}
+		for _, o := range markers.ScanWrites(files[path]) {
+			dep, declared := m.Dependencies[o.Arg]
+			if !declared || dep.Write || dep.Output || seenWrite[o.Arg] {
+				continue
+			}
+			seenWrite[o.Arg] = true
+			out = append(out, fmt.Sprintf(
+				"%s writes %q, and %s declares %q as a dependency the folder only reads — so the marker would send %q as the name of a NEW table the run creates, never the row it is bound to. Declare it \"write\": true (a table outside this folder) or \"output\": true (this workflow's own output, by name)%s",
+				path, o.Marker, wfdir.ManifestName, o.Arg, o.Arg, deadMarkerNote))
 		}
 	}
 	return out
@@ -841,9 +1242,18 @@ func unresolvedTableNames(m *wfdir.Manifest, files map[string]string, stems []st
 				continue
 			}
 			seen[o.Arg] = true
+			// What the server does with the name differs by where it is: a
+			// file's is resolved and stored as the id; a select parameter's
+			// optionsQuery binds its tables by id only, so a name there is
+			// refused at save (unresolved_ref) — this refusal takes nothing away
+			// that ever pushed, and says so.
+			consequence := "Ronja will resolve it and store the ID, so its copy reads back as an id while your file keeps the name, and this folder reads as drifted for ever with nothing to edit that fixes it"
+			if strings.HasSuffix(path, ".optionsQuery") {
+				consequence = "a select parameter's optionsQuery binds its tables by id, so Ronja would refuse the save as an unresolved table"
+			}
 			out = append(out, fmt.Sprintf(
-				"%s writes %q, and %q is neither a table id nor a name this folder resolves — Ronja will resolve it and store the ID, so its copy reads back as an id while your file keeps the name, and this folder reads as drifted for ever with nothing to edit that fixes it. Declare it in %s (\"dependencies\": {%q: {\"kind\": \"table\"}}) and bind it, or write the table's id%s",
-				path, o.Marker, o.Arg, wfdir.ManifestName, o.Arg, deadMarkerNote))
+				"%s writes %q, and %q is neither a table id nor a name this folder resolves — %s. Declare it in %s (\"dependencies\": {%q: {\"kind\": \"table\"}}) and bind it, or write the table's id%s",
+				path, o.Marker, o.Arg, consequence, wfdir.ManifestName, o.Arg, deadMarkerNote))
 		}
 	}
 	return out
@@ -879,6 +1289,7 @@ func literalBindTargets(codec aliasCodec, files map[string]string, access api.Da
 	if len(targets) == 0 {
 		return nil
 	}
+	writeTargets := codec.writeBindTargets()
 	var out []string
 	for _, dep := range accessDependencies(&access) {
 		for _, id := range *dep.IDs {
@@ -921,6 +1332,16 @@ func literalBindTargets(codec aliasCodec, files map[string]string, access api.Da
 				path, o.Marker, wfdir.ManifestName, alias, alias,
 				strings.Replace(o.Marker, o.Arg, alias, 1)))
 		}
+		for _, o := range markers.ScanWrites(files[path]) {
+			alias, bound := writeTargets[o.Arg]
+			if !bound || seen["write:"+o.Arg] {
+				continue
+			}
+			seen["write:"+o.Arg] = true
+			out = append(out, fmt.Sprintf(
+				"%s writes %q, and %s binds the write target %q to that id — so the server's copy reads back as the alias while your file keeps the id. Use the alias: %q",
+				path, o.Marker, wfdir.ManifestName, alias, strings.Replace(o.Marker, o.Arg, alias, 1)))
+		}
 	}
 	return out
 }
@@ -946,7 +1367,7 @@ func unusedAliases(m *wfdir.Manifest, files map[string]string, access api.DataAp
 	if len(m.Dependencies) == 0 {
 		return nil
 	}
-	used := map[aliasKey]bool{}
+	used := aliasesUsedInFiles(m, files)
 	// An automation folder's uses are all here and NONE of them are in the
 	// source: markers.Scan reads a .json file and finds nothing, so without this
 	// leg every dependency such a folder declares would be reported as dead
@@ -954,13 +1375,6 @@ func unusedAliases(m *wfdir.Manifest, files map[string]string, access api.DataAp
 	// that has no other way to say what it uses.
 	for _, field := range fields {
 		used[aliasKey{kind: field.Kind, name: field.Value}] = true
-	}
-	for _, path := range sortedPaths(files) {
-		for _, o := range markers.Scan(files[path]) {
-			if !o.Positional {
-				used[aliasKey{kind: o.Family.Kind, name: o.Arg}] = true
-			}
-		}
 	}
 	for _, dep := range accessDependencies(&access) {
 		for _, id := range *dep.IDs {
@@ -972,10 +1386,38 @@ func unusedAliases(m *wfdir.Manifest, files map[string]string, access api.DataAp
 		if used[aliasKey{kind: m.Dependencies[alias].Kind, name: alias}] {
 			continue
 		}
+		// A write-capable data source may be written ONLY through an output
+		// literal (tools.replaceTable("table-…")), which no codec rewrites: its
+		// declaration is what authorizes that write per stack, and no file
+		// "uses" it in a way this scan can see.
+		if m.Dependencies[alias].Write {
+			continue
+		}
 		out = append(out, fmt.Sprintf("%s declares the dependency %q (%s) and no file in this folder uses it",
 			wfdir.ManifestName, alias, m.Dependencies[alias].Kind))
 	}
 	return out
+}
+
+// aliasesUsedInFiles is every (kind, name) the files' markers name — the uses
+// unusedAliases looks for, before the fields and the access block it adds.
+func aliasesUsedInFiles(m *wfdir.Manifest, files map[string]string) map[aliasKey]bool {
+	used := map[aliasKey]bool{}
+	for _, path := range sortedPaths(files) {
+		for _, o := range markers.Scan(files[path]) {
+			if !o.Positional {
+				used[aliasKey{kind: o.Family.Kind, name: o.Arg}] = true
+			}
+		}
+		for _, o := range markers.ScanWrites(files[path]) {
+			// Only a dependency declared to be WRITTEN is used by a write
+			// marker; any other one there is refused by misusedAliases.
+			if dep, ok := m.Dependencies[o.Arg]; ok && (dep.Write || dep.Output) {
+				used[aliasKey{kind: markers.KindTable, name: o.Arg}] = true
+			}
+		}
+	}
+	return used
 }
 
 // noteAliases runs the alias pre-flight for a READ-ONLY command and reports what
@@ -1118,7 +1560,7 @@ func noteAliasWarnings(r aliasReport) {
 // A folder mid-promotion — declarations merged, binds not yet filled in — has to
 // stay inspectable, and `status` is the command you run when you are already
 // suspicious. Refusing there would take away the one report that could explain
-// the folder, which is the same trade openFolderForStatus makes about a dead
+// the folder, which is the same trade openFolderForStatusAt makes about a dead
 // token.
 func noteAliasReport(r aliasReport) {
 	for _, refusal := range r.Refusals {

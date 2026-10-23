@@ -41,6 +41,20 @@ const (
 	// not have is the join rule working: the prose is stored, the write
 	// succeeded, and the outcome is `pushed`.
 	pushOutcomeDocsFailed = "docs_failed"
+	// `up_to_date` is a LiveFirst file whose live table already held it: nothing
+	// was sent. Never in a --json payload — runPipelinePush leaves such a file
+	// out of Files, the way a bare push leaves out a file it did not target.
+	pushOutcomeUpToDate = "up_to_date"
+	// pullPending is a unit `ronja pipeline pull` left for the next deploy: a
+	// file with no row behind it yet, or one whose committed form the live row
+	// can only come to hold by a deploy (a documentation header is part of the
+	// table's SQL). Only a pull's anchor step answers it, for tables, metrics,
+	// docs sidecars and checks alike.
+	pullPending = "pull_pending"
+	// pullOutcomeInexpressible is a unit whose file, after a pull wrote it,
+	// still does not say what its live row says: nothing is recorded for it,
+	// and the pull is refused as inexpressible.
+	pullOutcomeInexpressible = "pull_inexpressible"
 )
 
 // `ronja pipeline push` syncs each changed .sql file into YOUR draft of its
@@ -77,8 +91,31 @@ columns hold, and a push writes it after the build:
   -- @column invoice_no: the supplier's own number, not Ronja's id
   -- @column amount: line total, excluding VAT
 
-It is OPT-IN: a leading comment that does not open with "-- @table" is ordinary
-commentary and is left alone. For a table this folder does NOT build — an
+It is OPT-IN: a leading comment that does not open with "-- @table" (or
+"-- @name") is ordinary commentary and is left alone.
+
+NAMES. A table is created under its file's stem, or under the name its header
+declares. To manage its name from the folder, add a "-- @name" line to the same
+header, AFTER its "-- @table" line if it has one (an older CLI reads the
+documentation only when "-- @table" comes first):
+
+  -- @table One row per order line.
+  -- @name Sales orders
+
+A push then renames the SAME table in place (it lands at publish, like the SQL),
+and refuses — rather than reverts — a name somebody changed in the web app since
+this folder last agreed with it; --force renames it back. Without "-- @name" the
+name is never written after the create. Renaming the FILE is not renaming the
+table: the path is the file's identity, so declare it in ronja.json, or the
+push reads the new file as a second table:
+
+  "moved": [{"from": "orders.sql", "to": "sales_orders.sql"}]
+
+which keeps the same table (and its name) under the new file, and needs
+"formatVersion": 5 in the same file. "removed": ["old.sql"] stops this folder
+managing a table whose file you deleted, and leaves the table in place. A bound
+file that is gone with neither is reported on every push. Metric files move the
+same way (metrics/<name>.json). For a table this folder does NOT build — an
 integration or foundation table, or one a workflow writes — put the same thing
 in tables/<alias>.json instead, where <alias> is a "table" dependency this
 folder declares and "ronja bind" points at a row:
@@ -92,12 +129,15 @@ build later produces the column, which is what makes a committed file safe to
 keep in git alongside data that changes.
 
 METRICS. A metric is a recipe rather than SQL, so it lives in
-metrics/<name>.json, where <name> is the metric's own name (or a "table"
-dependency this folder declares and "ronja bind" points at an existing metric):
+metrics/<name>.json, where <name> is the name it is created under (or a "table"
+dependency this folder declares and "ronja bind" points at an existing metric).
+An optional top-level "name" manages the metric's name the way "-- @name" does a
+table's:
 
   {"recipe": {"source": "orders", "time": {"column": "created_at",
    "native_grain": "day"}, "base_measures": [{"name": "revenue", "agg": "sum",
-   "column": "amount"}], "value": "revenue"}, "description": "..."}
+   "column": "amount"}], "value": "revenue"}, "description": "...",
+   "name": "Revenue"}
 
 It runs the identical cycle: your draft is staged, built and reported, and
 "ronja pipeline publish" commits it. "source" may name a table this folder
@@ -167,7 +207,7 @@ Publishing is a separate step:
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.PipelineKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.PipelineKind)
 			if err != nil {
 				return err
 			}
@@ -176,7 +216,9 @@ Publishing is a separate step:
 			// The report is emitted even on failure: a push that stopped part-way
 			// has already created tables and staged drafts, and "which ones" is
 			// the first thing anyone needs to know.
+			printManagedNotices(f.notices)
 			if result != nil {
+				result.ManagedInGit = f.notices
 				if flagJSON {
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
@@ -221,6 +263,50 @@ type pipelinePushOptions struct {
 	// not changed since — once tags were removed in the web app to make room.
 	// Without it a recorded refusal is reported and not re-sent.
 	RetryTags bool
+	// NoCreate refuses every CREATE this push would make — a .sql file with no
+	// table behind it, a metric file with no metric — per file, before the
+	// request, and leaves every update alone.
+	//
+	// `sync apply` sets it whenever --allow-create is absent. Its plan already
+	// refuses a folder holding a create unit, and this is the same gate on the
+	// path that actually creates, so the property never rests on the plan and
+	// the push agreeing about which files are units: a metric was once created
+	// here, in the last pass of an apply that had promised to create nothing.
+	// A single-folder push never sets it.
+	NoCreate bool
+	// LiveFirst skips a bound .sql file whose LIVE table already holds it —
+	// its SQL, the documentation its header declares and the name it declares —
+	// when no draft of it is open: no checkout, no write, no build, and the
+	// file is left out of the result's Files. See pushOneTable. A metric file
+	// gets the same question where its live row can answer it exactly; see
+	// pushOneMetric.
+	//
+	// It matters on a FRESH CHECKOUT, which is every CI run: the local baseline
+	// that tells a bare push which files changed lives in the git-ignored
+	// .ronja/, so without it every file is a target and every unchanged table
+	// was checked out, rebuilt and — by apply — published again, a version per
+	// table per run. `sync apply` sets it and nothing else does; a single-folder
+	// push keeps its behaviour.
+	LiveFirst bool
+	// Pull is `ronja pipeline pull`'s anchor step, after the pull wrote the
+	// live rows into the folder: every unit is visited, every anchor takes what
+	// the live row holds (the acknowledgement a --force records, without its
+	// write), no drift is refused and NOTHING IS WRITTEN — a unit the live row
+	// does not hold as the folder now says it is answered pullPending, for the
+	// next deploy. The open draft is neither read for drift nor touched. Set
+	// with LiveFirst and NoCreate.
+	Pull bool
+	// pullHint is f.pullHint for the folder being pushed, set by
+	// runPipelinePush: the remedy every drift refusal below names beside
+	// --force in an adopted folder.
+	pullHint string
+}
+
+// refuseCreateUnderApply is the sentence NoCreate refuses with, for both kinds of
+// unit a pipeline folder can create.
+func refuseCreateUnderApply(path, noun string) string {
+	return fmt.Sprintf("%s has no %s here yet, so pushing it would CREATE one, and `ronja sync apply` creates nothing without --allow-create.\n    Push this folder on its own once (`ronja pipeline push`), or re-run apply with --allow-create",
+		path, noun)
 }
 
 // pipelinePushResult is the --json shape and the human renderer's input, so the
@@ -244,11 +330,20 @@ type pipelinePushResult struct {
 	// Checks is one entry per CHECKS FILE this push visited. Absent for the
 	// folders that keep none.
 	Checks []pipelineChecksResult `json:"checks,omitempty"`
+	// Moved and Removed are what this folder's `moved` / `removed` declarations
+	// did to the selected stack's recorded state — re-keyed addresses and
+	// addresses it stopped managing. Neither is a write to any row, so neither
+	// makes a push "not up to date". Absent when nothing applied.
+	Moved   []addressMove    `json:"moved,omitempty"`
+	Removed []addressRemoval `json:"removed,omitempty"`
 	// UpToDate reports a push that found nothing to do.
 	UpToDate bool `json:"upToDate"`
 	// Error summarises a push that did not fully succeed. The per-file entries
 	// say what actually happened; this is the one-line version.
 	Error string `json:"error,omitempty"`
+	// ManagedInGit is every table or metric this command read whose `managedBy` names a
+	// repository folder other than this one (managed_notice.go).
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 // pipelineFileResult is what happened to one file.
@@ -290,12 +385,19 @@ type pipelineFileResult struct {
 	// joined it onto. Absent for a file that carries no header, which is every
 	// file in every folder that has not opted in.
 	Docs *tableDocsResult `json:"docs,omitempty"`
+	// Rename is the rename this push STAGED from the file's `-- @name`: written
+	// on the draft, so it reaches the live table when the draft is published.
+	// Absent when the file declares no name or the table already holds it.
+	Rename *renameResult `json:"rename,omitempty"`
 	// Sample and URL are rendered by the human report only — see pushResult.URL
 	// for why a link stays out of a shape scripts parse, and samples are garnish
 	// nothing should be scripted against.
 	Sample string   `json:"-"`
 	URL    string   `json:"-"`
 	Notes  []string `json:"notes,omitempty"`
+	// drift marks a refusal for drift — what `ronja <kind> pull` takes into an
+	// adopted folder — so the run's summary can name it.
+	drift bool
 }
 
 // printPipelineDocsResult renders one docs sidecar's outcome.
@@ -375,12 +477,18 @@ func printPipelineMetricResult(out *os.File, metric pipelineMetricFileResult) {
 	}
 
 	verb := "staged"
-	if metric.Created {
+	switch {
+	case metric.Adopted:
+		verb = "adopted and staged"
+	case metric.Created:
 		verb = "created and staged"
 	}
 	fmt.Fprintf(out, "\n  %s — %s\n", metric.Path, verb)
 	fmt.Fprintf(out, "    Metric: %s\n", metric.MetricID)
 	fmt.Fprintf(out, "    Draft:  %s\n", metric.DraftID)
+	if metric.Rename != nil {
+		fmt.Fprintf(out, "    Name:   %q → %q (the live metric takes it at publish)\n", metric.Rename.From, metric.Rename.To)
+	}
 	fmt.Fprintf(out, "    Reads:  %s\n", metric.SourceID)
 	for _, note := range metric.Notes {
 		fmt.Fprintf(out, "    Shape:  %s\n", note)
@@ -434,8 +542,41 @@ func pipelineChangedTargets(f *folder, local, known map[string]string) []string 
 	return targets
 }
 
+// withGoneDraftPointers is LiveFirst's answer to a recorded draft the server no
+// longer has: `pl push` staged an edit and recorded its draft, and somebody
+// published (or discarded) that draft in the web app. The file is unchanged
+// since that push, so it is not a target — and its pointer stays in
+// pipelineStagedDrafts, which sends apply's publish after a draft that is gone
+// and refuses the folder over nothing.
+//
+// So each such file is ASKED about, one GET per recorded draft and only on the
+// apply path. A draft still open is left to the publish, exactly as before. One
+// that is gone is the discard case (recordDiscarded: no pointer, and the file's
+// baseline re-pointed at live), and the file becomes a target, which hands the
+// question "does live hold it" to pushOneTable: a published draft is then
+// skipped, a discarded one is pushed again.
+func withGoneDraftPointers(ctx context.Context, client *api.Client, f *folder, inst *wfdir.InstanceState, local map[string]string, targets []string) ([]string, error) {
+	for _, path := range pipelineStagedDrafts(inst) {
+		tableID := f.Binding.Tables[path]
+		if _, onDisk := local[path]; !onDisk || tableID == "" || slices.Contains(targets, path) {
+			continue
+		}
+		draft, err := client.GetTableDraft(ctx, tableID)
+		if err != nil {
+			return nil, fmt.Errorf("check for your draft of %s (%s): %w", tableID, path, err)
+		}
+		if draft != nil {
+			continue
+		}
+		recordDiscarded(f.live(inst), path, tableID)
+		targets = append(targets, path)
+	}
+	return targets, nil
+}
+
 func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelinePushOptions) (*pipelinePushResult, error) {
 	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	opts.pullHint = f.pullHint("    ")
 	result := &pipelinePushResult{
 		FeatureID: f.Binding.FeatureID,
 		Target:    describeTarget(f.Resolved),
@@ -454,6 +595,16 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	if err := checkPushable(local, wfdir.PipelineKind, maxFileBytes); err != nil {
 		return nil, err
 	}
+	// The ADDRESS declarations, first of everything that reads the binding: a
+	// `moved` entry re-keys this stack's recorded table or metric to its new file
+	// before any create decision, drift guard or baseline lookup asks which row a
+	// path is. In memory here; written back below, once the local guards pass.
+	addresses, err := f.resolveAddresses()
+	if err != nil {
+		return nil, err
+	}
+	result.Moved, result.Removed = addresses.Moves, addresses.Removals
+	f.noteAddresses()
 	// The names this folder's code may use: its own files' stems, and whatever
 	// ronja.json declares. Built once, read live — a sibling's table id only
 	// exists after that sibling's own create, which happens inside the loop below.
@@ -476,7 +627,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	pruned := prunePhantoms(baseline, f.Binding, local)
 	if len(pruned) > 0 {
 		fmt.Fprintf(os.Stderr, "  Note: dropped the local baseline for %s — gone from this folder and from the bindings in %s.\n",
-			strings.Join(pruned, ", "), wfdir.ManifestName)
+			strings.Join(pruned, ", "), filepath.Base(tableBindingFile(f)))
 	}
 	known := baseline.Hashes()
 
@@ -551,25 +702,58 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 			}
 		}
 		checksFiles = namedChecks
+	} else if opts.Pull {
+		// Every file, whatever the local baseline says: the pull just rewrote
+		// them, and each one's anchor is to be taken from its live row.
+		targets = pipelineChangedTargets(f, local, nil)
 	} else {
 		targets = pipelineChangedTargets(f, local, known)
 		// A checks file deleted from the folder is visited too, on a bare push
 		// only: the checks it created are orphans until --prune silences them.
 		checksFiles = withDeletedChecksFiles(checksFiles, f.live(baseline))
-	}
-	// A file removed from the folder is NOT a table this push deletes. There is
-	// no delete verb here on purpose (doctrine: sync verbs yes, resource verbs
-	// no), and quietly dropping a colleague's table because somebody deleted a
-	// file in a merge is exactly the kind of thing a sync loop must not do.
-	for _, path := range sortedPaths(known) {
-		if _, onDisk := local[path]; !onDisk {
-			fmt.Fprintf(os.Stderr, "  Note: %s is gone from this folder — the table it was bound to (%s) is left alone; delete it in the web app if that is what you meant.\n",
-				path, f.Binding.Tables[path])
-			fmt.Fprintf(os.Stderr, "        Until then this folder keeps reporting it. Remove its entry from \"tables\" in %s to stop; the local baseline is dropped with it.\n",
-				wfdir.ManifestName)
+		if opts.LiveFirst && baseline != nil {
+			if targets, err = withGoneDraftPointers(ctx, client, f, baseline, local, targets); err != nil {
+				return nil, err
+			}
 		}
 	}
+	// A file removed from the folder is NOT a row this push deletes. There is no
+	// delete verb here on purpose (doctrine: sync verbs yes, resource verbs no),
+	// and quietly dropping a colleague's table because somebody deleted a file in
+	// a merge is exactly the kind of thing a sync loop must not do.
+	//
+	// RENAME DETECTION, and in this single-folder push it is a NOTE — the classic
+	// pattern's behaviour, unchanged but for the advice. `sync apply` REFUSES the
+	// same finding (decideApplyPushPreflight). It visits every address the STATE
+	// binds, tables and metrics alike, rather than the local baseline: a fresh
+	// checkout has no baseline at all, and nothing else visits a lock metric
+	// whose file is gone.
+	gone, err := f.goneAddresses()
+	if err != nil {
+		return nil, err
+	}
+	if len(gone) > 0 && f.managed != nil {
+		// An ADOPTED folder is the serious pattern: rename detection
+		// REFUSES here as it does in `sync apply`, because the address a bound
+		// file leaves is server state, and a note would let the next create
+		// claim a second row beside it.
+		return nil, fmt.Errorf("%s", goneRefusal(gone))
+	}
+	for _, g := range gone {
+		fmt.Fprintf(os.Stderr, "  Note: %s.\n", describeGone(g))
+		fmt.Fprintf(os.Stderr, "        The %s it is bound to in %s (%s) is left alone, and this folder keeps reporting it until one of the two is declared.\n",
+			g.Kind, f.addressRecordFile(), g.ID)
+	}
 	if len(targets) == 0 && len(sidecars) == 0 && len(metrics) == 0 && len(checksFiles) == 0 {
+		// A move with nothing else to push is still a real edit to the lock, and
+		// this is the path a pure rename takes. FIRST, before the prune's save:
+		// saveBaseline writes the lock before the local baseline, which is the
+		// order saveAddresses says does not heal, so the move has to be recorded
+		// in its own order (baseline, then lock) before anything else writes the
+		// lock.
+		if err := f.saveAddresses(); err != nil {
+			return nil, fmt.Errorf("record the moved addresses in %s: %w", f.addressRecordFile(), err)
+		}
 		// The prune above is a real edit to the baseline, and this is the path it
 		// is most likely to be taken on: the ordinary way to reach it is a folder
 		// with nothing left to push. Saved here or the note is printed on every
@@ -581,6 +765,14 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		}
 		result.UpToDate = true
 		return result, nil
+	}
+
+	// 2b. The WRITE GATE over the docs sidecars this push sends: each writes its
+	// table's prose, so in an adopted folder each table must be this stack's own
+	// or bound here as a write source (write_gate.go). Before anything is
+	// written — the tables below included.
+	if err := gateTableDocsSidecars(ctx, client, f, sidecars); err != nil {
+		return nil, err
 	}
 
 	// 3. Dependency order, over the WHOLE folder, so a cycle is caught wherever
@@ -610,6 +802,12 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	decisions := applyDecisionsFor(f, ordered)
 	if err := errFromDecisions(decisions); err != nil {
 		return nil, err
+	}
+	// Every local guard has passed, so the re-keyed addresses are written before
+	// the first request: the files below are pushed under their NEW paths, and a
+	// push that dies half way must not leave the lock naming the old ones.
+	if err := f.saveAddresses(); err != nil {
+		return nil, fmt.Errorf("record the moved addresses in %s: %w", f.addressRecordFile(), err)
 	}
 	creating := false
 	for _, d := range decisions {
@@ -664,6 +862,15 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		}
 		file := pushOneTable(ctx, client, f, codec, inst, path, local[path],
 			upstreamsInPush(codec, local[path], pushing), created, opts)
+		if file.Outcome == pushOutcomeUpToDate {
+			// Recorded as synced, and reported as what it is to a bare push: a
+			// file with nothing to send. The baseline write is what lets a
+			// re-run in the same checkout skip it without asking the server.
+			if err := f.saveBaseline(); err != nil {
+				fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
+			}
+			continue
+		}
 		result.Files = append(result.Files, file)
 		if file.Created {
 			created[path] = true
@@ -676,7 +883,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 			fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
 		}
 		switch file.Outcome {
-		case pushOutcomePushed:
+		case pushOutcomePushed, pullPending:
 		case pushOutcomeDocsFailed:
 			docsFailed++
 		default:
@@ -744,7 +951,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	// against the state this push left behind (a table it just staged a draft
 	// for is pending publish).
 	result.Checks = pushChecksFiles(ctx, client, f, inst, codec, local, checksFiles,
-		checksApplyOptions{Prune: opts.Prune, Force: opts.Force})
+		checksApplyOptions{Prune: opts.Prune, Force: opts.Force, Pull: opts.Pull, PullHint: opts.pullHint})
 	failedChecks, settledChecks := 0, 0
 	for _, checks := range result.Checks {
 		if checks.failed() {
@@ -792,6 +999,9 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		return result, nil
 	}
 	result.Error = strings.Join(problems, ", and ")
+	if opts.pullHint != "" && result.refusedForDrift() {
+		result.Error += fmt.Sprintf(" — what changed on the server since this folder last applied it is taken into the folder with `%s pull` (then commit it)", f.Kind.Command)
+	}
 	// Typed when the health checks and/or the metric tag halves are the ONLY
 	// problems, decided from the tally above and never from the error string,
 	// so `sync apply` can publish the folder's SQL past them (applyFolder).
@@ -813,6 +1023,31 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		}
 	}
 	return result, fmt.Errorf("%s", result.Error)
+}
+
+// refusedForDrift reports whether any unit of this push was refused for drift.
+func (r *pipelinePushResult) refusedForDrift() bool {
+	for _, file := range r.Files {
+		if file.drift {
+			return true
+		}
+	}
+	for _, m := range r.Metrics {
+		if m.drift {
+			return true
+		}
+	}
+	for _, d := range r.Docs {
+		if d.drift {
+			return true
+		}
+	}
+	for _, c := range r.Checks {
+		if c.Outcome == checksOutcomeDrift {
+			return true
+		}
+	}
+	return false
 }
 
 // splitFileKindArgs takes the docs sidecars and the metric files out of a push's
@@ -952,6 +1187,78 @@ func upstreamsInPush(c pipelineCodec, code string, pushing map[string]bool) []st
 	return out
 }
 
+// tableNameLeg is a table's drift leg (d), the NAME, armed only by a file that
+// declares one (`-- @name`): a file that does not manages nothing here and the
+// name is left as it is. Three arms, see name_attr.go — the live table holding
+// the declared name is never drift, holding the baseline is a rename to send,
+// and holding neither means somebody renamed it elsewhere since. It answers the
+// live arm and one drift reason per row that moved.
+//
+// …and our OWN draft, which is what a publish lands: a name on it that is
+// neither the declared one, nor the live one it forked with, nor the baseline,
+// nor the one THIS checkout staged on it at an earlier push was put there by
+// somebody else — chat or the web builder — and the rename would overwrite it.
+// The staged arm is what lets a `-- @name` change again before its publish lands
+// (or after a publish refused it as taken) without reading the folder's own
+// rename as somebody else's.
+func tableNameLeg(liveHash liveHashes, path string, declared *string, live, draft *api.Table) (nameAction, []string) {
+	base := nameBaseline{Recorded: liveHash.tableName(path), Stem: tableNameFor(path)}.withCarried(liveHash.carriedTableStem(path))
+	action := decideName(declared, live.Name, base)
+	var reasons []string
+	if action == nameDrift {
+		reasons = append(reasons, nameDriftReason("the live table", live.Name, *declared, base))
+	}
+	if draft != nil && declared != nil &&
+		!draftNameIsOurs(draft.Name, *declared, live.Name, base, liveHash.stagedName(path, draft.ID)) {
+		reasons = append(reasons, nameDriftReason("your draft "+draft.ID, draft.Name, *declared, base))
+	}
+	return action, reasons
+}
+
+// recordTableNameAgreement records the NAME's agreement at the two moments it is
+// true, and reports whether the live table holds the declared name. The live
+// table already holds it — whatever the anchor said, which is the re-anchor that
+// keeps this folder from refusing its own published rename after a lost lock
+// write. Or --force acknowledged the live name it is about to overwrite, so the
+// next push reads it as this folder's own state rather than re-reporting it
+// until the rename is published.
+func recordTableNameAgreement(liveHash liveHashes, path, tableID string, live *api.Table, action nameAction, forced bool) bool {
+	if action == nameAgrees || (forced && action == nameDrift) {
+		if !sameName(liveHash.tableName(path), live.Name) {
+			liveHash.setTableName(path, tableID, live.Name)
+		}
+	}
+	return action == nameAgrees
+}
+
+// tableHeldLive reports that the LIVE table already holds everything a push of
+// this file would write — its SQL, the documentation its header declares and
+// the name it declares — and no draft is open: LiveFirst's skip, and the one
+// answer `sync apply --dry-run` gives for the same file, so the preview and the
+// apply cannot come to disagree about it.
+//
+// Every clause is one the push's own legs use: the SQL as canonicalDisk reads it
+// back, the prose under docsHeldExactly (every documented column measured — the
+// join rule's exemption would let prose for a column the row has not measured
+// go unsent for ever), and the name as tableNameLeg decides it.
+func tableHeldLive(codec pipelineCodec, liveHash liveHashes, path, content string, live, draft *api.Table) bool {
+	if draft != nil {
+		return false
+	}
+	if code, unresolved := codec.canonicalDisk(content, live); unresolved || code != content {
+		return false
+	}
+	if docs, _ := tabledocs.ParseHeader(content); !docs.Empty() && !docsHeldExactly(docs, live) {
+		return false
+	}
+	declared, _ := tabledocs.ParseName(content)
+	if declared == nil {
+		return true
+	}
+	action, _ := tableNameLeg(liveHash, path, declared, live, nil)
+	return action == nameAgrees
+}
+
 // pushOneTable runs the whole edit cycle for one file.
 //
 // Failure is DATA, not an error return: the caller records what happened, moves
@@ -971,7 +1278,10 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	// push of SQL that is perfectly good. They are printed AND carried in the
 	// result, so a --json caller sees the same thing a person does.
 	docs, docWarnings := tabledocs.ParseHeader(content)
-	for _, warning := range docWarnings {
+	// The DECLARED NAME, from the same header — managed when present, never
+	// written when absent. See name_attr.go.
+	declaredName, nameWarnings := tabledocs.ParseName(content)
+	for _, warning := range append(docWarnings, nameWarnings...) {
 		fmt.Fprintf(os.Stderr, "  Note: %s — %s\n", path, warning)
 		out.Notes = append(out.Notes, warning)
 	}
@@ -1014,7 +1324,7 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	if recorded := inst.Tables[path].TableID; recorded != "" && out.TableID != "" && recorded != out.TableID {
 		if !opts.Force {
 			return refuse("%s is bound to %s in %s, but the local baseline was taken from %s — the binding was repointed by hand, by a merge, or by a second clone, so nothing here can say what changed.\n    Re-clone the feature into a fresh folder, delete %s to resync, or push --force to accept the new binding",
-				path, out.TableID, wfdir.ManifestName, recorded, wfdir.StatePath(f.Root))
+				path, out.TableID, filepath.Base(tableBindingFile(f)), recorded, wfdir.StatePath(f.Root))
 		}
 		fmt.Fprintf(os.Stderr, "  Note: --force — %s was rebound from %s to %s; the old baseline is discarded.\n",
 			path, recorded, out.TableID)
@@ -1027,8 +1337,21 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	// makes a created table's live fingerprint readable below: an ordinary create
 	// answers with the row it made, a reconciled one has to be read back.
 	var adoptedRow *api.Table
+	if out.TableID == "" && opts.Pull {
+		out.Outcome = pullPending
+		out.Error = "not deployed yet; the next apply creates its table (with --allow-create)"
+		return out
+	}
+	if out.TableID == "" && opts.NoCreate {
+		return refuse("%s", refuseCreateUnderApply(path, "table"))
+	}
 	if out.TableID == "" {
+		// The DECLARED name when the header has one, and the stem otherwise —
+		// which is what an undeclared name is stamped with, once.
 		name := tableNameFor(path)
+		if declaredName != nil {
+			name = *declaredName
+		}
 		// The header's prose rides the create so the table does not exist even
 		// briefly with none. Its `fields` all come back UNMATCHED — a create has
 		// measured nothing — which is why the report a reader is shown is taken
@@ -1041,6 +1364,9 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 			Code:        wire,
 			InputModels: inputs,
 			Fields:      docsCreateFields(docs),
+			// The address this folder claims, in the create's own transaction —
+			// nil (no key) for a folder with no id.
+			Managed: f.managedClaim(path),
 		}
 		if docs.Description != nil {
 			create.Description = *docs.Description
@@ -1049,9 +1375,31 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 			}
 		}
 		row, err := client.CreateTable(ctx, create)
+		// managedAdopted is a create that found this folder's own address already
+		// holding a row (a lost race, or a lost 200) and adopted it BY ID from the
+		// server's state: the file then continues as the update it is, every drift
+		// leg armed, rather than as a create.
+		managedAdopted := false
 		switch {
 		case err == nil:
 			out.TableID = row.IdentityID()
+		case api.IsTimeout(err) && f.managed != nil:
+			// An adopted folder asks its own address, never the name: a create
+			// that committed committed its claim with it.
+			holder := f.rereadManagedClaim(ctx, path)
+			if holder == nil {
+				return refuse("creating the table for %s in feature %s timed out, and the server's state names no row at this address: %v\n    Nothing this folder can see was created — push again",
+					path, f.Binding.FeatureID, err)
+			}
+			if holder.State != api.ManagedStateOK {
+				r := describeClaimState(f, holder)
+				return refuse("%v", &r)
+			}
+			if aerr := f.adoptManagedClaim(path, holder); aerr != nil {
+				return refuse("%v", aerr)
+			}
+			fmt.Fprintf(os.Stderr, "  Note: creating the table for %s timed out, but it had landed — adopting %s from the server's state.\n", path, holder.ResourceID)
+			out.TableID, managedAdopted = holder.ResourceID, true
 		case api.IsTimeout(err):
 			// A create whose request TIMED OUT may well have committed: the
 			// deadline was ours, the transaction was the server's. Treated as a
@@ -1060,8 +1408,8 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 			// mistake this loop cannot undo, because it has no delete verb.
 			adopted, why := reconcileTimedOutCreate(ctx, client, f.Binding, name, wire)
 			if adopted == nil {
-				return refuse("creating the table for %s in feature %s timed out, and %s: %v\n    Look at the feature in the web app before pushing again — if the table IS there and holds this file's SQL, add its id to \"tables\" in %s, or the next push creates a second one beside it",
-					path, f.Binding.FeatureID, why, err, wfdir.ManifestName)
+				return refuse("creating the table for %s in feature %s timed out, and %s: %v\n    Look at the feature in the web app before pushing again — if the table IS there and holds this file's SQL, %s, or the next push creates a second one beside it",
+					path, f.Binding.FeatureID, why, err, tableBindingAdvice(f, path))
 			}
 			fmt.Fprintf(os.Stderr, "  Note: creating the table for %s timed out, but it had landed — adopting %s rather than creating a second one.\n", path, adopted.ID)
 			out.TableID = adopted.ID
@@ -1077,36 +1425,71 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 			}
 			// The other one, and it is about WHO you are rather than what you
 			// sent. Creating a table (POST /feature/model) needs an admin or a
-			// maintainer of the feature; EDITING
-			// the tables that exist is not — the whole draft-and-review path this
-			// folder drives is open to any member. So a push that refuses here is
-			// one file that needs one of them once.
-			return refuse("creating the table for %s in feature %s was refused (%v).\n    Creating a NEW table needs an admin or a maintainer of the feature. Editing tables that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin or a maintainer of that feature to create %q (or to run this one push), then add its id to \"tables\" in %s and push again",
-				path, f.Binding.FeatureID, err, name, wfdir.ManifestName)
+			// maintainer of the feature; EDITING the tables that exist does not —
+			// the whole draft-and-review path this folder drives is open to any
+			// member. So a push that refuses here is one file that needs one of
+			// them once.
+			return refuse("creating the table for %s in feature %s was refused (%v).\n    Creating a NEW table needs an admin or a maintainer of the feature. Editing tables that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin or a maintainer of that feature to create %q (or to run this one push), then %s and push again",
+				path, f.Binding.FeatureID, err, name, tableBindingAdvice(f, path))
 		default:
+			if id, adopted, refusal := f.adoptOnAddressClaimed(ctx, path, err); adopted {
+				if refusal != nil {
+					return refuse("%v", refusal)
+				}
+				out.TableID, managedAdopted = id, true
+				break
+			}
+			if why, taken := api.AsNameTaken(err); taken && f.managed != nil {
+				// An ADOPTED folder: the name gate runs before the claim (B5), so
+				// this is also what a lost race to this folder's own address
+				// answers. The server's state says which — never the name.
+				id, aerr := f.adoptOnNameTaken(ctx, path, name, why)
+				if aerr != nil {
+					return refuse("creating the table for %s was refused — %v", path, aerr)
+				}
+				out.TableID, managedAdopted = id, true
+				break
+			}
 			// A name already taken in the target feature, which the generic
 			// arm reported as "HTTP 409" and nothing else. It is the one
 			// create refusal the author fixes in the FOLDER — the file stem is
 			// the name — so say which of the two things to rename, and never
 			// suggest a retry: this create will refuse identically forever.
 			if why, taken := api.AsNameTaken(err); taken {
-				return refuse("creating the table for %s in feature %s was refused — that name is taken:\n      %s\n    Rename the file (its stem is the table's name), or rename the table already holding the name in the web app, then push again",
-					path, f.Binding.FeatureID, why)
+				fix := "Rename the file (its stem is the table's name)"
+				if declaredName != nil {
+					fix = "Change the file's `" + tabledocs.NamePrefix + "`"
+				}
+				return refuse("creating the table for %s in feature %s was refused — that name is taken:\n      %s\n    %s, or rename the table already holding the name in the web app, then push again",
+					path, f.Binding.FeatureID, why, fix)
 			}
 			return refuse("create the table for %s in feature %s: %v", path, f.Binding.FeatureID, err)
 		}
-		out.Created = true
-		// Recorded IMMEDIATELY, before anything else is attempted. CreateTable
-		// returns a LIVE row — colleagues can see it the moment it exists — so a
-		// push that died before saving the manifest would leave a table nobody
-		// can find and the next push would create a second one beside it. That is
-		// worse here than for a workflow, whose create makes a hidden draft.
-		f.recordBinding(f.Binding.WithTable(path, out.TableID))
-		if err := f.saveFolder(); err != nil {
-			out.Outcome = pushOutcomeRefused
-			out.Error = fmt.Sprintf("table %s was CREATED, but %s does not name it: %v", out.TableID, wfdir.ManifestPath(f.Root), err)
-			fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n  Add it by hand, or the next push will create a second table for this file.\n", path, out.Error)
-			return out
+		if managedAdopted {
+			// adoptManagedClaim bound the row and its anchor; written now, for the
+			// create arm's reason below.
+			if err := f.saveFolder(); err != nil {
+				return refuse("adopted table %s for this file, but %s does not name it: %v", out.TableID, tableBindingFile(f), err)
+			}
+		} else {
+			out.Created = true
+			// Recorded IMMEDIATELY, before anything else is attempted. CreateTable
+			// returns a LIVE row — colleagues can see it the moment it exists — so a
+			// push that died before saving the manifest would leave a table nobody
+			// can find and the next push would create a second one beside it. That is
+			// worse here than for a workflow, whose create makes a hidden draft.
+			f.recordBinding(f.Binding.WithTable(path, out.TableID))
+			// A DECLARED name is now what the live row holds, so it is the name this
+			// folder agrees with — recorded in the same write as the binding.
+			if declaredName != nil {
+				liveHash.setTableName(path, out.TableID, *declaredName)
+			}
+			if err := f.saveFolder(); err != nil {
+				out.Outcome = pushOutcomeRefused
+				out.Error = fmt.Sprintf("table %s was CREATED, but %s does not name it: %v", out.TableID, tableBindingFile(f), err)
+				fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n  Add it by hand, or the next push will create a second table for this file.\n", path, out.Error)
+				return out
+			}
 		}
 	}
 
@@ -1142,6 +1525,9 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	// bytes, and the round trip is skipped rather than performed.
 	liveCode := content
 	liveKnown := out.Created
+	// Whether the live table already holds this file's documentation, under the
+	// join rule — decided by the drift legs below.
+	docsAgree := docs.Empty()
 	if adoptedRow != nil {
 		// A reconciled create is the one place "what we sent" is a claim about
 		// somebody else's row, so the fingerprint is taken from the row that was
@@ -1152,14 +1538,23 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 			liveCode = code
 		}
 	}
+	// heldLive is LiveFirst's question — does the live table already hold
+	// everything this file would write — asked of the rows as first read, before
+	// the drift legs re-anchor anything (tableHeldLive).
+	heldLive := false
 	if !out.Created {
 		recorded := inst.Tables[path]
 		live, err := client.GetTable(ctx, out.TableID)
 		if err != nil {
 			return refuse("read %s: %v", out.TableID, err)
 		}
+		f.noteTableManagedBy(live)
+		heldLive = tableHeldLive(codec, liveHash, path, content, live, draft)
 		if code, unresolved := codec.canonicalDisk(content, live); !unresolved {
 			liveCode, liveKnown = code, true
+		}
+		if opts.Pull {
+			return pullAnchorTable(f, liveHash, inst, path, content, out, live, liveCode, liveKnown, docs, declaredName, draft)
 		}
 		var drifted []string
 		// sqlDrifted counts the legs that are about CODE, so the refusal below
@@ -1186,7 +1581,12 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 		// ARMED ONLY BY A FILE THAT CARRIES A HEADER. A folder that documents
 		// nothing makes no claim about anybody's prose, so there is nothing here
 		// to protect and this leg does not exist for it.
-		if !docs.Empty() {
+		//
+		// Live equal to desired is never drift here either: a row that already
+		// says what this header declares (judged under the join rule, docsLanded)
+		// has nothing of anybody's for the write to overwrite.
+		docsAgree = docs.Empty() || docsLanded(docs, live)
+		if !docsAgree {
 			if reason := docsDriftReason("the live table", live, liveHash.getMeta(path)); reason != "" {
 				drifted = append(drifted, reason)
 			}
@@ -1219,11 +1619,20 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 				sqlDrifted++
 			}
 		}
+		// (d) The NAME — see tableNameLeg.
+		nameLive, nameReasons := tableNameLeg(liveHash, path, declaredName, live, draft)
+		drifted = append(drifted, nameReasons...)
+		nameDrifted := len(nameReasons)
 		forced := false
 		if len(drifted) > 0 {
 			if !opts.Force {
-				return refuse("%s of %s changed on the server since your last sync — pushing would overwrite it:\n      %s\n    Run `ronja pipeline status` to see the detail, or push --force to overwrite",
-					driftHeadline(sqlDrifted, len(drifted)), out.TableID, strings.Join(drifted, "\n      "))
+				out.drift = true
+				remedy := opts.pullHint
+				if nameDrifted > 0 {
+					remedy = nameRemedy(f, "pipeline push", "    ")
+				}
+				return refuse("%s of %s changed on the server since your last sync — pushing would overwrite it:\n      %s\n    Run `ronja pipeline status` to see the detail, or push --force to overwrite%s",
+					driftHeadline(sqlDrifted, len(drifted)-sqlDrifted-nameDrifted, nameDrifted), out.TableID, strings.Join(drifted, "\n      "), remedy)
 			}
 			fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s: %s\n", path, strings.Join(drifted, "; "))
 			forced = true
@@ -1240,7 +1649,11 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 		// difference is re-reported on every subsequent push and --force becomes
 		// a permanent part of the command line — which trains it past the one time
 		// it means something.
-		if liveKnown && (forced || liveHash.get(path) == "") {
+		//
+		// And the third moment: the live table already holds this file's SQL,
+		// whatever the recorded fingerprint said — the re-anchor that lets a
+		// folder whose lock fell behind its own publish push again.
+		if liveKnown && (forced || liveHash.get(path) == "" || liveCode == content) {
 			recordLiveAgreement(liveHash, path, out.TableID, liveCode)
 		}
 		// The documentation half of the same acknowledgement, on the same rule
@@ -1253,9 +1666,36 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 		//
 		// `live` is a GetTable answer, which is the only response that carries
 		// the column catalog — see metaOf.
-		if !docs.Empty() && (forced || liveHash.getMeta(path) == "") {
+		if !docs.Empty() && (forced || docsAgree || liveHash.getMeta(path) == "") {
 			recordMetaAgreement(liveHash, path, out.TableID, metaOf(live))
 		}
+		recordTableNameAgreement(liveHash, path, out.TableID, live, nameLive, forced)
+	}
+
+	// LiveFirst (`sync apply` only): the live table already holds everything
+	// this file would write — the SQL, the documentation, the name — and no
+	// draft is open, so there is nothing to stage and nothing to publish. The
+	// drift legs above have run and agreed (each excuses live equal to desired
+	// and re-anchored on it), so this costs no guard; what it saves is the
+	// checkout, the write, the build and the commit of a copy of live.
+	//
+	// ⚠️ ONLY WITH NO DRAFT OPEN. An open draft may hold an earlier run's staged
+	// change whose commit never landed, and the publish that follows is what
+	// lands it; skipping the push would not stop that publish (it targets the
+	// recorded drafts), but it would leave the draft unchecked against this
+	// file. That case keeps the ordinary path.
+	if opts.LiveFirst && !out.Created && heldLive {
+		recordSynced(inst, path, content)
+		// No draft is open — GetTableDraft just said so — so a recorded draft
+		// id names one committed or discarded elsewhere (an admin approved what
+		// `pl push` staged, say). Left standing, it is in pipelineStagedDrafts,
+		// and the publish that follows goes after a draft that is gone and
+		// refuses the folder over nothing.
+		if inst.Tables[path].DraftID != "" {
+			recordDraftPointer(inst, path, out.TableID, "")
+		}
+		out.Outcome = pushOutcomeUpToDate
+		return out
 	}
 
 	if draft == nil {
@@ -1274,6 +1714,29 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	// Recorded before the write, so a command killed mid-build still knows which
 	// draft holds the work.
 	recordDraftPointer(inst, path, out.TableID, draft.ID)
+
+	// --- 3b. The declared NAME, on the DRAFT ---------------------------------
+	// On the draft and never on the live row: a commit lands the DRAFT's name on
+	// the live table, so a rename written on live while this draft is open would
+	// be reverted by this very folder's next publish. It reaches the live table
+	// at publish, in place — the same row, the same id, every reference intact —
+	// and the server checks the name is free in the feature there.
+	//
+	// BEFORE the SQL, so a name the server refuses stops this file before
+	// anything else is written to it, and the next push simply tries again.
+	if declaredName != nil {
+		carrier := "`" + tabledocs.NamePrefix + "`"
+		renamed, err := renameDraft(ctx, client, liveHash, path, out.TableID, draft, strings.TrimSpace(*declaredName), draftRenameWords{
+			noun: "table", change: "this file's " + carrier, from: "this file's " + carrier,
+			holder: "the table holding it",
+		})
+		if err != nil {
+			return refuse("%s", err)
+		}
+		if renamed != nil {
+			out.Rename = renamed
+		}
+	}
 
 	// --- 4. Write, sync, wait ----------------------------------------------
 	// The server's layer-1 precondition, and the ONE fingerprint that may be sent
@@ -1470,6 +1933,29 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 	return out
 }
 
+// tableBindingFile is the committed file that records which table a .sql file
+// is, and it is not the same file for the two folder shapes. A legacy
+// instances[] folder keeps the map in ronja.json; a folder on a named stack
+// keeps it in ronja.lock.json, and its ronja.json has no "tables" at all —
+// sending somebody there to repair a binding is sending them to a key nothing
+// reads.
+func tableBindingFile(f *folder) string {
+	if f.Stack == "" {
+		return wfdir.ManifestPath(f.Root)
+	}
+	return wfdir.LockPath(f.Root)
+}
+
+// tableBindingAdvice is the instruction for binding a file to a table by hand,
+// spelled in the shape each file actually stores: a bare id in a legacy entry,
+// an object in the lock.
+func tableBindingAdvice(f *folder, path string) string {
+	if f.Stack == "" {
+		return fmt.Sprintf("add `%q: \"<table id>\"` to \"tables\" in %s", path, wfdir.ManifestName)
+	}
+	return fmt.Sprintf("add `%q: {\"tableID\": \"<table id>\"}` under \"stacks\" → %q → \"tables\" in %s", path, f.Stack, wfdir.LockName)
+}
+
 // driftHeadline names WHAT moved, from the legs that actually fired.
 //
 // Three legs, two subjects: (a) the live table's SQL and (b) our own draft are
@@ -1477,14 +1963,24 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 // sent a reader looking for a code difference that does not exist whenever a
 // colleague had merely reworded a description — and a message that is wrong in a
 // case anybody meets is one nobody reads in the cases it is right.
-func driftHeadline(sqlLegs, total int) string {
-	switch {
-	case sqlLegs == 0:
-		return "the documentation"
-	case sqlLegs == total:
-		return "the SQL"
+func driftHeadline(sqlLegs, docsLegs, nameLegs int) string {
+	var subjects []string
+	if sqlLegs > 0 {
+		subjects = append(subjects, "the SQL")
+	}
+	if docsLegs > 0 {
+		subjects = append(subjects, "the documentation")
+	}
+	if nameLegs > 0 {
+		subjects = append(subjects, "the name")
+	}
+	switch len(subjects) {
+	case 0:
+		return "the table"
+	case 1:
+		return subjects[0]
 	default:
-		return "the SQL and the documentation"
+		return strings.Join(subjects[:len(subjects)-1], ", ") + " and " + subjects[len(subjects)-1]
 	}
 }
 
@@ -1675,6 +2171,13 @@ func driftReason(c pipelineCodec, local, what string, row *api.Table, baselineHa
 	if wfdir.HashString(code) == baselineHash {
 		return ""
 	}
+	// LIVE EQUALS DESIRED IS NEVER DRIFT: the row moved since the baseline, to
+	// exactly what this file holds, so writing it overwrites nothing — and the
+	// likeliest history is this folder's own publish whose anchor write was
+	// lost. See live_equals_desired.go; the caller re-anchors.
+	if code == local {
+		return ""
+	}
 	return fmt.Sprintf("%s holds SQL that is not what your last sync recorded", what)
 }
 
@@ -1720,13 +2223,14 @@ func fetchReview(ctx context.Context, client *api.Client, draftID, path string) 
 	return out
 }
 
-// tableNameFor is the display name a new table is created with: the file's stem.
+// tableNameFor is the name a new table is created with when its file declares
+// none: the file's stem.
 //
-// Renames are unmanaged in v1 — the name is stamped once, at create, and a later
-// rename in the web app is never reverted by a push. That is deliberate: a
-// folder that pushed the name too would revert a colleague's rename silently,
-// and the metadata three-state convention that would fix it properly is a
-// follow-up.
+// An UNDECLARED name is stamped once, at create, and never written again, so a
+// rename made in the web app stands. A file that declares one with `-- @name`
+// manages it instead — see name_attr.go — and this stem is then the BASELINE the
+// rule compares against when nothing has been recorded, because it is what the
+// create stamped.
 func tableNameFor(path string) string {
 	base := filepath.Base(path)
 	return strings.TrimSuffix(base, filepath.Ext(base))
@@ -1849,6 +2353,9 @@ func printPipelineFileResult(out *os.File, file pipelineFileResult) {
 	fmt.Fprintf(out, "\n  %s — %s (%s)\n", file.Path, verb, describeVerdict(file.Verdict))
 	fmt.Fprintf(out, "    Table:  %s\n", file.TableID)
 	fmt.Fprintf(out, "    Draft:  %s\n", file.DraftID)
+	if file.Rename != nil {
+		fmt.Fprintf(out, "    Name:   %q → %q (the live table takes it at publish)\n", file.Rename.From, file.Rename.To)
+	}
 	for _, note := range file.Notes {
 		fmt.Fprintf(out, "    Note:   %s\n", note)
 	}

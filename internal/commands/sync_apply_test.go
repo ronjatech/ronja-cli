@@ -377,7 +377,7 @@ func TestSyncApplyPushesAndPublishes(t *testing.T) {
 	}
 	// The report names the order it used, because a CI log that does not leaves
 	// the reader guessing whether a failure was an ordering problem.
-	if report.Order != "path" {
+	if report.Order != applyOrderDependency {
 		t.Errorf("order = %q", report.Order)
 	}
 }

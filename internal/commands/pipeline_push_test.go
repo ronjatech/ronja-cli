@@ -885,7 +885,7 @@ func TestPipelinePushLeavesADeletedFilesTableAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("push: %v\n%s", err, stderr)
 	}
-	if !strings.Contains(stderr, "revenue.sql is gone from this folder") {
+	if !strings.Contains(stderr, "revenue.sql is bound but gone") || !strings.Contains(stderr, `"removed" entry`) {
 		t.Errorf("the deletion was not reported:\n%s", stderr)
 	}
 	if f.tables["table-revenue"] == nil {

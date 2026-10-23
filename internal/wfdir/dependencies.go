@@ -41,6 +41,56 @@ type Dependency struct {
 	// all.
 	Kind string `json:"kind"`
 
+	// From and Address declare a dependency BY ADDRESS: the row another folder
+	// of the same repository manages, named by where that folder declares it
+	// rather than by an id. From is the other folder's path relative to this
+	// one ("../../pipelines/sales"); Address is that folder's local key —
+	// "orders.sql", "metrics/aov.json", "nightly.json", or "" for a workflow,
+	// data-app or module folder, whose one row is the folder itself.
+	//
+	// Resolution is the CLI's, per stack: the other folder's id and its stack
+	// of the SAME NAME (same url and tenantID, or refused) name a claim, and the
+	// claim's row is what the alias resolves to. So no `bind` entry is needed —
+	// a managed thing is found through the repository's own state, and the same
+	// declaration answers in every stack that deploys both folders. See
+	// commands.resolveAddressDependencies.
+	From    string `json:"from,omitempty"`
+	Address string `json:"address,omitempty"`
+
+	// Write marks a WRITE-CAPABLE data source: a row outside this folder that
+	// the folder's code writes — a table named by `{{ write(...) }}` or by a
+	// tools.replaceTable-style output literal, a codex the workflow may upsert
+	// into, a feature an agent automation's reference set names (its run is
+	// given every table of that feature, and may write each one). It is bound
+	// per stack like any other dependency, and the flag is
+	// what says the bind authorizes a WRITE: a stack that has not bound it
+	// cannot deploy the folder (an unbound alias is refused), and a later stack
+	// never inherits the bind by default. The alias also resolves inside
+	// `{{ write(...) }}` markers, which no other dependency does.
+	Write bool `json:"write,omitempty"`
+
+	// Run marks a RUN EDGE out of this stack's feature: a workflow or
+	// saved agent outside this repository that the folder runs — a workflow's
+	// `{{ workflow() }}` / `{{ agent() }}`, an app's allowedWorkflowIDs /
+	// allowedAgentIDs, an automation's action or `workflow` reference. Running a
+	// row is acting with that row's own authority, so a run of one in another
+	// feature is as deliberate as a write there: the write gate refuses
+	// `runs_outside_target` unless the dependency says "run": true AND the
+	// stack binds it. A run of a row in the stack's own feature, or of one this
+	// repository manages in the stack (an address dependency), needs neither.
+	// Bound per stack like any other dependency, and never inferred by `ronja
+	// bind`.
+	Run bool `json:"run,omitempty"`
+
+	// Output marks the folder's OWN OUTPUT, written by its logical name
+	// (`{{ write('orders_daily') }}`): the table the workflow's runs create in
+	// the stack's own feature. The alias IS that name. A stack that already
+	// holds the row MAY bind it, so the marker round-trips the id the live row's
+	// code carries; a stack that binds nothing sends the name, which the runtime
+	// resolves (creating the table on the first run) in that stack's feature.
+	// So unlike every other dependency an unbound output is not an error.
+	Output bool `json:"output,omitempty"`
+
 	// unknown is this entry's forward-compatibility sidecar, for the reasons on
 	// Manifest.unknown. A dependency is an object in a COMMITTED file, so a key
 	// a newer CLI writes into it — a description, a default, a required flag —
@@ -287,6 +337,15 @@ func (m *Manifest) CheckDeclarations() error {
 			ManifestName, manifestVersionDependencies, ManifestName)
 	}
 	for _, alias := range m.AliasNames() {
+		if dep := m.Dependencies[alias]; dep.NeedsAddressDepsVersion() && m.FormatVersion < manifestVersionAddressDeps {
+			return fmt.Errorf("%s declares dependency %q with \"from\", \"address\", \"write\", \"output\" or \"run\" but says \"formatVersion\": %d — a CLI older than version %d reads it as an ordinary alias, and an older CLI sends a write-capable one inside {{ write() }} as a NEW table's name. Set \"formatVersion\": %d in %s",
+				ManifestName, alias, declaredFormatVersion(m.FormatVersion), manifestVersionAddressDeps, manifestVersionAddressDeps, ManifestName)
+		}
+		if err := checkDependencyShape(alias, m.Dependencies[alias]); err != nil {
+			return fmt.Errorf("%s: %w", ManifestName, err)
+		}
+	}
+	for _, alias := range m.AliasNames() {
 		kind := m.Dependencies[alias].Kind
 		if kind != "" && !isDependencyKind(kind) {
 			// Names the possibility that this build is simply older than the
@@ -395,6 +454,10 @@ func (m *Manifest) CheckBind(sel Selection) error {
 	for _, alias := range aliases {
 		id := sel.Bind[alias]
 		dep, declared := m.Dependencies[alias]
+		if declared && dep.ByAddress() {
+			return fmt.Errorf("%s binds %q, which %s declares by address (\"from\": %q) — an address dependency resolves through that folder's claim in every stack, so a bind beside it is a second answer to one question. Remove the bind",
+				where, alias, ManifestName, dep.From)
+		}
 		if !declared {
 			declaredNames := "none are declared"
 			if names := m.AliasNames(); len(names) > 0 {
@@ -412,7 +475,14 @@ func (m *Manifest) CheckBind(sel Selection) error {
 			// duplicated.
 			continue
 		}
-		if !markers.IsResourceID(dep.Kind, id) {
+		if dep.Kind == markers.KindFolder {
+			// A folder is a PATH, not a row: the bind is the path this stack
+			// may write into, in the shape the server normalizes a scope to.
+			if norm, ok := NormalizeFolderPath(id); !ok || norm == "" {
+				return fmt.Errorf("%s binds the folder %q to %q, which is not a folder path — bind it to the path this stack may write into, such as \"/exports\" (not the root, and no \".\" or \"..\")",
+					where, alias, id)
+			}
+		} else if !markers.IsResourceID(dep.Kind, id) {
 			return fmt.Errorf("%s binds %q to %q, which is not a %s id — a bind names the row in THIS organization that the alias resolves to, and the value is substituted into the source and sent as an id. Use the id the web app shows for the %s",
 				where, alias, id, dep.Kind, dep.Kind)
 		}

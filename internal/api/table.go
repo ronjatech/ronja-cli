@@ -214,6 +214,16 @@ type Table struct {
 	// `null` into a non-pointer is a documented no-op, so "" is exactly what
 	// "unset" means.
 	MetricStatus string `json:"metricStatus"`
+	// ReportingTimezone is the row's DECLARED calendar (feature.TableView's
+	// field of the same name, migration 000499): the zone a derived table's SQL
+	// executes at, or the one a metric is evaluated at. Empty is UNDECLARED —
+	// the server sends `null` for it, which a plain string reads as "". An
+	// instance older than the column sends nothing, which reads the same.
+	//
+	// Read by the metric loop to tell whether the live metric already holds the
+	// zone its file declares, on the recipe route's own rule: an explicit ""
+	// in the file is stored as the literal "UTC", a name is stored trimmed.
+	ReportingTimezone string `json:"reportingTimezone"`
 
 	// Archived and Hidden mirror feature.TableView's two flags of the same
 	// names, which every TableView has always carried and this mirror did not.
@@ -242,6 +252,11 @@ type Table struct {
 	// on Workflow for why. Absent on the list routes and on rows the server
 	// refuses to link (a committed version snapshot).
 	URL string `json:"url,omitempty"`
+	// ManagedBy names the repository folder that deploys this table or metric, when one
+	// does (backend/api/v2/feature/tableview.go). Only the
+	// single-row GET carries it; nil on every other route, on a row no
+	// repository manages, and on an instance older than the field.
+	ManagedBy *ManagedBy `json:"managedBy,omitempty"`
 }
 
 // TableField is one entry of Table.Fields: a column and its documentation,
@@ -366,6 +381,11 @@ type TableListItem struct {
 	// GET's buildVerdict for the answer.
 	HasError  bool      `json:"hasError"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// WorkflowID and WorkflowLogicalName mark a workflow's OWN output: the
+	// table its runs create by name, in its feature (rmodelv2.ModelV2QueryItem,
+	// backend/resource/rmodelv2/model.go). Empty for every other table.
+	WorkflowID          string `json:"workflowID"`
+	WorkflowLogicalName string `json:"workflowLogicalName"`
 }
 
 // tableListResponse mirrors model.PaginationResponse[ModelV2QueryItem].

@@ -1159,7 +1159,8 @@ func TestMetricTagsAdoptedArchivedMetricIsSkipped(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedTaggedStack(t, f, `["Finance"]`)
-	adopted := f.AddMetric("table-aov", "average_order", `{"source":"table-orders","value":"revenue","version":1}`)
+	// This file's own definition, so the reconcile may adopt it.
+	adopted := f.AddMetric("table-aov", "average_order", taggedRecipe)
 	adopted.FeatureID = "collection-1"
 	adopted.Archived = true
 	f.nameTakenOnMetricCreate = `a table or metric called "average_order" already exists in this feature`
@@ -1383,7 +1384,11 @@ func TestSyncApplyPublishesTheSQLPastAFailedTagHalf(t *testing.T) {
 		map[string]string{"orders.sql": "table-orders"}, nil)
 	f.tags().denyScope[http.MethodPatch] = true
 
-	out, err := runCLI(t, tree, "sync", "apply", "--stack", "prod", "--json")
+	// --allow-create, because the metric file has no metric behind it yet and a
+	// metric is a creation unit: without the flag apply refuses the folder before
+	// the push, which is a different test. This one ran green for a while only
+	// because apply used to create metrics without asking.
+	out, err := runCLI(t, tree, "sync", "apply", "--stack", "prod", "--allow-create", "--json")
 	if code := exitCodeOf(err); code != syncExitDrifted {
 		t.Fatalf("exit = %d (%v), want %d\n%s", code, err, syncExitDrifted, out)
 	}

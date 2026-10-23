@@ -381,3 +381,61 @@ func TestParseHeaderTreatsAStraySQLSemanticsLineAsAComment(t *testing.T) {
 		t.Fatalf("docs = %+v, warnings = %v; want an ordinary comment", docs, warnings)
 	}
 }
+
+// TestParseNameReadsTheDirectiveFromTheHeader: `-- @name` opens a header on its
+// own, sits beside `-- @table`, and is never documentation.
+func TestParseNameReadsTheDirectiveFromTheHeader(t *testing.T) {
+	cases := []struct {
+		name, sql, want string
+	}{
+		{"alone", "-- @name Sales orders\nSELECT 1", "Sales orders"},
+		{"before the description", "-- @name Sales orders\n-- @table One row per order.\nSELECT 1", "Sales orders"},
+		{"after the description", "-- @table One row per order.\n-- @name Sales orders\nSELECT 1", "Sales orders"},
+		{"leading blank lines", "\n\n-- @name  Sales orders  \nSELECT 1", "Sales orders"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, warnings := ParseName(c.sql)
+			if got == nil || *got != c.want || len(warnings) != 0 {
+				t.Fatalf("ParseName = %v %v, want %q", got, warnings, c.want)
+			}
+			docs, _ := ParseHeader(c.sql)
+			if docs.Description != nil && strings.Contains(*docs.Description, "Sales orders") {
+				t.Errorf("the name leaked into the description: %q", *docs.Description)
+			}
+		})
+	}
+}
+
+// TestParseNameIsOptIn: a name directive is read only in an opted-in header, and
+// a header naming its table documents nothing — the docs drift leg must stay
+// disarmed for it.
+func TestParseNameIsOptIn(t *testing.T) {
+	if got, _ := ParseName("-- a note\n-- @name Sales orders\nSELECT 1"); got != nil {
+		t.Errorf("a name under an ordinary comment was read: %q", *got)
+	}
+	if got, _ := ParseName("SELECT 1"); got != nil {
+		t.Errorf("a file with no header declared %q", *got)
+	}
+	if docs, warnings := ParseHeader("-- @name Sales orders\nSELECT 1"); !docs.Empty() || len(warnings) != 0 {
+		t.Errorf("a name-only header documents %+v (warnings %v)", docs, warnings)
+	}
+	// @name inside a documented header is a known directive, not a typo.
+	if _, warnings := ParseHeader("-- @table Orders.\n-- @name Sales orders\n-- @column id: the id\nSELECT 1"); len(warnings) != 0 {
+		t.Errorf("warnings = %v", warnings)
+	}
+}
+
+// TestParseNameWarnsRatherThanRenaming: an empty directive, a second one, and
+// one below the bare `--` are each said, and none of them renames anything.
+func TestParseNameWarnsRatherThanRenaming(t *testing.T) {
+	if got, warnings := ParseName("-- @name\nSELECT 1"); got != nil || len(warnings) != 1 {
+		t.Errorf("empty: %v %v", got, warnings)
+	}
+	if got, warnings := ParseName("-- @name A\n-- @name B\nSELECT 1"); got == nil || *got != "A" || len(warnings) != 1 {
+		t.Errorf("twice: %v %v", got, warnings)
+	}
+	if got, warnings := ParseName("-- @table T.\n--\n-- @name A\nSELECT 1"); got != nil || len(warnings) != 1 {
+		t.Errorf("below the terminator: %v %v", got, warnings)
+	}
+}

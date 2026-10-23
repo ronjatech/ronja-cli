@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"os"
@@ -59,7 +60,7 @@ Publishing is a separate step:
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.WorkflowKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.WorkflowKind)
 			if err != nil {
 				return err
 			}
@@ -69,7 +70,9 @@ Publishing is a separate step:
 			// The report is emitted even on failure: a push that stopped
 			// halfway has already written files, and "which ones" is the first
 			// thing anyone needs to know.
+			printManagedNotices(f.notices)
 			if result != nil {
+				result.ManagedInGit = f.notices
 				if flagJSON {
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
@@ -100,6 +103,27 @@ type pushOptions struct {
 	// accident is how this CLI already spells "I know, and I mean it"
 	// (--force, --write-live, --no-validate).
 	AllowDroppedBindings bool
+	// LiveFirst compares the folder against the LIVE row before anything is
+	// checked out, and when the live row already holds it — files and every
+	// piece of metadata the push writes — returns UpToDate having written
+	// nothing at all: no checkout, no validate, no file write, no patch. See
+	// pushNothingLiveHolds and workflowRowHoldsFolder.
+	//
+	// `sync apply` sets it and nothing else does. A single-folder `wf push`
+	// opening a draft is the classic check-out gesture, and `wf test` runs that
+	// draft and refuses without one, so "nothing to write, no draft" is the
+	// deploy verb's rule and never a change to push.
+	//
+	// The comparison is made whether or not a draft is already open, and that
+	// is load-bearing for the publish gate in applyFolder: a draft that
+	// pre-exists an up-to-date apply can then only be one holding something
+	// live does not, so pre-existence alone decides the publish.
+	LiveFirst bool
+	// Apply is the push run by `sync apply`: a drift refusal names what works
+	// from there (it has no --force), and a folder whose live row changed
+	// since its baseline is refused BEFORE a checkout that would only copy it
+	// — no draft is opened and withdrawn for nothing.
+	Apply bool
 }
 
 // pushResult is the --json shape and the human renderer's input, so the two
@@ -141,6 +165,10 @@ type pushResult struct {
 	// publish may never have landed. "Is a draft open" cannot tell them apart:
 	// resolvePushTarget checks one out on the way past, so after ANY push the
 	// answer is yes. See applyFolder.
+	//
+	// Under LiveFirst a folder the live row already holds never gets this far
+	// — it returns with no DraftID — so an up-to-date LiveFirst push carrying
+	// it names a draft holding what live does not.
 	//
 	// Deliberately NOT in the --json payload: it is a fact about the CLI's own
 	// state machine rather than about the row, and the shape is a contract. Same
@@ -209,6 +237,10 @@ type pushResult struct {
 	// readably reads it straight off the API response (`ronja api
 	// /api/v2/workflow/<id> --jq .url`), which is where it comes from anyway.
 	URL string `json:"-"`
+	// ManagedInGit is the workflow's `managedBy`, when a repository folder
+	// other than this one deploys it (managed_notice.go): the classic-loop
+	// notice, never a refusal.
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 // newClient builds the client a push — and `wf run` — talks to. A package var,
@@ -246,6 +278,17 @@ func refuseMissingEntrypoint(f *folder, local map[string]string) error {
 // It returns (result, err): a non-nil result with a non-nil error is the
 // partial-push case, and both halves matter.
 func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, error) {
+	result, err := runPushOnce(ctx, f, opts)
+	if adoptedOnCreate(err) {
+		// The create lost a race to this folder's own address and adopted the
+		// winner by id; the push now runs as the UPDATE it is, drift guards and
+		// all. Once: the binding is set, so the second run cannot create.
+		return runPushOnce(ctx, f, opts)
+	}
+	return result, err
+}
+
+func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult, error) {
 	client := newClient(f.Resolved.URL, f.Resolved.Token)
 	result := &pushResult{
 		WorkflowID: f.Binding.WorkflowID,
@@ -257,14 +300,14 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 
 	// 1. Local guards. Nothing here needs the network, and each refusal names a
 	// file the author can act on immediately.
-	local, enumeration, err := readLocalFiles(f.Root, wfdir.WorkflowKind)
+	local, enumeration, err := readLocalFiles(f.Root, f.Kind)
 	if err != nil {
 		return nil, err
 	}
 	for _, s := range enumeration.Skipped {
 		fmt.Fprintf(os.Stderr, "  Note: skipping %s — %s\n", s.Path, s.Reason)
 	}
-	if err := checkPushable(local, wfdir.WorkflowKind, maxFileBytes); err != nil {
+	if err := checkPushable(local, f.Kind, maxFileBytes); err != nil {
 		return nil, err
 	}
 	entrypoint := f.Manifest.Entrypoint
@@ -292,6 +335,9 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	if err != nil {
 		return nil, err
 	}
+	if row := existing.Workflow; row != nil {
+		f.noteManagedBy(wfdir.ManagedWorkflow, row.IdentityID(), row.ManagedBy)
+	}
 	featureID, err := featureIDFor(ctx, client, f, existing.Workflow)
 	if err != nil {
 		return nil, err
@@ -306,6 +352,9 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	if err := checkRuntimeDrift(f, existing.Workflow); err != nil {
 		return nil, err
 	}
+	if err := checkLanguageDrift(f, existing.Workflow); err != nil {
+		return nil, err
+	}
 	// 2c. A CREATE names its runtime, always. A folder that names none (written
 	// by hand, or by a `wf init` older than the pin) is pinned to the runtime the
 	// instance creates on — asked, never assumed — BEFORE validate, so the
@@ -315,6 +364,11 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// IN MEMORY ONLY until the create lands: the manifest is saved by
 	// resolvePushTarget once the workflow exists, so a push refused before then
 	// (validation, a failed create) leaves ronja.json byte-identical.
+	if f.Binding.WorkflowID == "" {
+		if err := requireLanguageSupport(ctx, client, f); err != nil {
+			return nil, err
+		}
+	}
 	pinned := false
 	if f.Binding.WorkflowID == "" && f.Manifest.Runtime == 0 {
 		runtime, err := createRuntimeFor(ctx, client, f)
@@ -324,61 +378,61 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		f.Manifest.Runtime, pinned = runtime, true
 	}
 
-	// 3. Validate, so a binding error names the file that contains it rather
-	// than whichever file the sync happened to be writing.
-	if opts.Validate {
-		// The set this push is about to MAKE TRUE, not the one the row holds
-		// now: a managed folder patches its declaration in step 5, so validating
-		// the row's would check something this push is about to overwrite — and
-		// would never check a newly declared select parameter's optionsQuery
-		// markers at all. An unmanaged folder keeps borrowing the row's, which is
-		// still the set that will be in force after it pushes.
-		validateParams := existing.Parameters()
-		if f.Manifest.ManagesParameters() {
-			validateParams = f.Manifest.DeclaredParameters()
+	// 2d. THE WRITE GATE, in an ADOPTED folder, before anything asks whether
+	// there is something to deploy: a folder whose code writes or runs outside
+	// its stack's feature is refused whether or not it changed — a web edit
+	// pulled into the folder that writes outside would otherwise deploy green
+	// for ever behind the live-first shortcut below. An adopted folder
+	// validates whatever --no-validate says: the same answer carries the
+	// server's writeTargets, and a gate a flag could skip would not be one.
+	gate := f.adoptedHere()
+	var validated *api.ValidateResult
+	if gate {
+		var posted []api.ValidateFile
+		if posted, validated, err = validateWorkflowCandidate(ctx, client, f, existing, featureID, local, opts.Validate); err != nil {
+			return nil, err
 		}
-		validated, err := client.ValidateWorkflowFiles(ctx, api.ValidateInput{
-			FeatureID:  featureID,
-			Entrypoint: entrypoint,
-			Parameters: validateParams,
-			Files:      validateFilesOf(f.Codec, local),
-			// The runtime the folder DECLARES, including on a push to a workflow
-			// that already exists — where it is both what the metadata patch may
-			// RAISE the row to (never lowered) and, either way, the runtime this
-			// candidate's author wrote for. Validating against the row's instead
-			// would check the code about to be upgraded past. On a create the
-			// folder always declares one by now (step 2c); an unpinned folder
-			// pushed to an existing row is checked against the row's. See
-			// Manifest.RuntimeForValidate.
-			RuntimeVersion: f.Manifest.RuntimeForValidate(existing.Workflow),
-		})
+		// FIRST, before any finding: a write outside this stack's feature is
+		// the refusal that matters most, and it must not hide behind a finding
+		// about the same line.
+		if err := gateWorkflowCandidate(ctx, client, f, posted, validated); err != nil {
+			return nil, err
+		}
+	}
+
+	// 2e. `sync apply` only: does the LIVE row already hold this folder? Then
+	// there is nothing to deploy, and the push ends here having written nothing
+	// — before the validate (a candidate save that is not going to happen) and
+	// before the checkout that would leave a draft identical to live behind.
+	var liveFiles map[string]string
+	if opts.LiveFirst {
+		done, read, raw, err := pushNothingLiveHolds(ctx, client, f, existing, local, result)
+		if done {
+			return result, err
+		}
 		if err != nil {
-			// The feature this folder names is not one this credential can use.
-			// Reported HERE and not only at create, because validate runs FIRST
-			// on the default push — so this is the message a foreign feature id
-			// actually produces — and without the special case it arrives as
-			// "no rows (HTTP 400) (use --no-validate to skip this check)" on an
-			// older backend and "not found (HTTP 404) ..." on a current one —
-			// either way advising the reader to skip a check that would fail
-			// identically one step later at create.
-			if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
-				return nil, fmt.Errorf("%s\n  %s", message, f.featureFixAdvice())
+			return nil, err
+		}
+		liveFiles = read
+		// The drift guard, BEFORE the checkout, when the checkout would only
+		// copy the live row just read: the same answer the guard gives the
+		// copy, without opening a draft only to withdraw it.
+		if opts.Apply && existing.Row() == nil && raw != nil && f.State.For(f.Key) != nil && !opts.Force {
+			if _, err := checkDrift(f, existing.Workflow, read, hashFiles(f.baselineCodec(), raw), local, false, headAgreement{},
+				driftAsk{apply: true}); err != nil {
+				return nil, err
 			}
-			// The instance never delivered a verdict. Nothing has been written —
-			// validate runs before every write on this path — so the honest report
-			// is that the push did not start, not that the folder is wrong. The
-			// --no-validate advice is deliberately absent: skipping the check on
-			// an instance that did not answer would push files nobody has
-			// checked, which is the opposite of what this calls for. "Did not
-			// answer" and not "is down", here and in the message: all the CLI
-			// saw was silence, and a 5xx from a healthy instance behind a broken
-			// dependency looks exactly the same from this side.
-			if api.Unanswered(err) {
-				return nil, fmt.Errorf(
-					"validate before pushing: the instance did not answer (%w) — nothing was pushed, "+
-						"and this is not a verdict on your files. Try again in a moment.", err)
+		}
+	}
+
+	// 3. Validate, so a binding error names the file that contains it rather
+	// than whichever file the sync happened to be writing. An adopted folder
+	// already did, for the gate.
+	if opts.Validate {
+		if validated == nil {
+			if _, validated, err = validateWorkflowCandidate(ctx, client, f, existing, featureID, local, true); err != nil {
+				return nil, err
 			}
-			return nil, fmt.Errorf("validate before pushing: %w (use --no-validate to skip this check)", err)
 		}
 		result.Findings = validated.Findings
 		result.DroppedBindings = droppedBindings(validated.Findings)
@@ -411,6 +465,23 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// same link — including the up-to-date one, which returns before the
 	// closing re-read. Both describe one row, and a row's page cannot move.
 	result.URL = target.URL
+	// Every refusal from here to the first write goes through refuseUnwritten:
+	// under LiveFirst, a draft THIS push checked out is discarded rather than
+	// left behind. See discardUnwrittenCheckout.
+	//
+	// ownCheckout is asked at the refusal, not here: DraftPreexisted comes from
+	// the inspection, and the checkout is get-or-create, so a draft the same user
+	// opened in between comes back looking like this run's. What settles it is
+	// that the draft still holds what live held when the push read it
+	// (draftCopiesLive) — a draft with anybody's work in it is never discarded.
+	var draftFiles map[string]string
+	ownCheckout := func() bool {
+		return opts.LiveFirst && !result.Created && !result.DraftPreexisted &&
+			workflowDraftCopiesLive(existing.Workflow, target, liveFiles, draftFiles)
+	}
+	refuseUnwritten := func(err error) (*pushResult, error) {
+		return nil, discardUnwrittenCheckout(ctx, ownCheckout(), target.ID, "wf", client.DiscardWorkflowDraft, err)
+	}
 	if target.SubmittedForReviewAt != nil {
 		result.DraftUnderReview = true
 		fmt.Fprintf(os.Stderr, "  Warning: draft %s has already been submitted for review — this push changes what the admin is reviewing.\n",
@@ -426,9 +497,10 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// --force for a workflow the CLI made seconds earlier.
 	files, err := client.ListWorkflowFiles(ctx, target.ID)
 	if err != nil {
-		return nil, fmt.Errorf("read files of %s: %w", target.ID, err)
+		return refuseUnwritten(fmt.Errorf("read files of %s: %w", target.ID, err))
 	}
 	remoteFiles := contentByPath(f.Codec, files)
+	draftFiles = remoteFiles
 
 	// The drift GUARD is what a fresh create skips, and only that: nothing on
 	// the server is older than this push, so there is nothing anyone could have
@@ -436,6 +508,9 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	baselineClean := false
 	preconditions := filePreconditions{}
 	head := headAgreement{}
+	// writeTitle is the title leg's answer; a push that CREATED the row sent the
+	// title in the create and has nothing to decide.
+	writeTitle := true
 	if !result.Created {
 		// The committed anchor, read once. AnchoredDraft is derived from what
 		// the caller already knows rather than reported back out of
@@ -444,16 +519,37 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		// that records the binding.)
 		head = readHeadAgreement(ctx, workflowHeadReader(client), f, existing.Workflow.ID,
 			existing.AnchoredDraft())
-		verdict, err := checkDrift(f, target, remoteFiles, opts.Force, head)
+		verdict, err := checkDrift(f, target, remoteFiles, hashFiles(f.baselineCodec(), files), local, opts.Force, head,
+			driftAsk{draft: result.DraftPreexisted, apply: opts.Apply})
 		if err != nil {
-			return nil, err
+			return refuseUnwritten(err)
 		}
 		baselineClean = verdict.BaselineClean
+		// The TITLE's own leg (name_attr.go's titleLeg), against the committed
+		// applied title as well as the local baseline: metadataDriftOf above
+		// checks it only against a LOCAL baseline, so a fresh checkout wrote the
+		// title blind and reverted a rename made in the web app.
+		var liveRow *titledRow
+		if existing.Workflow != nil {
+			liveRow = &titledRow{ID: existing.Workflow.ID, Title: existing.Workflow.Title, RetitledInPlace: true}
+		}
+		// The head anchor can NEVER vouch for a workflow's title: a live
+		// workflow in a private feature is retitled IN PLACE (rworkflow.Update),
+		// which files no version, so the head does not move — and for the same
+		// reason the live row is held to the title leg even while this folder's
+		// own rename is staged (RetitledInPlace).
+		if writeTitle, err = titleLeg(f, "workflow", liveRow, titledRow{ID: target.ID, Title: target.Title}, false, opts.Force); err != nil {
+			return refuseUnwritten(err)
+		}
 		// Server-side preconditions are armed EXACTLY where the drift guard
 		// vouched for the baseline, and suppressed everywhere it was bypassed.
 		// See filePreconditions for why that equivalence is the whole rule.
 		if !verdict.Bypassed {
-			preconditions = filePreconditions{Armed: true, Hashes: verdict.Preconditions}
+			stored := make(map[string]string, len(files))
+			for _, file := range files {
+				stored[file.Path] = file.Content
+			}
+			preconditions = filePreconditions{Armed: true, Hashes: verdict.Preconditions}.onTheWire(stored, f.Codec, f.baselineCodec())
 		}
 	}
 
@@ -482,7 +578,21 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// part of this baseline" everywhere (metadataDriftOf and baselineDescribes
 	// both skip it), so the next push simply tries again.
 	zoneUnconfirmed := false
+	// metadataLanded: the metadata patch was accepted, so the draft no longer
+	// holds only a copy of live even when no file was written.
+	metadataLanded := false
 	stop := func(err error) (*pushResult, error) {
+		// A stop before anything landed — the server refused the push's first
+		// write — is still a refusal before the first write: the draft holds
+		// only the copy of live the checkout made, and an apply discards it as
+		// refuseUnwritten does (there is then no row to record a baseline for).
+		// Not after a timeout: a write whose deadline was ours may still have
+		// committed, so the draft and the baseline describing it are kept.
+		if len(result.Pushed) == 0 && len(result.Deleted) == 0 && !metadataLanded && !api.IsTimeout(err) && ownCheckout() {
+			err = discardUnwrittenCheckout(ctx, true, target.ID, "wf", client.DiscardWorkflowDraft, err)
+			result.Error = err.Error()
+			return result, err
+		}
 		result.Error = err.Error()
 		saveBaseline(f, target, landed, zoneUnconfirmed)
 		return result, err
@@ -502,7 +612,10 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 	// works in this order: the new file has to exist on the row before the
 	// server accepts the patch, and the row has to have stopped naming the old
 	// file before it will let that one be deleted.
-	patch := metadataPatch(f.Manifest, target)
+	patch := metadataPatch(f.Manifest, f.Codec, target)
+	if !writeTitle {
+		patch.Title = ""
+	}
 	// Read now, against the row as the push found it: a raise is decided by the
 	// manifest and the server's runtime, neither of which steps 7 and 8 change.
 	raise := runtimeRaise(f.Manifest, target)
@@ -511,6 +624,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		if err != nil {
 			return stop(fmt.Errorf("update %s: %w", describePatch(patch), err))
 		}
+		metadataLanded = true
 		result.Warnings = appendDistinct(result.Warnings, patchWarnings...)
 		// The row holds this now, and `target` is what a baseline recorded from
 		// here on describes — including the one stop() writes if the deletions
@@ -579,7 +693,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		// would actually change — a no-op push that re-stamped the baseline
 		// would move its timestamp to describe a sync that never happened.
 		if !baselineDescribes(f.State.For(f.Key), target) {
-			f.State.Set(f.Key, baselineFromLocal(target, landed))
+			f.State.Set(f.Key, baselineFromLocal(f.Codec, target, landed))
 			if err := wfdir.SaveState(f.Root, f.State); err != nil {
 				return result, err
 			}
@@ -606,7 +720,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 
 	// 10. The new baseline is what we just pushed: the server now holds exactly
 	// these bytes, and `updated` is the freshest thing we know about the row.
-	f.State.Set(f.Key, baselineFromLocal(updated, local))
+	f.State.Set(f.Key, baselineFromLocal(f.Codec, updated, local))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return result, err
 	}
@@ -614,6 +728,240 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 		return result, err
 	}
 	return result, refuseDroppedBindings(result)
+}
+
+// validateWorkflowCandidate posts the folder as this push would make it true to
+// POST /workflow/validate, and answers the files it posted (the WHOLE folder,
+// in wire form — the row's output bindings derive from every file, and the
+// write gate must see every write and run edge the published code will make)
+// and the verdict. asked reports whether the author asked for the check (not
+// --no-validate): when only the gate asked, a failure carries no advice to skip
+// a check there is no way to skip.
+func validateWorkflowCandidate(ctx context.Context, client *api.Client, f *folder, existing existingTarget, featureID string, local map[string]string, asked bool) ([]api.ValidateFile, *api.ValidateResult, error) {
+	// The set this push is about to MAKE TRUE, not the one the row holds now: a
+	// managed folder patches its declaration in step 5, so validating the row's
+	// would check something this push is about to overwrite — and would never
+	// check a newly declared select parameter's optionsQuery markers at all. An
+	// unmanaged folder keeps borrowing the row's, which is still the set that
+	// will be in force after it pushes.
+	validateParams := existing.Parameters()
+	if f.Manifest.ManagesParameters() {
+		validateParams = f.wireParameters()
+	}
+	posted := validateFilesOf(f.Codec, local)
+	validated, err := client.ValidateWorkflowFiles(ctx, api.ValidateInput{
+		FeatureID:  featureID,
+		Entrypoint: f.Manifest.Entrypoint,
+		Parameters: validateParams,
+		Files:      posted,
+		// The runtime the folder DECLARES, including on a push to a workflow
+		// that already exists — where it is both what the metadata patch may
+		// RAISE the row to (never lowered) and, either way, the runtime this
+		// candidate's author wrote for. Validating against the row's instead
+		// would check the code about to be upgraded past. On a create the
+		// folder always declares one by now (step 2c); an unpinned folder
+		// pushed to an existing row is checked against the row's. See
+		// Manifest.RuntimeForValidate.
+		RuntimeVersion: f.Manifest.RuntimeForValidate(existing.Workflow),
+		Language:       languageOnTheWire(f.Manifest),
+	})
+	if err == nil {
+		return posted, validated, nil
+	}
+	// The feature this folder names is not one this credential can use.
+	// Reported HERE and not only at create, because validate runs FIRST on the
+	// default push — so this is the message a foreign feature id actually
+	// produces — and without the special case it arrives as "no rows (HTTP
+	// 400) (use --no-validate to skip this check)" on an older backend and "not
+	// found (HTTP 404) ..." on a current one — either way advising the reader
+	// to skip a check that would fail identically one step later at create.
+	if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
+		return nil, nil, fmt.Errorf("%s\n  %s", message, f.featureFixAdvice())
+	}
+	if !asked {
+		// The gate's own request: there is no check to skip, so no advice to
+		// skip it.
+		return nil, nil, fmt.Errorf("check where this folder writes before pushing (POST /workflow/validate): %w — nothing was pushed", err)
+	}
+	// The instance never delivered a verdict. Nothing has been written —
+	// validate runs before every write on this path — so the honest report is
+	// that the push did not start, not that the folder is wrong. The
+	// --no-validate advice is deliberately absent: skipping the check on an
+	// instance that did not answer would push files nobody has checked, which
+	// is the opposite of what this calls for. "Did not answer" and not "is
+	// down", here and in the message: all the CLI saw was silence, and a 5xx
+	// from a healthy instance behind a broken dependency looks exactly the same
+	// from this side.
+	if api.Unanswered(err) {
+		return nil, nil, fmt.Errorf(
+			"validate before pushing: the instance did not answer (%w) — nothing was pushed, "+
+				"and this is not a verdict on your files. Try again in a moment.", err)
+	}
+	return nil, nil, fmt.Errorf("validate before pushing: %w (use --no-validate to skip this check)", err)
+}
+
+// pushNothingLiveHolds is runPush's LiveFirst leg: when the binding names a
+// LIVE workflow that already holds this folder, it re-takes the two anchors and
+// reports the push up to date, having sent nothing but reads. It answers false
+// — and touches nothing — for everything else: an unbound folder, a parentless
+// draft (there is no live row; the draft IS the workflow, and it awaits its
+// publish), and a live row that differs, which goes on to the ordinary push and
+// its drift guard.
+//
+// Asked whether or not a draft is open, deliberately. A draft that is open over
+// a live row already holding the folder is the author's own (`wf push` is the
+// classic check-out, and leaves one), or a web edit in progress: either way it
+// is not this deploy's to write to or to publish, and live is already what the
+// repository says. Asking only when no draft is open would send exactly that
+// draft to applyFolder as "pre-existed and up to date" — and committing it
+// mints an empty version.
+//
+// LIVE EQUALS DESIRED is never drift (live_equals_desired.go), so no drift guard
+// runs here: there is nothing of anybody's to overwrite. The anchors are what
+// that rule says to do instead — the applied title becomes the live one, and
+// the head pointer moves onto the live version, which is honest because the
+// folder holds exactly that version's content. The local sync baseline is left
+// alone: it describes the DRAFT a push writes to, and none was written.
+//
+// liveFiles is the live row's listing it read (nil when it read none), which the
+// push keeps to tell a draft it checked out from one somebody else opened — see
+// discardUnwrittenCheckout.
+//
+// raw is that listing as stored, for a drift guard asked before the checkout.
+func pushNothingLiveHolds(ctx context.Context, client *api.Client, f *folder, existing existingTarget, local map[string]string, result *pushResult) (done bool, liveFiles map[string]string, raw []api.WorkflowFile, err error) {
+	live := existing.Workflow
+	if live == nil {
+		return false, nil, nil, nil
+	}
+	done, liveFiles, err = nothingLiveHolds(ctx, f, liveDraftKindRow{ID: live.ID, Lifecycle: live.Lifecycle, Title: live.Title},
+		func(ctx context.Context) (map[string]string, error) {
+			files, err := client.ListWorkflowFiles(ctx, live.ID)
+			raw = files
+			return contentByPath(f.Codec, files), err
+		},
+		func(liveFiles map[string]string) bool { return workflowRowHoldsFolder(f, live, liveFiles, local) },
+		workflowHeadReader(client))
+	if done {
+		result.UpToDate, result.URL = true, live.URL
+	}
+	return done, liveFiles, raw, err
+}
+
+// liveDraftKindRow is what nothingLiveHolds reads off a draft kind's live row.
+type liveDraftKindRow struct {
+	ID, Lifecycle, Title string
+}
+
+// nothingLiveHolds is the LiveFirst leg the three draft kinds share — the
+// workflow's (pushNothingLiveHolds, whose comment carries the reasoning), the
+// data app's and the module's: read the LIVE row's files, ask the kind's own
+// parity function whether a push would write anything, and when it would not,
+// re-take the applied-title and head-version anchors and answer done. listFiles
+// answers the live row's files in the folder's disk form; holds is the kind's
+// *RowHoldsFolder over them. liveFiles is the listing read (nil when none was),
+// which the push keeps to tell a draft it checked out from one somebody else
+// opened.
+func nothingLiveHolds(ctx context.Context, f *folder, live liveDraftKindRow,
+	listFiles func(ctx context.Context) (map[string]string, error),
+	holds func(liveFiles map[string]string) bool, head headReader) (done bool, liveFiles map[string]string, err error) {
+	if live.Lifecycle != api.LifecycleLive {
+		return false, nil, nil
+	}
+	liveFiles, err = listFiles(ctx)
+	if err != nil {
+		return false, nil, fmt.Errorf("read files of %s: %w", live.ID, err)
+	}
+	if !holds(liveFiles) {
+		return false, liveFiles, nil
+	}
+	if f.Manifest.Title != "" {
+		recordAppliedTitle(f, live.Title)
+	}
+	agreement := readHeadAgreement(ctx, head, f, live.ID, true)
+	return true, liveFiles, anchorAfterPush(f, agreement, false)
+}
+
+// discardUnwrittenCheckout is what `sync apply` does with a draft its push
+// checked out and then refused to write to: it discards it, so the refusal
+// leaves nothing behind on the server. runPush and runAppPush route every
+// refusal between resolving their target and their first write through it.
+//
+// Why the draft has to go: the push resolves its target BEFORE its drift guard
+// runs, so a refused apply — a colleague's web publish the repository does not
+// hold, say — had checked out a copy of live. Left standing, that copy is a
+// draft every LATER fresh-checkout apply finds already open: AnchoredDraft is
+// false whenever one pre-exists, so the committed head anchor cannot vouch, and
+// the folder is refused ("you already have a draft … run discard") long after
+// the author has absorbed the change, until somebody discards it by hand.
+//
+// `own` is the whole safety argument, and the callers compute it the same way:
+// LiveFirst (the apply path only — a single-folder push is the classic check-out
+// and keeps its draft),
+// not a create (a created row's draft IS the resource, and discarding it is
+// a delete), not DraftPreexisted (a draft that was already open is the
+// author's or a colleague's work, never this run's to throw away), and the
+// draft still holding exactly what live held when the push read it
+// (workflowDraftCopiesLive, appDraftCopiesLive). The last is what makes the
+// second airtight: DraftPreexisted is read at inspection, and the checkout is
+// get-or-create, so a draft the same user opened between the two comes back
+// from the checkout as if this run had made it. The callers stand before the
+// first write of any kind, or at a stop where the server refused every write
+// the push had sent (nothing pushed, deleted or patched).
+//
+// A discard that fails leaves the refusal as THE error, with the leftover draft
+// named beside it — the refusal is what the reader has to act on first.
+func discardUnwrittenCheckout(ctx context.Context, own bool, draftID, tool string,
+	discard func(context.Context, string) error, refusal error) error {
+	if !own || draftID == "" {
+		return refusal
+	}
+	if err := discard(ctx, draftID); err != nil {
+		return fmt.Errorf("%w\n  The draft %s this run checked out could not be discarded (%v) — run `ronja %s discard` before the next apply, which would otherwise find it open and refuse",
+			refusal, draftID, err, tool)
+	}
+	return refusal
+}
+
+// workflowDraftCopiesLive reports that a draft holds what the live row held when
+// the push read it: the same files, title and entrypoint — what a checkout
+// copies and what an edit made in the web app or by a second job would change.
+// False whenever either listing is missing, so a draft nobody could compare is
+// kept.
+func workflowDraftCopiesLive(live, draft *api.Workflow, liveFiles, draftFiles map[string]string) bool {
+	if live == nil || draft == nil || liveFiles == nil || draftFiles == nil {
+		return false
+	}
+	return filesAgree(liveFiles, draftFiles) && draft.Title == live.Title && draft.Entrypoint == live.Entrypoint
+}
+
+// workflowRowHoldsFolder reports that a push of this folder onto `row` — or
+// onto a fresh checkout of it, which copies its files and metadata — would
+// write NOTHING. It is runPush's own write rule, read off the same functions
+// rather than restated:
+//
+//   - files: putFiles skips a path whose remote bytes equal the local ones and
+//     deleteFiles removes a remote path the folder lacks, so neither writes
+//     exactly when the two sets agree (filesAgree);
+//   - metadata: the patch metadataPatch builds — title, entrypoint, declared
+//     parameters, declared calendar — with the title dropped where titleLeg
+//     would not write it (it compares trimmed; the patch does not);
+//   - the runtime raise, which is its own request (runtimeRaise) and so is
+//     asked separately: metadataPatch no longer carries it.
+//
+// ⚠️ PARITY IS THE WHOLE CONTRACT. A row this calls different, while the push
+// then writes nothing to a checkout of it, leaves a draft identical to live
+// behind — and the NEXT apply finds that draft pre-existing and up to date and
+// publishes it, an empty version (see applyFolder). Anything the push learns to
+// write has to be added here in the same change.
+func workflowRowHoldsFolder(f *folder, row *api.Workflow, remote, local map[string]string) bool {
+	if !filesAgree(remote, local) {
+		return false
+	}
+	patch := metadataPatch(f.Manifest, f.Codec, row)
+	if f.Manifest.Title != "" && sameName(row.Title, f.Manifest.Title) {
+		patch.Title = ""
+	}
+	return patch.Empty() && runtimeRaise(f.Manifest, row) == 0
 }
 
 // droppedBindings names the bindings the validate pass says this candidate's
@@ -751,7 +1099,7 @@ func describePatch(patch api.WorkflowPatch) string {
 // pre-patch zone in that case, and writing it would make the next push read our
 // own change back as somebody else's.
 func saveBaseline(f *folder, source *api.Workflow, files map[string]string, zoneUnconfirmed bool) {
-	inst := baselineFromLocal(source, files)
+	inst := baselineFromLocal(f.Codec, source, files)
 	if zoneUnconfirmed {
 		inst.ReportingTimezone = nil
 	}
@@ -869,79 +1217,7 @@ func inspectTarget(ctx context.Context, client *api.Client, f *folder) (existing
 // consumers pointing at a row nobody edits any more.
 func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featureID string, decision applyDecision, existing existingTarget, result *pushResult) (*api.Workflow, error) {
 	if decision.Creates() {
-		// A first push is the one path here that WRITES a binding, so this is
-		// where the organization has to be authoritative rather than adopted
-		// from an entry that does not exist yet.
-		//
-		// Only when this folder is NOT bound here. A folder that declares a
-		// stack (or carries a legacy entry) but has no row yet is creating and
-		// bound at once, and it already names both the organization and the
-		// stack the create belongs to — re-deriving them writes the new id into
-		// a second, unnamed entry beside the stack. Same condition as
-		// `pipeline push` and `app push`; see folder.bindNew.
-		if !f.Bound {
-			if _, err := f.bindNew(ctx); err != nil {
-				return nil, err
-			}
-		}
-		created, err := client.CreateWorkflow(ctx, api.CreateWorkflowInput{
-			FeatureID:  featureID,
-			Title:      f.Manifest.Title,
-			Entrypoint: f.Manifest.Entrypoint,
-			// Declared at creation rather than left to the metadata patch below:
-			// the patch only fires when the manifest and the row disagree, and a
-			// row created without them would disagree — this just saves the round
-			// trip. Nil for an unmanaged folder, which creates none either way.
-			Parameters: f.Manifest.DeclaredParameters(),
-			// The runtime, stamped at create. This is the only request that can
-			// pick it FREELY: afterwards it moves one way only, so a push to a
-			// workflow that already exists sends the declared runtime as a
-			// metadata patch when it is above the row's (reported as an upgrade),
-			// and refuses the reverse before writing anything.
-			//
-			// Never zero here: a folder that declared nothing was pinned to the
-			// instance's default before validate (runPush, step 2c).
-			RuntimeVersion: f.Manifest.Runtime,
-			// Same round-trip saving for the declared calendar, but the value is
-			// the EFFECTIVE one: create refuses an explicit "" outright (unlike
-			// patch, where it is the reset), so a folder declaring the reset sends
-			// the literal "UTC" here. Empty for an unmanaged folder, where
-			// omitempty drops the key and the server stamps the organization
-			// default.
-			ReportingTimezone: declaredZoneForCreate(f.Manifest),
-		})
-		if err != nil {
-			// Reachable on `--no-validate`, where nothing asked the server about
-			// the feature until this write. With validation on the same failure
-			// is caught above.
-			if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
-				return nil, fmt.Errorf("%s\n  %s", message, f.featureFixAdvice())
-			}
-			return nil, fmt.Errorf("create workflow in feature %s: %w", featureID, err)
-		}
-		// Recorded IMMEDIATELY, before any file is written: the workflow now
-		// exists, and a push that died before saving the manifest would leave
-		// an orphan the next push could not find and would create again.
-		f.recordBinding(wfdir.Binding{WorkflowID: created.ID, FeatureID: featureID})
-		// A workflow that has just been created has never been versioned, and an
-		// unversioned row IS its own head — the same fallback
-		// api.HeadVersionID resolves, and the same one rworkflow's commit CAS
-		// resolves. Recorded here rather than by a round trip, in the write that
-		// records the binding it describes: they are one fact and a folder
-		// holding half of it is a folder with an anchor pointing at nothing.
-		f.setHeadVersion(created.ID)
-		// The runtime is saved with the binding: it is the one the create sent
-		// — the folder's own, or the instance's default runPush pinned in memory
-		// — so the committed folder states the runtime its workflow was created
-		// on, whatever that instance's default becomes later.
-		if err := f.saveFolder(); err != nil {
-			return nil, fmt.Errorf("record the new workflow %s in %s: %w",
-				created.ID, f.bindingFiles(), err)
-		}
-		result.Created = true
-		result.WorkflowID = created.ID
-		result.RuntimeVersion = f.Manifest.RuntimeVersion()
-		return created, nil
+		return createWorkflowRow(ctx, client, f, featureID, f.wireParameters(), result)
 	}
 
 	if row := existing.Row(); row != nil {
@@ -952,6 +1228,124 @@ func resolvePushTarget(ctx context.Context, client *api.Client, f *folder, featu
 		return nil, fmt.Errorf("check out a draft of %s: %w", existing.Workflow.ID, err)
 	}
 	return draft, nil
+}
+
+// createWorkflowRow CREATES the folder's workflow, with its claim, and records
+// the binding before anything else happens. Its two callers are a first push
+// (resolvePushTarget) and `sync apply`'s first pass, which creates every
+// missing workflow before any code is written so a `{{ workflow }}` marker —
+// a cycle included — always names a row that exists. The second
+// passes no parameters: their select queries may read a table by an address
+// this run has not resolved yet, and the push that follows writes them.
+func createWorkflowRow(ctx context.Context, client *api.Client, f *folder, featureID string, params []api.WorkflowParameter, result *pushResult) (*api.Workflow, error) {
+	// A first push is the one path here that WRITES a binding, so this is
+	// where the organization has to be authoritative rather than adopted
+	// from an entry that does not exist yet.
+	//
+	// Only when this folder is NOT bound here. A folder that declares a
+	// stack (or carries a legacy entry) but has no row yet is creating and
+	// bound at once, and it already names both the organization and the
+	// stack the create belongs to — re-deriving them writes the new id into
+	// a second, unnamed entry beside the stack. Same condition as
+	// `pipeline push` and `app push`; see folder.bindNew.
+	if !f.Bound {
+		if _, err := f.bindNew(ctx); err != nil {
+			return nil, err
+		}
+	}
+	// A CREATE names its runtime, always (runPush, step 2c, pins it before
+	// validate). Asked here too for `sync apply`'s first pass, which creates
+	// without going through runPush: in memory, saved with the binding below.
+	// The language gate likewise, or that pass would create a Python workflow
+	// out of JavaScript source on an instance that predates js.
+	if err := requireLanguageSupport(ctx, client, f); err != nil {
+		return nil, err
+	}
+	pinned := false
+	if f.Manifest.Runtime == 0 {
+		runtime, err := createRuntimeFor(ctx, client, f)
+		if err != nil {
+			return nil, err
+		}
+		f.Manifest.Runtime, pinned = runtime, true
+	}
+	created, err := client.CreateWorkflow(ctx, api.CreateWorkflowInput{
+		FeatureID:  featureID,
+		Title:      f.Manifest.Title,
+		Entrypoint: f.Manifest.Entrypoint,
+		// Declared at creation rather than left to the metadata patch below:
+		// the patch only fires when the manifest and the row disagree, and a
+		// row created without them would disagree — this just saves the round
+		// trip. Nil for an unmanaged folder, which creates none either way —
+		// and for `sync apply`'s first pass, whose create carries nothing an
+		// address could still be pending in (the push that follows patches
+		// them).
+		Parameters: params,
+		// The runtime, stamped at create. This is the only request that can
+		// pick it FREELY: afterwards it moves one way only, so a push to a
+		// workflow that already exists sends the declared runtime as a
+		// metadata patch when it is above the row's (reported as an upgrade),
+		// and refuses the reverse before writing anything.
+		//
+		// Never zero here: a folder that declared nothing was pinned to the
+		// instance's default above.
+		RuntimeVersion: f.Manifest.Runtime,
+		// Same round-trip saving for the declared calendar, but the value is
+		// the EFFECTIVE one: create refuses an explicit "" outright (unlike
+		// patch, where it is the reset), so a folder declaring the reset sends
+		// the literal "UTC" here. Empty for an unmanaged folder, where
+		// omitempty drops the key and the server stamps the organization
+		// default.
+		ReportingTimezone: declaredZoneForCreate(f.Manifest),
+		Language:          languageOnTheWire(f.Manifest),
+		// The address this folder claims, in the create's own transaction —
+		// nil (no key) for a folder with no id.
+		Managed: f.managedClaim(""),
+	})
+	if err != nil {
+		if _, adopted, refusal := f.adoptOnAddressClaimed(ctx, "", err); adopted {
+			if refusal != nil {
+				return nil, refusal
+			}
+			return nil, errAdoptedOnCreate
+		}
+		// Reachable on `--no-validate`, where nothing asked the server about
+		// the feature until this write. With validation on the same failure
+		// is caught above.
+		if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {
+			return nil, fmt.Errorf("%s\n  %s", message, f.featureFixAdvice())
+		}
+		return nil, fmt.Errorf("create workflow in feature %s: %w", featureID, err)
+	}
+	// Recorded IMMEDIATELY, before any file is written: the workflow now
+	// exists, and a push that died before saving the manifest would leave
+	// an orphan the next push could not find and would create again.
+	f.recordBinding(wfdir.Binding{WorkflowID: created.ID, FeatureID: featureID})
+	// The created workflow holds the declared title, so it is the title this
+	// folder agrees with — recorded in the same write as the binding.
+	if f.Manifest.Title != "" {
+		f.Lock.SetAppliedTitle(f.Stack, created.Title)
+	}
+	// A workflow that has just been created has never been versioned, and an
+	// unversioned row IS its own head — the same fallback
+	// api.HeadVersionID resolves, and the same one rworkflow's commit CAS
+	// resolves. Recorded here rather than by a round trip, in the write that
+	// records the binding it describes: they are one fact and a folder
+	// holding half of it is a folder with an anchor pointing at nothing.
+	f.setHeadVersion(created.ID)
+	// The runtime is saved with the binding: it is the one the create sent
+	// — the folder's own, or the instance's default pinned in memory — so the
+	// committed folder states the runtime its workflow was created on,
+	// whatever that instance's default becomes later.
+	if err := f.saveFolder(); err != nil {
+		return nil, fmt.Errorf("record the new workflow %s in %s: %w",
+			created.ID, f.bindingFiles(), err)
+	}
+	result.Created = true
+	result.WorkflowID = created.ID
+	result.RuntimeVersion = f.Manifest.RuntimeVersion()
+	result.RuntimePinned = pinned
+	return created, nil
 }
 
 // driftVerdict is what the drift guard decided, and it carries two independent
@@ -1010,14 +1404,29 @@ type driftVerdict struct {
 // where there is no local baseline at all. Everywhere else the baseline is a
 // finer-grained answer to a question the anchor cannot address — the anchor is
 // about the LIVE row, and a baseline is about the draft this push writes to.
-func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force bool, head headAgreement) (driftVerdict, error) {
+//
+// atBaseline is the remote hashed through the codec the baseline was taken
+// under (baselineCodec), the only rendering the baseline can be compared with;
+// remote is in the folder's current aliases, for every comparison with local.
+func checkDrift(f *folder, target *api.Workflow, remote, atBaseline, local map[string]string, force bool, head headAgreement, ask driftAsk) (driftVerdict, error) {
 	baseline := f.State.For(f.Key)
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
 		remoteHashes[path] = wfdir.HashString(content)
 	}
-	drift := wfdir.DiffHashes(remoteHashes, baseline.Hashes())
-	meta := metadataDriftOf(baseline, target, metadataPatch(f.Manifest, target))
+	drift := wfdir.DiffHashes(atBaseline, baseline.Hashes())
+	// A file that moved since the baseline TO WHAT THIS FOLDER HOLDS is not
+	// drift: there is nothing of anybody's to overwrite. See
+	// live_equals_desired.go.
+	//
+	// Only against a BASELINE: with none, every remote file reads as added, and
+	// excusing them here would walk a fresh checkout past the head anchor on its
+	// files alone. That case has its own leg below, which asks the metadata too.
+	excused := 0
+	if baseline != nil {
+		drift, excused = excuseAgreedFiles(drift, remote, local)
+	}
+	meta := metadataDriftOf(baseline, target, metadataPatch(f.Manifest, f.Codec, target))
 	if !drift.Dirty() && len(meta) == 0 {
 		// Bypassed still tracks --force here, even though nothing needed
 		// bypassing: it is what suppresses the per-file preconditions, and
@@ -1027,12 +1436,24 @@ func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force
 		// to override — a remote that moved AFTER this comparison read it —
 		// and answer it with a 409 whose advice is to run --force, which is
 		// what the caller just did.
-		return driftVerdict{BaselineClean: baseline != nil, Bypassed: force, Preconditions: baseline.Hashes()}, nil
+		//
+		// An EXCUSED file makes the baseline unclean — it no longer describes the
+		// server — so the push records a fresh one rather than leaving it.
+		return driftVerdict{BaselineClean: baseline != nil && excused == 0, Bypassed: force, Preconditions: baseline.Hashes()}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s that changed on the server since your last sync.\n",
 			describeDrifted(drift, meta))
 		return driftVerdict{Bypassed: true}, nil
+	}
+	if baseline == nil && filesAgree(remote, local) && metadataPatch(f.Manifest, f.Codec, target).Empty() {
+		// LIVE EQUALS DESIRED, with no baseline at all: the row already holds
+		// this folder exactly, files and metadata, so a moved head or a missing
+		// anchor has nothing to protect. This is the fresh checkout whose lock
+		// fell behind a publish this repository made. Armed on the remote
+		// listing, as the vouched path is, and anchorAfterPush re-anchors.
+		noteLiveEqualsDesired(target.ID)
+		return driftVerdict{HeadVouched: true, Preconditions: remoteHashes}, nil
 	}
 	if baseline == nil {
 		// A first push that died between recording the binding and writing the
@@ -1063,7 +1484,7 @@ func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force
 		}
 		if head.Moved() {
 			return driftVerdict{}, refuseHeadMoved("workflow", f.Binding.WorkflowID, head,
-				"`ronja wf clone "+f.Binding.WorkflowID+"`")
+				"`ronja wf clone "+f.Binding.WorkflowID+"`", f.pullHint("  "))
 		}
 		// The anchor agreed about the LIVE row and still could not vouch, which
 		// leaves exactly one cause: an EDIT SHADOW over the live row was already
@@ -1084,11 +1505,69 @@ func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force
 			return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and you already have a draft of %s open there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  Run `ronja wf discard` to throw the draft away and push onto the live version, or push --force to overwrite it",
 				f.Resolved.URL, f.Binding.WorkflowID, wfdir.LockName)
 		}
-		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the workflow already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the workflow into a fresh folder to get one, or push --force to overwrite the remote files with what you have here",
-			f.Resolved.URL, len(remote))
+		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the workflow already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the workflow into a fresh folder to get one, or push --force to overwrite the remote files with what you have here%s",
+			f.Resolved.URL, len(remote), f.pullHint("  "))
 	}
-	return driftVerdict{}, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja wf status` to see the detail, or push --force to overwrite",
-		driftSummary(drift, meta))
+	if len(meta) == 0 {
+		ask.rebound = f.reboundUnrecorded(drift, remote, local)
+	}
+	return driftVerdict{}, baselineDriftRefusal(f, ask, driftSummary(drift, meta))
+}
+
+// driftAsk is what a drift refusal says beyond the drift itself.
+type driftAsk struct {
+	// draft: the row compared is a draft that was open before this push —
+	// otherwise it is the live row, or a fresh copy of it.
+	draft bool
+	// apply: the push runs under `sync apply`, which has no --force.
+	apply bool
+	// rebound: what moved is only a binding re-pointed in ronja.json, read
+	// over a baseline that does not record the old one (reboundUnrecorded).
+	rebound []reboundAlias
+}
+
+// baselineDriftRefusal is the refusal of a workflow or data-app push whose
+// row changed since the folder's baseline, action first: what changed, and
+// the command that takes it into the folder (`<kind> pull`, for an adopted
+// folder and the live row), then which files, then how to see or overwrite
+// it — `push --force` in the folder itself, which is what works from `sync
+// apply` too.
+func baselineDriftRefusal(f *folder, ask driftAsk, summary string) error {
+	row := "the live " + f.Kind.Label
+	if ask.draft {
+		row = "your open draft of the " + f.Kind.Label
+	}
+	head := fmt.Sprintf("%s changed on the server since your last sync, and pushing would overwrite it", row)
+	if f.adoptedHere() && !ask.draft {
+		head = fmt.Sprintf("%s changed in Ronja since stack %q last applied it — run `%s pull` to take it into this folder", row, f.Stack, f.Kind.Command)
+	}
+	how := fmt.Sprintf("`%s status` shows the detail, and `%s push --force` overwrites it", f.Kind.Command, f.Kind.Command)
+	if ask.apply {
+		how = fmt.Sprintf("`%s status` shows the detail; to overwrite it instead, run `%s push --force` in this folder, then apply again", f.Kind.Command, f.Kind.Command)
+	}
+	if len(ask.rebound) > 0 {
+		head = reboundRefusalHead(f, row, ask)
+	}
+	return fmt.Errorf("%s:\n%s%s", head, summary, how)
+}
+
+// reboundRefusalHead is the head of a drift refusal whose only cause is a
+// binding re-pointed in ronja.json over a baseline an older CLI wrote: what
+// the row still holds, why it reads as a change made in Ronja, and the way
+// past it — put the binding back, take a baseline that records it (`pull` in
+// an adopted folder, a push in a classic one, which writes nothing when the
+// row holds the folder), then re-point it.
+func reboundRefusalHead(f *folder, row string, ask driftAsk) string {
+	held := make([]string, 0, len(ask.rebound))
+	for _, r := range ask.rebound {
+		held = append(held, fmt.Sprintf("binding `%s` as %s (ronja.json now says %s)", r.Alias, r.From, cmp.Or(r.To, "nothing")))
+	}
+	again := "push again"
+	if ask.apply {
+		again = "apply again"
+	}
+	return fmt.Sprintf("%s still holds %s — this folder's last sync was recorded by an older CLI, which did not note its bindings, so the re-pointed binding reads as a change made in Ronja; %s and %s",
+		row, joinAnd(held), reboundWayPast(f), again)
 }
 
 // filePreconditions is the compare-and-swap guard a push attaches to each file
@@ -1123,6 +1602,46 @@ func checkDrift(f *folder, target *api.Workflow, remote map[string]string, force
 type filePreconditions struct {
 	Armed  bool
 	Hashes map[string]string
+}
+
+// onTheWire re-expresses the hashes in the bytes the SERVER stores, which is
+// what it compares a baseSha256 against (rworkflow/rdataapp
+// store_concurrency.go: sha256 over the raw stored bytes).
+//
+// The drift guard compares — and the baseline records — DISK form: the remote
+// listing de-aliased through the codec (alias.go's invariant). For a folder
+// that declares no dependency the two forms are the same bytes; for one that
+// does, a disk-form hash asserted on the wire names content the server never
+// held, and every armed push of an aliased file was refused 409 as a change
+// nobody made. stored is the raw listing the guard just read: a path whose
+// de-aliased content hashes to what the guard vouched for is asserted at its
+// stored bytes' hash. A path that does not (or that the listing lacks) keeps
+// the vouched hash, which the server then refuses exactly as it should.
+//
+// codecs are every rendering the vouched hashes may be in: the folder's
+// current aliases (a hash vouched off the remote listing) and the baseline's
+// (a hash off the baseline, taken before a binding was re-pointed). A stored
+// file whose rendering through either hashes to what was vouched IS the
+// vouched content, so either one asserting its raw bytes is the same claim.
+func (p filePreconditions) onTheWire(stored map[string]string, codecs ...aliasCodec) filePreconditions {
+	if !p.Armed || !slices.ContainsFunc(codecs, func(c aliasCodec) bool { return !c.identity() }) {
+		return p
+	}
+	out := filePreconditions{Armed: true, Hashes: make(map[string]string, len(p.Hashes))}
+	for path, vouched := range p.Hashes {
+		out.Hashes[path] = vouched
+		raw, ok := stored[path]
+		if !ok {
+			continue
+		}
+		for _, codec := range codecs {
+			if wfdir.HashString(codec.toDisk(raw)) == vouched {
+				out.Hashes[path] = wfdir.HashString(raw)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // ForWrite returns the baseSha256 a PUT should assert, or nil for none.

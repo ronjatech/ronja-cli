@@ -111,6 +111,25 @@ type LockStack struct {
 	// rebound to a different row drops it, by the same invariant LockTable
 	// states: a pointer is only ever compared against the row it was read from.
 	HeadVersionID string `json:"headVersionID,omitempty"`
+	// Title is the data app's, workflow's or module's title as the LIVE row
+	// held it the last moment this folder agreed with it — the applied half of the name rule a manifest
+	// `title` is checked against (the declared half is the manifest's). It is
+	// what tells a rename this folder declares from a rename somebody made in the
+	// web app: the live title equal to this is the folder's own last state, so a
+	// different declared title is a rename to send; a live title equal to
+	// neither moved elsewhere, and is refused as drift.
+	//
+	// Committed for HeadVersionID's reason: it is a fact about the ENVIRONMENT,
+	// and a fresh CI checkout with no local baseline has nothing else to tell
+	// the two apart with. EMPTY means "no answer" — a lock written before the
+	// field existed — and the push then falls back to the local baseline's
+	// title, then to the head anchor where the kind's head moves with its title
+	// (a data app), and otherwise refuses a mismatch.
+	//
+	// ⚠️ It describes the row this stack is bound to (WorkflowID, DataAppID or
+	// ModuleID) and nothing else, and is dropped with HeadVersionID when the
+	// stack is rebound to a different row.
+	Title string `json:"title,omitempty"`
 	// Tables is a PIPELINE folder's per-file state: the slash-separated relative
 	// path of each .sql file, the table it builds, and the fingerprint of that
 	// LIVE row as of the last moment this folder agreed with it.
@@ -240,6 +259,29 @@ type LockTable struct {
 	// Empty means the guard is DISARMED — "no answer", never "agreed" — exactly
 	// as an absent LiveSHA256 disarms leg (a).
 	MetaSHA256 string `json:"metaSHA256,omitempty"`
+	// Name is the table's NAME as the live row held it the last moment this
+	// folder agreed with it — the applied half of the `-- @name` rule (the
+	// declared half is the file's header). Empty means "no answer": a lock
+	// written before the field existed, or a table whose name this folder has
+	// never declared. The baseline is then the file's stem, which is what the
+	// create stamped. See the commands package's decideName.
+	//
+	// Recorded only when it is TRUE that the live row holds it: the push or
+	// publish that read the live name equal to the declared one, or a --force
+	// that acknowledged the live name it overwrote. Never at a push that staged
+	// the rename on a draft — live still holds the old name then, and recording
+	// the new one would read this folder's own unpublished rename as somebody
+	// else's on the next push.
+	Name string `json:"name,omitempty"`
+	// Stem is the file stem the name baseline falls back to when no Name is
+	// recorded, and it is set only by a `moved` entry: a row re-keyed to a file
+	// with a different stem keeps the stem its create stamped, rather than
+	// silently taking the new file's. Empty means the current file's stem.
+	//
+	// Kept apart from Name because the two are different claims, and a drift
+	// refusal says which one it compared against: Name is a name this folder
+	// SAW on the live row, Stem only what the create would have stamped.
+	Stem string `json:"stem,omitempty"`
 
 	// unknown is this table entry's forward-compatibility sidecar, and it is
 	// here for the same reason Lock and LockStack have one: it is an object in a
@@ -372,6 +414,15 @@ type LockMetric struct {
 	// tag-pending, so `sync apply` cannot loop on it. Editing the file's tags, or
 	// `push --retry-tags`, tries again.
 	TagsRefused *TagsRefusal `json:"tagsRefused,omitempty"`
+	// Name is the metric's NAME as the live row held it the last moment this
+	// folder agreed with it — the applied half of the file's `"name"`, on
+	// LockTable.Name's rules exactly: empty is "no answer" and falls back to the
+	// file's stem, and it is recorded only when the live row is known to hold it.
+	// The recipe setters carry it forward untouched, as they do the tag half.
+	Name string `json:"name,omitempty"`
+	// Stem is LockTable.Stem for a metric file: the stem a `moved` entry
+	// carried, empty for the current file's.
+	Stem string `json:"stem,omitempty"`
 
 	// unknown is this entry's forward-compatibility sidecar, for the reason
 	// LockTable's has one: it is an object in a COMMITTED file.
@@ -479,6 +530,17 @@ type LockAutomation struct {
 	// Empty DISARMS both, exactly as an absent LiveSHA256 disarms a pipeline's
 	// drift guard: "no answer", never "agreed".
 	UpdatedAt string `json:"updatedAt,omitempty"`
+	// Name is the automation's NAME as the row held it the last moment this
+	// folder agreed with it — the applied half of the file's optional `"name"`.
+	// Recorded only for a file that DECLARES one: an undeclared name is stamped
+	// at create and unmanaged after, and recording it anyway would turn a web
+	// rename made while it was unmanaged into this folder's baseline. Empty is
+	// "no answer", and falls back to the filename, which is what every push
+	// before the key existed wrote.
+	Name string `json:"name,omitempty"`
+	// Stem is LockTable.Stem for an automation: the filename a `moved` entry
+	// carried as the name baseline, empty for the current file's.
+	Stem string `json:"stem,omitempty"`
 
 	// unknown is this entry's forward-compatibility sidecar, for the reason
 	// LockTable's has one: it is an object in a COMMITTED file, so a key a newer
@@ -863,6 +925,9 @@ func (l *Lock) SetBinding(stack string, b Binding) {
 	// a guard that refuses every push and names a version nobody recognises.
 	if entry.WorkflowID != b.WorkflowID || entry.DataAppID != b.DataAppID || entry.ModuleID != b.ModuleID {
 		entry.HeadVersionID = ""
+		// The applied title describes the row the stack pointed at, by the same
+		// invariant: one app's title is no baseline for another's.
+		entry.Title = ""
 	}
 	entry.WorkflowID = b.WorkflowID
 	entry.DataAppID = b.DataAppID
@@ -1306,6 +1371,169 @@ func (l *Lock) SetAutomationSeen(stack, path, automationID, updatedAt string) {
 	}
 	automation.AutomationID, automation.UpdatedAt = automationID, updatedAt
 	entry.Automations[path] = automation
+	l.Stacks[stack] = entry
+}
+
+// TableName reads the name this folder last agreed the live table held, empty
+// when there is none — "no answer", which the name rule reads as "the stem".
+func (l *Lock) TableName(stack, path string) string {
+	if l == nil {
+		return ""
+	}
+	return l.Stacks[stack].Tables[path].Name
+}
+
+// SetTableName records the live table's name as the one this folder agrees
+// with. Read-edit-store so every other field and the forward-compatibility
+// sidecar survive, and only for the SAME table: a path rebound to a different
+// row keeps nothing, by the invariant on LockTable.
+func (l *Lock) SetTableName(stack, path, tableID, name string) {
+	l.editTable(stack, path, tableID, func(t *LockTable) { t.Name = name })
+}
+
+// TableStem reads the stem a `moved` entry carried for a table, empty when there
+// is none — the current file's stem, then. See LockTable.Stem.
+func (l *Lock) TableStem(stack, path string) string {
+	if l == nil {
+		return ""
+	}
+	return l.Stacks[stack].Tables[path].Stem
+}
+
+// SetTableStem records the stem a move carried, on SetTableName's rules: every
+// other field survives, and only for the SAME table.
+func (l *Lock) SetTableStem(stack, path, tableID, stem string) {
+	l.editTable(stack, path, tableID, func(t *LockTable) { t.Stem = stem })
+}
+
+// editTable is the read-edit-store the table name and stem setters share, on
+// editMetric's rules: an empty stack or id writes nothing (a legacy folder has
+// nowhere committed to put it), and a path rebound to a different row keeps
+// nothing, by the invariant on LockTable.
+func (l *Lock) editTable(stack, path, tableID string, edit func(*LockTable)) {
+	if stack == "" || tableID == "" {
+		return
+	}
+	entry := l.stack(stack)
+	if entry.Tables == nil {
+		entry.Tables = map[string]LockTable{}
+	}
+	table := entry.Tables[path]
+	if table.TableID != tableID {
+		table = LockTable{TableID: tableID}
+	}
+	edit(&table)
+	entry.Tables[path] = table
+	l.Stacks[stack] = entry
+}
+
+// MetricName reads the row a metric file was recorded against and the name this
+// folder last agreed it held. The id is returned so a caller can apply
+// LockMetric's invariant: a name recorded against another row says nothing.
+func (l *Lock) MetricName(stack, path string) (metricID, name string) {
+	if l == nil {
+		return "", ""
+	}
+	entry := l.Stacks[stack].Metrics[path]
+	return entry.MetricID, entry.Name
+}
+
+// SetMetricName records the live metric's name as the one this folder agrees
+// with, and NOTHING ELSE — the recipe and tag fields are left as they are, on
+// SetMetricTagsApplied's rule.
+func (l *Lock) SetMetricName(stack, path, metricID, name string) {
+	l.editMetric(stack, path, metricID, func(m *LockMetric) { m.Name = name })
+}
+
+// MetricStem reads the row a metric file was recorded against and the stem a
+// `moved` entry carried for it. See LockTable.Stem.
+func (l *Lock) MetricStem(stack, path string) (metricID, stem string) {
+	if l == nil {
+		return "", ""
+	}
+	entry := l.Stacks[stack].Metrics[path]
+	return entry.MetricID, entry.Stem
+}
+
+// SetMetricStem records the stem a move carried, and nothing else.
+func (l *Lock) SetMetricStem(stack, path, metricID, stem string) {
+	l.editMetric(stack, path, metricID, func(m *LockMetric) { m.Stem = stem })
+}
+
+// AutomationName reads the name this folder last agreed one automation held,
+// empty when there is none.
+func (l *Lock) AutomationName(stack, path string) string {
+	if l == nil {
+		return ""
+	}
+	return l.Stacks[stack].Automations[path].Name
+}
+
+// SetAutomationName records an automation's name as the one this folder agrees
+// with, leaving the anchor and the sidecar alone. A legacy folder has nowhere
+// committed to put it — see SetAutomationSeen — and a path recorded against
+// another row is reset first.
+func (l *Lock) SetAutomationName(stack, path, automationID, name string) {
+	l.editAutomation(stack, path, automationID, func(a *LockAutomation) { a.Name = name })
+}
+
+// AutomationStem reads the filename a `moved` entry carried as one automation's
+// name baseline, empty when there is none. See LockAutomation.Stem.
+func (l *Lock) AutomationStem(stack, path string) string {
+	if l == nil {
+		return ""
+	}
+	return l.Stacks[stack].Automations[path].Stem
+}
+
+// SetAutomationStem records the filename a move carried, on SetAutomationName's
+// rules.
+func (l *Lock) SetAutomationStem(stack, path, automationID, stem string) {
+	l.editAutomation(stack, path, automationID, func(a *LockAutomation) { a.Stem = stem })
+}
+
+// editAutomation is the read-edit-store the automation name and stem setters
+// share, on editMetric's rules.
+func (l *Lock) editAutomation(stack, path, automationID string, edit func(*LockAutomation)) {
+	if stack == "" || automationID == "" {
+		return
+	}
+	entry := l.stack(stack)
+	if entry.Automations == nil {
+		entry.Automations = map[string]LockAutomation{}
+	}
+	automation := entry.Automations[path]
+	if automation.AutomationID != automationID {
+		automation = LockAutomation{AutomationID: automationID}
+	}
+	edit(&automation)
+	entry.Automations[path] = automation
+	l.Stacks[stack] = entry
+}
+
+// AppliedTitle reads the title — a data app's, workflow's or module's — this
+// stack last agreed the live row held, empty when there is none.
+func (l *Lock) AppliedTitle(stack string) string {
+	if l == nil {
+		return ""
+	}
+	return l.Stacks[stack].Title
+}
+
+// SetAppliedTitle records the title the live row holds as the one this folder
+// agrees with. A legacy folder has no stack name and keeps its title in the
+// local baseline instead, so an empty stack writes nothing; and a stack that has
+// recorded nothing yet is not created for it, on SetBinding's rule — a title
+// without the id it describes is a committed line that says nothing.
+func (l *Lock) SetAppliedTitle(stack, title string) {
+	if stack == "" {
+		return
+	}
+	entry, ok := l.entry(stack)
+	if !ok || entry.Title == title {
+		return
+	}
+	entry.Title = title
 	l.Stacks[stack] = entry
 }
 

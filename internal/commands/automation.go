@@ -74,6 +74,7 @@ production without either overwriting the other's.`,
 	}
 	auto.AddCommand(
 		newAutomationInitCmd(), newAutomationStatusCmd(), newAutomationPushCmd(),
+		newPullCmd(wfdir.AutomationKind),
 	)
 	addStackFlag(auto)
 	return auto

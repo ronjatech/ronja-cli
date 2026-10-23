@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/ronjatech/ronja-cli/internal/markers"
 )
 
 // v3Manifest is a folder that declares dependencies and binds them per stack —
@@ -448,6 +450,7 @@ func TestCheckBindRefusals(t *testing.T) {
 		"orders":   {Kind: "table"},
 		"lines":    {Kind: "table"},
 		"acme_api": {Kind: "secret"},
+		"exports":  {Kind: "folder", Write: true},
 	}
 	cases := []struct {
 		name    string
@@ -455,6 +458,11 @@ func TestCheckBindRefusals(t *testing.T) {
 		wantErr string
 	}{
 		{"declared and bound", map[string]string{"orders": "table-1", "acme_api": "secret-1"}, ""},
+		// A folder write scope is bound to a PATH, in any spelling the server
+		// normalizes to a non-root folder.
+		{"a folder bound to a path", map[string]string{"exports": "exports//daily/"}, ""},
+		{"a folder bound to the root", map[string]string{"exports": "/"}, "not a folder path"},
+		{"a folder bound through ..", map[string]string{"exports": "/exports/../payroll"}, "not a folder path"},
 		{"nothing bound", nil, ""},
 		// A typo. Inert on its own, which is exactly why it has to be said out
 		// loud: unreported, the reader sees only "orders has no binding here"
@@ -536,5 +544,87 @@ func TestCheckAliasCollisionsFoldsCase(t *testing.T) {
 	// them looking for the wrong thing.
 	if !strings.Contains(err.Error(), `"orders"`) || !strings.Contains(err.Error(), `"Orders"`) {
 		t.Errorf("refusal = %v, want it to name both spellings", err)
+	}
+}
+
+// TestAddressWriteAndOutputDependenciesStampTheirFormatVersion: a dependency declared
+// by address, as a write target or as an output is format version 7, and a
+// file claiming less is refused at acceptance.
+func TestAddressWriteAndOutputDependenciesStampTheirFormatVersion(t *testing.T) {
+	for name, dep := range map[string]Dependency{
+		"address": {Kind: markers.KindTable, From: "../sales", Address: "orders.sql"},
+		"write":   {Kind: markers.KindTable, Write: true},
+		"output":  {Kind: markers.KindTable, Output: true},
+		"run":     {Kind: markers.KindWorkflow, Run: true},
+	} {
+		m := Manifest{Kind: KindWorkflow, Dependencies: map[string]Dependency{"x": dep}}
+		if got := m.StampedFormatVersion(); got != 7 {
+			t.Errorf("%s: stamped %d, want 7", name, got)
+		}
+		m.FormatVersion = 6
+		if err := m.CheckDeclarations(); err == nil || !strings.Contains(err.Error(), `"formatVersion": 7`) {
+			t.Errorf("%s below version 7: %v", name, err)
+		}
+	}
+}
+
+// TestDependencyShapeRefusesMeaninglessCombinations: each combination of the
+// address / write / output keys that means nothing is refused by name.
+func TestDependencyShapeRefusesMeaninglessCombinations(t *testing.T) {
+	for name, dep := range map[string]Dependency{
+		"address without from": {Kind: markers.KindTable, Address: "orders.sql"},
+		"address and write":    {Kind: markers.KindTable, From: "../s", Write: true},
+		"write and output":     {Kind: markers.KindTable, Write: true, Output: true},
+		"secret by address":    {Kind: markers.KindSecret, From: "../s"},
+		"write secret":         {Kind: markers.KindSecret, Write: true},
+		"output workflow":      {Kind: markers.KindWorkflow, Output: true},
+		"absolute from":        {Kind: markers.KindTable, From: "/abs", Address: "a.sql"},
+		// A run edge: a workflow or an agent, never by address,
+		// never a write or an output.
+		"run a table":       {Kind: markers.KindTable, Run: true},
+		"run a secret":      {Kind: markers.KindSecret, Run: true},
+		"run by address":    {Kind: markers.KindWorkflow, From: "../w", Run: true},
+		"run and write":     {Kind: markers.KindWorkflow, Run: true, Write: true},
+		"run and output":    {Kind: markers.KindWorkflow, Run: true, Output: true},
+		"run feature write": {Kind: markers.KindFeature, Run: true, Write: true},
+	} {
+		m := Manifest{FormatVersion: 7, Kind: KindWorkflow, Dependencies: map[string]Dependency{"x": dep}}
+		if err := m.CheckDeclarations(); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	ok := Manifest{FormatVersion: 7, Kind: KindWorkflow, Dependencies: map[string]Dependency{
+		"orders": {Kind: markers.KindTable, From: "../sales", Address: "orders.sql"},
+		"events": {Kind: markers.KindTable, Write: true},
+		"docs":   {Kind: markers.KindCodex, Write: true},
+		// A feature an agent automation's reference set names: its run may
+		// write every table of the feature.
+		"fin":    {Kind: markers.KindFeature, Write: true},
+		"daily":  {Kind: markers.KindTable, Output: true},
+		"close":  {Kind: markers.KindWorkflow, Run: true},
+		"triage": {Kind: markers.KindAgent, Run: true},
+		"app":    {Kind: markers.KindDataApp, From: "../app"},
+	}}
+	if err := ok.CheckDeclarations(); err != nil {
+		t.Fatalf("legal declarations refused: %v", err)
+	}
+}
+
+// TestAFolderDependencyIsAWriteScope: a folder is declared only as a write
+// scope — "write": true — because nothing reads or resolves through one.
+func TestAFolderDependencyIsAWriteScope(t *testing.T) {
+	if err := checkDependencyShape("exports", Dependency{Kind: "folder"}); err == nil || !strings.Contains(err.Error(), "write scope") {
+		t.Fatalf("a folder declared without write: %v", err)
+	}
+	if err := checkDependencyShape("exports", Dependency{Kind: "folder", Write: true}); err != nil {
+		t.Fatalf("a folder write scope was refused: %v", err)
+	}
+	for raw, want := range map[string]string{"exports": "/exports", " /a//b/ ": "/a/b", "/": "", "": ""} {
+		if got, ok := NormalizeFolderPath(raw); !ok || got != want {
+			t.Errorf("NormalizeFolderPath(%q) = %q, %v; want %q", raw, got, ok, want)
+		}
+	}
+	if _, ok := NormalizeFolderPath("/a/./b"); ok {
+		t.Error("a . segment normalized")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -22,6 +23,9 @@ const (
 	automationOutcomeUnchanged = "unchanged"
 	automationOutcomeDeleted   = "deleted"
 	automationOutcomeRefused   = "refused"
+	// automationOutcomePending is a file `pull` left for the next deploy: one
+	// with no automation behind it yet, which a pull never creates.
+	automationOutcomePending = "pending"
 )
 
 // `ronja automation push` makes each automation match the file that describes
@@ -45,7 +49,11 @@ For each .json file in the folder:
   3. otherwise only the DECLARED fields the row does not already hold are sent
 
 A field a file does not mention is not managed by this folder and is never
-touched, so adding a key is how you take a field over.
+touched, so adding a key is how you take a field over. That includes the
+automation's "name": without it the automation keeps the name it was created
+under (the filename), and a rename in the web app stands; with it, the name is
+managed, and a rename made in the web app since this folder last agreed with it
+is refused rather than reverted.
 
 It refuses, rather than guessing, when:
 
@@ -56,8 +64,12 @@ It refuses, rather than guessing, when:
   * a file changes the trigger kind, the event name, or whether the run is
     reference-based — the update route carries none of the three, so sending the
     change would answer 200 for a write that never happened
-  * a file this folder is bound to is gone. --prune deletes those automations
-    instead; without it a bad rebase cannot silently stop one. --prune obeys the
+  * a file this folder is bound to is gone. Declare what happened in ronja.json:
+    "moved": [{"from": "old.json", "to": "new.json"}] for a rename (the same
+    automation, name unchanged; needs "formatVersion": 5), or "removed":
+    ["old.json"] to stop managing it and leave it running. --prune deletes
+    those automations instead; without one of the three a bad rebase cannot
+    silently stop one. --prune obeys the
     drift guard too — a row somebody has been editing is the last one to delete
     because a file went missing`,
 		Args: cobra.NoArgs,
@@ -66,15 +78,18 @@ It refuses, rather than guessing, when:
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.AutomationKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.AutomationKind)
 			if err != nil {
 				return err
 			}
 			result, err := runAutomationPush(cmd.Context(), f, automationPushOptions{Force: force, Prune: prune})
+			noteWrittenAutomationsManagedBy(cmd.Context(), f, result)
 			// Emitted even on failure: a push that stopped part-way has really
 			// created and updated automations, and "which ones" is the first
 			// thing anybody needs to know.
+			printManagedNotices(f.notices)
 			if result != nil {
+				result.ManagedInGit = f.notices
 				if flagJSON {
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
@@ -96,6 +111,20 @@ It refuses, rather than guessing, when:
 type automationPushOptions struct {
 	Force bool
 	Prune bool
+	// RequireAnchor is `sync apply`'s, on an ADOPTED folder: a bound row this
+	// folder holds no drift anchor for is written only when the row read at
+	// WRITE time already equals the file (the anchor is then recorded and
+	// nothing else is sent), and is otherwise refused no_drift_anchor. Apply's
+	// plan answers the same question earlier (relieveAnchorlessAtDesired), but
+	// the write comes after every earlier folder has run, and with no anchor
+	// the drift and re-enable guards are both disarmed — so a pause made in
+	// that window would be reverted by a push the plan had cleared. The single
+	// folder push leaves it off: its write is how a folder earns an anchor.
+	RequireAnchor bool
+	// Pull is `ronja automation pull`'s anchor step: a file with no automation
+	// behind it is left for the next deploy (automationOutcomePending) rather
+	// than created — a pull writes no row.
+	Pull bool
 }
 
 // automationPushResult is the --json shape and the human renderer's input, so
@@ -106,9 +135,16 @@ type automationPushResult struct {
 	// mistake is visible where it happens rather than only from a later status.
 	Target string                 `json:"target,omitempty"`
 	Files  []automationFileResult `json:"files"`
+	// Moved and Removed are what this folder's `moved` / `removed` declarations
+	// did to the selected stack's lock — see pipelinePushResult's.
+	Moved   []addressMove    `json:"moved,omitempty"`
+	Removed []addressRemoval `json:"removed,omitempty"`
 	// UpToDate reports a push that found nothing to do.
 	UpToDate bool   `json:"upToDate"`
 	Error    string `json:"error,omitempty"`
+	// ManagedInGit is every automation this push wrote whose `managedBy` names a
+	// repository folder other than this one (managed_notice.go).
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 // automationFileResult is what happened to one file.
@@ -128,6 +164,9 @@ type automationFileResult struct {
 	// serialized: it is a signal to the loop, and by the time a reader sees the
 	// report the Error string already says what happened.
 	infrastructural bool
+	// drift marks a refusal for drift — what `ronja <kind> pull` takes into an
+	// adopted folder — so the run's summary can name it.
+	drift bool
 }
 
 func (r *automationFileResult) note(format string, args ...any) {
@@ -155,10 +194,18 @@ func automationWriteIsInfrastructural(err error) bool {
 
 // automationOrphanError is the refusal a file that left the folder earns, in the
 // one place the push and `sync apply`'s local pre-flight both read it from.
-func automationOrphanError(orphans []string) error {
-	return fmt.Errorf("%d %s bound to an automation and %s gone from this folder:\n    %s\n  Those automations are LIVE and this push leaves them alone. A file lost to a bad rebase must not silently stop one, so deleting is an explicit choice: `ronja automation push --prune`. Restore the files instead if that is what you meant.\n  ⚠️ --prune is a 30-day SOFT delete that also pauses the row, and this CLI cannot empty that trash (purging is a human-only route in the web app).",
-		len(orphans), plural(len(orphans), "file"), agree(len(orphans), "is", "are"),
-		strings.Join(orphans, "\n    "))
+//
+// It names the DECLARED ways through first, because they are the ones that
+// leave the automation running: a "moved" entry for a rename, a "removed" entry
+// to stop managing it. --prune is the third, and the only one that deletes.
+func automationOrphanError(gone []goneAddress) error {
+	lines := make([]string, 0, len(gone))
+	for _, g := range gone {
+		lines = append(lines, describeGone(g)+".")
+	}
+	return fmt.Errorf("%d %s bound to an automation and %s gone from this folder:\n    %s\n  Those automations are LIVE and this push leaves them alone. A file lost to a bad rebase must not silently stop one, so what happened has to be said. Restore the files if they went missing; to DELETE the automations instead, `ronja automation push --prune`.\n  ⚠️ --prune is a 30-day SOFT delete that also pauses the row, and this CLI cannot empty that trash (purging is a human-only route in the web app). A \"removed\" entry deletes nothing.",
+		len(gone), plural(len(gone), "file"), agree(len(gone), "is", "are"),
+		strings.Join(lines, "\n    "))
 }
 
 // refuseBoundAutomationsWithNoFeature is runAutomationPush's step-5 refusal, in
@@ -224,7 +271,7 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 	var unresolved []string
 	for _, path := range sortedPaths(local) {
 		file := *parsed[path]
-		if err := resolveAutomationRefs(&file, f.Codec, f.Stack); err != nil {
+		if err := resolveAutomationRefs(&file, f.Codec, f.Stack, f.Binding.FeatureID); err != nil {
 			unresolved = append(unresolved, fmt.Sprintf("%s:\n    %v", path, err))
 			continue
 		}
@@ -236,13 +283,34 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 	}
 
 	// --- 2. A file that left the folder is not an automation this deletes ----
+	//
+	// The ADDRESS declarations first: a `moved` entry re-keys this stack's
+	// recorded automation to its new file, and a `removed` one stops managing it,
+	// so neither path is an orphan below. In memory; written back once every
+	// local guard has passed.
+	addresses, err := f.resolveAddresses()
+	if err != nil {
+		return nil, err
+	}
+	result.Moved, result.Removed = addresses.Moves, addresses.Removals
+	f.noteAddresses()
 	orphans := automationOrphans(f.Binding, local)
 	if len(orphans) > 0 && !opts.Prune {
-		return nil, automationOrphanError(orphans)
+		gone, err := f.goneAddresses()
+		if err != nil {
+			return nil, err
+		}
+		return nil, automationOrphanError(gone)
 	}
 
 	// --- 3. The authority a mailbox needs, said before it is needed ---------
 	if err := checkAutomationMailboxAuthority(ctx, client, resolvedFiles); err != nil {
+		return nil, err
+	}
+	// --- 3b. The WRITE GATE: a table in an agent action's reference set is one
+	// its headless run may write, so it must be this stack's own or bound here
+	// as a write source. Every file, before any is sent (write_gate.go).
+	if err := gateAutomationReferences(ctx, client, f, resolvedFiles); err != nil {
 		return nil, err
 	}
 
@@ -262,6 +330,11 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 	decisions := applyDecisionsFor(f, sortedPaths(local))
 	if err := errFromDecisions(decisions); err != nil {
 		return nil, err
+	}
+	// Every local guard has passed: the re-keyed addresses are recorded before
+	// the first request, so the writes below land under the NEW paths.
+	if err := f.saveAddresses(); err != nil {
+		return nil, fmt.Errorf("record the moved addresses in %s: %w", f.addressRecordFile(), err)
 	}
 	creating := false
 	for _, d := range decisions {
@@ -370,6 +443,9 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 	}
 	if failed > 0 {
 		result.Error = fmt.Sprintf("%d of %d file(s) did not land", failed, len(result.Files))
+		if hint := f.pullHint(""); hint != "" && slices.ContainsFunc(result.Files, func(r automationFileResult) bool { return r.drift }) {
+			result.Error += fmt.Sprintf(" — what changed on the server since this folder last applied it is taken into the folder with `%s pull` (then commit it)", f.Kind.Command)
+		}
 		return result, fmt.Errorf("%s", result.Error)
 	}
 	return result, nil
@@ -392,7 +468,13 @@ func anyAutomationWritten(files []automationFileResult) bool {
 func pushOneAutomation(ctx context.Context, client *api.Client, f *folder, path string,
 	file *automationFile, rows map[string]*api.Automation, opts automationPushOptions) automationFileResult {
 
+	// The name a CREATE stamps: the declared one when the file has it, the
+	// filename's stem otherwise. After the create an undeclared name is never
+	// written again (see automationDelta).
 	name := automationNameFor(path)
+	if file.Name != nil {
+		name = *file.Name
+	}
 	out := automationFileResult{Path: path, Name: name, AutomationID: f.Binding.Automations[path]}
 	refuse := func(format string, args ...any) automationFileResult {
 		out.Outcome = automationOutcomeRefused
@@ -409,8 +491,32 @@ func pushOneAutomation(ctx context.Context, client *api.Client, f *folder, path 
 	}
 
 	// --- Create, for a file with no automation behind it yet ----------------
+	if out.AutomationID == "" && opts.Pull {
+		out.Outcome = automationOutcomePending
+		out.Error = "not deployed yet; the next apply creates it (with --allow-create)"
+		return out
+	}
 	if out.AutomationID == "" {
-		row, err := client.CreateAutomation(ctx, automationCreateInput(f.Binding.FeatureID, name, file))
+		create := automationCreateInput(f.Binding.FeatureID, name, file)
+		// The address this folder claims, in the create's own transaction — nil
+		// (no key) for a folder with no id.
+		create.Managed = f.managedClaim(path)
+		row, err := client.CreateAutomation(ctx, create)
+		if id, adopted, refusal := f.adoptOnAddressClaimed(ctx, path, err); err != nil && adopted {
+			// Another apply created this address's automation at the same moment
+			// and its claim won: that row is this file's, adopted by id, and the
+			// file continues below as the update it now is.
+			if refusal != nil {
+				return refuse("%v", refusal)
+			}
+			out.AutomationID = id
+			if _, known := rows[id]; !known {
+				if adoptedRow, gerr := client.GetAutomation(ctx, id); gerr == nil {
+					rows[id] = adoptedRow
+				}
+			}
+			err, row = nil, nil
+		}
 		if err != nil {
 			// ⚠️ A timeout is NOT reconciled here, unlike a table create, and the
 			// difference is the surface rather than a decision: scheduled_jobs.name
@@ -422,11 +528,14 @@ func pushOneAutomation(ctx context.Context, client *api.Client, f *folder, path 
 			return refuseWrite(err, "creating it in feature %s failed: %v\n    If the request timed out, look at the feature in the web app before pushing again — an automation's name is not unique, so nothing here can tell a landed create from a lost one, and the next push would make a second one",
 				f.Binding.FeatureID, err)
 		}
-		out.AutomationID, out.Created = row.ID, true
-		out.Outcome = automationOutcomeCreated
-		recordAutomation(f, path, row)
-		noteAutomationWarnings(&out, row)
-		return out
+		if row != nil {
+			out.AutomationID, out.Created = row.ID, true
+			out.Outcome = automationOutcomeCreated
+			recordAutomation(f, path, row)
+			recordAutomationName(f, path, file, row)
+			noteAutomationWarnings(&out, row)
+			return out
+		}
 	}
 
 	row, present := rows[out.AutomationID]
@@ -434,15 +543,53 @@ func pushOneAutomation(ctx context.Context, client *api.Client, f *folder, path 
 		return refuse("binding broken: %s is not in feature %s any more (deleted, moved, or you lost access to it).\n    Remove this file's entry from %s to create a new automation for it, or point it at the right id",
 			out.AutomationID, f.Binding.FeatureID, wfdir.LockName)
 	}
+	// A file that declares no name leaves the row's name alone, so the report
+	// names the automation by the name it HAS — the filename is only what a
+	// create would have stamped. A declared name is what the push converges to.
+	if file.Name == nil {
+		out.Name = row.Name
+	}
 
 	// --- The three refusals, in the order whose MESSAGE is most specific ----
 	if err := refuseUnpatchableAutomation(file, row); err != nil {
 		return refuse("%v", err)
 	}
 	_, seen := f.Lock.AutomationSeen(f.Stack, path)
+
+	// LIVE EQUALS DESIRED IS NEVER DRIFT, and it is asked FIRST. A row that
+	// already holds every field this file declares has nothing to overwrite, so
+	// there is nothing for the drift anchor to protect — and refusing it would
+	// refuse this folder's own work whenever the anchor fell behind a write that
+	// DID land (the anchor is recorded in a separate step from the write). The
+	// anchor is re-recorded from the row just read, which is exactly what it
+	// records: the moment this folder last agreed with the row.
+	changed, patch := automationDelta(file, row)
+	out.Changed = changed
+	if patch.Empty() {
+		out.Outcome = automationOutcomeUnchanged
+		// A LEGACY instances[] folder is a no-op here, guarded inside
+		// SetAutomationSeen: its bindings live in the manifest and a lock keyed by
+		// stack name has nowhere to put its anchor. recordAutomation says that out
+		// loud on the paths that WRITE; nothing was written here.
+		f.Lock.SetAutomationSeen(f.Stack, path, row.ID, row.Stamp())
+		recordAutomationName(f, path, file, row)
+		return out
+	}
+
+	// No anchor, and something to write: refused when the caller requires an
+	// anchor (see RequireAnchor). Decided HERE, on the row this push just read,
+	// never on an earlier read — the window between the two is exactly where a
+	// pause made by an operator would be written over with both guards off.
+	if opts.RequireAnchor && seen == "" {
+		detail := fmt.Sprintf("this folder holds no drift anchor for automation %s, and the row now differs from the file in %s — with no anchor a write would overwrite whatever moved on the server, and would turn the row back on if somebody had paused it. Push this folder on its own (`ronja automation push`) to write it and record the anchor, or bring the file in line with the row",
+			out.AutomationID, strings.Join(changed, ", "))
+		f.noteCreateRefusal(&managedRefusal{Reason: syncReasonNoDriftAnchor, Detail: detail})
+		return refuse("%s", detail)
+	}
 	if err := automationReEnableGuard(file, row, seen); err != nil {
 		if !opts.Force {
-			return refuse("%v", err)
+			out.drift = true
+			return refuse("%v%s", err, f.pullHint("    "))
 		}
 		// --force is an explicit choice, and this is the one it is worth being
 		// loud about: it turns an automation somebody paused back on.
@@ -450,27 +597,26 @@ func pushOneAutomation(ctx context.Context, client *api.Client, f *folder, path 
 	}
 	if drift := automationDrift(seen, row); drift == driftChanged {
 		if !opts.Force {
-			return refuse("this automation changed on the server since your last push (it was last written %s, and this folder last agreed with %s).\n    There is no version history and no compare-and-set here, so a push would overwrite whatever moved without knowing what it was. Run `ronja automation status` for the detail, pull the change into the file, or push --force to overwrite it",
-				row.UpdatedAt.UTC().Format(time.RFC3339), seen)
+			out.drift = true
+			return refuse("this automation changed on the server since your last push (it was last written %s, and this folder last agreed with %s).\n    There is no version history and no compare-and-set here, so a push would overwrite whatever moved without knowing what it was. Run `ronja automation status` for the detail, pull the change into the file, or push --force to overwrite it%s",
+				row.UpdatedAt.UTC().Format(time.RFC3339), seen, f.pullHint("    "))
 		}
 		fmt.Fprintf(os.Stderr, "  Note: --force — %s changed on the server since your last push; overwriting.\n", path)
 	}
-
-	changed, patch := automationDelta(name, file, row)
-	out.Changed = changed
-	if patch.Empty() {
-		out.Outcome = automationOutcomeUnchanged
-		// The anchor is re-recorded even when nothing is written: this folder has
-		// just READ the row and agrees with it, which is exactly what the anchor
-		// records. Leaving it stale would make the next push refuse on a change
-		// this one already reconciled.
-		//
-		// A LEGACY instances[] folder is a no-op here, guarded inside
-		// SetAutomationSeen: its bindings live in the manifest and a lock keyed by
-		// stack name has nowhere to put its anchor. recordAutomation says that out
-		// loud on the paths that WRITE; nothing was written here.
-		f.Lock.SetAutomationSeen(f.Stack, path, row.ID, row.Stamp())
-		return out
+	// The NAME's own three arms (name_attr.go), for a file that declares one.
+	// The anchor above usually catches a rename made in the web app first — any
+	// write moves updatedAt — but not on a folder with no anchor, and its message
+	// would not say it was the name. The baseline is the name this folder last
+	// recorded, else the filename, which is what every push before the key
+	// existed wrote.
+	nameBase := nameBaseline{Recorded: f.Lock.AutomationName(f.Stack, path), Stem: automationNameFor(path)}.withCarried(f.Lock.AutomationStem(f.Stack, path))
+	if decideName(file.Name, row.Name, nameBase) == nameDrift {
+		reason := nameDriftReason("the automation", row.Name, *file.Name, nameBase)
+		if !opts.Force {
+			out.drift = true
+			return refuse("%s.\n    Set \"name\" in the file to what it is now, remove the key to stop managing it, or push --force to rename it back%s", reason, nameRemedy(f, "automation push", "    "))
+		}
+		fmt.Fprintf(os.Stderr, "  Note: --force — %s: %s; renaming it back.\n", path, reason)
 	}
 
 	updated, err := client.UpdateAutomation(ctx, out.AutomationID, patch)
@@ -480,16 +626,17 @@ func pushOneAutomation(ctx context.Context, client *api.Client, f *folder, path 
 		// SEPARATE server-side calls, so a failure at the second leaves the new
 		// schedule with the old references — a state indistinguishable, a day
 		// later, from somebody editing references in the web app.
-		return refuseWrite(err, "%v%s", err, diagnoseAutomationHalfApply(ctx, client, out.AutomationID, name, file, changed))
+		return refuseWrite(err, "%v%s", err, diagnoseAutomationHalfApply(ctx, client, out.AutomationID, file, changed))
 	}
 	out.Outcome = automationOutcomeUpdated
 	recordAutomation(f, path, updated)
+	recordAutomationName(f, path, file, updated)
 	noteAutomationWarnings(&out, updated)
 	// The write is VERIFIED against the row it returned. A field the server
 	// accepted and did not store answers 200 and changes nothing — the exact
 	// class of bug the two spelling mismatches on this surface produce — and
 	// without this the folder would report it as pushed for ever.
-	if left, _ := automationDelta(name, file, updated); len(left) > 0 {
+	if left, _ := automationDelta(file, updated); len(left) > 0 {
 		out.note("the server accepted the update and the row still differs in %s — the write was reported as successful, so this is worth looking at rather than re-pushing",
 			strings.Join(left, ", "))
 	}
@@ -514,6 +661,21 @@ func recordAutomation(f *folder, path string, row *api.Automation) {
 		return
 	}
 	f.Lock.SetAutomationSeen(f.Stack, path, row.ID, row.Stamp())
+}
+
+// recordAutomationName records the name a row holds as the one this folder agrees
+// with — ONLY for a file that declares one, and only when the row really holds
+// it. An undeclared name is unmanaged, and recording whatever the row is called
+// would turn a rename made in the web app while nobody managed the name into
+// this folder's baseline the day somebody adds the key.
+func recordAutomationName(f *folder, path string, file *automationFile, row *api.Automation) {
+	if file == nil || file.Name == nil || row == nil || !sameName(row.Name, *file.Name) {
+		return
+	}
+	if sameName(f.Lock.AutomationName(f.Stack, path), row.Name) {
+		return
+	}
+	f.Lock.SetAutomationName(f.Stack, path, row.ID, row.Name)
 }
 
 // noteAutomationWarnings carries the server's non-blocking advisories about a
@@ -585,7 +747,7 @@ func automationReEnableGuard(file *automationFile, row *api.Automation, seen str
 // which is the state §5.4 warns about and the one nobody can reconstruct later.
 // A read that fails degrades to the uncertain wording rather than claiming
 // either half.
-func diagnoseAutomationHalfApply(ctx context.Context, client *api.Client, id, name string,
+func diagnoseAutomationHalfApply(ctx context.Context, client *api.Client, id string,
 	file *automationFile, wanted []string) string {
 
 	const uncertain = "\n    ⚠️ The row and its references are written by SEPARATE server-side calls, so this may have landed in part — the new schedule with the old references, say. Run `ronja automation status` before pushing again."
@@ -593,7 +755,7 @@ func diagnoseAutomationHalfApply(ctx context.Context, client *api.Client, id, na
 	if err != nil || row == nil {
 		return uncertain
 	}
-	left, _ := automationDelta(name, file, row)
+	left, _ := automationDelta(file, row)
 	stillOff := map[string]bool{}
 	for _, field := range left {
 		stillOff[field] = true

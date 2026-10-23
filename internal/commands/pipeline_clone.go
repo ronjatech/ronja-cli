@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/metricfile"
 	"github.com/ronjatech/ronja-cli/internal/tablerefs"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
@@ -102,158 +103,27 @@ directory must be empty or absent.`,
 				}
 			}
 
-			// ONE claimed-path set across both writers, for uniqueMetricPath's
-			// reason: the two kinds share a namespace server-side, and a folder
-			// holding revenue.sql beside metrics/revenue.json is one whose very
-			// first push this loop's own collision guard refuses.
-			used := map[string]bool{}
-			sources, err := fetchCloneSources(cmd.Context(), client, used, cloneable)
+			set, err := fetchPipelineClone(cmd.Context(), client, cloneable, metricRows, skipped, false)
 			if err != nil {
 				return err
 			}
-			metricSources, err := fetchCloneMetrics(cmd.Context(), client, used, metricRows, &skipped)
-			if err != nil {
-				return err
-			}
-			// Each cloned table's ENABLED health checks, as checks/<stem>.json.
-			checkFiles := fetchCloneChecks(cmd.Context(), client, sources)
-			// The binding is keyed by organization as well as instance, so it has
-			// to be known before one is written — and it is resolved BEFORE the
-			// first file is laid down, not after. A folder whose files landed and
-			// whose manifest did not is one every command refuses (the target
-			// directory is no longer empty) and nothing can repair: the whole point
-			// of doing it here is that a failed /me leaves an empty directory
-			// rather than a half-clone.
-			if err := ensureTenant(cmd.Context(), resolved); err != nil {
-				return err
-			}
-			// Checked BEFORE anything is created, and fatal rather than per-file:
-			// the baseline written below claims every one of these paths is on
-			// disk, and a set that cannot all be written produces a folder whose
-			// baseline lies from birth. See wfdir.CheckLocalPaths.
-			paths := make([]string, 0, len(sources))
-			for _, s := range sources {
-				paths = append(paths, s.Path)
-			}
-			if err := wfdir.CheckLocalPaths(paths, wfdir.PipelineKind); err != nil {
-				return err
-			}
-			// The METRIC files are checked SEPARATELY and with a different
-			// question, because CheckLocalPaths asks two things and only one of
-			// them applies here. It asks "can this path be written to disk", which
-			// a metric file must pass — and "is this path SYNCABLE for this kind",
-			// which a metric file must FAIL: a pipeline folder's SyncExt is ".sql",
-			// so `metrics/x.json` is deliberately invisible to Enumerate and is
-			// read by the metric pass alone. Running the whole check over them
-			// would refuse every clone of a feature holding a metric, for a
-			// property this carrier is designed to have.
-			//
-			// Case collisions are already impossible here: uniqueMetricPath and
-			// uniqueSQLPath share one claimed-path set, folded to lower case.
-			for _, m := range metricSources {
-				if err := wfdir.ValidatePath(m.Path); err != nil {
-					return fmt.Errorf("metric %q cannot be written to disk as %s (%v) — rename it in the web app, then clone again",
-						m.Name, m.Path, err)
-				}
-			}
-
-			if err := os.MkdirAll(root, 0o755); err != nil {
-				return fmt.Errorf("create %s: %w", root, err)
-			}
-			for _, s := range sources {
-				// Validated once more inside WriteFile: the path is built from a
-				// server-supplied name, and writing it is a local filesystem
-				// operation that must not be able to escape the folder.
-				if err := wfdir.WriteFile(root, s.Path, s.Code); err != nil {
-					return fmt.Errorf("write %s: %w", s.Path, err)
-				}
-			}
-			for _, m := range metricSources {
-				if err := wfdir.WriteFile(root, m.Path, m.Body); err != nil {
-					return fmt.Errorf("write %s: %w", m.Path, err)
-				}
-			}
-			for _, c := range checkFiles {
-				if err := wfdir.WriteFile(root, c.Path, string(c.Body)); err != nil {
-					return fmt.Errorf("write %s: %w", c.Path, err)
-				}
-			}
-
-			key := wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID}
-			manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: feature.Name}
-			binding := wfdir.Binding{FeatureID: featureID, Tables: map[string]string{}}
-			baseline := &wfdir.InstanceState{
-				SourceID: featureID,
-				Files:    map[string]wfdir.FileState{},
-				Tables:   map[string]wfdir.TableState{},
-			}
-			// The live fingerprints go wherever this folder's shape puts them:
-			// the lock file for a --stack clone, the local baseline otherwise.
-			// See liveHashes.
-			lock := &wfdir.Lock{}
-			liveHash := liveHashes{lock: lock, stack: flagStack, inst: baseline}
-			for _, s := range sources {
-				// The STABLE identity, never the draft's id: a draft dies at commit
-				// while the binding lives in the customer's git.
-				binding.Tables[s.Path] = s.TableID
-				// TWO fingerprints, from two rows, and this is the clearest place to
-				// see why they cannot be one: when the clone preferred an open draft,
-				// what is on disk is the DRAFT's SQL while the live table holds
-				// something else entirely. Recorded as one hash, the next push
-				// compared the live table against the draft's bytes and refused a
-				// folder that had done nothing wrong.
-				if s.LiveCode != "" {
-					recordLiveAgreement(liveHash, s.Path, s.TableID, s.LiveCode)
-				}
-				if s.DraftID != "" {
-					// No WIRE fingerprint: this clone read that draft, it did not
-					// write it, so there are no sent bytes to vouch for. See
-					// recordDraftWrite — the first push writes unconditionally.
-					recordDraftWrite(baseline, s.Path, s.TableID, s.DraftID, s.Code, "")
-				} else {
-					recordDraftPointer(baseline, s.Path, s.TableID, "")
-				}
-				recordSynced(baseline, s.Path, s.Code)
-			}
-			for _, m := range metricSources {
-				// BOTH fingerprints, and neither is optional. The live one is what
-				// the drift guard compares the row against on the next push; the
-				// declared one is what tells that push the file has not changed
-				// since this clone wrote it. Recorded here rather than left to the
-				// first push, so a fresh clone reads as clean instead of proposing
-				// to re-stage every metric it just copied.
-				//
-				// ⚠️ On a LEGACY (unnamed instances[]) folder these land in
-				// .ronja/state.json, which is per-user and git-ignored — so a
-				// colleague's clone of that folder starts with no metric id and its
-				// first push would try to CREATE a metric that already exists. That
-				// push is caught by the adopt-by-name recovery in
-				// reconcileMetricNameTaken rather than duplicating the row; a
-				// --stack folder has the recording committed and never gets there.
-				liveHash.setMetricSeen(m.Path, m.MetricID, m.LiveSHA256, m.Declared)
-				if len(m.Tags) > 0 {
-					liveHash.setMetricTagsApplied(m.Path, m.MetricID, m.Tags)
-				}
-			}
-			// Every check a clone writes is one the folder now owns, with the
-			// fingerprint it was read at — so the next push is a no-op, and an
-			// edit in the app after this is drift.
-			for _, c := range checkFiles {
-				liveHash.setChecksSeen(c.Path, c.TableID, c.Managed)
-			}
-			if err := recordFirstBindingInto(manifest, lock, key, binding); err != nil {
-				return err
-			}
-			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
-				return err
-			}
-			state := &wfdir.State{}
-			state.Set(key, baseline)
-			if err := wfdir.SaveState(root, state); err != nil {
+			sources, metricSources, checkFiles := set.sources, set.metrics, set.checks
+			skipped = set.skipped
+			if err := writePipelineClone(cmd.Context(), resolved, featureID, feature.Name, root, set, cloneHooks{}); err != nil {
 				return err
 			}
 
 			reportSkippedKinds(skipped)
+			var notices []managedNotice
+			for _, s := range sources {
+				notices = appendManagedNotice(notices,
+					noticeManagedBy(nil, wfdir.PipelineKind, wfdir.ManagedTable, s.TableID, s.ManagedBy, noticeForClone))
+			}
+			for _, m := range metricSources {
+				notices = appendManagedNotice(notices,
+					noticeManagedBy(nil, wfdir.PipelineKind, wfdir.ManagedMetric, m.MetricID, m.ManagedBy, noticeForClone))
+			}
+			printManagedNotices(notices)
 			for _, s := range sources {
 				if s.DraftID != "" {
 					fmt.Fprintf(os.Stderr, "  Note: %s came from your open draft %s (newer than the live table).\n",
@@ -279,7 +149,7 @@ directory must be empty or absent.`,
 						"path": m.Path, "metricID": m.MetricID, "name": m.Name,
 					})
 				}
-				return emitJSON(map[string]any{
+				return emitJSON(withManagedInGit(map[string]any{
 					"root":        root,
 					"url":         resolved.URL,
 					"kind":        wfdir.KindPipeline,
@@ -291,7 +161,7 @@ directory must be empty or absent.`,
 					"metricFiles": metricFiles,
 					"checkFiles":  len(checkFiles),
 					"skipped":     skippedPayload(skipped),
-				})
+				}, notices))
 			}
 			printPipelineCloneReport(root, resolved.URL, feature, sources, metricSources, checkFiles, skipped)
 			return nil
@@ -302,9 +172,14 @@ directory must be empty or absent.`,
 
 // cloneSource is one table as it will be laid down on disk.
 type cloneSource struct {
-	Path    string
-	Name    string
-	TableID string
+	Path string
+	Name string
+	// LiveName is the LIVE row's name, read off the row rather than the
+	// listing, and recorded as the name this folder agrees the table has — the
+	// exact baseline a later `-- @name` is compared against. The file's stem is
+	// only a slug of it.
+	LiveName string
+	TableID  string
 	// DraftID is the caller's own draft the SQL came from, empty when it came
 	// from the live table. Recorded in the baseline so the next push resumes that
 	// draft rather than trying to check out a second one.
@@ -321,6 +196,9 @@ type cloneSource struct {
 	LiveCode string
 	// URL is the table's frontend page, as the SERVER stamped it.
 	URL string
+	// ManagedBy is the live row's `managedBy`: the repository folder that
+	// deploys it, nil for none (managed_notice.go).
+	ManagedBy *api.ManagedBy
 }
 
 // skippedTables is what a clone left behind, split by REASON rather than lumped
@@ -403,8 +281,11 @@ func partitionCloneable(items []*api.TableListItem) (cloneable, metrics []*api.T
 
 // metricCloneSource is one metric as it will be laid down on disk.
 type metricCloneSource struct {
-	Path     string
-	Name     string
+	Path string
+	Name string
+	// LiveName is the live metric's name, recorded as the baseline a later
+	// "name" is compared against — see cloneSource.LiveName.
+	LiveName string
 	MetricID string
 	// Body is the file's bytes, and Declared is the fingerprint of what a push of
 	// exactly those bytes would send — computed by PARSING what was just written
@@ -423,6 +304,8 @@ type metricCloneSource struct {
 	// OR when they could not be read; the file then has no `tags` key, which
 	// leaves them alone.
 	Tags []wfdir.AppliedTag
+	// ManagedBy is the live metric's `managedBy` (managed_notice.go).
+	ManagedBy *api.ManagedBy
 }
 
 // fetchCloneMetrics reads each metric's recipe and lays out the file that
@@ -431,8 +314,13 @@ type metricCloneSource struct {
 // THE RECIPE IS WRITTEN VERBATIM, in ID FORM, exactly as the .sql files' refs
 // are and for the same reason: `clone` refuses a destination that is not empty,
 // so the folder it writes declares no dependencies and claims no stems — there
-// is nothing an alias codec here could translate. `ronja bind` is what turns
-// those ids into names later.
+// is nothing an alias codec here could translate. Nothing turns those ids into
+// names later, either: `ronja bind` only fills in binds for aliases a folder
+// already declares and never edits source, and once an alias is bound to an id
+// the source still spells, the push refuses it (literalBindTargets). A cloned
+// folder stays in id form; `ronja import feature` is what writes a feature's
+// folders in alias form, by rewriting this same content (writePipelineClone's
+// caller) before it is laid down.
 //
 // THE DESCRIPTION IS CLONED ONLY WHEN A PERSON WROTE IT. `descriptionSource`
 // distinguishes prose Ronja may rewrite from prose it may not, and a push sends
@@ -502,12 +390,14 @@ func fetchCloneMetrics(ctx context.Context, client *api.Client, used map[string]
 		out = append(out, metricCloneSource{
 			Path:       uniqueMetricPath(used, item.Name, item.ID),
 			Name:       item.Name,
+			LiveName:   row.Name,
 			MetricID:   row.IdentityID(),
 			Body:       body,
 			Declared:   declared,
 			LiveSHA256: metricfile.RecipeSHA256(row.MetricRecipe),
 			URL:        row.URL,
 			Tags:       tags,
+			ManagedBy:  row.ManagedBy,
 		})
 	}
 	return out, nil
@@ -595,7 +485,7 @@ const cloneProgressEvery = 10
 // `used` is the folder's whole claimed-path set, shared with fetchCloneMetrics:
 // a metric and a table cannot hold one name inside a feature, so the two writers
 // have to be able to see each other's filenames.
-func fetchCloneSources(ctx context.Context, client *api.Client, used map[string]bool, items []*api.TableListItem) ([]cloneSource, error) {
+func fetchCloneSources(ctx context.Context, client *api.Client, used map[string]bool, items []*api.TableListItem, liveOnly bool) ([]cloneSource, error) {
 	var out []cloneSource
 	var refused []string
 
@@ -616,7 +506,9 @@ func fetchCloneSources(ctx context.Context, client *api.Client, used map[string]
 		// live over it would look like their web-builder or chat edits had
 		// vanished. Best-effort — a failure here degrades to the live SQL rather
 		// than aborting a clone that can perfectly well proceed.
-		if draft, draftErr := client.GetTableDraft(ctx, item.ID); draftErr != nil {
+		if liveOnly {
+			// Import reads the live row: it is what gets claimed and anchored.
+		} else if draft, draftErr := client.GetTableDraft(ctx, item.ID); draftErr != nil {
 			fmt.Fprintf(os.Stderr, "  Note: could not check for your open draft of %s (%v) — cloning the live version.\n",
 				item.ID, draftErr)
 		} else if draft != nil {
@@ -624,11 +516,12 @@ func fetchCloneSources(ctx context.Context, client *api.Client, used map[string]
 			draftID = draft.ID
 		}
 
-		// Canonicalized and NOT de-aliased, deliberately: `clone` refuses a
-		// destination that is not empty, so the folder this writes declares no
-		// dependencies and claims no stems — there is nothing an alias codec here
-		// could translate. The ids it writes to disk are what a later `ronja bind`
-		// converts into names.
+		// Canonicalized and NOT de-aliased here, deliberately: `clone` refuses a
+		// destination that is not empty, so the folder it writes declares no
+		// dependencies and claims no stems — there is nothing an alias codec
+		// could translate. The ids stay ids in a cloned folder (`ronja bind`
+		// never edits source); `import feature` rewrites this id form into
+		// stems and aliases before writing — see fetchCloneMetrics.
 		code, unresolved := source.CanonicalCode()
 		if unresolved {
 			refused = append(refused, fmt.Sprintf("%s (%s): %s",
@@ -648,13 +541,15 @@ func fetchCloneSources(ctx context.Context, client *api.Client, used map[string]
 			}
 		}
 		out = append(out, cloneSource{
-			Path:     uniqueSQLPath(used, item.Name, item.ID),
-			Name:     item.Name,
-			TableID:  row.IdentityID(),
-			DraftID:  draftID,
-			Code:     code,
-			LiveCode: liveCode,
-			URL:      row.URL,
+			Path:      uniqueSQLPath(used, item.Name, item.ID),
+			Name:      item.Name,
+			LiveName:  row.Name,
+			TableID:   row.IdentityID(),
+			DraftID:   draftID,
+			Code:      code,
+			LiveCode:  liveCode,
+			URL:       row.URL,
+			ManagedBy: row.ManagedBy,
 		})
 	}
 
@@ -741,4 +636,195 @@ func printPipelineCloneReport(root, url string, feature *api.Feature, sources []
 		fmt.Fprintf(out, "\n  Not cloned: %d\n", notCloned)
 	}
 	fmt.Fprintf(out, "\n  Next: cd %s && ronja pipeline status\n", filepath.Base(root))
+}
+
+// pipelineCloneSet is everything a pipeline clone READ, before anything is
+// written: each derived table's SQL (in id form) with its file path, each
+// metric's file, each table's checks file, and what was left behind. Reading
+// and writing are two steps so `import feature` can know every path — the
+// addresses other folders reference — and rewrite the content into its alias
+// form before a byte lands, through the same clone.
+type pipelineCloneSet struct {
+	sources []cloneSource
+	metrics []metricCloneSource
+	checks  []checksCloneFile
+	skipped skippedTables
+}
+
+// fetchPipelineClone reads a pipeline folder's content. liveOnly reads the live
+// rows even where the caller has a draft open — import's rule, since what it
+// claims and anchors is the live row.
+func fetchPipelineClone(ctx context.Context, client *api.Client, cloneable, metricRows []*api.TableListItem, skipped skippedTables, liveOnly bool) (*pipelineCloneSet, error) {
+	// ONE claimed-path set across both writers, for uniqueMetricPath's
+	// reason: the two kinds share a namespace server-side, and a folder
+	// holding revenue.sql beside metrics/revenue.json is one whose very
+	// first push this loop's own collision guard refuses.
+	used := map[string]bool{}
+	sources, err := fetchCloneSources(ctx, client, used, cloneable, liveOnly)
+	if err != nil {
+		return nil, err
+	}
+	metricSources, err := fetchCloneMetrics(ctx, client, used, metricRows, &skipped)
+	if err != nil {
+		return nil, err
+	}
+	// Each cloned table's ENABLED health checks, as checks/<stem>.json.
+	checkFiles := fetchCloneChecks(ctx, client, sources)
+	return &pipelineCloneSet{sources: sources, metrics: metricSources, checks: checkFiles, skipped: skipped}, nil
+}
+
+// writePipelineClone lays a fetched pipeline down in root: the .sql, metric and
+// checks files, ronja.json, the lock with every live fingerprint and applied
+// name, and the local baseline. Shared by `pipeline clone` and `import feature`
+// (cloneHooks: the dependencies, binds and folder id; the content has already
+// been rewritten into the folder's alias form by then).
+func writePipelineClone(ctx context.Context, resolved *config.Resolved, featureID, featureName, root string, set *pipelineCloneSet, hooks cloneHooks) error {
+	sources, metricSources, checkFiles := set.sources, set.metrics, set.checks
+	// The binding is keyed by organization as well as instance, so it has
+	// to be known before one is written — and it is resolved BEFORE the
+	// first file is laid down, not after. A folder whose files landed and
+	// whose manifest did not is one every command refuses (the target
+	// directory is no longer empty) and nothing can repair: the whole point
+	// of doing it here is that a failed /me leaves an empty directory
+	// rather than a half-clone.
+	if err := ensureTenant(ctx, resolved); err != nil {
+		return err
+	}
+	// Checked BEFORE anything is created, and fatal rather than per-file:
+	// the baseline written below claims every one of these paths is on
+	// disk, and a set that cannot all be written produces a folder whose
+	// baseline lies from birth. See wfdir.CheckLocalPaths.
+	paths := make([]string, 0, len(sources))
+	for _, s := range sources {
+		paths = append(paths, s.Path)
+	}
+	if err := wfdir.CheckLocalPaths(paths, wfdir.PipelineKind); err != nil {
+		return err
+	}
+	// The METRIC files are checked SEPARATELY and with a different
+	// question, because CheckLocalPaths asks two things and only one of
+	// them applies here. It asks "can this path be written to disk", which
+	// a metric file must pass — and "is this path SYNCABLE for this kind",
+	// which a metric file must FAIL: a pipeline folder's SyncExt is ".sql",
+	// so `metrics/x.json` is deliberately invisible to Enumerate and is
+	// read by the metric pass alone. Running the whole check over them
+	// would refuse every clone of a feature holding a metric, for a
+	// property this carrier is designed to have.
+	//
+	// Case collisions are already impossible here: uniqueMetricPath and
+	// uniqueSQLPath share one claimed-path set, folded to lower case.
+	for _, m := range metricSources {
+		if err := wfdir.ValidatePath(m.Path); err != nil {
+			return fmt.Errorf("metric %q cannot be written to disk as %s (%v) — rename it in the web app, then clone again",
+				m.Name, m.Path, err)
+		}
+	}
+
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", root, err)
+	}
+	for _, s := range sources {
+		// Validated once more inside WriteFile: the path is built from a
+		// server-supplied name, and writing it is a local filesystem
+		// operation that must not be able to escape the folder.
+		if err := wfdir.WriteFile(root, s.Path, s.Code); err != nil {
+			return fmt.Errorf("write %s: %w", s.Path, err)
+		}
+	}
+	for _, m := range metricSources {
+		if err := wfdir.WriteFile(root, m.Path, m.Body); err != nil {
+			return fmt.Errorf("write %s: %w", m.Path, err)
+		}
+	}
+	for _, c := range checkFiles {
+		if err := wfdir.WriteFile(root, c.Path, string(c.Body)); err != nil {
+			return fmt.Errorf("write %s: %w", c.Path, err)
+		}
+	}
+
+	key := wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID}
+	manifest := &wfdir.Manifest{Kind: wfdir.KindPipeline, Title: featureName}
+	binding := wfdir.Binding{FeatureID: featureID, Tables: map[string]string{}}
+	baseline := &wfdir.InstanceState{
+		SourceID: featureID,
+		Files:    map[string]wfdir.FileState{},
+		Tables:   map[string]wfdir.TableState{},
+	}
+	// The live fingerprints go wherever this folder's shape puts them:
+	// the lock file for a --stack clone, the local baseline otherwise.
+	// See liveHashes.
+	lock := &wfdir.Lock{}
+	liveHash := liveHashes{lock: lock, stack: flagStack, inst: baseline}
+	for _, s := range sources {
+		// The STABLE identity, never the draft's id: a draft dies at commit
+		// while the binding lives in the customer's git.
+		binding.Tables[s.Path] = s.TableID
+		// TWO fingerprints, from two rows, and this is the clearest place to
+		// see why they cannot be one: when the clone preferred an open draft,
+		// what is on disk is the DRAFT's SQL while the live table holds
+		// something else entirely. Recorded as one hash, the next push
+		// compared the live table against the draft's bytes and refused a
+		// folder that had done nothing wrong.
+		if s.LiveCode != "" {
+			recordLiveAgreement(liveHash, s.Path, s.TableID, s.LiveCode)
+		}
+		if s.DraftID != "" {
+			// No WIRE fingerprint: this clone read that draft, it did not
+			// write it, so there are no sent bytes to vouch for. See
+			// recordDraftWrite — the first push writes unconditionally.
+			recordDraftWrite(baseline, s.Path, s.TableID, s.DraftID, s.Code, "")
+		} else {
+			recordDraftPointer(baseline, s.Path, s.TableID, "")
+		}
+		recordSynced(baseline, s.Path, s.Code)
+		// The NAME the live table has, exactly — so a later `-- @name`
+		// is compared against what the row was called, not against a
+		// slug of it. See nameBaseline.Stem.
+		if s.LiveName != "" {
+			liveHash.setTableName(s.Path, s.TableID, s.LiveName)
+		}
+	}
+	for _, m := range metricSources {
+		// BOTH fingerprints, and neither is optional. The live one is what
+		// the drift guard compares the row against on the next push; the
+		// declared one is what tells that push the file has not changed
+		// since this clone wrote it. Recorded here rather than left to the
+		// first push, so a fresh clone reads as clean instead of proposing
+		// to re-stage every metric it just copied.
+		//
+		// ⚠️ On a LEGACY (unnamed instances[]) folder these land in
+		// .ronja/state.json, which is per-user and git-ignored — so a
+		// colleague's clone of that folder starts with no metric id and its
+		// first push would try to CREATE a metric that already exists. That
+		// push is caught by the adopt-by-name recovery in
+		// reconcileMetricNameTaken rather than duplicating the row; a
+		// --stack folder has the recording committed and never gets there.
+		liveHash.setMetricSeen(m.Path, m.MetricID, m.LiveSHA256, m.Declared)
+		if len(m.Tags) > 0 {
+			liveHash.setMetricTagsApplied(m.Path, m.MetricID, m.Tags)
+		}
+		if m.LiveName != "" {
+			liveHash.setMetricName(m.Path, m.MetricID, m.LiveName)
+		}
+	}
+	// Every check a clone writes is one the folder now owns, with the
+	// fingerprint it was read at — so the next push is a no-op, and an
+	// edit in the app after this is drift.
+	for _, c := range checkFiles {
+		liveHash.setChecksSeen(c.Path, c.TableID, c.Managed)
+	}
+	if err := recordFirstBindingInto(manifest, lock, key, binding); err != nil {
+		return err
+	}
+	hooks.finishManifest(manifest)
+	if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
+		return err
+	}
+	state := &wfdir.State{}
+	state.Set(key, baseline)
+	if err := wfdir.SaveState(root, state); err != nil {
+		return err
+	}
+
+	return nil
 }

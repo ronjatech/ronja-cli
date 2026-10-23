@@ -204,6 +204,15 @@ func runLive(ctx context.Context, f *folder, opts runOptions) (*testOutcome, err
 	// agreeing with each other and both behind the row that is about to run.
 	noteLiveDrift(ctx, client, f, live)
 
+	// 3b. The WRITE GATE over the LIVE code about to run, as `wf test` gates the
+	// draft it runs: in an adopted folder a run of code writing — or running —
+	// outside this stack's feature is the slip the gate exists for. The live
+	// row as the server holds it, which a republish may have changed since
+	// this folder last synced (the note above).
+	if err := gateWorkflowRow(ctx, client, f, live); err != nil {
+		return nil, err
+	}
+
 	// 4. The approval gate, BEFORE the run POST rather than as a 400 from it —
 	// and it names the CONVERSION rather than the off-switch, for the reason
 	// spelled out at the same step of runTest: a caller who learns to disable the
@@ -315,7 +324,7 @@ func checkFolderIsLive(f *folder, live *api.Workflow) error {
 		return fmt.Errorf("this folder's sync baseline came from %s (%s), not from the live workflow %s, so there is no way to tell whether it holds the code that would run.\n  Usually the folder is fine and only the record is missing: publishing a shared workflow submits your draft for review, and when an admin commits it nothing re-anchors this folder on the live row. `ronja wf status` shows the comparison.\n  Run `ronja wf clone %s` into a fresh folder to anchor one on live",
 			baseline.SourceID, baseline.SourceLifecycle, live.ID, live.ID)
 	}
-	enumeration, err := wfdir.Enumerate(f.Root, wfdir.WorkflowKind)
+	enumeration, err := wfdir.Enumerate(f.Root, f.Kind)
 	if err != nil {
 		return err
 	}

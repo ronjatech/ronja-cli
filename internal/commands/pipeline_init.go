@@ -111,6 +111,12 @@ Every .sql file in the folder is one derived table. Anything else is ignored.`,
 				// someone to fill in a field that means nothing — see the omitempty
 				// on Manifest.Entrypoint.
 			}
+			// A folder INITIALIZED onto a stack is born adopted: its id is minted
+			// here, locally, so its first push claims its address on the server and
+			// CI never needs the lock. See mintFolderIDAtInit.
+			if err := mintFolderIDAtInit(manifest); err != nil {
+				return err
+			}
 			// No tables: nothing exists server-side yet. The first push of each
 			// file creates its table and records the binding.
 			lock, err := recordFirstBinding(manifest,

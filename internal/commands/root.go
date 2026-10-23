@@ -149,6 +149,10 @@ var (
 func addStackFlag(cmd *cobra.Command) {
 	cmd.PersistentFlags().StringVar(&flagStack, "stack", "",
 		"stack in ronja.json to act on (default: the one matching this credential)")
+	// Beside --stack because it is about the same thing: whose state a stack's
+	// addresses are. See foreignClaim.
+	cmd.PersistentFlags().BoolVar(&flagAdoptForeign, "adopt-foreign", false,
+		"take over addresses another repository (a fork or template copy) claimed in the same feature")
 }
 
 func Execute() {
@@ -318,7 +322,14 @@ credentials entirely and never touch disk.`,
 	// somebody asked for. See update_check.go.
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		pendingUpdateCheck = startUpdateCheck(cmd.Context(), cmd)
+		managedFolders = nil
 		return nil
+	}
+	// An acting command on an ADOPTED folder ends by recording any anchor that
+	// is still not on the server, and fails if one could not be (managed.go).
+	// A no-op for every legacy folder: nothing registers.
+	root.PersistentPostRunE = func(cmd *cobra.Command, args []string) error {
+		return managedFinish()
 	}
 
 	root.PersistentFlags().StringVar(&flagURL, "url", "",
@@ -340,7 +351,7 @@ credentials entirely and never touch disk.`,
 	// verb would be filing a repository-wide question under one of its answers.
 	root.AddCommand(newLoginCmd(), newLogoutCmd(), newWhoamiCmd(), newProfileCmd(),
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
-		newPipelineCmd(), newModuleCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(),
+		newPipelineCmd(), newModuleCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(), newImportCmd(),
 		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newSecretCmd(), newTokenCmd(), newUpdateCmd())
 	return root
 }

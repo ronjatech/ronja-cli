@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,10 @@ import (
 // Folding that into the workflow fake would have meant a fake that lies about
 // one kind or the other.
 type fakeAppInstance struct {
+	// managed is the server-side state behind an adopted folder
+	// (managed_harness_test.go).
+	managed *fakeManaged
+
 	t *testing.T
 
 	apps map[string]*api.DataApp
@@ -36,6 +41,9 @@ type fakeAppInstance struct {
 	// the created row is already the draft — and only a count can prove the
 	// absence of a request that would otherwise be invisible in the result.
 	checkouts int
+	// beforeCheckout runs at the start of POST :id/checkout — a draft the same
+	// user opened between a push's inspection and its checkout.
+	beforeCheckout func(liveID string)
 	// featureScope answers GET /feature/:id, which is how `app publish` learns
 	// whether committing is admin-only.
 	featureScope map[string]string
@@ -154,6 +162,9 @@ type fakeAppInstance struct {
 	// first — the drift anchor `app push` reads. Nil for an app nobody has ever
 	// committed, which is the state the CLI resolves to the app's own id.
 	versions map[string][]api.DataApp
+	// versionFiles is each committed version's file set, by version id —
+	// what GET :id/files answers for a version id (snapshotHead).
+	versionFiles map[string][]api.DataAppFile
 	// updates is what GET :id/updates answers with. Nil leaves the route
 	// unserved, so it 404s the way an instance that predates it does.
 	updates *fakeUpdatesAnswer
@@ -235,13 +246,25 @@ func newFakeAppInstance(t *testing.T) *fakeAppInstance {
 		kit:            map[string]string{},
 		blobs:          map[string]fakeBlob{},
 		versions:       map[string][]api.DataApp{},
+		versionFiles:   map[string][]api.DataAppFile{},
 		privilegeLevel: 50,
 
 		enforcePreconditions: true,
 	}
+	f.managed = newFakeManaged(t, f.probeRow)
+	f.managed.setRowFeature = func(_, id, feature string) { f.apps[id].FeatureID = feature }
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
+}
+
+// probeRow is the app fake's half of fakeManaged.
+func (f *fakeAppInstance) probeRow(kind, id string) fakeRowFacts {
+	if a := f.apps[id]; kind == "dataapp" && a != nil {
+		return fakeRowFacts{Exists: true, FeatureID: a.FeatureID, Root: a.ParentDataAppID == "", Name: a.Name, Lifecycle: a.Lifecycle,
+			Drafter: a.DrafterUserID}
+	}
+	return fakeRowFacts{}
 }
 
 func (f *fakeAppInstance) URL() string { return f.server.URL }
@@ -331,6 +354,9 @@ func (f *fakeAppInstance) AddDraft(liveID, draftID string, files ...api.DataAppF
 
 func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
+	if f.managed.serve(w, r) {
+		return
+	}
 
 	// The read-only component kit on the docs surface. Served BEFORE the auth
 	// check below because the real one takes no credential either.
@@ -421,6 +447,9 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 
 	case rest == "checkout":
 		f.checkouts++
+		if f.beforeCheckout != nil {
+			f.beforeCheckout(id)
+		}
 		f.serveCheckout(w, id)
 
 	case rest == "validate":
@@ -499,7 +528,11 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 			return
 		}
-		f.writeRow(w, app)
+		// GET :id carries `managedBy` (backend/api/v2/dataapp/handler.go, the
+		// single-row GET).
+		row := *app
+		row.ManagedBy = f.managed.managedBy("dataapp", app.ID, app.ParentDataAppID)
+		f.writeRow(w, &row)
 
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
@@ -678,11 +711,18 @@ func (f *fakeAppInstance) serveCreate(w http.ResponseWriter, r *http.Request) {
 		Name:          in.Name,
 		FeatureID:     in.FeatureID,
 		Lifecycle:     api.LifecycleDraft,
+		DrafterUserID: fakePrincipal,
 		DataAppAccess: in.DataAppAccess,
 		// No bundle: nothing has compiled yet.
 		BundleFileKey: " ",
 	})
 	app.BundleFileKey = ""
+	if status, body := f.managed.createClaim("dataapp", in.FeatureID, app.ID, in.Managed); status != 0 {
+		delete(f.apps, app.ID)
+		delete(f.files, app.ID)
+		writeCreateRefusal(w, status, body)
+		return
+	}
 	f.writeRow(w, app)
 }
 
@@ -748,20 +788,22 @@ func (f *fakeAppInstance) serveValidate(w http.ResponseWriter, id string) {
 	f.writeRow(w, app)
 }
 
-// serveFileList models the SILENT DRAFT RESOLUTION the real handler performs:
-// asked for a live app's files while the caller has a draft open, it answers
-// with the DRAFT's, and nothing in the response says so.
-//
-// Modelled rather than simplified because it is the trap: a CLI that addresses
-// the live id gets draft bytes and records them under the live row's identity.
+// serveFileList answers with the files of EXACTLY the row named, as the real
+// handler does (api/v2/dataapp resolveFileSourceID: "always the row that was
+// named"; `?live` is a deprecated no-op). It used to model the OLD
+// draft-preferring default — asked for a live app's files while the caller had
+// a draft open, it answered with the draft's — after the server had stopped
+// doing that, so a CLI reading live while a draft was open was tested against
+// a server that no longer exists.
 func (f *fakeAppInstance) serveFileList(w http.ResponseWriter, id string) {
 	f.FileReads = append(f.FileReads, id)
 	if _, ok := f.apps[id]; !ok {
+		if files, isVersion := f.versionFiles[id]; isVersion {
+			writeJSON(w, files)
+			return
+		}
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
-	}
-	if draftID, hasDraft := f.draftOf[id]; hasDraft {
-		id = draftID
 	}
 	files := f.files[id]
 	if files == nil {
@@ -974,7 +1016,18 @@ func (f *fakeAppInstance) deleteFile(id, path string) {
 // way commitDraftInTx does.
 func (f *fakeAppInstance) commitDraft(draftID string) {
 	draft := f.apps[draftID]
-	if draft == nil || draft.ParentDataAppID == "" {
+	if draft == nil {
+		return
+	}
+	if draft.ParentDataAppID == "" {
+		// A PARENTLESS draft — a created app never published — is promoted IN
+		// PLACE: the same id becomes the live app (POST /dataapp mints the
+		// draft, and its first commit is what makes it exist for everyone; see
+		// resolveAppPushTarget). It files the app's first version.
+		if draft.Lifecycle == api.LifecycleDraft {
+			draft.Lifecycle = api.LifecycleLive
+			f.versions[draft.ID] = append([]api.DataApp{{ID: fmt.Sprintf("dav-commit-%d", len(f.committed))}}, f.versions[draft.ID]...)
+		}
 		return
 	}
 	parent := f.apps[draft.ParentDataAppID]
@@ -989,8 +1042,23 @@ func (f *fakeAppInstance) commitDraft(draftID string) {
 			copied[i].DataAppID = parent.ID
 		}
 		f.files[parent.ID] = copied
+		// Every commit files a version, as rdataapp's does — even one changing
+		// nothing, which is the empty version an idempotent apply must never
+		// mint. Newest first, so the head moves to it.
+		f.versions[parent.ID] = append([]api.DataApp{{ID: fmt.Sprintf("dav-commit-%d", len(f.committed))}}, f.versions[parent.ID]...)
+		f.versionFiles[f.versions[parent.ID][0].ID] = slices.Clone(copied)
 	}
 	f.dropDraft(draftID)
+}
+
+// snapshotHead files the live app's current files under its head version, when
+// no commit has (see fakeInstance.snapshotHead).
+func (f *fakeAppInstance) snapshotHead(id string) {
+	if versions := f.versions[id]; len(versions) > 0 {
+		if _, ok := f.versionFiles[versions[0].ID]; !ok {
+			f.versionFiles[versions[0].ID] = slices.Clone(f.files[id])
+		}
+	}
 }
 
 func (f *fakeAppInstance) dropDraft(draftID string) {

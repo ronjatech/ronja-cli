@@ -128,6 +128,13 @@ is pushed, and everything else is skipped.`,
 				// DefaultEntrypoint is empty, so the file this writes carries no
 				// mention of a concept the primitive does not have.
 			}
+			// A folder INITIALIZED onto a stack is born adopted, like every other
+			// kind's: its id is minted here, locally, so its first push claims its
+			// address on the server and CI never needs the lock. See
+			// mintFolderIDAtInit.
+			if err := mintFolderIDAtInit(manifest); err != nil {
+				return err
+			}
 			// No moduleID: nothing exists server-side yet. The first push creates
 			// the module and fills it in.
 			lock, err := recordFirstBinding(manifest,

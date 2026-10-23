@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
+	"github.com/ronjatech/ronja-cli/internal/markers"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
@@ -87,9 +89,24 @@ type fakeInstance struct {
 	// other words, and those get the generic line.
 	failPolicy        int
 	failPolicyMessage string
+	// policyGeneral, when set, is the `general` GET /policy/org serves beside
+	// `content` — an instance that parses people-property sections.
+	policyGeneral *string
+	// applied is what GET /policy/applied answers. nil derives it from policy
+	// (its content as the general part, no sections), and failPolicy fails it
+	// too, so a test staging the org read alone stages both reads alike.
+	// failApplied fails only this route, which is how an instance older than
+	// it (404) or a token with no person (a non-scope 403) is staged.
+	applied            *api.AppliedPolicy
+	failApplied        int
+	failAppliedMessage string
 	// failPut maps a file path to the status a PUT of it should answer with,
 	// which is how the mid-push failure case is staged.
 	failPut map[string]int
+	// beforeCheckout runs at the start of POST :id/checkout, which is how a
+	// draft the same user opened between a push's inspection and its checkout
+	// is staged. With it set, the checkout is get-or-create, as the server's is.
+	beforeCheckout func(liveID string)
 	// failDelete is failPut for DELETE — the way to stage a rejected deletion
 	// that is not the entrypoint rule modelled below.
 	failDelete map[string]int
@@ -132,6 +149,11 @@ type fakeInstance struct {
 	// newest first. Deliberately separate from commitHeadVersionID so a test
 	// can stage the two disagreeing.
 	versions map[string][]api.Workflow
+	// versionFiles is each committed version's file set, by version id —
+	// what GET :id/files answers for a version row. A commit files one; a web
+	// publish staged by a test files the version it moved off
+	// (snapshotHead).
+	versionFiles map[string][]api.WorkflowFile
 	// commitConfirmations records the confirmHeadVersionID of every commit
 	// attempt, "" for a commit that sent none. Its LENGTH is what pins "no
 	// retry loop".
@@ -222,17 +244,27 @@ type fakeInstance struct {
 	// channel the test waits on, is the same knowledge with a happens-before
 	// edge attached.
 	onPoll func()
+	// beforeServe, when set, runs before each request is answered: how a test
+	// lands an edit between two reads of one command.
+	beforeServe func(r *http.Request)
 
 	// tableNames answers GET /feature/model/:id, the best-effort name lookup
 	// behind the --write-live refusal. failTableLookup makes it fail instead.
 	tableNames      map[string]string
 	failTableLookup int
+	// tableFeature is the feature GET /feature/model/:id reports for a table
+	// tableNames answers. A row of featureTables answers that GET too, with
+	// its listed name and feature, when tableNames does not name it.
+	tableFeature map[string]string
 	// agentIDs / secretIDs are the ids GET /agent/:id and GET /secret/:id answer
 	// 200 for — the two reference reads `ronja sync check` makes. A SET rather
 	// than a row map because nothing reads the payload: the verifier branches on
 	// whether the call succeeded and, when it did not, on the status.
 	agentIDs  map[string]bool
 	secretIDs map[string]bool
+	// agentFeatures is the feature GET /agent/:id reports for an agent id
+	// agentIDs answers — what the write gate's run-edge rule reads.
+	agentFeatures map[string]string
 	// tableDrafts maps a live table id to the caller's open draft of it. Absent
 	// is the ordinary case and answers a JSON `null`, not a 404.
 	tableDrafts map[string]string
@@ -277,6 +309,13 @@ type fakeInstance struct {
 	failValidateMessage string
 	failCreate          int
 	failCreateMessage   string
+	// writeRows answers what the caller can read about a table or codex a
+	// posted file writes — the facts validate's writeTargets carry. Nil falls
+	// back to featureTables (tables only).
+	writeRows func(kind, id string) (fakeWriteRow, bool)
+	// noWriteTargets models an instance older than validate's writeTargets:
+	// the key is absent from every answer.
+	noWriteTargets bool
 	// validate is what POST /workflow/validate answers with. Nil means clean,
 	// which is what most tests want: the validate gate is not the subject.
 	validate *api.ValidateResult
@@ -324,6 +363,10 @@ type fakeInstance struct {
 	ignoreRuntimeParam bool
 	defaultsAsked      []string
 	defaultsUserAgent  string
+	// jsDefaults is what ?language=js answers. Nil models an instance that
+	// predates JavaScript workflows: it ignores the parameter and answers its
+	// Python defaults, with no language in them.
+	jsDefaults *api.WorkflowDefaults
 
 	// What the fake was asked to do, for assertions.
 	created      []api.CreateWorkflowInput
@@ -376,6 +419,10 @@ type fakeInstance struct {
 	// rather than interleaved with the workflow one it shares nothing with.
 	mod *moduleFake
 
+	// managed is the server-side state behind an adopted folder, for the
+	// workflow and module rows this fake holds (managed_harness_test.go).
+	managed *fakeManaged
+
 	server *httptest.Server
 	// Requests records every request served as "METHOD /path", in order — the
 	// cheapest way to assert that a command did NOT make a round trip it
@@ -386,6 +433,24 @@ type fakeInstance struct {
 	// response the client waited for orders after the append.
 	mu       sync.Mutex
 	Requests []string
+}
+
+// probeRow is the workflow fake's half of fakeManaged: a workflow or module
+// row's facts as probe.go loadFacts reads them.
+func (f *fakeInstance) probeRow(kind, id string) fakeRowFacts {
+	switch kind {
+	case "workflow":
+		if wf := f.workflows[id]; wf != nil {
+			return fakeRowFacts{Exists: true, FeatureID: wf.FeatureID, Root: wf.ParentWorkflowID == "", Name: wf.Title, Lifecycle: wf.Lifecycle,
+				Drafter: wf.DrafterUserID}
+		}
+	case "module":
+		if m := f.mod.rows[id]; m != nil {
+			return fakeRowFacts{Exists: true, FeatureID: m.FeatureID, Root: m.ParentModuleID == "", Name: m.Title, Lifecycle: m.Lifecycle,
+				Drafter: m.DrafterUserID}
+		}
+	}
+	return fakeRowFacts{}
 }
 
 // fakeEntrypointStarter mirrors rworkflow's defaultEntrypointStarter — the
@@ -445,6 +510,7 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 		tenantZone:          "UTC",
 		tableNames:          map[string]string{},
 		agentIDs:            map[string]bool{},
+		agentFeatures:       map[string]string{},
 		secretIDs:           map[string]bool{},
 		tableDrafts:         map[string]string{},
 		tableCode:           map[string]string{},
@@ -456,8 +522,18 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 		defaults:            &api.WorkflowDefaults{RuntimeVersion: wfdir.RuntimeQuery, EntrypointStarter: fakeStarter},
 
 		versions:             map[string][]api.Workflow{},
+		versionFiles:         map[string][]api.WorkflowFile{},
 		enforcePreconditions: true,
 		mod:                  newModuleFake(),
+	}
+	f.managed = newFakeManaged(t, f.probeRow)
+	f.managed.setRowFeature = func(kind, id, feature string) {
+		switch kind {
+		case "workflow":
+			f.workflows[id].FeatureID = feature
+		case "module":
+			f.mod.rows[id].FeatureID = feature
+		}
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
@@ -563,7 +639,13 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
 	f.mu.Unlock()
+	if f.beforeServe != nil {
+		f.beforeServe(r)
+	}
 
+	if f.managed.serve(w, r) {
+		return
+	}
 	if r.URL.Path == "/api/v2/authentication/me" {
 		if f.failMe != 0 {
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, orDefault(f.failMeMessage, "no")), f.failMe)
@@ -586,6 +668,25 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 	// GET /policy/org — the organization's standing rules, which `context`
 	// inlines. Read whenever a token is present, independently of /me, so
 	// failMe and failPolicy are staged separately on purpose.
+	if r.URL.Path == "/api/v2/policy/applied" {
+		status, msg := f.failApplied, f.failAppliedMessage
+		if status == 0 {
+			status, msg = f.failPolicy, f.failPolicyMessage
+		}
+		if status != 0 {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, orDefault(msg, "no")), status)
+			return
+		}
+		applied := f.applied
+		if applied == nil {
+			applied = &api.AppliedPolicy{General: api.AppliedDocument{Version: 1}, Sections: []api.AppliedSection{}}
+			if f.policy != nil {
+				applied.General = api.AppliedDocument{Content: f.policy.Content, Version: f.policy.Version}
+			}
+		}
+		writeJSON(w, applied)
+		return
+	}
 	if r.URL.Path == "/api/v2/policy/org" {
 		if f.failPolicy != 0 {
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, orDefault(f.failPolicyMessage, "no")), f.failPolicy)
@@ -598,6 +699,9 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 		body := map[string]any{"scope": "org", "content": f.policy.Content, "version": f.policy.Version, "maxChars": 20000}
 		if f.policy.UpdatedAt != "" {
 			body["updatedAt"] = f.policy.UpdatedAt
+		}
+		if f.policyGeneral != nil {
+			body["general"] = *f.policyGeneral
 		}
 		writeJSON(w, body)
 		return
@@ -638,6 +742,16 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		name, known := f.tableNames[tableID]
+		feature := f.tableFeature[tableID]
+		if !known {
+			for _, rows := range f.featureTables {
+				for _, row := range rows {
+					if row.ID == tableID {
+						name, feature, known = row.Name, row.FeatureID, true
+					}
+				}
+			}
+		}
 		if !known {
 			http.Error(w, `{"error":"not found"}`, f.missStatus)
 			return
@@ -647,7 +761,7 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 		// A fake that always served "" made every in-step fixture look drifted
 		// against a lock recording real SQL — and made a drifted one look in step
 		// against a lock recording "".
-		writeJSON(w, map[string]any{"id": tableID, "name": name, "code": f.tableCode[tableID]})
+		writeJSON(w, map[string]any{"id": tableID, "name": name, "code": f.tableCode[tableID], "featureID": feature})
 		return
 	}
 	// GET /feature/:id — the existence check `wf init` makes before it writes a
@@ -693,7 +807,7 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"not found"}`, f.missStatus)
 			return
 		}
-		writeJSON(w, map[string]any{"id": agentID, "name": agentID})
+		writeJSON(w, map[string]any{"id": agentID, "name": agentID, "featureID": f.agentFeatures[agentID]})
 		return
 	}
 	if secretID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/secret/"); ok {
@@ -717,6 +831,14 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 				message = "boom"
 			}
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, message), f.failDefaults)
+			return
+		}
+		if r.URL.Query().Get("language") == "js" && f.jsDefaults != nil {
+			if r.URL.Query().Has("runtime") && r.URL.Query().Get("runtime") != strconv.Itoa(f.jsDefaults.RuntimeVersion) {
+				http.Error(w, fmt.Sprintf(`{"error":"a JavaScript workflow can be created on runtime %d only"}`, f.jsDefaults.RuntimeVersion), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, f.jsDefaults)
 			return
 		}
 		if !r.URL.Query().Has("runtime") || f.ignoreRuntimeParam {
@@ -825,6 +947,10 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, ok := f.workflows[id]; !ok {
+			if files, isVersion := f.versionFiles[id]; isVersion {
+				writeJSON(w, files)
+				return
+			}
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 			return
 		}
@@ -844,7 +970,11 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 			return
 		}
-		f.writeRow(w, wf)
+		// GET :id is the one route carrying `managedBy`
+		// (backend/api/v2/workflow/handler.go, the single-row GET).
+		row := *wf
+		row.ManagedBy = f.managed.managedBy("workflow", wf.ID, wf.ParentWorkflowID)
+		f.writeRow(w, &row)
 	}
 }
 
@@ -904,10 +1034,13 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		// Echoed rather than dropped, so a test asserting on the created ROW
 		// fails against a create that never carried the runtime.
 		created := f.AddWorkflow(&api.Workflow{
-			ID:                id,
-			Lifecycle:         api.LifecycleDraft,
+			ID:        id,
+			Lifecycle: api.LifecycleDraft,
+			// rworkflow.Add stamps the creator as the parentless draft's drafter.
+			DrafterUserID:     fakePrincipal,
 			Title:             in.Title,
 			RuntimeVersion:    in.RuntimeVersion,
+			Language:          in.Language,
 			Entrypoint:        entrypoint,
 			FeatureID:         in.FeatureID,
 			Parameters:        in.Parameters,
@@ -922,6 +1055,14 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// assume it is.
 			WorkflowID: id, Path: entrypoint, Content: fakeEntrypointStarter,
 		})
+		// The claim, in the create's own transaction: a refused claim rolls the
+		// whole create back (rworkflow.Add + rmanaged.ClaimCreatedTx).
+		if status, body := f.managed.createClaim("workflow", in.FeatureID, id, in.Managed); status != 0 {
+			delete(f.workflows, id)
+			delete(f.files, id)
+			writeCreateRefusal(w, status, body)
+			return true
+		}
 		f.writeRow(w, created)
 		return true
 	}
@@ -936,6 +1077,26 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		result := f.validate
 		if result == nil {
 			result = &api.ValidateResult{Findings: []api.ValidateFinding{}}
+		}
+		// writeTargets, computed from the POSTED files as the server does
+		// (write_targets_fake_test.go) — unless the test staged
+		// its own, or an instance older than the field (noWriteTargets).
+		if result.WriteTargets == nil && !f.noWriteTargets {
+			computed := *result
+			computed.WriteTargets = fakeWriteTargets(in.Files, f.writeTargetRow)
+			result = &computed
+		}
+		// resolved.workflowIDs / agentIDs: the run edges of the POSTED files,
+		// as the server resolves them (rworkflow.ValidateBindings) — unless
+		// the test staged its own.
+		if result.Resolved.WorkflowIDs == nil && result.Resolved.AgentIDs == nil {
+			computed := *result
+			computed.Resolved.WorkflowIDs, computed.Resolved.AgentIDs = f.resolvedRunEdges(in.Files)
+			// A run edge the caller cannot reach is DROPPED from resolved and
+			// reported as an error finding instead, as the server's binding
+			// legs do (rworkflow droppedFindings).
+			computed.Findings = append(slices.Clone(computed.Findings), f.unresolvedRunEdgeFindings(in.Files)...)
+			result = &computed
 		}
 		writeJSON(w, result)
 		return true
@@ -1153,6 +1314,13 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		})
 		return true
 	case "checkout":
+		if f.beforeCheckout != nil {
+			f.beforeCheckout(id)
+			if draftID, exists := f.draftOf[id]; exists {
+				f.writeRow(w, f.workflows[draftID])
+				return true
+			}
+		}
 		if _, exists := f.draftOf[id]; exists {
 			f.t.Errorf("checkout called for %s, which already has a draft", id)
 		}
@@ -1197,7 +1365,22 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		if draft != nil && draft.ParentWorkflowID != "" {
 			parent := draft.ParentWorkflowID
 			f.files[parent] = f.files[id]
-			f.workflows[parent].Title = draft.Title
+			// The commit lands the draft's METADATA too, as rworkflow's commit
+			// does — a fake that carried only the files would report a live row
+			// still holding the old entrypoint, parameters or calendar, and a
+			// second apply would read that as a change still to deploy.
+			live := f.workflows[parent]
+			live.Title = draft.Title
+			live.Entrypoint = draft.Entrypoint
+			live.Parameters = draft.Parameters
+			live.ReportingTimezone = draft.ReportingTimezone
+			live.RuntimeVersion = draft.RuntimeVersion
+			// And every commit files a VERSION — even one changing nothing, which
+			// is the empty version an idempotent apply must never mint. Newest
+			// first, so the head moves to it: a fake whose head stood still on a
+			// commit would let a stale committed anchor pass for a current one.
+			f.versions[parent] = append([]api.Workflow{{ID: fmt.Sprintf("wfv-commit-%d", len(f.committed)), ParentWorkflowID: parent}}, f.versions[parent]...)
+			f.versionFiles[f.versions[parent][0].ID] = slices.Clone(f.files[parent])
 			delete(f.draftOf, parent)
 			delete(f.workflows, id)
 		}
@@ -1337,6 +1520,17 @@ func (f *fakeInstance) serveRunHeadPoll(w http.ResponseWriter, runID string) {
 // server does: UpsertFile re-derives the workflow's binding columns in the same
 // transaction, so a file write is a row write. That is what makes "which row
 // did the baseline's timestamp come from" observable.
+// snapshotHead files the live workflow's current files under its head version,
+// when no commit has: a test's own versions list names versions no commit
+// made, and the publish it is about to stage moves the head off one.
+func (f *fakeInstance) snapshotHead(id string) {
+	if versions := f.versions[id]; len(versions) > 0 {
+		if _, ok := f.versionFiles[versions[0].ID]; !ok {
+			f.versionFiles[versions[0].ID] = slices.Clone(f.files[id])
+		}
+	}
+}
+
 func (f *fakeInstance) putFile(id, path, content string) {
 	if wf := f.workflows[id]; wf != nil {
 		wf.UpdatedAt = wf.UpdatedAt.Add(time.Minute)
@@ -1775,4 +1969,80 @@ func currentProfile(t *testing.T) string {
 		t.Fatalf("load config: %v", err)
 	}
 	return f.Current
+}
+
+// resolvedRunEdges is validate's resolved.workflowIDs / agentIDs for posted
+// files: every `{{ workflow() }}` naming a workflow this instance holds and
+// every `{{ agent() }}` naming an agent it answers for — the caller's reach —
+// each once, in first-seen order. Empty slices, never nil: the server always
+// sends both keys.
+func (f *fakeInstance) resolvedRunEdges(files []api.ValidateFile) (workflows, agents []string) {
+	workflows, agents = []string{}, []string{}
+	seen := map[string]bool{}
+	for _, file := range files {
+		for _, o := range markers.Scan(file.Content) {
+			key := o.Family.Kind + "\x00" + o.Arg
+			if seen[key] {
+				continue
+			}
+			switch o.Family.Kind {
+			case markers.KindWorkflow:
+				if _, ok := f.workflows[o.Arg]; ok {
+					seen[key] = true
+					workflows = append(workflows, o.Arg)
+				}
+			case markers.KindAgent:
+				if f.agentIDs[o.Arg] {
+					seen[key] = true
+					agents = append(agents, o.Arg)
+				}
+			}
+		}
+	}
+	return workflows, agents
+}
+
+// unresolvedRunEdgeFindings are the error findings the server reports for a
+// `{{ workflow() }}` / `{{ agent() }}` marker it cannot resolve: the codes and
+// the marker form of rworkflow's binding legs.
+func (f *fakeInstance) unresolvedRunEdgeFindings(files []api.ValidateFile) []api.ValidateFinding {
+	var out []api.ValidateFinding
+	seen := map[string]bool{}
+	for _, file := range files {
+		for _, o := range markers.Scan(file.Content) {
+			key := o.Family.Kind + "\x00" + o.Arg
+			if seen[key] || o.Positional {
+				continue
+			}
+			seen[key] = true
+			switch {
+			case o.Family.Kind == markers.KindWorkflow && f.workflows[o.Arg] == nil:
+				out = append(out, api.ValidateFinding{Severity: api.SeverityError, Code: "unresolved_workflow", Path: file.Path,
+					Marker: fmt.Sprintf("{{ workflow('%s') }}", o.Arg), Message: "workflow " + o.Arg + " isn't reachable to you"})
+			case o.Family.Kind == markers.KindAgent && !f.agentIDs[o.Arg]:
+				out = append(out, api.ValidateFinding{Severity: api.SeverityError, Code: "unresolved_agent", Path: file.Path,
+					Marker: fmt.Sprintf("{{ agent('%s') }}", o.Arg), Message: "Agent " + o.Arg + " isn't reachable to you"})
+			}
+		}
+	}
+	return out
+}
+
+// writeTargetRow is the fake's reach for validate's writeTargets: writeRows when a
+// test (or a composite instance) set one, else the tables featureTables lists.
+func (f *fakeInstance) writeTargetRow(kind, id string) (fakeWriteRow, bool) {
+	if f.writeRows != nil {
+		return f.writeRows(kind, id)
+	}
+	if kind != api.WriteTargetTable {
+		return fakeWriteRow{}, false
+	}
+	for featureID, rows := range f.featureTables {
+		for _, row := range rows {
+			if row.ID == id {
+				return fakeWriteRow{FeatureID: featureID, Name: row.Name, TableKind: row.Kind}, true
+			}
+		}
+	}
+	return fakeWriteRow{}, false
 }

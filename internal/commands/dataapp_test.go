@@ -1211,11 +1211,12 @@ func TestAppPushSaysSoWhenItCannotFindOutWhatLanded(t *testing.T) {
 // baseline still claiming it. A deletion that MISSED is readable, because the
 // file is still there to be returned.
 //
-// The consequence for the author is real and is asserted below: after an
-// uncertain delete the retry is a DRIFT REFUSAL ("removed there"), not an
-// ordinary push. That is the honest cost of the 400, and it is the reason
-// reconcileUncertainAppWrite's 404 branch is dormant against every shipped
-// backend — see TestAppReconcile404BranchIsDormant for that branch's own cover.
+// The consequence for the author is asserted below: after an uncertain delete
+// the baseline still claims the file, and the retry is nevertheless an ORDINARY
+// push, because the server already holds what the folder wants there (no file)
+// — live equals desired is never drift. reconcileUncertainAppWrite's 404 branch
+// stays dormant against every shipped backend — see
+// TestAppReconcile404BranchIsDormant for that branch's own cover.
 //
 // rdataapp.DeleteFile removes the row and recompiles the bundle afterwards, out
 // of transaction, which is what makes the outcome uncertain in the first place —
@@ -1308,19 +1309,15 @@ func TestAppPushReconcilesAnUncertainDelete(t *testing.T) {
 			}
 
 			f.failDeleteAfterWrite, f.failDelete = nil, map[string]int{}
-			_, retryErr := runCLI(t, root, "app", "push", "--json")
-			if tc.landed {
-				// The honest cost of the 400: the server no longer holds a file
-				// the baseline still claims, so the retry reports DRIFT rather
-				// than quietly re-deleting. The author sees it and forces past.
-				if retryErr == nil {
-					t.Fatal("want a drift refusal on the retry — the baseline still claims a file the server deleted, and pushing over that silently is the failure mode the guard exists for")
-				}
-				if _, forceErr := runCLI(t, root, "app", "push", "--force", "--json"); forceErr != nil {
-					t.Fatalf("--force must clear it: %v", forceErr)
-				}
-			} else if retryErr != nil {
-				t.Fatalf("nothing moved on the server, so the retry is an ordinary push: %v", retryErr)
+			// The retry is an ordinary push in BOTH halves. Where the deletion
+			// landed, the server no longer holds a file the baseline still claims
+			// — but this folder does not hold it either, so the server already
+			// holds what the push would leave there and there is nothing of
+			// anybody's to overwrite: live equals desired is never drift. (It
+			// used to be a drift refusal the author had to --force past, about a
+			// deletion this same folder had made.)
+			if _, retryErr := runCLI(t, root, "app", "push", "--json"); retryErr != nil {
+				t.Fatalf("the retry must be an ordinary push: %v", retryErr)
 			}
 			if _, ok := f.FileContents(draft.ID)["lib/old.tsx"]; ok {
 				t.Error("the retry left the deleted file on the server")

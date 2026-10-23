@@ -12,7 +12,17 @@ import (
 const (
 	tableDirective  = "@table"
 	columnDirective = "@column"
+	// nameDirective declares the table's NAME, which is not documentation at
+	// all — see ParseName. It is spelled in the same header because that is the
+	// one place a .sql file already says things about its table, and it may
+	// open the header on its own: a file that names its table and documents
+	// nothing is the ordinary first use of it.
+	nameDirective = "@name"
 )
+
+// NamePrefix is the exact spelling of the name directive, for help text and
+// messages.
+const NamePrefix = "-- " + nameDirective
 
 // HeaderPrefix is the exact opening a .sql file must carry to opt in, quoted in
 // help text and in the message a malformed header earns so the two cannot drift.
@@ -69,6 +79,15 @@ func ParseHeader(sql string) (Docs, []string) {
 	payload, isComment := commentPayload(lines, i)
 	if !isComment {
 		return Docs{}, nil
+	}
+	// A header may OPEN with the table's name — `-- @name` is a header line that
+	// is not documentation (ParseName reads it) — so the documentation is looked
+	// for on the first line that is not one.
+	for isDirective(payload, nameDirective) {
+		i++
+		if payload, isComment = commentPayload(lines, i); !isComment {
+			return Docs{}, nil
+		}
 	}
 	rest, opened := cutDirective(payload, tableDirective)
 	if !opened {
@@ -171,6 +190,10 @@ func ParseHeader(sql string) (Docs, []string) {
 				warnings = append(warnings, fmt.Sprintf(
 					"`%s` appears more than once in this file's header; only the first one is read", HeaderPrefix))
 				open = false
+			case isDirective(payload, nameDirective):
+				// The table's NAME, which ParseName reads. It ends whatever was
+				// open — a name is one line — and documents nothing.
+				open = false
 			default:
 				// An unknown directive is a TYPO far more often than it is a
 				// deliberate `@`-opening sentence, and a typo silently swallowed is
@@ -186,6 +209,87 @@ func ParseHeader(sql string) (Docs, []string) {
 	}
 	flush()
 	return docs, warnings
+}
+
+// ParseName reads the table's DECLARED NAME from a pipeline .sql file's header:
+//
+//	-- @table One row per order line.
+//	-- @name Sales orders
+//	SELECT ...
+//
+// `-- @name` goes AFTER `-- @table`, the order every example and doc shows:
+// this parser also accepts a header that opens with `-- @name`, but an older
+// CLI's ParseHeader opts in only on a first line of `-- @table`, and would
+// silently drop the documentation of such a file.
+//
+// nil means the file declares no name, which is the ordinary case and the
+// UNMANAGED one: the table keeps whatever name it has now and a push never
+// sends one. A declared name is MANAGED — a push renames the
+// table to it, in place, after checking nobody renamed it elsewhere since.
+//
+// It lives in the same opt-in header as the documentation, under the same
+// rule: it is read only when the file's FIRST comment line opens with `-- @name`
+// or `-- @table`, and only down to a bare `--`. It is NOT part of Docs, because
+// it is not documentation — a header naming its table and documenting nothing
+// must not arm the documentation drift leg, and must not send a `fields` write.
+//
+// Warnings, never errors, as ParseHeader's are: an empty `-- @name` is a
+// half-typed line far more often than an instruction, and reading it as a
+// rename to "" would be refused by the server half way through a push.
+func ParseName(sql string) (*string, []string) {
+	lines := strings.Split(sql, "\n")
+	i := 0
+	for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+		i++
+	}
+	payload, isComment := commentPayload(lines, i)
+	if !isComment || !(isDirective(payload, nameDirective) || isDirective(payload, tableDirective)) {
+		return nil, nil
+	}
+	var (
+		name     *string
+		warnings []string
+	)
+	for ; i < len(lines); i++ {
+		payload, isComment := commentPayload(lines, i)
+		if !isComment {
+			break
+		}
+		if payload == "" {
+			// The bare `--` ends the header, for the name as for the prose. A
+			// `-- @name` below it is not read — and said so, because a rename
+			// that silently does not happen on a push that reports success is
+			// the one drop nobody can see.
+			for j := i + 1; j < len(lines); j++ {
+				below, more := commentPayload(lines, j)
+				if !more {
+					break
+				}
+				if isDirective(below, nameDirective) {
+					warnings = append(warnings, fmt.Sprintf(
+						"a `%s` below a bare `--` is not read, so the table's name is not managed by it — move it above the `--` line", NamePrefix))
+					break
+				}
+			}
+			break
+		}
+		if !isDirective(payload, nameDirective) {
+			continue
+		}
+		text, _ := cutDirective(payload, nameDirective)
+		switch {
+		case text == "":
+			warnings = append(warnings, fmt.Sprintf(
+				"`%s` declares no name, so the table's name is left alone — write the name after it", NamePrefix))
+		case name != nil:
+			warnings = append(warnings, fmt.Sprintf(
+				"`%s` appears more than once in this file's header; only the first one is read", NamePrefix))
+		default:
+			declared := text
+			name = &declared
+		}
+	}
+	return name, warnings
 }
 
 // orphanedDirectives counts the documentation directives written BELOW a bare

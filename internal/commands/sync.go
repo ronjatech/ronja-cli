@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
@@ -46,20 +47,22 @@ func newSyncCmd() *cobra.Command {
 		Long: `Check, and deploy, every Ronja folder in a tree at once.
 
 Walks down from a directory for every ronja.json — workflow, data app,
-automation and pipeline folders alike — and answers one question about all of
-them:
+automation, module and pipeline folders alike — and answers one question about
+all of them:
 
   ronja sync status                is the committed content what the
                                    organization holds?
   ronja sync check                 does every reference that content makes
                                    still resolve?
   ronja sync apply                 push and publish all of it
+  ronja sync adopt                 keep the folders' state on the server
+  ronja sync unmanage              ...and stop
 
 status and check are read-only: nothing is written, not even a checkout, so they
 are safe to run on a repository you only have read access to. apply writes, and
 refuses by default to create anything that does not already exist.`,
 	}
-	sync.AddCommand(newSyncStatusCmd(), newSyncCheckCmd(), newSyncApplyCmd())
+	sync.AddCommand(newSyncStatusCmd(), newSyncCheckCmd(), newSyncApplyCmd(), newSyncAdoptCmd(), newSyncUnmanageCmd())
 	sync.PersistentFlags().StringVar(&flagSyncDir, "dir", ".",
 		"directory to walk for folders (default: the working directory)")
 	addStackFlag(sync)
@@ -236,7 +239,7 @@ func (r *syncStatusReport) exitError() error {
 // when somebody reports a slow repository, with this landed and tested.
 func syncStatusTree(ctx context.Context, dir string, resolved *config.Resolved) (*syncStatusReport, error) {
 	// A bad --stack is the one thing this command does NOT degrade around, and
-	// it follows openFolderForStatus's rule exactly. Degrading is for an
+	// it follows openFolderForStatusAt's rule exactly. Degrading is for an
 	// environment that will not answer; a name that cannot be a stack name at
 	// all is a wrong ARGUMENT, and reporting every folder in the repository as
 	// `stack_absent` would describe a problem the reader does not have.
@@ -253,9 +256,12 @@ func syncStatusTree(ctx context.Context, dir string, resolved *config.Resolved) 
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", dir, err)
 	}
+	// A folder in no git work tree may name by address only folders of this
+	// tree (addressBoundary).
+	ctx = withAddressWalkRoot(ctx, base)
 
 	// The organization is resolved ONCE, before the loop, and the failure is
-	// swallowed exactly as openFolderForStatus swallows it.
+	// swallowed exactly as openFolderForStatusAt swallows it.
 	//
 	// Once rather than per folder because it is not only a saved request: the
 	// stack resolution below compares the folder's declared organization against
@@ -301,8 +307,14 @@ func syncStatusTree(ctx context.Context, dir string, resolved *config.Resolved) 
 			verdicts = append(verdicts, line.Verdict)
 			continue
 		}
-		verdict := statusVerdictOfFolder(ctx, folder, resolved)
+		verdict := addressStatusVerdict(ctx, folder, resolved)
+		if verdict.Verdict == "" {
+			verdict = statusVerdictOfFolder(ctx, folder, resolved)
+		}
 		line.Verdict, line.Detail = verdict.Verdict, verdict.Detail
+		if verdict.Reason != "" {
+			line.Reason = verdict.Reason
+		}
 		report.Folders = append(report.Folders, line)
 		verdicts = append(verdicts, line.Verdict)
 	}
@@ -352,7 +364,14 @@ func statusVerdictOfFolder(ctx context.Context, folder discoveredFolder, resolve
 		if err != nil {
 			return unknownVerdict("%v", err)
 		}
-		return verdictOfAppStatus(report, local)
+		verdict := verdictOfAppStatus(report, local, adoptedPullCommand(folder))
+		if report.Baseline == nil {
+			return answeredByLive(ctx, folder, report.opened, verdict)
+		}
+		if report.Remote != nil && report.Remote.Draft != nil {
+			return heldByLive(ctx, folder, report.opened, verdict, report.Remote.Draft.ID)
+		}
+		return verdict
 	case wfdir.KindAutomation:
 		report, err := automationStatusReportAt(ctx, folder.Root, resolved)
 		if err != nil {
@@ -364,13 +383,187 @@ func statusVerdictOfFolder(ctx context.Context, folder discoveredFolder, resolve
 		// local baseline at all, so its ordinary comparison IS the committed-file
 		// one and needs no second leg to survive a clone.
 		return verdictOfAutomationStatus(report, local)
+	case wfdir.KindModule:
+		// Its own arm, never the `default:` below: that one reads a WORKFLOW's
+		// report, and a module folder reaching it would be reported on against
+		// workflow endpoints using a module's id.
+		report, err := moduleStatusReportAt(ctx, folder.Root, resolved)
+		if err != nil {
+			return unknownVerdict("%v", err)
+		}
+		verdict := verdictOfModuleStatus(report, local, adoptedPullCommand(folder))
+		if report.Baseline == nil {
+			return answeredByLive(ctx, folder, report.opened, verdict)
+		}
+		if report.Remote != nil && report.Remote.Draft != nil {
+			return heldByLive(ctx, folder, report.opened, verdict, report.Remote.Draft.ID)
+		}
+		return verdict
 	default:
 		report, err := workflowStatusReportAt(ctx, folder.Root, resolved)
 		if err != nil {
 			return unknownVerdict("%v", err)
 		}
-		return verdictOfWorkflowStatus(report, local)
+		verdict := verdictOfWorkflowStatus(report, local, adoptedPullCommand(folder))
+		if report.Baseline == nil {
+			return answeredByLive(ctx, folder, report.opened, verdict)
+		}
+		if report.Remote != nil && report.Remote.Draft != nil {
+			return heldByLive(ctx, folder, report.opened, verdict, report.Remote.Draft.ID)
+		}
+		return verdict
 	}
+}
+
+// adoptedPullCommand is the command that takes a change made in Ronja into an
+// ADOPTED folder (`ronja <kind> pull`), "" for a classic one, which has none.
+func adoptedPullCommand(folder discoveredFolder) string {
+	if folder.Manifest == nil || !folder.Manifest.Adopted() {
+		return ""
+	}
+	return folder.Kind.Command + " pull"
+}
+
+// answeredByLive re-answers an ADOPTED workflow, data-app or module folder
+// whose status could not compare anything — no local baseline, which is every
+// fresh clone and CI checkout — by the comparison `sync apply --dry-run` makes
+// of it: does the live row hold the folder (liveHoldsFolder)? Clean when it
+// does, so `sync status --stack S` agrees with the dry run that a deploy
+// changes nothing; drifted when it does not. Reads only. A classic folder, a
+// read that fails and a row that is not live keep the unknown verdict. f is
+// the folder the status report was computed from.
+func answeredByLive(ctx context.Context, folder discoveredFolder, f *folder, verdict folderVerdict) folderVerdict {
+	if verdict.Verdict != verdictUnknown || verdict.Detail != noLocalBaselineDetail {
+		return verdict
+	}
+	if f == nil || f.OrgErr != nil || !f.adoptedHere() || f.Binding.WorkflowID+f.Binding.DataAppID+f.Binding.ModuleID == "" {
+		return verdict
+	}
+	held, err := liveHoldsFolder(ctx, f)
+	switch {
+	case err != nil:
+		return verdict
+	case held:
+		return folderVerdict{Verdict: verdictClean, Detail: fmt.Sprintf(
+			"no local baseline here, and the live %s holds this folder, so `sync apply` changes nothing for it", folder.Kind.Label)}
+	}
+	return driftedVerdict("no local baseline here, and the live %s differs from this folder — `ronja sync apply --dry-run` says what a deploy would change; if the change was made in Ronja, `%s pull` takes it into this folder",
+		folder.Kind.Label, folder.Kind.Command)
+}
+
+// heldByLive re-answers a DRIFTED adopted workflow, data-app or module folder whose
+// status was measured against the caller's own open draft — the row a classic
+// push writes to — by the question the tree gate asks: would `sync apply`
+// change the organization? Its first step reads the LIVE row, and when that
+// holds the folder exactly it pushes and publishes nothing, whatever the draft
+// holds (pushNothingLiveHolds). Such a folder is clean, and the draft is said
+// as a note: it is the author's work in progress, not a difference between the
+// repository and what is deployed.
+//
+// The live read is the apply's own comparison (liveHoldsFolder). Anything it
+// cannot establish — a read that fails, a live row that differs — leaves the
+// verdict as it was.
+func heldByLive(ctx context.Context, folder discoveredFolder, f *folder, verdict folderVerdict, draftID string) folderVerdict {
+	if verdict.Verdict != verdictDrifted {
+		return verdict
+	}
+	if f == nil || f.OrgErr != nil || !f.adoptedHere() {
+		// A classic folder (no folder id) keeps the verdict it always had.
+		return verdict
+	}
+	held, err := liveHoldsFolder(ctx, f)
+	if err != nil || !held {
+		return verdict
+	}
+	return folderVerdict{Verdict: verdictClean, Detail: fmt.Sprintf(
+		"the live %s holds this folder, so `sync apply` changes nothing for it. Note: your open draft %s differs from the folder — `%s status` compares the folder with that draft, `%s push` would write the folder into it, and `%s discard` throws it away",
+		folder.Kind.Label, orUnknown(draftID), folder.Kind.Command, folder.Kind.Command, folder.Kind.Command)}
+}
+
+// liveHoldsFolder reports whether the LIVE row a workflow, data-app or module
+// folder is bound to already holds the folder exactly: the comparison `sync
+// apply` makes before anything else (pushNothingLiveHolds and its twins), by
+// the same parity functions, so true means an apply pushes and publishes
+// nothing for the folder. Reads only. False, with no error, for a folder bound
+// to nothing, a row that is not live (a parentless draft awaits its publish),
+// and every other kind.
+func liveHoldsFolder(ctx context.Context, f *folder) (bool, error) {
+	held, _, err := compareWithLive(ctx, f, false)
+	return held, err
+}
+
+// compareWithLive is liveHoldsFolder, and with guard the drift guard `sync
+// apply` asks next for a workflow or data app the live row does not hold:
+// before its checkout, when no draft is open and the folder has a baseline
+// (runPush's and runAppPush's LiveFirst step). refusal is the guard's
+// refusal, in the apply's words, so a dry run can say it; nil when the apply
+// would go on to push. Reads only.
+func compareWithLive(ctx context.Context, f *folder, guard bool) (held bool, refusal, err error) {
+	local, _, err := readLocalFiles(f.Root, f.Kind)
+	if err != nil {
+		return false, nil, err
+	}
+	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	guarded := guard && f.State.For(f.Key) != nil
+	switch f.Kind.Name {
+	case wfdir.KindWorkflow:
+		if f.Binding.WorkflowID == "" {
+			return false, nil, nil
+		}
+		live, err := client.GetWorkflow(ctx, f.Binding.WorkflowID)
+		if err != nil || live.Lifecycle != api.LifecycleLive {
+			return false, nil, err
+		}
+		files, err := client.ListWorkflowFiles(ctx, live.ID)
+		if err != nil {
+			return false, nil, err
+		}
+		remote := contentByPath(f.Codec, files)
+		if held := workflowRowHoldsFolder(f, live, remote, local); held || !guarded {
+			return held, nil, nil
+		}
+		if draft, err := client.GetWorkflowDraft(ctx, live.ID); err != nil || draft != nil {
+			return false, nil, err
+		}
+		_, refusal = checkDrift(f, live, remote, hashFiles(f.baselineCodec(), files), local, false, headAgreement{}, driftAsk{apply: true})
+		return false, refusal, nil
+	case wfdir.KindDataApp:
+		if f.Binding.DataAppID == "" {
+			return false, nil, nil
+		}
+		live, err := client.GetDataApp(ctx, f.Binding.DataAppID)
+		if err != nil || live.Lifecycle != api.LifecycleLive {
+			return false, nil, err
+		}
+		files, err := client.ListDataAppFiles(ctx, live.ID)
+		if err != nil {
+			return false, nil, err
+		}
+		remote := appContentByPath(f.Codec, files)
+		if held := appRowHoldsFolder(f, live, remote, local); held || !guarded {
+			return held, nil, nil
+		}
+		if draft, err := client.GetDataAppDraft(ctx, live.ID); err != nil || draft != nil {
+			return false, nil, err
+		}
+		_, refusal = checkAppDrift(f, remote, hashAppFiles(f.baselineCodec(), files), local, appMetaAgrees(f, live), false, headAgreement{}, live.ID,
+			driftAsk{apply: true})
+		return false, refusal, nil
+	case wfdir.KindModule:
+		if f.Binding.ModuleID == "" {
+			return false, nil, nil
+		}
+		live, err := client.GetModule(ctx, f.Binding.ModuleID)
+		if err != nil || live.Lifecycle != api.LifecycleLive {
+			return false, nil, err
+		}
+		files, err := client.ListModuleFiles(ctx, live.ID)
+		if err != nil {
+			return false, nil, err
+		}
+		return moduleRowHoldsFolder(f, live, moduleContentByPath(files), local), nil, nil
+	}
+	return false, nil, nil
 }
 
 // undeployedAgainstLock names the .sql files whose COMMITTED content differs
@@ -420,6 +613,11 @@ func undeployedAgainstLock(root string, resolved *config.Resolved, files map[str
 	if err != nil || f.Stack == "" {
 		return nil
 	}
+	// A pending `moved` entry re-keys the fingerprint to the file that now holds
+	// the SQL — in memory, like every read here. A declaration that cannot be
+	// applied is pipelineStatusReportAt's to report; this leg then compares the
+	// recorded keys as they stand.
+	_, _ = f.resolveAddresses()
 	var out []string
 	for path, hash := range files {
 		// An empty fingerprint is "never recorded", not "empty file": the folder

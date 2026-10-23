@@ -139,6 +139,11 @@ func pipelineStatusReportAt(ctx context.Context, root string, resolved *config.R
 
 	// Reported, never refused — see folder.noteAliases.
 	f.noteAliases()
+	// The address declarations, IN MEMORY ONLY — status writes nothing, and
+	// that includes the lock a `moved` entry re-keys. Evaluated so that a pending
+	// rename reads as the one table it is rather than as a deletion beside a
+	// create, and before anything below reads the binding.
+	addresses, addressErr := f.resolveAddresses()
 
 	report := &pipelineStatusReport{
 		Root:      f.Root,
@@ -174,6 +179,19 @@ func pipelineStatusReportAt(ctx context.Context, root string, resolved *config.R
 	// files — see newPipelineCodec, which reads nothing else from the map.
 	// A status that read every .sql file a second time to learn the same
 	// thing would be paying for the alias layer on every folder.
+	if addressErr != nil {
+		report.AddressProblem = addressErr.Error()
+	} else {
+		report.Moved, report.Removed = addresses.Moves, addresses.Removals
+		gone, err := f.goneAddresses()
+		if err != nil {
+			return nil, err
+		}
+		for _, g := range gone {
+			report.Gone = append(report.Gone, describeGone(g))
+		}
+	}
+
 	report.Remote = pipelineRemoteStatus(ctx, resolved, f, newPipelineCodec(f, enumeration.Files))
 	return report, nil
 }
@@ -202,8 +220,20 @@ type pipelineStatusReport struct {
 	Local   wfdir.Diff      `json:"local"`
 	Skipped []wfdir.Skipped `json:"skipped,omitempty"`
 	// WillCreate lists local .sql files with no table behind them yet.
-	WillCreate []string              `json:"willCreate"`
-	Remote     *pipelineRemoteReport `json:"remote"`
+	WillCreate []string `json:"willCreate"`
+	// Moved and Removed are what this folder's `moved` / `removed` declarations
+	// WOULD do to this stack's recorded state — pending until a push writes
+	// them, since status writes nothing.
+	Moved   []addressMove    `json:"moved,omitempty"`
+	Removed []addressRemoval `json:"removed,omitempty"`
+	// Gone is rename detection: each table or metric this stack binds whose
+	// file is gone with no declaration covering it, as the sentence a push
+	// notes and `sync apply` refuses with.
+	Gone []string `json:"gone,omitempty"`
+	// AddressProblem is why the declarations cannot be applied to this stack as
+	// they stand — the refusal a push would make. Empty when they can.
+	AddressProblem string                `json:"addressProblem,omitempty"`
+	Remote         *pipelineRemoteReport `json:"remote"`
 }
 
 // pipelineRemoteReport is shaped so "we did not look" and "we looked and it is
@@ -758,6 +788,7 @@ func printPipelineStatus(r *pipelineStatusReport) {
 	for _, path := range r.WillCreate {
 		fmt.Fprintf(out, "    %-9s %s\n", "creates", path)
 	}
+	printAddressStatus(out, r.Moved, r.Removed, r.Gone, r.AddressProblem)
 	for _, s := range r.Skipped {
 		fmt.Fprintf(out, "    skipped  %s — %s\n", s.Path, s.Reason)
 	}

@@ -174,6 +174,25 @@ func TestPatternParity(t *testing.T) {
 	}
 }
 
+// TestWritePatternParity: the write marker is not a family (see writes.go), but
+// the declared write targets and outputs are rewritten through it, so it is
+// held to the server's pattern exactly as the families are.
+func TestWritePatternParity(t *testing.T) {
+	root := repoRoot(t)
+	if root == "" {
+		t.Skip("backend tree not present — nothing to check parity against")
+	}
+	server := map[string]string{}
+	for _, rel := range serverFiles {
+		for name, pattern := range serverPatterns(t, filepath.Join(root, rel)) {
+			server[name] = pattern
+		}
+	}
+	if want, got := server["writeMarkerPattern"], writePattern.String(); got != want {
+		t.Errorf("write pattern has drifted from writeMarkerPattern\n  cli:    %s\n  server: %s", got, want)
+	}
+}
+
 // excludedServerPatterns is every marker-shaped pattern on the server that this
 // package deliberately does NOT mirror, with the reason, so the enumeration
 // below can tell "considered and excluded" from "nobody has looked at it".
@@ -181,7 +200,7 @@ func TestPatternParity(t *testing.T) {
 // Each reason is the short form of one in the package doc; that doc is where the
 // argument lives.
 var excludedServerPatterns = map[string]string{
-	"writeMarkerPattern": "a bare name is an auto-created OUTPUT table, not a reference",
+	"writeMarkerPattern": "a bare name is an auto-created OUTPUT table, not a reference — mirrored on its own as writePattern (writes.go), read only for declared write targets and outputs",
 	"fileMarkerPattern":  "the first argument is a store-relative folder PATH, never an id",
 	"FileURLPattern":     "resolved only on the session runPython path; a workflow never inlines it",
 	// Not a family at all — the two below are other readings of markers this

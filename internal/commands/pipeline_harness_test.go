@@ -38,6 +38,10 @@ import (
 //     another scope group, which is why "no confidence report" has to be a
 //     survivable outcome rather than a failure.
 type fakePipelineInstance struct {
+	// managed is the server-side state behind an adopted folder
+	// (managed_harness_test.go).
+	managed *fakeManaged
+
 	t *testing.T
 	// mu guards everything below. UNLIKE the other two fakes, which is not
 	// stylistic: `pipeline status` reads its tables CONCURRENTLY, so several
@@ -47,6 +51,10 @@ type fakePipelineInstance struct {
 
 	// tables is every row, live and draft, keyed by id.
 	tables map[string]*api.Table
+	// outputOf marks a table as a workflow's own output: id → (workflow id,
+	// logical name), which the feature listing reports (ModelV2QueryItem's
+	// workflowID / workflowLogicalName).
+	outputOf map[string][2]string
 	// draftOf maps a live table id to the caller's open draft id.
 	draftOf map[string]string
 	// buildErr is the failure recorded against a row, cleared at the start of
@@ -132,6 +140,12 @@ type fakePipelineInstance struct {
 
 	// --- failure injection, per row where it makes sense ---------------------
 	failGet map[string]int
+	// failGetOnce is failGet for ONE read: the next GET of the row answers the
+	// status, and the one after is served — a transient failure.
+	failGetOnce map[string]int
+	// beforeServe, when set, runs before each request is answered (outside
+	// mu): how a test lands a web edit between two reads of one command.
+	beforeServe func(r *http.Request)
 	// failDocsPut answers a DOCUMENTING PUT — one carrying `description` or
 	// `fields` — with a status, leaving the SQL PUT of the same row alone.
 	//
@@ -239,6 +253,9 @@ type recordedTableUpdate struct {
 	// client that dropped `omitempty` — and therefore 400s every unconditional
 	// write in production — pass every test.
 	BaseCodeSha256 *string
+	// Name is the rename the PUT carried, nil when it named no `name` — which is
+	// what every write that is not a rename must be.
+	Name *string
 }
 
 // recordedRecipeWrite is one PUT to the metric-recipe route, with the row it was
@@ -274,6 +291,7 @@ type tableUpdateBody struct {
 	Description       *string               `json:"description"`
 	DescriptionSource string                `json:"descriptionSource"`
 	Fields            []api.TableFieldInput `json:"fields"`
+	Name              *string               `json:"name"`
 }
 
 func newFakePipelineInstance(t *testing.T) *fakePipelineInstance {
@@ -281,6 +299,7 @@ func newFakePipelineInstance(t *testing.T) *fakePipelineInstance {
 	f := &fakePipelineInstance{
 		t:                 t,
 		tables:            map[string]*api.Table{},
+		outputOf:          map[string][2]string{},
 		draftOf:           map[string]string{},
 		buildErr:          map[string]*api.TableBuildError{},
 		synced:            map[string]bool{},
@@ -295,6 +314,7 @@ func newFakePipelineInstance(t *testing.T) *fakePipelineInstance {
 		rejectCommit:      map[string]bool{},
 		syncBusy:          map[string]int{},
 		failGet:           map[string]int{},
+		failGetOnce:       map[string]int{},
 		failDocsPut:       map[string]int{},
 		failDraftGet:      map[string]int{},
 		failCheckout:      map[string]int{},
@@ -308,9 +328,30 @@ func newFakePipelineInstance(t *testing.T) *fakePipelineInstance {
 		privilegeLevel:    50,
 		queryCSV:          "id,total\n1,42\n2,17\n",
 	}
+	f.managed = newFakeManaged(t, f.probeRow)
+	f.managed.setRowFeature = func(_, id, feature string) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.tables[id].FeatureID = feature
+	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
+}
+
+// probeRow is the pipeline fake's half of fakeManaged. A table claim on a
+// metric row (or the reverse) probes as not existing (probe.go loadFacts).
+func (f *fakePipelineInstance) probeRow(kind, id string) fakeRowFacts {
+	row := f.tables[id]
+	if row == nil || (kind == "metric") != (row.Kind == api.TableKindMetric) || (kind != "table" && kind != "metric") {
+		return fakeRowFacts{}
+	}
+	lifecycle := "live"
+	if row.ParentModelID != "" || row.ShadowStatus != "" {
+		lifecycle = "draft"
+	}
+	return fakeRowFacts{Exists: true, FeatureID: row.FeatureID, Root: row.ParentModelID == "", Name: row.Name,
+		Lifecycle: lifecycle, ModelKind: row.Kind}
 }
 
 func (f *fakePipelineInstance) URL() string { return f.server.URL }
@@ -580,7 +621,13 @@ func (f *fakePipelineInstance) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
 	f.mu.Unlock()
+	if f.beforeServe != nil {
+		f.beforeServe(r)
+	}
 
+	if f.managed.serve(w, r) {
+		return
+	}
 	switch {
 	case r.URL.Path == "/api/v2/authentication/me":
 		// The organization lookup, failing the way a revoked token makes it fail:
@@ -730,6 +777,22 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 			ID: id, BaseCodeSha256: in.BaseCodeSha256,
 			SetsCode: in.Code != nil, SetsInputModels: in.InputModels != nil,
 			Description: in.Description, DescriptionSource: in.DescriptionSource, Fields: in.Fields,
+			Name: in.Name,
+		}
+		// A RENAME, modelled as rmodelv2's rename arm decides it: the name gate
+		// runs ONLY on a row that occupies the feature's namespace — a live root
+		// row — and ONLY when the name actually changes. A DRAFT's rename is not
+		// checked here at all; the commit that lands it on the live row is where
+		// the namespace is asked. A fake that checked drafts too would hide a CLI
+		// that reported a rename as safe at push time.
+		if in.Name != nil {
+			want := strings.TrimSpace(*in.Name)
+			if want != strings.TrimSpace(row.Name) && row.ParentModelID == "" && row.ShadowStatus == "" {
+				if holder := f.nameHolder(row.FeatureID, want, row.ID); holder != "" {
+					http.Error(w, `{"error":"a table named `+want+` already exists in this feature (`+holder+`)","code":"name_taken"}`, http.StatusConflict)
+					return
+				}
+			}
 		}
 		if in.Code != nil {
 			recorded.Code = *in.Code
@@ -776,6 +839,9 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 			row.Description = *in.Description
 			row.DescriptionSource = in.DescriptionSource
 		}
+		if in.Name != nil {
+			row.Name = strings.TrimSpace(*in.Name)
+		}
 		row.UpdatedAt = row.UpdatedAt.Add(time.Minute)
 		if in.Fields == nil {
 			// A PUT that documents nothing answers exactly what it always did.
@@ -789,6 +855,11 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 
 	case action == "" && r.Method == http.MethodGet:
 		if status := f.failGet[id]; status != 0 {
+			http.Error(w, `{"error":"boom"}`, status)
+			return
+		}
+		if status := f.failGetOnce[id]; status != 0 {
+			delete(f.failGetOnce, id)
 			http.Error(w, `{"error":"boom"}`, status)
 			return
 		}
@@ -812,7 +883,11 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 			http.Error(w, `{"error":"no rows"}`, http.StatusBadRequest)
 			return
 		}
-		f.writeRowWithCatalog(w, row)
+		// GET :id carries `managedBy`, a draft answering its root's
+		// (backend/api/v2/feature/api_model.go, the single-row GET).
+		withClaim := *row
+		withClaim.ManagedBy = f.managed.managedBy("table", row.ID, row.ParentModelID)
+		f.writeRowWithCatalog(w, &withClaim)
 		// A row left `building` — which only a refused sync does here — lands on
 		// the read that watched it. Reported first and landed after, so the caller
 		// that asked BECAUSE it was refused sees the build it was told about.
@@ -844,6 +919,7 @@ func (f *fakePipelineInstance) serveList(w http.ResponseWriter, r *http.Request)
 		items = append(items, &api.TableListItem{
 			ID: row.ID, FeatureID: row.FeatureID, Name: row.Name, Kind: row.Kind,
 			Status: row.Status, HasError: f.buildErr[row.ID] != nil, UpdatedAt: row.UpdatedAt,
+			WorkflowID: f.outputOf[row.ID][0], WorkflowLogicalName: f.outputOf[row.ID][1],
 		})
 	}
 
@@ -901,6 +977,14 @@ func (f *fakePipelineInstance) serveCreate(w http.ResponseWriter, r *http.Reques
 		DescriptionSource: in.DescriptionSource,
 	})
 	f.synced[row.ID] = false
+	// The claim, in rmodelv2.Create's transaction, AFTER its name gate (B5): a
+	// refused claim rolls the create back.
+	if status, body := f.managed.createClaim("table", in.FeatureID, row.ID, in.Managed); status != 0 {
+		delete(f.tables, row.ID)
+		delete(f.synced, row.ID)
+		writeCreateRefusal(w, status, body)
+		return
+	}
 	// The report rides the create response, embedded — and on a create it is
 	// ALWAYS every name unmatched, because a table that has never built has
 	// measured nothing. That is the join rule, not a special case.
@@ -960,6 +1044,7 @@ func (f *fakePipelineInstance) serveCheckout(w http.ResponseWriter, liveID strin
 	// what the CLI's baseRecipeSha256 is taken over on a resumed draft.
 	draft.MetricRecipe = live.MetricRecipe
 	draft.MetricStatus = live.MetricStatus
+	draft.ReportingTimezone = live.ReportingTimezone
 	f.copyColumnDocs(liveID, draftID)
 	f.writeRow(w, draft)
 }
@@ -1112,7 +1197,18 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confi
 	// folder would be refused against a version it had just overwritten.
 	delete(f.intervening, draft.ParentModelID)
 	parent := f.tables[draft.ParentModelID]
+	// The DRAFT'S NAME lands on the live row with everything else, and that is
+	// the moment the feature's namespace is asked — only when the name changes,
+	// rule B1. Refused BEFORE anything is written, as the server's transaction
+	// is.
+	if parent != nil && strings.TrimSpace(draft.Name) != strings.TrimSpace(parent.Name) {
+		if holder := f.nameHolder(parent.FeatureID, draft.Name, parent.ID); holder != "" {
+			http.Error(w, `{"error":"a table named `+draft.Name+` already exists in this feature (`+holder+`)","code":"name_taken"}`, http.StatusConflict)
+			return
+		}
+	}
 	if parent != nil {
+		parent.Name = draft.Name
 		parent.Code = draft.Code
 		parent.InputModels = append([]string{}, draft.InputModels...)
 		parent.Status = draft.Status
@@ -1127,11 +1223,29 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confi
 		// change lands DRIFTED — the definition moved and the verification did
 		// not — which is the one governance consequence the metric loop reports.
 		parent.MetricRecipe = draft.MetricRecipe
+		parent.ReportingTimezone = draft.ReportingTimezone
 		f.copyColumnDocs(draftID, parent.ID)
 		f.synced[parent.ID] = true
 	}
 	f.dropDraft(draftID)
 	writeJSON(w, nil)
+}
+
+// nameHolder answers the id of a LIVE root row in the feature already holding
+// `name`, compared the way the store compares it — lower(btrim()) — or "" when
+// the name is free. `except` is the row being renamed.
+func (f *fakePipelineInstance) nameHolder(featureID, name, except string) string {
+	want := strings.ToLower(strings.TrimSpace(name))
+	for _, id := range f.sortedIDs() {
+		row := f.tables[id]
+		if id == except || row.FeatureID != featureID || row.ParentModelID != "" || row.ShadowStatus != "" {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(row.Name)) == want {
+			return id
+		}
+	}
+	return ""
 }
 
 func (f *fakePipelineInstance) dropDraft(draftID string) {
@@ -1472,9 +1586,10 @@ func assertPipelineBaselineMatchesDisk(t *testing.T, root string, key wfdir.Inst
 // real instance:
 //
 //  1. THE RECIPE IS CANONICALIZED ON THE WAY IN. What the row stores is not the
-//     bytes the client sent — a `version` is defaulted in — so a client that
-//     hashed its own local file for the compare-and-swap would be refused. The
-//     fake defaults the same key for that reason alone.
+//     bytes the client sent — it is the server's typed marshal, every key
+//     present and `version` defaulted (canonicalRecipe) — so a client that
+//     hashed its own local file for the compare-and-swap would be refused, and
+//     one that compared its file with the row would never find them equal.
 //  2. THE PRECONDITION IS COMPARED AGAINST WHAT THE ROW STORES, whatever the
 //     client believed it was fingerprinting, and its three states answer
 //     differently: absent is no check, "" is a 400 rather than a silent
@@ -1493,7 +1608,8 @@ func (f *fakePipelineInstance) AddMetric(id, name, recipe string) *api.Table {
 	f.t.Helper()
 	return f.AddTable(&api.Table{
 		ID: id, Name: name, Kind: api.TableKindMetric,
-		MetricRecipe: json.RawMessage(recipe),
+		// Stored as the server stores every recipe, whoever wrote it.
+		MetricRecipe: canonicalRecipe(f.t, json.RawMessage(recipe)),
 		MetricStatus: api.MetricStatusUnvetted,
 	})
 }
@@ -1508,24 +1624,49 @@ func (f *fakePipelineInstance) RecipeOf(id string) string {
 	return ""
 }
 
-// canonicalRecipe is the server's canonicalization, modelled to the one degree
-// that matters to a client: the stored bytes are NOT the sent bytes.
+// canonicalRecipe is the server's canonicalization: what metric_recipe stores is
+// json.Marshal(rdb.MetricRecipeV1) of what the caller sent, with a missing (or
+// zero) `version` defaulted to 1 and `source` trimmed
+// (backend/agent/tools/metric_core.go parseMetricRecipe, decodeMetricRecipe,
+// canonicalMetricRecipe). The struct has no `omitempty`, so every key is always
+// present — a recipe that left `dimensions` out is stored with
+// `"dimensions":null`, one that left `time` out with an empty time object — and
+// a key the struct does not have is dropped. A fake that kept the sent bytes, or
+// only defaulted `version`, would let a client that compared its own file with
+// the stored row pass here and never match a real one.
 //
-// `version` is defaulted to 1 when the caller omitted it, which is enough to
-// make the point — a client that hashed its own file rather than what the server
-// answered would be refused by the precondition, exactly as it would in
-// production. Everything else is carried through verbatim, because the recipe
-// grammar is the server's and the CLI passes it through untouched.
+// The mirror below is the fake's own copy of rdb.MetricRecipeV1, deliberately
+// not the CLI's: a fake that borrowed the code under test could not catch it.
 func canonicalRecipe(t *testing.T, raw json.RawMessage) json.RawMessage {
 	t.Helper()
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
+	type timeAnchor struct {
+		Column      string `json:"column"`
+		NativeGrain string `json:"native_grain"`
+	}
+	type dimension struct {
+		Name string `json:"name"`
+	}
+	type measure struct {
+		Name   string `json:"name"`
+		Agg    string `json:"agg"`
+		Column string `json:"column"`
+	}
+	var r struct {
+		Version      int         `json:"version"`
+		Source       string      `json:"source"`
+		Time         timeAnchor  `json:"time"`
+		Dimensions   []dimension `json:"dimensions"`
+		BaseMeasures []measure   `json:"base_measures"`
+		Value        string      `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
 		return raw
 	}
-	if _, has := fields["version"]; !has {
-		fields["version"] = json.RawMessage("1")
+	if r.Version == 0 {
+		r.Version = 1
 	}
-	out, err := json.Marshal(fields)
+	r.Source = strings.TrimSpace(r.Source)
+	out, err := json.Marshal(r)
 	if err != nil {
 		t.Fatalf("canonicalRecipe: %v", err)
 	}
@@ -1564,11 +1705,18 @@ func (f *fakePipelineInstance) serveCreateMetric(w http.ResponseWriter, r *http.
 		Description:       in.Description,
 		DescriptionSource: api.DescriptionSourceUser,
 		MetricRecipe:      canonicalRecipe(f.t, in.Recipe),
+		ReportingTimezone: in.ReportingTimezone,
 		// UNVETTED, forced, whatever the body said — and the body has no field
 		// for it, which is the other half of the same guarantee.
 		MetricStatus: api.MetricStatusUnvetted,
 	})
 	f.synced[row.ID] = false
+	if status, body := f.managed.createClaim("metric", in.FeatureID, row.ID, in.Managed); status != 0 {
+		delete(f.tables, row.ID)
+		delete(f.synced, row.ID)
+		writeCreateRefusal(w, status, body)
+		return
+	}
 	writeJSON(w, map[string]any{"metric": row})
 }
 
@@ -1615,12 +1763,21 @@ func (f *fakePipelineInstance) serveWriteRecipe(w http.ResponseWriter, r *http.R
 	if len(in.Recipe) > 0 {
 		row.MetricRecipe = canonicalRecipe(f.t, in.Recipe)
 	}
+	// The declared calendar, three-state as rmodelv2.resolveDeclaredZonePatch
+	// reads it: absent leaves it alone, "" is the literal UTC, a name is stored
+	// trimmed.
+	if in.ReportingTimezone != nil {
+		row.ReportingTimezone = strings.TrimSpace(*in.ReportingTimezone)
+		if row.ReportingTimezone == "" {
+			row.ReportingTimezone = "UTC"
+		}
+	}
 	row.UpdatedAt = row.UpdatedAt.Add(time.Minute)
 	writeJSON(w, map[string]any{
 		"draftID": draftID, "metricID": row.ParentModelID,
 		"recipe": row.MetricRecipe, "additive": false,
 		"dimensions": []string{}, "timeColumn": "created_at",
 		"inputModels": []string{}, "sourceClosure": []string{},
-		"reportingTimezone": "",
+		"reportingTimezone": row.ReportingTimezone,
 	})
 }

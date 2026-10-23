@@ -151,12 +151,26 @@ type Kind struct {
 }
 
 var (
-	// WorkflowKind is a Python workflow folder.
+	// WorkflowKind is a Python workflow folder, and the kind every workflow
+	// command opens a folder as; Kind.ForManifest narrows it to WorkflowJSKind
+	// once the manifest says the folder is JavaScript.
 	WorkflowKind = Kind{
 		Name:              KindWorkflow,
 		Label:             "workflow",
 		Command:           "ronja wf",
 		DefaultEntrypoint: "main.py",
+	}
+	// WorkflowJSKind is a JavaScript workflow folder. The same manifest kind as
+	// WorkflowKind — the language is a property of the workflow, not a second
+	// folder type — plus the directories a Node project grows, for DataAppKind's
+	// reason: node_modules/ alone is thousands of files the server would refuse
+	// late, by count.
+	WorkflowJSKind = Kind{
+		Name:              KindWorkflow,
+		Label:             "workflow",
+		Command:           "ronja wf",
+		DefaultEntrypoint: "main.js",
+		SkipDirs:          []string{"node_modules", "dist", "build"},
 	}
 	// DataAppKind is a data-app folder.
 	//
@@ -250,6 +264,34 @@ var (
 		SyncExt:  ".json",
 	}
 )
+
+// The workflow languages a folder may declare. An ABSENT `language` is python,
+// on every manifest and every instance.
+const (
+	LanguagePython = "python"
+	LanguageJS     = "js"
+)
+
+// ForManifest is the kind a folder of this kind is synced as once its manifest
+// is known: a workflow manifest declaring js is WorkflowJSKind, and everything
+// else is k unchanged.
+//
+// Every workflow command opens a folder as WorkflowKind, because the language is
+// in the file being opened; the narrowing has to happen before anything
+// enumerates, or a JavaScript folder pushes its node_modules/.
+func (k Kind) ForManifest(m *Manifest) Kind {
+	if k.Name == KindWorkflow && m != nil && m.IsJS() {
+		return WorkflowJSKind
+	}
+	return k
+}
+
+// IsJSSource reports whether path is a file a JavaScript workflow can run as
+// its entrypoint. The suffix is matched case-sensitively, as the server does:
+// main.JS is a different file, which it refuses as an entrypoint.
+func IsJSSource(path string) bool {
+	return strings.HasSuffix(path, ".js") || strings.HasSuffix(path, ".mjs")
+}
 
 // The workflow runtime versions a folder may declare.
 //

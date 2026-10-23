@@ -37,6 +37,10 @@ type CreateDataAppInput struct {
 	Description string `json:"description,omitempty"`
 
 	DataAppAccess
+	// Managed is the repository address this create claims, in the create's own
+	// transaction (backend resource/rmanaged). Nil — no key — for a folder that
+	// has no folder id, which is every create a legacy folder makes.
+	Managed *ManagedClaimInput `json:"managed,omitempty"`
 }
 
 // DataAppPatch is the body of PUT /dataapp/:id, mirroring the subset of

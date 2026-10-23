@@ -496,6 +496,29 @@ func docsLanded(docs tabledocs.Docs, row *api.Table) bool {
 	return true
 }
 
+// docsHeldExactly is docsLanded WITHOUT the join rule's exemption: the row says
+// what the carrier declares AND has measured every column the carrier documents.
+//
+// It is the question `sync apply`'s LiveFirst skips ask — "would a write here
+// change nothing" — and the exemption cannot be granted there. Prose for a
+// column the table does not have yet is stored server-side against the name and
+// never reported back, so the row cannot say whether it was ever sent; a fresh
+// checkout skipping on docsLanded would never send it at all. Such a file is
+// therefore written on every apply, as it was before the skip existed — the
+// honest cost of a question the server gives no way to answer.
+func docsHeldExactly(docs tabledocs.Docs, row *api.Table) bool {
+	if !docsLanded(docs, row) {
+		return false
+	}
+	onRow := row.ColumnDescriptions()
+	for _, name := range docs.Names() {
+		if _, measured := onRow[name]; !measured {
+			return false
+		}
+	}
+	return true
+}
+
 // docsDriftReason is the third leg of the pipeline drift guard: has this row's
 // DOCUMENTATION moved since the folder last agreed with it?
 //
@@ -546,6 +569,9 @@ type pipelineDocsFileResult struct {
 	// Warning is a note about a file that is nonetheless fine — see
 	// tableDocsSidecar.Warning. Never a reason for a non-zero exit.
 	Warning string `json:"warning,omitempty"`
+	// drift marks a refusal for drift — what `ronja <kind> pull` takes into an
+	// adopted folder — so the run's summary can name it.
+	drift bool
 }
 
 // pushTableDocs is the SIDECAR half of a pipeline push: the tables this folder
@@ -591,6 +617,28 @@ func pushTableDocs(ctx context.Context, client *api.Client, f *folder, inst *wfd
 		}
 	}
 	return out
+}
+
+// recordedDocsSeen is what this folder recorded about a sidecar's table — the
+// row's documentation fingerprint and the file's — or nothing when the recording
+// was taken from a different table: a sidecar rebound by `ronja bind` or by a
+// stack switch describes another row, and a fingerprint from the old one can
+// only ever refuse or, worse, agree by accident.
+func recordedDocsSeen(live liveHashes, file tableDocsSidecar) (baseline, declared string) {
+	recordedID, baseline, declared := live.docsSeen(file.Path)
+	if recordedID != file.TableID {
+		return "", ""
+	}
+	return baseline, declared
+}
+
+// docsUnchangedSinceRecorded is a sidecar push's ordinary "nothing to do": the
+// FILE has not changed since the last push from this folder, and the ROW has not
+// moved since then either. The dry run asks it too, beside the LiveFirst
+// docsHeldExactly, so it and the apply cannot disagree.
+func docsUnchangedSinceRecorded(live liveHashes, file tableDocsSidecar, row *api.Table) bool {
+	baseline, declared := recordedDocsSeen(live, file)
+	return declared != "" && declared == file.Docs.Fingerprint() && baseline != "" && metaOf(row) == baseline
 }
 
 // pushOneTableDocs runs the whole cycle for one sidecar: resolve, guard, compare,
@@ -656,14 +704,41 @@ func pushOneTableDocs(ctx context.Context, client *api.Client, live liveHashes,
 	// damage is bounded meanwhile: prose only, never SQL or data, the losing
 	// edit is in the row's audit history, and the NEXT push re-reads and reports
 	// the divergence rather than compounding it.
-	recordedID, baseline, declared := live.docsSeen(file.Path)
-	if recordedID != file.TableID {
-		baseline, declared = "", ""
+	if opts.Pull {
+		// `ronja pipeline pull`: the folder now says what the row says, as far
+		// as a sidecar can — record the row as seen, and leave what it cannot
+		// hold for the next deploy. Nothing is written.
+		//
+		// The row is recorded as seen ONLY when the file holds it: exactly, or
+		// short only of columns the table has not measured (which the row says
+		// nothing about). A file that says something else — the folder's own
+		// prose left as it is, or one the pull could not plan — records
+		// nothing, so the next apply still compares against the old baseline
+		// and refuses a web edit as drift rather than overwriting it.
+		switch {
+		case docsHeldExactly(file.Docs, row):
+			live.setDocsSeen(file.Path, file.TableID, metaOf(row), file.Docs.Fingerprint())
+			out.Outcome = docsOutcomeUpToDate
+			out.Result = &tableDocsResult{UpToDate: true}
+		case docsLanded(file.Docs, row):
+			live.setDocsSeen(file.Path, file.TableID, metaOf(row), "")
+			out.Outcome = pullPending
+			out.Error = "the table has not measured every column this file documents, so only a deploy can send that prose"
+		default:
+			out.Outcome = pullPending
+			out.Error = "this file does not say what the table says, and nothing was recorded for it — the next apply writes it, or refuses it as drift if the table's prose changed since the stack last applied it"
+		}
+		return out
 	}
-	if reason := docsDriftReason(file.TableID, row, baseline); reason != "" {
+	baseline, _ := recordedDocsSeen(live, file)
+	// Live equal to desired is never drift: a row that already says what this
+	// file declares (under the join rule) has nothing for the write to
+	// overwrite, whatever moved since the recording.
+	if reason := docsDriftReason(file.TableID, row, baseline); reason != "" && !docsLanded(file.Docs, row) {
 		if !opts.Force {
-			return refuse("%s — pushing %s would overwrite it.\n    Run `ronja pipeline status` to see what the table says now, or push --force to overwrite",
-				reason, file.Path)
+			out.drift = true
+			return refuse("%s — pushing %s would overwrite it.\n    Run `ronja pipeline status` to see what the table says now, or push --force to overwrite%s",
+				reason, file.Path, opts.pullHint)
 		}
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting the documentation of %s (%s).\n", file.TableID, file.Path)
 	}
@@ -677,7 +752,20 @@ func pushOneTableDocs(ctx context.Context, client *api.Client, live liveHashes,
 	// the join rule's doing: a documented name the table does not have is stored
 	// server-side and never reported back, so such a file would read as pending
 	// for ever and be re-sent on every push.
-	if declared != "" && declared == file.Docs.Fingerprint() && baseline != "" && metaOf(row) == baseline {
+	if docsUnchangedSinceRecorded(live, file, row) {
+		out.Outcome = docsOutcomeUpToDate
+		out.Result = &tableDocsResult{UpToDate: true}
+		return out
+	}
+	// LiveFirst (`sync apply` only): the recording above goes STALE on a fresh
+	// checkout — every CI run carries the lock from before the last apply's
+	// write — so a sidecar would be re-sent on every run. The row is asked
+	// instead, and where it already says exactly what the file declares
+	// (docsHeldExactly — every documented column measured) there is nothing to
+	// write. The drift guard above has run either way. What is recorded is what
+	// a write would have recorded after its re-read.
+	if opts.LiveFirst && docsHeldExactly(file.Docs, row) {
+		live.setDocsSeen(file.Path, file.TableID, metaOf(row), file.Docs.Fingerprint())
 		out.Outcome = docsOutcomeUpToDate
 		out.Result = &tableDocsResult{UpToDate: true}
 		return out

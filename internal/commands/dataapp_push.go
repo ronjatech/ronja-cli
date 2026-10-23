@@ -56,7 +56,9 @@ What decides whether the result is publishable is the validate at the end,
 which is reported as "compiles: yes/no".
 
 It refuses when the draft changed on the server since your last sync (the web
-builder edits the same draft), listing what moved. --force overwrites.
+builder edits the same draft), listing what moved, and when the app's title was
+renamed somewhere other than this folder's "title" — a rename made in the web
+app is refused, never silently reverted. --force overwrites both.
 --no-validate skips the final compile check.
 
 Publishing is a separate step:
@@ -68,7 +70,7 @@ Publishing is a separate step:
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.DataAppKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.DataAppKind)
 			if err != nil {
 				return err
 			}
@@ -76,7 +78,9 @@ Publishing is a separate step:
 			// The report is emitted even on failure: a push that stopped halfway
 			// has already written files, and "which ones" is the first thing
 			// anyone needs to know.
+			printManagedNotices(f.notices)
 			if result != nil {
+				result.ManagedInGit = f.notices
 				if flagJSON {
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
@@ -98,6 +102,16 @@ Publishing is a separate step:
 type appPushOptions struct {
 	Validate bool
 	Force    bool
+	// LiveFirst is pushOptions.LiveFirst for a data app: compare the folder
+	// against the LIVE app before anything is checked out, and when the live
+	// app already holds it — files, title and declared access — return
+	// UpToDate having written nothing, not even the closing validate (there is
+	// no draft to compile). `sync apply` sets it and nothing else does; a
+	// single-folder `app push` still checks a draft out. See
+	// appPushNothingLiveHolds.
+	LiveFirst bool
+	// Apply is pushOptions.Apply for a data app.
+	Apply bool
 }
 
 // appPushResult is the --json shape and the human renderer's input, so the two
@@ -119,13 +133,18 @@ type appPushResult struct {
 	// before this push ran, rather than one this push checked out (or created).
 	// It is `sync apply`'s half of the up-to-date question — see the identical
 	// field on pushResult, and applyFolder — and is deliberately out of the
-	// --json payload for the same reason.
+	// --json payload for the same reason. Under LiveFirst, as there, an
+	// up-to-date push carrying it names a draft holding what live does not.
 	DraftPreexisted bool `json:"-"`
 	// DraftUnderReview reports that the draft written to has already been
 	// submitted for admin review — the push changed what someone is reviewing.
 	DraftUnderReview bool `json:"draftUnderReview"`
 	// AccessChanges is every grant and revocation this push made, in full.
 	AccessChanges []accessChange `json:"accessChanges,omitempty"`
+	// Rename is the title change this push wrote on the draft from ronja.json's
+	// "title" — it reaches the live app at publish. Absent when the draft
+	// already held it.
+	Rename *renameResult `json:"rename,omitempty"`
 	// Compiles is the verdict from the closing validate: nil when there is no
 	// verdict — the check was skipped (--no-validate) or the compiler did not
 	// answer (see CompileCheck) — otherwise whether the draft is publishable as
@@ -204,6 +223,9 @@ type appPushResult struct {
 	// the draft IS the app and there is no live version behind it. Human report
 	// only, for the same reason as URL; --json already carries dataAppID.
 	LiveURL string `json:"-"`
+	// ManagedInGit is the app's `managedBy`, when a repository folder other
+	// than this one deploys it (managed_notice.go).
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 // compileCheck records a compile check that was ASKED FOR and not answered.
@@ -264,6 +286,16 @@ func refuseMissingAppEntrypoint(f *folder, local map[string]string) error {
 // Returns (result, err): a non-nil result with a non-nil error is the
 // partial-push case, and both halves matter.
 func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushResult, error) {
+	result, err := runAppPushOnce(ctx, f, opts)
+	if adoptedOnCreate(err) {
+		// See runPush: the create adopted the row that won this address, and the
+		// push runs once more as the update it now is.
+		return runAppPushOnce(ctx, f, opts)
+	}
+	return result, err
+}
+
+func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPushResult, error) {
 	// newClient rather than api.New, for the reason it is a var at all (see
 	// workflow_push.go): it is the seam a test injects a transport through, and
 	// the two failures the closing validate has to tell apart — a request that
@@ -325,6 +357,40 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 			wfdir.ManifestPath(f.Root), existing.App.Entrypoint)
 	}
 
+	// 2b. The WRITE GATE (write_gate.go), before the first write AND before the
+	// live-first shortcut below: a codex the access block grants is one the app
+	// may write, and a workflow or agent it allows is one it runs — refused
+	// whether or not the folder changed, so a web edit pulled into the folder
+	// cannot deploy green behind "live already holds it".
+	if f.Manifest.ManagesAccess() {
+		if err := gateAppAccess(ctx, client, f, f.declaredAccess()); err != nil {
+			return nil, err
+		}
+	}
+
+	// 2c. `sync apply` only: does the LIVE app already hold this folder? Then
+	// there is nothing to deploy, and the push ends here having written nothing
+	// — before the checkout that would leave a draft identical to live behind.
+	var liveFiles map[string]string
+	if opts.LiveFirst {
+		done, read, raw, err := appPushNothingLiveHolds(ctx, client, f, existing, local, result)
+		if done {
+			return result, err
+		}
+		if err != nil {
+			return nil, err
+		}
+		liveFiles = read
+		// The drift guard, BEFORE the checkout, when the checkout would only
+		// copy the live app just read — see the same step in runPush.
+		if live := existing.App; opts.Apply && existing.Row() == nil && live != nil && raw != nil && f.State.For(f.Key) != nil && !opts.Force {
+			if _, err := checkAppDrift(f, read, hashAppFiles(f.baselineCodec(), raw), local, appMetaAgrees(f, live), false, headAgreement{}, live.ID,
+				driftAsk{apply: true}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// 3. Resolve the row to write to — the first step that changes anything.
 	// Whether this is a CREATE is a local decision (see sync_decision.go), taken
 	// there rather than re-read off the inspection: the two agree by construction
@@ -343,6 +409,18 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// same link — including the up-to-date one, which can return before the
 	// closing validate re-reads the row.
 	result.URL = target.URL
+	// Every refusal from here to the first write goes through refuseUnwritten:
+	// under LiveFirst, a draft THIS push checked out is discarded rather than
+	// left behind. See discardUnwrittenCheckout.
+	// ownCheckout is asked at the refusal — see the same lines in runPush.
+	var draftFiles map[string]string
+	ownCheckout := func() bool {
+		return opts.LiveFirst && !result.Created && !result.DraftPreexisted &&
+			appDraftCopiesLive(existing.App, target, liveFiles, draftFiles)
+	}
+	refuseUnwritten := func(err error) (*appPushResult, error) {
+		return nil, discardUnwrittenCheckout(ctx, ownCheckout(), target.ID, "app", client.DiscardDataAppDraft, err)
+	}
 	if existing.App != nil && existing.App.ID != target.ID {
 		result.LiveURL = existing.App.URL
 	}
@@ -357,9 +435,10 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// baseline would then record draft bytes under a row we never named.
 	files, err := client.ListDataAppFiles(ctx, target.ID)
 	if err != nil {
-		return nil, fmt.Errorf("read files of %s: %w", target.ID, err)
+		return refuseUnwritten(fmt.Errorf("read files of %s: %w", target.ID, err))
 	}
 	remoteFiles := appContentByPath(f.Codec, files)
+	draftFiles = remoteFiles
 
 	baselineClean := false
 	preconditions := filePreconditions{}
@@ -370,17 +449,34 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 		// write that records the binding.)
 		head = readHeadAgreement(ctx, dataAppHeadReader(client), f, existing.App.ID,
 			existing.AnchoredDraft())
-		verdict, err := checkAppDrift(f, remoteFiles, opts.Force, head, target.ID)
+		// Whether the app's metadata already agrees, for the live-equals-desired
+		// leg of the guard: the allowlists, and the title (whose own drift leg is
+		// appTitleLeg). Files alone agreeing is not "nothing to overwrite".
+		metaAgrees := (f.Manifest.Title == "" || sameName(f.Manifest.Title, target.Name)) &&
+			(!f.Manifest.ManagesAccess() || len(diffAccess(target.DataAppAccess, f.declaredAccess())) == 0)
+		verdict, err := checkAppDrift(f, remoteFiles, hashAppFiles(f.baselineCodec(), files), local, metaAgrees, opts.Force, head, target.ID,
+			driftAsk{draft: result.DraftPreexisted, apply: opts.Apply})
 		if err != nil {
-			return nil, err
+			return refuseUnwritten(err)
 		}
 		baselineClean = verdict.BaselineClean
 		// Server-side preconditions are armed EXACTLY where the drift guard
 		// vouched for the baseline, and suppressed everywhere it was bypassed.
 		// See filePreconditions for why that equivalence is the whole rule.
 		if !verdict.Bypassed {
-			preconditions = filePreconditions{Armed: true, Hashes: verdict.Preconditions}
+			stored := make(map[string]string, len(files))
+			for _, file := range files {
+				stored[file.Path] = file.Content
+			}
+			preconditions = filePreconditions{Armed: true, Hashes: verdict.Preconditions}.onTheWire(stored, f.Codec, f.baselineCodec())
 		}
+	}
+	// The TITLE's drift leg, decided HERE — before the first write of any kind —
+	// so a title somebody renamed elsewhere refuses the push rather than being
+	// reverted under it. Written at step 6.
+	writeTitle, err := appTitleLeg(f, existing.App, target, head, opts.Force)
+	if err != nil {
+		return refuseUnwritten(err)
 	}
 
 	// landed tracks what the baseline may honestly claim as the sync proceeds, so
@@ -390,6 +486,16 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// content it was forcing past.
 	landed := acknowledgedRemote(f.State.For(f.Key), remoteFiles, local, result.Created)
 	stop := func(err error) (*appPushResult, error) {
+		// A stop before anything landed — the server refused the push's first
+		// write — is still a refusal before the first write, and an apply
+		// discards the copy of live it checked out (see the same lines in runPush).
+		// Not when a write's outcome is unknown (Uncertain): it may have landed.
+		if len(result.AccessChanges) == 0 && result.Rename == nil &&
+			len(result.Pushed) == 0 && len(result.Deleted) == 0 && len(result.Uncertain) == 0 && ownCheckout() {
+			err = discardUnwrittenCheckout(ctx, true, target.ID, "app", client.DiscardDataAppDraft, err)
+			result.Error = err.Error()
+			return result, err
+		}
 		result.Error = err.Error()
 		saveAppBaseline(f, target, landed)
 		return result, err
@@ -424,14 +530,17 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 		}
 	}
 
-	// 6. The TITLE, which is the row's `name`.
-	if f.Manifest.Title != "" && f.Manifest.Title != target.Name {
+	// 6. The TITLE, which is the row's `name` — only when appTitleLeg cleared it.
+	// On the draft, which is what publish lands on the live app.
+	if writeTitle {
 		title := f.Manifest.Title
+		from := target.Name
 		updated, err := client.UpdateDataApp(ctx, target.ID, api.DataAppPatch{Name: &title})
 		if err != nil {
 			return stop(fmt.Errorf("update the title of %s: %w", target.ID, err))
 		}
 		target.Name = updated.Name
+		result.Rename = &renameResult{From: from, To: updated.Name}
 	}
 
 	// 7. Files: everything but the entrypoint, then the entrypoint, then the
@@ -459,11 +568,12 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 	// 8. A push that wrote nothing at all, against a baseline that already
 	// described the server, has nothing to re-read.
 	nothingChanged := !result.Created && baselineClean &&
-		len(result.Pushed) == 0 && len(result.Deleted) == 0 && len(result.AccessChanges) == 0
+		len(result.Pushed) == 0 && len(result.Deleted) == 0 && len(result.AccessChanges) == 0 &&
+		result.Rename == nil
 	if nothingChanged && !opts.Validate {
 		result.UpToDate = true
 		if !appBaselineDescribes(f.State.For(f.Key), target) {
-			f.State.Set(f.Key, baselineFromAppLocal(target, landed))
+			f.State.Set(f.Key, baselineFromAppLocal(f.Codec, target, landed))
 			if err := wfdir.SaveState(f.Root, f.State); err != nil {
 				return result, err
 			}
@@ -562,7 +672,7 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 
 	// 10. The new baseline is what we just pushed: the server now holds exactly
 	// these bytes.
-	f.State.Set(f.Key, baselineFromAppLocal(target, local))
+	f.State.Set(f.Key, baselineFromAppLocal(f.Codec, target, local))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return result, err
 	}
@@ -589,6 +699,63 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 		return result, errAlreadyReported
 	}
 	return result, nil
+}
+
+// appPushNothingLiveHolds is runAppPush's LiveFirst leg, and the data-app twin
+// of pushNothingLiveHolds — whose comment carries the reasoning for both: why
+// it is asked whether or not a draft is open, why no drift guard runs, and what
+// the two anchors record instead. It answers false, touching nothing, for an
+// unbound folder, a parentless draft (the app has never been published, so its
+// draft awaits a publish) and a live app that differs.
+func appPushNothingLiveHolds(ctx context.Context, client *api.Client, f *folder, existing appTarget, local map[string]string, result *appPushResult) (done bool, liveFiles map[string]string, raw []api.DataAppFile, err error) {
+	live := existing.App
+	if live == nil {
+		return false, nil, nil, nil
+	}
+	done, liveFiles, err = nothingLiveHolds(ctx, f, liveDraftKindRow{ID: live.ID, Lifecycle: live.Lifecycle, Title: live.Name},
+		func(ctx context.Context) (map[string]string, error) {
+			files, err := client.ListDataAppFiles(ctx, live.ID)
+			raw = files
+			return appContentByPath(f.Codec, files), err
+		},
+		func(liveFiles map[string]string) bool { return appRowHoldsFolder(f, live, liveFiles, local) },
+		dataAppHeadReader(client))
+	if done {
+		result.UpToDate, result.URL = true, live.URL
+	}
+	return done, liveFiles, raw, err
+}
+
+// appDraftCopiesLive is workflowDraftCopiesLive for a data app: the same files,
+// name and allowlists as the live app the push read.
+func appDraftCopiesLive(live, draft *api.DataApp, liveFiles, draftFiles map[string]string) bool {
+	if live == nil || draft == nil || liveFiles == nil || draftFiles == nil {
+		return false
+	}
+	return filesAgree(liveFiles, draftFiles) && draft.Name == live.Name &&
+		len(diffAccess(live.DataAppAccess, draft.DataAppAccess)) == 0
+}
+
+// appMetaAgrees is the metadata half of appRowHoldsFolder — the title and,
+// for a folder managing them, the allowlists — which the drift guard asks
+// beside the files.
+func appMetaAgrees(f *folder, row *api.DataApp) bool {
+	return (f.Manifest.Title == "" || sameName(f.Manifest.Title, row.Name)) &&
+		(!f.Manifest.ManagesAccess() || len(diffAccess(row.DataAppAccess, f.declaredAccess())) == 0)
+}
+
+// appRowHoldsFolder reports that a push of this folder onto `row` — or onto a
+// fresh checkout of it — would write NOTHING, by runAppPush's own write rule:
+// the files agree (putAppFiles / deleteAppFiles write exactly when they do
+// not), the title agrees as appTitleLeg compares it, and a folder managing
+// `access` declares exactly what the row grants. It is the same pair of tests
+// runAppPush calls metaAgrees.
+//
+// ⚠️ Parity is the whole contract, for the reason workflowRowHoldsFolder gives:
+// anything the push learns to write has to be added here in the same change, or
+// an apply leaves a draft identical to live behind and the next one publishes it.
+func appRowHoldsFolder(f *folder, row *api.DataApp, remote, local map[string]string) bool {
+	return filesAgree(remote, local) && appMetaAgrees(f, row)
 }
 
 // compileMessageOf picks the most useful compile message available: the
@@ -644,14 +811,26 @@ func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, de
 			// allowed_secret_ids on the very first file write, so the grants have to
 			// be on the row before any file reaches it.
 			DataAppAccess: f.declaredAccess(),
+			Managed:       f.managedClaim(""),
 		})
 		if err != nil {
+			if _, adopted, refusal := f.adoptOnAddressClaimed(ctx, "", err); adopted {
+				if refusal != nil {
+					return nil, refusal
+				}
+				return nil, errAdoptedOnCreate
+			}
 			return nil, explainCreateFailure(err, featureID, f)
 		}
 		// Recorded IMMEDIATELY, before any file is written: the app now exists —
 		// live and visible — and a push that died before saving the manifest would
 		// leave an orphan the next push could not find and would create again.
 		f.recordBinding(wfdir.Binding{DataAppID: created.ID, FeatureID: featureID})
+		// The created app holds the declared title, so it is the title this
+		// folder agrees with — recorded in the same write as the binding.
+		if f.Manifest.Title != "" {
+			f.Lock.SetAppliedTitle(f.Stack, created.Name)
+		}
 		// A data app that has just been created has never been committed, and an
 		// unversioned row IS its own head — the convention
 		// api.DataAppHeadVersionID resolves. Recorded in the same write as the
@@ -710,6 +889,34 @@ func explainCreateFailure(err error, featureID string, f *folder) error {
 	return fmt.Errorf("create the data app in feature %s: %w", featureID, err)
 }
 
+// appTitleLeg is the data app's title leg: ronja.json's "title" held to the
+// name rule — see titleLeg.
+//
+// A data-app title used to be patched onto the draft WHENEVER it differed from
+// the manifest, with no drift check at all, so a rename made in the web app was
+// reverted by the next push, silently. The two rows are the live app and the
+// draft the push writes to (what a publish lands); for an app never published
+// they are one row.
+//
+// The head anchor may vouch for the live title here, and only here among the
+// folder kinds: a data app's live row cannot be retitled in place. A rename of
+// a live app through the API, the web app or the agent auto-forks a draft
+// (rdataapp.Update), and reaches the live row only through a commit, which
+// files a version snapshot — so the head moves. The one exception is a row
+// never published: a parentless draft is retitled in place and its head is its
+// own id, so it is never vouched for.
+func appTitleLeg(f *folder, live, target *api.DataApp, head headAgreement, force bool) (bool, error) {
+	if target == nil {
+		return false, nil
+	}
+	var liveRow *titledRow
+	if live != nil {
+		liveRow = &titledRow{ID: live.ID, Title: live.Name}
+	}
+	headVouches := head.Vouches() && live != nil && live.ID != target.ID && live.Lifecycle == api.LifecycleLive
+	return titleLeg(f, "data app", liveRow, titledRow{ID: target.ID, Title: target.Name}, headVouches, force)
+}
+
 // checkAppDrift refuses a push that would overwrite server-side changes made
 // since the last sync.
 //
@@ -737,23 +944,40 @@ func explainCreateFailure(err error, featureID string, f *folder) error {
 // preconditions are one answer. HeadVouched is the one field this path fills
 // that nothing here reads; it is set because the verdict describes what the
 // guard decided, not what today's caller happens to consult.
-func checkAppDrift(f *folder, remote map[string]string, force bool, head headAgreement, targetID string) (driftVerdict, error) {
+//
+// atBaseline and remote are the remote in the baseline's aliases and the
+// folder's current ones — see checkDrift.
+func checkAppDrift(f *folder, remote, atBaseline, local map[string]string, metaAgrees, force bool, head headAgreement, targetID string, ask driftAsk) (driftVerdict, error) {
 	baseline := f.State.For(f.Key)
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
 		remoteHashes[path] = wfdir.HashString(content)
 	}
-	drift := wfdir.DiffHashes(remoteHashes, baseline.Hashes())
+	drift := wfdir.DiffHashes(atBaseline, baseline.Hashes())
+	// Live equals desired is never drift — see live_equals_desired.go.
+	//
+	// Only against a BASELINE: with none, every remote file reads as added, and
+	// excusing them here would walk a fresh checkout past the head anchor on its
+	// files alone. That case has its own leg below, which asks the metadata too.
+	excused := 0
+	if baseline != nil {
+		drift, excused = excuseAgreedFiles(drift, remote, local)
+	}
 	if !drift.Dirty() {
 		// Bypassed still tracks --force here, even though nothing needed
 		// bypassing — see checkDrift's copy of this branch for why a clean
 		// baseline does not make the flag conditional.
-		return driftVerdict{BaselineClean: baseline != nil, Bypassed: force, Preconditions: baseline.Hashes()}, nil
+		return driftVerdict{BaselineClean: baseline != nil && excused == 0, Bypassed: force, Preconditions: baseline.Hashes()}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %d file(s) that changed on the server since your last sync.\n",
 			drift.Total())
 		return driftVerdict{Bypassed: true}, nil
+	}
+	if baseline == nil && metaAgrees && filesAgree(remote, local) {
+		// LIVE EQUALS DESIRED with no baseline: see checkDrift's copy.
+		noteLiveEqualsDesired(targetID)
+		return driftVerdict{HeadVouched: true, Preconditions: remoteHashes}, nil
 	}
 	if baseline == nil {
 		if head.Vouches() {
@@ -766,7 +990,7 @@ func checkAppDrift(f *folder, remote map[string]string, force bool, head headAgr
 		}
 		if head.Moved() {
 			return driftVerdict{}, refuseHeadMoved("data app", f.Binding.DataAppID, head,
-				"`ronja app clone "+f.Binding.DataAppID+"`")
+				"`ronja app clone "+f.Binding.DataAppID+"`", f.pullHint("  "))
 		}
 		// ⚠️ Reachable only for a draft forked from a LIVE app — a parentless
 		// draft vouches (appTarget.AnchoredDraft) — which is what makes
@@ -777,11 +1001,11 @@ func checkAppDrift(f *folder, remote map[string]string, force bool, head headAgr
 			return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and you already have a draft of %s open there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  Run `ronja app discard` to throw the draft away and push onto the live version, or push --force to overwrite it",
 				f.Resolved.URL, f.Binding.DataAppID, wfdir.LockName)
 		}
-		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the data app already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the app into a fresh folder to get one, or push --force to overwrite the remote files with what you have here",
-			f.Resolved.URL, len(remote))
+		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the data app already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the app into a fresh folder to get one, or push --force to overwrite the remote files with what you have here%s",
+			f.Resolved.URL, len(remote), f.pullHint("  "))
 	}
-	return driftVerdict{}, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja app status` to see the detail, or push --force to overwrite",
-		driftSummary(drift, nil))
+	ask.rebound = f.reboundUnrecorded(drift, remote, local)
+	return driftVerdict{}, baselineDriftRefusal(f, ask, driftSummary(drift, nil))
 }
 
 // putAppFiles writes the folder's files into the target row.
@@ -1074,7 +1298,7 @@ func appBaselineDescribes(baseline *wfdir.InstanceState, row *api.DataApp) bool 
 // has already failed and a second failure must not replace the first in the
 // report.
 func saveAppBaseline(f *folder, source *api.DataApp, files map[string]string) {
-	f.State.Set(f.Key, baselineFromAppLocal(source, files))
+	f.State.Set(f.Key, baselineFromAppLocal(f.Codec, source, files))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
 	}
@@ -1105,6 +1329,9 @@ func printAppPushReport(r *appPushResult) {
 
 	if r.Created {
 		fmt.Fprintf(out, "  Created data app %s (an unpublished draft — nobody else can see it yet)\n", r.DataAppID)
+	}
+	if r.Rename != nil {
+		fmt.Fprintf(out, "    title    %q → %q (the live app takes it at publish)\n", r.Rename.From, r.Rename.To)
 	}
 	for _, c := range r.AccessChanges {
 		for _, id := range c.Added {

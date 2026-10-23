@@ -83,6 +83,9 @@ type ValidateInput struct {
 	// the create will be made on, or it rehearses a different save (see
 	// createRuntimeFor in internal/commands).
 	RuntimeVersion int `json:"runtimeVersion,omitempty"`
+	// Language is sent only for a js candidate, so a python request's bytes stay
+	// what every instance has always read.
+	Language string `json:"language,omitempty"`
 }
 
 // ValidateFinding mirrors rworkflow.ValidateFinding: one problem, attributed to
@@ -116,12 +119,67 @@ type ValidateBindings struct {
 	QuerySecretIDs []string `json:"querySecretIDs"`
 	AgentIDs       []string `json:"agentIDs"`
 	CodexIDs       []string `json:"codexIDs"`
+	// WorkflowIDs is every saved workflow the posted code would RUN
+	// (`{{ workflow() }}`), resolved with the caller's bind-time reach
+	// (rworkflow.ValidateBindings.WorkflowIDs). With AgentIDs it is the run
+	// edges the write gate checks: the server's own resolution, so
+	// the CLI keeps no scanner of its own for what a workflow runs.
+	WorkflowIDs []string `json:"workflowIDs"`
 }
 
 // ValidateResult mirrors rworkflow.ValidateResult.
 type ValidateResult struct {
 	Findings []ValidateFinding `json:"findings"`
 	Resolved ValidateBindings  `json:"resolved"`
+	// WriteTargets is every write position in the POSTED files, located and
+	// resolved (rworkflow.ValidateWriteTarget,
+	// backend/resource/rworkflow/validate_write_targets.go). The server
+	// always sends the key — `[]` for a candidate that writes nothing — so a
+	// NIL slice here is an instance too old to report write targets at all,
+	// which the write gate must not read as "writes nothing".
+	WriteTargets []ValidateWriteTarget `json:"writeTargets"`
+}
+
+// The write positions and target kinds of a ValidateWriteTarget, spelled as
+// the server spells them (validate_write_targets.go:18-46): values may be
+// added server-side, never renamed.
+const (
+	WritePositionMarker        = "write_marker"
+	WritePositionOutputLiteral = "output_literal"
+	WritePositionCodexMarker   = "codex_marker"
+	WritePositionFileMarker    = "file_marker"
+	WritePositionFolderLiteral = "folder_literal"
+
+	WriteTargetTable  = "table"
+	WriteTargetCodex  = "codex"
+	WriteTargetFolder = "folder"
+)
+
+// ValidateWriteTarget is one place the posted code WRITES: a table (a
+// `{{ write() }}` marker or a tools.replaceTable-style output literal), a codex
+// it binds (a run may upsert and delete in it), or a folder write scope.
+//
+// Readable is the caller's BIND reach; an unreadable table or codex keeps its
+// position and id and nothing else, and a folder is never readable — it is a
+// path, owned by no feature. TargetFeatureID, TargetName, TargetTableKind,
+// OwnerWorkflowID and LogicalName are set only when Readable.
+type ValidateWriteTarget struct {
+	Position        string `json:"position"`
+	TargetKind      string `json:"targetKind"`
+	Direction       string `json:"direction"`
+	Path            string `json:"path"`
+	Line            int    `json:"line"`
+	Call            string `json:"call,omitempty"`
+	Arg             string `json:"arg"`
+	TargetID        string `json:"targetID,omitempty"`
+	TargetPath      string `json:"targetPath,omitempty"`
+	NameForm        bool   `json:"nameForm,omitempty"`
+	Readable        bool   `json:"readable"`
+	TargetFeatureID string `json:"targetFeatureID,omitempty"`
+	TargetName      string `json:"targetName,omitempty"`
+	TargetTableKind string `json:"targetTableKind,omitempty"`
+	OwnerWorkflowID string `json:"ownerWorkflowID,omitempty"`
+	LogicalName     string `json:"logicalName,omitempty"`
 }
 
 // Errors returns the blocking findings, in the order the server reported them.
@@ -191,6 +249,13 @@ type CreateWorkflowInput struct {
 	// which is exactly what an unmanaged folder wants. A folder declaring the
 	// reset value sends the literal "UTC" instead — see effectiveDeclaredZone.
 	ReportingTimezone string `json:"reportingTimezone,omitempty"`
+	// Managed is the repository address this create claims, in the create's own
+	// transaction (backend resource/rmanaged). Nil — no key — for a folder that
+	// has no folder id, which is every create a legacy folder makes.
+	Managed *ManagedClaimInput `json:"managed,omitempty"`
+	// Language is fixed at create and sent only for js: an absent key is python
+	// on every instance, including one that predates the field.
+	Language string `json:"language,omitempty"`
 }
 
 // WorkflowPatch is the body of PUT /workflow/:id, mirroring the subset of

@@ -287,6 +287,13 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	if err := warnIfAppDirty(f); err != nil {
 		return err
 	}
+	// The WRITE GATE over the access of the row about to be rendered: a render
+	// runs with the row's grants, and with --steps its clicks write for real,
+	// so — as `wf test` is gated on the draft it runs — a codex the access
+	// grants outside the stack's feature is refused before anything renders.
+	if err := gateAppAccess(ctx, client, f, target.FilesRow().DataAppAccess); err != nil {
+		return err
+	}
 
 	req := api.PreviewRequest{
 		Route:          opts.Route,

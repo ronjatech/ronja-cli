@@ -24,10 +24,14 @@ import (
 // you" and never says which — least of all now that a current backend answers a
 // lookup miss with the same 404 the no-enumeration refusal uses.
 
-// Agent is the sliver of a saved Agent the edge verifier reads.
+// Agent is the sliver of a saved Agent the edge verifier and the write gate
+// read. FeatureID is the feature the Agent belongs to — what decides whether a
+// run edge to it stays inside a stack's feature; empty for one that
+// belongs to none.
 type Agent struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	FeatureID string `json:"featureID"`
 }
 
 // GetAgent reads one saved Agent. Scope: agents:read.
@@ -93,6 +97,23 @@ type Note struct {
 func (c *Client) GetNote(ctx context.Context, id string) (*Note, error) {
 	var out Note
 	if err := c.Do(ctx, "GET", "note/"+url.PathEscape(id), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// MCPServer is the sliver of an MCP server the edge verifier reads. Like Secret
+// it carries no credential: the server's secret is a separate row.
+type MCPServer struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// GetMCPServer reads one MCP server. Scope: agents:read (the /mcpserver group's
+// declared scope). Failure shapes collapse as GetAgent's do.
+func (c *Client) GetMCPServer(ctx context.Context, id string) (*MCPServer, error) {
+	var out MCPServer
+	if err := c.Do(ctx, "GET", "mcpserver/"+url.PathEscape(id), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

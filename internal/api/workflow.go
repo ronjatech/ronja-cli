@@ -56,6 +56,9 @@ type Workflow struct {
 	Entrypoint  string `json:"entrypoint"`
 	// Kind is the output-channel discriminator: unspecified|function|report|pipeline.
 	Kind string `json:"kind"`
+	// Language is "python" or "js", fixed at create. EMPTY is an instance that
+	// predates the column, and means python.
+	Language string `json:"language"`
 	// RuntimeVersion is the semantics generation the code is written against: 1
 	// (the standard runtime, retired), 2 (durable — steps are journaled, so a
 	// failed run can be resumed; retired) or 3 (durable, reading tables only
@@ -161,6 +164,11 @@ type Workflow struct {
 	// rows the server refuses to link, so read it off the response you have
 	// rather than assuming every Workflow value carries one.
 	URL string `json:"url,omitempty"`
+	// ManagedBy names the repository folder that deploys this workflow, when one
+	// does (backend/api/v2/workflow/view.go). Only the
+	// single-row GET carries it; nil on every other route, on a row no
+	// repository manages, and on an instance older than the field.
+	ManagedBy *ManagedBy `json:"managedBy,omitempty"`
 }
 
 // WorkflowParameter mirrors rdb.WorkflowParameter. OptionsQuery is SQL carrying

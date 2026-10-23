@@ -87,6 +87,7 @@ production without either overwriting the other's binding.`,
 	pl.AddCommand(
 		newPipelineInitCmd(), newPipelineCloneCmd(), newPipelineStatusCmd(),
 		newPipelinePushCmd(), newPipelinePublishCmd(), newPipelineDiscardCmd(),
+		newPullCmd(wfdir.PipelineKind),
 	)
 	addStackFlag(pl)
 	return pl
@@ -610,6 +611,146 @@ func (h liveHashes) dropChecksSeen(path string) {
 	if h.inst != nil {
 		delete(h.inst.Checks, path)
 	}
+}
+
+// tableName and setTableName are the NAME leg's recording — the name this folder
+// last agreed the live table held — on the same lock/baseline fork as the SQL
+// fingerprint, with the same nil-inst answer: nothing recorded, which the name
+// rule reads as "the stem".
+func (h liveHashes) tableName(path string) string {
+	if h.stack != "" {
+		return h.lock.TableName(h.stack, path)
+	}
+	return h.inst.TableStateFor(path).Name
+}
+
+func (h liveHashes) setTableName(path, tableID, name string) {
+	if h.stack != "" {
+		h.lock.SetTableName(h.stack, path, tableID, name)
+		return
+	}
+	if h.inst == nil {
+		return
+	}
+	mutateTable(h.inst, path, func(s *wfdir.TableState) {
+		s.TableID = tableID
+		s.Name = name
+	})
+}
+
+// carriedTableStem and setTableStem are the STEM a `moved` entry carried with a
+// table (see wfdir.LockTable.Stem), on the same lock/baseline fork as its name:
+// empty when the row has none, and the file's own stem is the baseline then.
+func (h liveHashes) carriedTableStem(path string) string {
+	if h.stack != "" {
+		return h.lock.TableStem(h.stack, path)
+	}
+	return h.inst.TableStateFor(path).Stem
+}
+
+func (h liveHashes) setTableStem(path, tableID, stem string) {
+	if h.stack != "" {
+		h.lock.SetTableStem(h.stack, path, tableID, stem)
+		return
+	}
+	if h.inst == nil {
+		return
+	}
+	mutateTable(h.inst, path, func(s *wfdir.TableState) {
+		s.TableID = tableID
+		s.Stem = stem
+	})
+}
+
+// metricName and setMetricName are the same pair for a metric file, keyed by the
+// row the caller is acting on: a name recorded against another row is no answer.
+func (h liveHashes) metricName(path, metricID string) string {
+	var recorded, name string
+	switch {
+	case h.stack != "":
+		recorded, name = h.lock.MetricName(h.stack, path)
+	case h.inst == nil:
+		return ""
+	default:
+		entry := h.inst.Metrics[path]
+		recorded, name = entry.MetricID, entry.Name
+	}
+	if metricID == "" || recorded != metricID {
+		return ""
+	}
+	return name
+}
+
+func (h liveHashes) setMetricName(path, metricID, name string) {
+	if h.stack != "" {
+		h.lock.SetMetricName(h.stack, path, metricID, name)
+		return
+	}
+	h.editLegacyMetric(path, metricID, func(entry *wfdir.MetricState) { entry.Name = name })
+}
+
+// carriedMetricStem and setMetricStem are the same pair for a metric file, keyed
+// by the row like metricName: a stem carried for another row is no answer.
+func (h liveHashes) carriedMetricStem(path, metricID string) string {
+	var recorded, stem string
+	switch {
+	case h.stack != "":
+		recorded, stem = h.lock.MetricStem(h.stack, path)
+	case h.inst == nil:
+		return ""
+	default:
+		entry := h.inst.Metrics[path]
+		recorded, stem = entry.MetricID, entry.Stem
+	}
+	if metricID == "" || recorded != metricID {
+		return ""
+	}
+	return stem
+}
+
+func (h liveHashes) setMetricStem(path, metricID, stem string) {
+	if h.stack != "" {
+		h.lock.SetMetricStem(h.stack, path, metricID, stem)
+		return
+	}
+	h.editLegacyMetric(path, metricID, func(entry *wfdir.MetricState) { entry.Stem = stem })
+}
+
+// stagedName and recordStagedName are the name this checkout STAGED on its own
+// open draft of a table or a metric — local-only on every folder, for the
+// reason wfdir.InstanceState.StagedNames states. The read is keyed by the draft
+// the caller is looking at and answers NOTHING for a name staged on another
+// one: a draft that was committed, discarded or replaced since is a different
+// row, and a name staged there says nothing about this one.
+func (h liveHashes) stagedName(path, draftID string) string {
+	if h.inst == nil || draftID == "" {
+		return ""
+	}
+	staged := h.inst.StagedNames[path]
+	if staged.DraftID != draftID {
+		return ""
+	}
+	return staged.Name
+}
+
+func (h liveHashes) recordStagedName(path, draftID, name string) {
+	if h.inst == nil || draftID == "" {
+		return
+	}
+	if h.inst.StagedNames == nil {
+		h.inst.StagedNames = map[string]wfdir.StagedName{}
+	}
+	h.inst.StagedNames[path] = wfdir.StagedName{DraftID: draftID, Name: strings.TrimSpace(name)}
+}
+
+// draftNameIsOurs is the DRAFT leg of the name rule, in the one place both the
+// table and the metric push read it from: a draft name that is the declared
+// one, the live one it forked with, the baseline, or the name this checkout
+// itself staged on THIS draft is the folder's own. Anything else was put there
+// by somebody else — chat or the web builder — and a publish would land it.
+func draftNameIsOurs(draftName, declared, liveName string, base nameBaseline, staged string) bool {
+	return sameName(draftName, declared) || sameName(draftName, liveName) || base.matches(draftName) ||
+		(staged != "" && sameName(draftName, staged))
 }
 
 func (h liveHashes) set(path, tableID, liveCode string) {

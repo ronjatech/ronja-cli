@@ -91,6 +91,11 @@ func (b BytesBody) Open() (io.ReadCloser, error) {
 // rides on Body.Close, not on this function's return. Zero or less means no
 // client-side deadline at all, which the command surfaces as `--timeout 0`.
 func (c *Client) DoRaw(ctx context.Context, method, path string, header http.Header, body BodySource, timeout time.Duration) (*RawResponse, error) {
+	// A guarded context's write is refused here, before a request exists, as
+	// Do refuses it: this is the one other way out of the process.
+	if err := checkGuardRaw(ctx, method, path); err != nil {
+		return nil, err
+	}
 	// NOT deferred: the deadline has to outlive this function, because the
 	// caller is about to stream a body that is still in flight. Cancelling on
 	// return would truncate every response larger than one buffer. The

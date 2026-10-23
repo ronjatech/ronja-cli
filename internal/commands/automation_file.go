@@ -55,11 +55,16 @@ import (
 // which is the same bug this model exists to remove, one object deeper. See
 // automationActionConfigFile.
 //
-// ⚠️ The NAME is not here. It is the filename's stem (automationNameFor), so
-// renaming the automation is renaming the file — and a `name` key is refused
-// rather than ignored, because two sources for one value is a value nobody can
-// predict.
+// The NAME is optional, and the two states are different instructions. ABSENT,
+// the automation is created under the filename's stem (automationNameFor) and
+// its name is never written again — a rename in the web app stands. PRESENT,
+// the name is MANAGED: a push renames the SAME automation to it, in place, on
+// the three-arm rule in name_attr.go, with the filename as the baseline when the
+// lock records none (that is what every push before the key existed wrote). The
+// file's PATH stays its identity either way, so renaming the file is still an
+// orphan plus a create.
 type automationFile struct {
+	Name        *string `json:"name,omitempty"`
 	Description *string `json:"description,omitempty"`
 	// Prompt is the INLINE AGENT action's instructions. A saved-agent action's
 	// per-run seed message is action.config.prompt, which is a different field
@@ -199,7 +204,6 @@ func strOrCarried(declared *string, carried string) string {
 // them is a key somebody writes ON PURPOSE — three of them are what a GET
 // response actually contains, so "unknown field" would read as a bug in the CLI.
 var automationRefusedKeys = map[string]string{
-	"name":                  "the automation's name is the FILE's name — rename the file",
 	"id":                    "the row's id is recorded per stack in " + wfdir.LockName + ", not in the file",
 	"featureID":             "the feature is the stack's, in " + wfdir.ManifestName,
 	"private":               "visibility is fixed when an automation is created and the update route refuses a change; a shared folder declaring it would also hide the row from the next colleague who pushes, whose push then creates a duplicate",
@@ -256,6 +260,13 @@ func parseAutomationFile(path, body string) (*automationFile, error) {
 	var file automationFile
 	if err := dec.Decode(&file); err != nil {
 		return nil, fmt.Errorf("this file is not a valid automation declaration: %w", err)
+	}
+	if file.Name != nil {
+		trimmed := strings.TrimSpace(*file.Name)
+		if trimmed == "" {
+			return nil, fmt.Errorf("\"name\" is empty — an automation cannot be renamed to nothing; remove the key to leave its name alone, or write the name it should have")
+		}
+		file.Name = &trimmed
 	}
 	if err := checkAutomationVocabulary(&file); err != nil {
 		return nil, err
@@ -623,22 +634,29 @@ func validAutomationAction(kind string) bool {
 // The one that catches people: a table is `model` here and `table` in
 // ronja.json, because the server's reference kinds mirror models_v2's own name.
 //
-// An empty value means the kind has NO alias vocabulary — `dataapp`,
-// `mcpserver` and `feature` are reference kinds the alias layer cannot express,
-// so a folder could only name one by committing a raw id. resolveAutomationRefs
-// REFUSES those rather than committing one silently: an id belongs to exactly
-// one organization, and a folder carrying one deploys green to the second stack
-// and grants an id nobody there has.
+// Every kind the server accepts has an alias kind. `dataapp`, `mcpserver` and
+// `feature` were the last three; before they had one, a folder could name such a
+// reference only by committing a raw id, and the resolver refused that rather
+// than deploy one organization's id to the next. A `feature` reference to the
+// automation's OWN feature is spelled `"@feature"` (featureSelfRef), which the
+// CLI resolves to the stack's feature before sending — the one reference whose
+// right answer is a property of the stack rather than a row anybody binds.
 var automationReferenceKinds = map[string]string{
 	"model":     markers.KindTable,
 	"workflow":  markers.KindWorkflow,
 	"note":      markers.KindNote,
 	"secret":    markers.KindSecret,
 	"mailbox":   markers.KindMailbox,
-	"dataapp":   "",
-	"mcpserver": "",
-	"feature":   "",
+	"dataapp":   markers.KindDataApp,
+	"mcpserver": markers.KindMCPServer,
+	"feature":   markers.KindFeature,
 }
+
+// featureSelfRef is the value of a `feature` reference that names the
+// automation's own feature: whichever feature the selected stack deploys to.
+// The `@` cannot start an alias (wfdir.ValidAliasName), so the token can never
+// collide with a declared name.
+const featureSelfRef = "@feature"
 
 // sortedKeys orders any string-keyed map, so a report built from one reads the
 // same way twice. Generic rather than one helper per value type: its callers
@@ -742,10 +760,20 @@ func (a *automationFile) refFields() []automationRefField {
 //     as a resource id, resolves to nothing, and fails at the first run; and for
 //     a kind the alias layer has no word for, the only way to make the push
 //     succeed would be committing one organization's id into a shared folder.
-func resolveAutomationRefs(file *automationFile, codec aliasCodec, stack string) error {
+func resolveAutomationRefs(file *automationFile, codec aliasCodec, stack, featureID string) error {
 	var refusals []string
 	for _, field := range file.refFields() {
 		switch {
+		case field.Kind == markers.KindFeature && field.Value == featureSelfRef:
+			// The stack's own feature, which is what the automation is created
+			// in — so the reference follows the deployment wherever it goes.
+			if featureID == "" {
+				refusals = append(refusals, fmt.Sprintf(
+					"%s: %q names the feature %s deploys to, and it names none yet — add its featureID to %s",
+					field.Where, featureSelfRef, describeStackFor(stack), wfdir.ManifestName))
+				continue
+			}
+			field.set(featureID)
 		case field.Kind == "":
 			refusals = append(refusals, fmt.Sprintf(
 				"%s: this reference kind has no alias, so the only way to name it here is one organization's raw id — which deploys green to a second stack and grants an id nobody there has. Manage this automation in the web app until the alias layer covers it",
@@ -929,18 +957,20 @@ func automationCreateInput(featureID, name string, file *automationFile) api.Cre
 // in its order, and the server is free to return one in whatever order it stored
 // it — so an ordered comparison would report permanent drift on a folder whose
 // declaration is already correct, with nothing the author could edit to fix it.
-func automationDelta(name string, file *automationFile, row *api.Automation) ([]string, api.AutomationPatch) {
+func automationDelta(file *automationFile, row *api.Automation) ([]string, api.AutomationPatch) {
 	var changed []string
 	var patch api.AutomationPatch
 	mark := func(field string) { changed = append(changed, field) }
 
-	// The name is ALWAYS declared — it is the filename — so a renamed file is a
-	// renamed automation. (It is also a new binding key, which is why a rename
-	// shows up as an orphan plus a create rather than a rename; see
-	// automationOrphans.)
-	if name != row.Name {
+	// The name, ONLY when the file declares one. An undeclared name is stamped
+	// at create and unmanaged afterwards — it used to be the filename and was
+	// re-patched on every push, which reverted every rename made in the web app.
+	// Whether a declared one may be WRITTEN is the name rule's question
+	// (pushOneAutomation asks it first); this only says whether it differs.
+	if file.Name != nil && !sameName(*file.Name, row.Name) {
 		mark("name")
-		patch.Name = &name
+		value := *file.Name
+		patch.Name = &value
 	}
 	diffString := func(field string, declared *string, current string, into **string) {
 		if declared == nil || *declared == current {

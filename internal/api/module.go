@@ -51,6 +51,10 @@ type Module struct {
 	// brand-new module nobody has published yet). Non-empty on an edit draft
 	// and on a committed version snapshot.
 	ParentModuleID string `json:"parentModuleID"`
+	// CommittedAt is when a version snapshot was committed; nil on every other
+	// row. Read by `module pull` off the OLDEST version, to tell a local
+	// baseline taken before the module was first versioned from one taken after.
+	CommittedAt *time.Time `json:"committedAt"`
 	// BaseVersionID is the committed version a DRAFT was forked from. Empty on
 	// every row that is not an open draft, and on a draft of a module that has
 	// never been versioned — so empty means "no anchor" rather than "no such
@@ -74,6 +78,11 @@ type Module struct {
 
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// ManagedBy names the repository folder that deploys this module, when one
+	// does (backend/api/v2/module/handler.go). Only the
+	// single-row GET carries it; nil on every other route, on a row no
+	// repository manages, and on an instance older than the field.
+	ManagedBy *ManagedBy `json:"managedBy,omitempty"`
 }
 
 // ModuleFile mirrors rdb.CodeModuleFile — one source file of one module row.

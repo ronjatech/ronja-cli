@@ -1,11 +1,13 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
 )
@@ -105,97 +107,16 @@ back into.`,
 				}
 			}
 
-			files, err := client.ListModuleFiles(cmd.Context(), source.ID)
-			if err != nil {
-				return fmt.Errorf("read files of module %s: %w", source.ID, err)
-			}
-			// Checked BEFORE anything is created, and fatal rather than per-file:
-			// the baseline written below claims every one of these paths is on
-			// disk, and a set that cannot all be written produces a folder whose
-			// baseline lies from birth — status invents deletions and a push acts
-			// on them. See wfdir.CheckLocalPaths.
-			//
-			// It also enforces the .py rule from the OTHER side: a module folder
-			// syncs .py and ignores everything else, so a non-.py file the server
-			// somehow holds would be written once and then invisible to every
-			// walk. Today the server refuses to store one, which makes this a
-			// guard rather than a case anyone hits — and exactly the kind of
-			// guard whose absence is discovered by losing somebody's file.
-			if err := wfdir.CheckLocalPaths(modulePathsOf(files), wfdir.ModuleKind); err != nil {
-				return err
-			}
-
-			if err := os.MkdirAll(root, 0o755); err != nil {
-				return fmt.Errorf("create %s: %w", root, err)
-			}
-			for _, f := range files {
-				// Validated once more inside WriteFile: the path arrives from the
-				// server, and writing it is a local filesystem operation that must
-				// not be able to escape the folder.
-				if err := wfdir.WriteFile(root, f.Path, f.Content); err != nil {
-					return fmt.Errorf("write %s: %w", f.Path, err)
-				}
-			}
-
-			// The binding is keyed by organization as well as instance, so it has
-			// to be known before one is written. Resolved here rather than up
-			// front so the cheap refusals above still cost no round trip.
-			if err := ensureTenant(cmd.Context(), resolved); err != nil {
-				return err
-			}
-			key := wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID}
-			manifest := &wfdir.Manifest{
-				Kind:  wfdir.KindModule,
-				Name:  source.Name,
-				Title: source.Title,
-			}
-			// The STABLE identity, not source.ID: when the files came from a
-			// draft, the draft's id dies at commit while the binding lives in the
-			// customer's git.
-			lock, err := recordFirstBinding(manifest, key,
-				wfdir.Binding{ModuleID: mod.IdentityID(), FeatureID: source.FeatureID})
+			files, err := writeModuleClone(cmd.Context(), client, resolved, mod, source, root, cloneHooks{})
 			if err != nil {
 				return err
 			}
-			// The committed anchor: which live version this folder's content
-			// descends from. A clone is the cleanest moment there is to record
-			// one, and recording it here is what lets a CI checkout of the result
-			// push without --force.
-			//
-			// ⚠️ Read off the SOURCE, not off the current head, and the two are
-			// not the same when the files came from a draft: a draft forked before
-			// somebody else published sits on an OLDER version, and a folder that
-			// recorded the newer one would claim to have seen a publish whose
-			// changes it does not contain — after which the first baseline-less
-			// push would quietly overwrite it.
-			//
-			// cloneAnchor, not dataAppCloneAnchor: rmodule stamps base_version_id
-			// the way rworkflow does (the head VERSION row's id, falling back to
-			// the parent's own id for an unversioned module), so the workflow
-			// function's three cases are literally this primitive's three cases.
-			// The rdataapp divergence that forced a second function — a base that
-			// holds the LIVE APP'S id for every draft — does not exist here.
-			if flagStack != "" {
-				anchor, err := cloneAnchor(cmd.Context(), moduleHeadReader(client),
-					mod.IdentityID(), source.ID, source.BaseVersionID)
-				if err != nil {
-					return err
-				}
-				lock.SetHeadVersion(flagStack, anchor)
-			}
-			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
-				return err
-			}
-			state := &wfdir.State{}
-			// The baseline records the row the files actually came from, which may
-			// be the draft even though the binding names the live module.
-			state.Set(key, moduleBaselineFrom(source, files))
-			if err := wfdir.SaveState(root, state); err != nil {
-				return err
-			}
+			notices := appendManagedNotice(nil,
+				noticeManagedBy(nil, wfdir.ModuleKind, wfdir.ManagedModule, mod.IdentityID(), mod.ManagedBy, noticeForClone))
+			printManagedNotices(notices)
 
 			if flagJSON {
-				return emitJSON(map[string]any{
+				return emitJSON(withManagedInGit(map[string]any{
 					"root":            root,
 					"url":             resolved.URL,
 					"moduleID":        mod.IdentityID(),
@@ -209,7 +130,7 @@ back into.`,
 					// No skipped count: a clone that could not write every file
 					// fails, so this is always the whole set.
 					"files": len(files),
-				})
+				}, notices))
 			}
 			printModuleCloneReport(root, resolved.URL, mod, source, len(files))
 			return nil
@@ -231,4 +152,103 @@ func printModuleCloneReport(root, url string, mod, source *api.Module, written i
 	fmt.Fprintf(out, "  Files:    %d\n", written)
 	fmt.Fprintf(out, "  Instance: %s\n", url)
 	fmt.Fprintf(out, "\n  Next: cd %s && ronja module status\n", filepath.Base(root))
+}
+
+// writeModuleClone lays a module down in root — files, ronja.json, the lock
+// with its head-version anchor and the local baseline. Shared by `module clone`
+// and `import feature` (cloneHooks; a module's files are marker-free, so only
+// the folder id and the stack apply).
+func writeModuleClone(ctx context.Context, client *api.Client, resolved *config.Resolved, mod, source *api.Module, root string, hooks cloneHooks) ([]api.ModuleFile, error) {
+	files, err := client.ListModuleFiles(ctx, source.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read files of module %s: %w", source.ID, err)
+	}
+	// Checked BEFORE anything is created, and fatal rather than per-file:
+	// the baseline written below claims every one of these paths is on
+	// disk, and a set that cannot all be written produces a folder whose
+	// baseline lies from birth — status invents deletions and a push acts
+	// on them. See wfdir.CheckLocalPaths.
+	//
+	// It also enforces the .py rule from the OTHER side: a module folder
+	// syncs .py and ignores everything else, so a non-.py file the server
+	// somehow holds would be written once and then invisible to every
+	// walk. Today the server refuses to store one, which makes this a
+	// guard rather than a case anyone hits — and exactly the kind of
+	// guard whose absence is discovered by losing somebody's file.
+	if err := wfdir.CheckLocalPaths(modulePathsOf(files), wfdir.ModuleKind); err != nil {
+		return nil, err
+	}
+
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, fmt.Errorf("create %s: %w", root, err)
+	}
+	for _, f := range files {
+		// Validated once more inside WriteFile: the path arrives from the
+		// server, and writing it is a local filesystem operation that must
+		// not be able to escape the folder.
+		if err := wfdir.WriteFile(root, f.Path, f.Content); err != nil {
+			return nil, fmt.Errorf("write %s: %w", f.Path, err)
+		}
+	}
+
+	// The binding is keyed by organization as well as instance, so it has
+	// to be known before one is written. Resolved here rather than up
+	// front so the cheap refusals above still cost no round trip.
+	if err := ensureTenant(ctx, resolved); err != nil {
+		return nil, err
+	}
+	key := wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID}
+	manifest := &wfdir.Manifest{
+		Kind:  wfdir.KindModule,
+		Name:  source.Name,
+		Title: source.Title,
+	}
+	// The STABLE identity, not source.ID: when the files came from a
+	// draft, the draft's id dies at commit while the binding lives in the
+	// customer's git.
+	lock, err := recordFirstBinding(manifest, key,
+		wfdir.Binding{ModuleID: mod.IdentityID(), FeatureID: source.FeatureID})
+	if err != nil {
+		return nil, err
+	}
+	// The committed anchor: which live version this folder's content
+	// descends from. A clone is the cleanest moment there is to record
+	// one, and recording it here is what lets a CI checkout of the result
+	// push without --force.
+	//
+	// ⚠️ Read off the SOURCE, not off the current head, and the two are
+	// not the same when the files came from a draft: a draft forked before
+	// somebody else published sits on an OLDER version, and a folder that
+	// recorded the newer one would claim to have seen a publish whose
+	// changes it does not contain — after which the first baseline-less
+	// push would quietly overwrite it.
+	//
+	// cloneAnchor, not dataAppCloneAnchor: rmodule stamps base_version_id
+	// the way rworkflow does (the head VERSION row's id, falling back to
+	// the parent's own id for an unversioned module), so the workflow
+	// function's three cases are literally this primitive's three cases.
+	// The rdataapp divergence that forced a second function — a base that
+	// holds the LIVE APP'S id for every draft — does not exist here.
+	if flagStack != "" {
+		anchor, err := cloneAnchor(ctx, moduleHeadReader(client),
+			mod.IdentityID(), source.ID, source.BaseVersionID)
+		if err != nil {
+			return nil, err
+		}
+		lock.SetHeadVersion(flagStack, anchor)
+	}
+	hooks.finishManifest(manifest)
+	hooks.appliedTitle(lock, source.Title)
+	if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
+		return nil, err
+	}
+	state := &wfdir.State{}
+	// The baseline records the row the files actually came from, which may
+	// be the draft even though the binding names the live module.
+	state.Set(key, moduleBaselineFrom(source, files))
+	if err := wfdir.SaveState(root, state); err != nil {
+		return nil, err
+	}
+
+	return files, nil
 }

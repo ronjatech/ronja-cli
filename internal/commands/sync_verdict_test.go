@@ -355,7 +355,7 @@ func TestSyncFileDriftVerdict(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := verdictOfWorkflowStatus(&statusReport{Remote: tc.remote, Baseline: tc.baseline}, tc.localFiles)
+			got := verdictOfWorkflowStatus(&statusReport{Remote: tc.remote, Baseline: tc.baseline}, tc.localFiles, "")
 			if got.Verdict != tc.want {
 				t.Fatalf("verdict = %q, want %q (detail: %s)", got.Verdict, tc.want, got.Detail)
 			}
@@ -370,13 +370,24 @@ func TestSyncAppVerdictReadsItsOwnReport(t *testing.T) {
 	drifted := verdictOfAppStatus(&appStatusReport{
 		Baseline: &baselineReport{SourceID: "app-1"},
 		Remote:   &appRemoteReport{Checked: true, Drift: &wfdir.Diff{Modified: []string{"App.tsx"}}},
-	}, 1)
+	}, 1, "")
 	if drifted.Verdict != verdictDrifted {
 		t.Errorf("verdict = %q, want %q", drifted.Verdict, verdictDrifted)
 	}
+	if strings.Contains(drifted.Detail, "pull") {
+		t.Errorf("a classic folder's drift names a pull it does not have: %q", drifted.Detail)
+	}
+	// An adopted folder's drift names the command that takes it in.
+	adopted := verdictOfAppStatus(&appStatusReport{
+		Baseline: &baselineReport{SourceID: "app-1"},
+		Remote:   &appRemoteReport{Checked: true, Drift: &wfdir.Diff{Modified: []string{"App.tsx"}}},
+	}, 1, "ronja app pull")
+	if want := "1 thing changed on the server since the last sync (App.tsx) — `ronja app pull` takes it into this folder"; adopted.Detail != want {
+		t.Errorf("detail = %q, want %q", adopted.Detail, want)
+	}
 	noBaseline := verdictOfAppStatus(&appStatusReport{
 		Remote: &appRemoteReport{Checked: true, Drift: &wfdir.Diff{Added: []string{"App.tsx"}}},
-	}, 1)
+	}, 1, "")
 	if noBaseline.Verdict != verdictUnknown {
 		t.Errorf("no-baseline verdict = %q, want %q", noBaseline.Verdict, verdictUnknown)
 	}
@@ -384,7 +395,7 @@ func TestSyncAppVerdictReadsItsOwnReport(t *testing.T) {
 	// nothing here to deploy.
 	nothingYet := verdictOfAppStatus(&appStatusReport{
 		Remote: &appRemoteReport{NotCheckedReason: reasonNoAppYet},
-	}, 0)
+	}, 0, "")
 	if nothingYet.Verdict != verdictClean {
 		t.Errorf("nothing-yet verdict = %q, want %q", nothingYet.Verdict, verdictClean)
 	}
@@ -392,7 +403,7 @@ func TestSyncAppVerdictReadsItsOwnReport(t *testing.T) {
 	// deployed, reported as a healthy folder. That was the false green.
 	neverDeployed := verdictOfAppStatus(&appStatusReport{
 		Remote: &appRemoteReport{NotCheckedReason: reasonNoAppYet},
-	}, 1)
+	}, 1, "")
 	if neverDeployed.Verdict != verdictDrifted {
 		t.Errorf("never-deployed verdict = %q, want %q", neverDeployed.Verdict, verdictDrifted)
 	}

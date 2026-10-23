@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +43,10 @@ type moduleFake struct {
 	files    map[string][]api.ModuleFile
 	draftOf  map[string]string       // live module id -> its ONE open draft
 	versions map[string][]api.Module // parent id -> committed versions, NEWEST FIRST
+	// versionFiles is the file set of a version no row stands for — one a
+	// test's own versions list names (snapshotHead). A committed version is a
+	// row, and answers from files.
+	versionFiles map[string][]api.ModuleFile
 
 	// created records every POST /module body.
 	created []api.CreateModuleInput
@@ -73,6 +78,17 @@ type moduleFake struct {
 	// sharedFeature makes a create land as a PROPOSAL in an organization-scoped
 	// feature. A private create lands LIVE — see serveModule's create branch.
 	sharedFeature bool
+	// failCommit is the status every POST :id/commit answers with; 0 is
+	// success. A refused commit lands nothing and leaves the draft as it was.
+	failCommit int
+	// discarded records the id of every draft POST :id/discard threw away.
+	discarded []string
+	// failPut maps a file path to the status a PUT of it answers with (0 or
+	// absent is success) — a write the server refuses, landing nothing.
+	failPut map[string]int
+	// beforeCheckout runs at the start of POST :id/checkout: the instant a
+	// draft the same user opened elsewhere would appear.
+	beforeCheckout func(liveID string)
 
 	next int
 }
@@ -91,11 +107,13 @@ const fakeModuleInitSeed = "\"\"\"Shared Ronja module.\"\"\"\n"
 
 func newModuleFake() *moduleFake {
 	return &moduleFake{
-		rows:      map[string]*api.Module{},
-		files:     map[string][]api.ModuleFile{},
-		draftOf:   map[string]string{},
-		versions:  map[string][]api.Module{},
-		nameTaken: map[string]bool{},
+		rows:         map[string]*api.Module{},
+		files:        map[string][]api.ModuleFile{},
+		draftOf:      map[string]string{},
+		versions:     map[string][]api.Module{},
+		versionFiles: map[string][]api.ModuleFile{},
+		nameTaken:    map[string]bool{},
+		failPut:      map[string]int{},
 	}
 }
 
@@ -169,7 +187,13 @@ func (f *fakeInstance) serveModule(w http.ResponseWriter, r *http.Request) bool 
 			row.Lifecycle, row.DrafterUserID = api.LifecycleProposed, fakeCallerUserID
 			row.FeatureScope = scopeOrganization
 		}
-		writeJSON(w, f.AddModule(row, api.ModuleFile{Path: moduleInitFile, Content: fakeModuleInitSeed}))
+		added := f.AddModule(row, api.ModuleFile{Path: moduleInitFile, Content: fakeModuleInitSeed})
+		if status, body := f.managed.createClaim("module", in.FeatureID, row.ID, in.Managed); status != 0 {
+			delete(m.rows, row.ID)
+			writeCreateRefusal(w, status, body)
+			return true
+		}
+		writeJSON(w, added)
 		return true
 	}
 
@@ -198,6 +222,10 @@ func (f *fakeInstance) serveModule(w http.ResponseWriter, r *http.Request) bool 
 
 	id, action, _ := strings.Cut(rest, "/")
 	row := m.rows[id]
+	if files, isVersion := m.versionFiles[id]; row == nil && isVersion && r.Method == "GET" && action == "files" {
+		writeJSON(w, files)
+		return true
+	}
 	if row == nil {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return true
@@ -236,6 +264,19 @@ func (f *fakeInstance) serveModule(w http.ResponseWriter, r *http.Request) bool 
 		f.serveModuleCheckout(w, r, row)
 	case r.Method == "POST" && action == "commit":
 		f.serveModuleCommit(w, r, row)
+	case r.Method == "POST" && action == "discard":
+		// rmodule's draft discard: a DRAFT of a live module goes, files and
+		// all, and its parent has no open draft afterwards. Anything else is
+		// refused, the way the route refuses a live row.
+		if row.Lifecycle != api.LifecycleDraft || row.ParentModuleID == "" {
+			http.Error(w, `{"error":"only a draft can be discarded"}`, http.StatusBadRequest)
+			return true
+		}
+		delete(m.draftOf, row.ParentModuleID)
+		delete(m.rows, row.ID)
+		delete(m.files, row.ID)
+		m.discarded = append(m.discarded, row.ID)
+		writeJSON(w, map[string]any{})
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}
@@ -269,7 +310,11 @@ func (f *fakeInstance) serveModuleRow(w http.ResponseWriter, row *api.Module) {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}
-	writeJSON(w, row)
+	// GET :id carries `managedBy` (backend/api/v2/module/handler.go, the
+	// single-row GET).
+	out := *row
+	out.ManagedBy = f.managed.managedBy("module", row.ID, row.ParentModuleID)
+	writeJSON(w, out)
 }
 
 // serveModulePatch is PUT /module/:id — the metadata patch, LIVE rows only.
@@ -316,6 +361,10 @@ func (f *fakeInstance) serveModuleFile(w http.ResponseWriter, r *http.Request, r
 		}
 		decodeBody(f.t, r, &in)
 		f.fileWrites = append(f.fileWrites, recordedFileWrite{Method: "PUT", Path: path, BaseSha256: in.BaseSha256})
+		if status := f.mod.failPut[path]; status != 0 {
+			http.Error(w, `{"error":"the write was refused"}`, status)
+			return true
+		}
 		if f.refusePrecondition(w, "module", contents, path, in.BaseSha256) {
 			return true
 		}
@@ -361,6 +410,9 @@ func (f *fakeInstance) serveModuleCheckout(w http.ResponseWriter, r *http.Reques
 		http.Error(w, `{"error":"only a live module can be checked out"}`, http.StatusBadRequest)
 		return
 	}
+	if m.beforeCheckout != nil {
+		m.beforeCheckout(row.ID)
+	}
 	draft, open := m.rows[m.draftOf[row.ID]], false
 	if draftID, isOpen := m.draftOf[row.ID]; isOpen {
 		// Idempotent, like the real route: a second checkout returns the same
@@ -402,6 +454,10 @@ func (f *fakeInstance) serveModuleCommit(w http.ResponseWriter, r *http.Request,
 	var in api.ModuleCommitInput
 	decodeOptionalBody(f.t, r, &in)
 	m.commitConfirmations = append(m.commitConfirmations, in.ConfirmHeadVersionID)
+	if m.failCommit != 0 {
+		http.Error(w, `{"error":"the commit was refused"}`, m.failCommit)
+		return
+	}
 
 	if draft.Lifecycle != api.LifecycleDraft && draft.Lifecycle != api.LifecycleProposed {
 		http.Error(w, `{"error":"row is not a draft"}`, http.StatusBadRequest)
@@ -479,6 +535,20 @@ func (f *fakeInstance) moduleHeadVersionID(id string) string {
 
 // putModuleFile writes one file and moves the ROW's updatedAt with it, the way
 // a file save does server-side.
+// snapshotModuleHead files the live module's current files under its head
+// version, when no row stands for it (see fakeInstance.snapshotHead).
+func (f *fakeInstance) snapshotModuleHead(id string) {
+	m := f.mod
+	if versions := m.versions[id]; len(versions) > 0 {
+		head := versions[0].ID
+		if _, isRow := m.rows[head]; !isRow {
+			if _, ok := m.versionFiles[head]; !ok {
+				m.versionFiles[head] = slices.Clone(m.files[id])
+			}
+		}
+	}
+}
+
 func (f *fakeInstance) putModuleFile(row *api.Module, path, content string) {
 	row.UpdatedAt = row.UpdatedAt.Add(time.Minute)
 	files := f.mod.files[row.ID]

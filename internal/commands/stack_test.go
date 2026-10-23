@@ -516,7 +516,9 @@ func TestStatusDoesNotClaimAStackTheFileDoesNotDeclare(t *testing.T) {
 // again.
 func TestPushAdoptsAndHealsAStrandedLockEntry(t *testing.T) {
 	f := newFakeInstance(t)
-	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft, FeatureScope: "private"},
+	// Titled "x" because that is what the push that created it sent: the create
+	// carries the manifest's title, and the stranded entry is that row.
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleDraft, FeatureScope: "private", Title: "x"},
 		api.WorkflowFile{Path: "main.py", Content: "body\n"})
 	signIn(t, f)
 

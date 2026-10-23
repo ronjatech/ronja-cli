@@ -260,7 +260,7 @@ func TestModuleDriftGuardVerdicts(t *testing.T) {
 
 	t.Run("clean baseline arms preconditions", func(t *testing.T) {
 		f := moduleFolderFor(t, root, key, baseline)
-		verdict, err := checkModuleDrift(f, target, remote, false, headAgreement{})
+		verdict, err := checkModuleDrift(f, target, remote, nil, false, headAgreement{})
 		if err != nil {
 			t.Fatalf("clean baseline must not refuse: %v", err)
 		}
@@ -275,7 +275,7 @@ func TestModuleDriftGuardVerdicts(t *testing.T) {
 	t.Run("remote moved refuses", func(t *testing.T) {
 		f := moduleFolderFor(t, root, key, baseline)
 		moved := map[string]string{"__init__.py": "", "tracker.py": "x = 2"}
-		if _, err := checkModuleDrift(f, target, moved, false, headAgreement{}); err == nil {
+		if _, err := checkModuleDrift(f, target, moved, nil, false, headAgreement{}); err == nil {
 			t.Fatal("expected drift against the baseline to be refused")
 		} else if !strings.Contains(err.Error(), "tracker.py") {
 			t.Fatalf("the refusal must name what moved, got: %v", err)
@@ -285,7 +285,7 @@ func TestModuleDriftGuardVerdicts(t *testing.T) {
 	t.Run("force bypasses and disarms preconditions", func(t *testing.T) {
 		f := moduleFolderFor(t, root, key, baseline)
 		moved := map[string]string{"__init__.py": "", "tracker.py": "x = 2"}
-		verdict, err := checkModuleDrift(f, target, moved, true, headAgreement{})
+		verdict, err := checkModuleDrift(f, target, moved, nil, true, headAgreement{})
 		if err != nil {
 			t.Fatalf("--force must proceed: %v", err)
 		}
@@ -297,7 +297,7 @@ func TestModuleDriftGuardVerdicts(t *testing.T) {
 	t.Run("no baseline vouches on the committed anchor", func(t *testing.T) {
 		f := moduleFolderFor(t, root, key, nil)
 		head := headAgreement{Recorded: "cmv-1", Current: "cmv-1", AnchoredDraft: true}
-		verdict, err := checkModuleDrift(f, target, remote, false, head)
+		verdict, err := checkModuleDrift(f, target, remote, nil, false, head)
 		if err != nil {
 			t.Fatalf("a vouching anchor must let a fresh checkout through: %v", err)
 		}
@@ -314,7 +314,7 @@ func TestModuleDriftGuardVerdicts(t *testing.T) {
 	t.Run("no baseline and a moved head refuses without suggesting force", func(t *testing.T) {
 		f := moduleFolderFor(t, root, key, nil)
 		head := headAgreement{Recorded: "cmv-1", Current: "cmv-2", AnchoredDraft: true}
-		_, err := checkModuleDrift(f, target, remote, false, head)
+		_, err := checkModuleDrift(f, target, remote, nil, false, head)
 		if err == nil {
 			t.Fatal("expected a moved head to be refused")
 		}
@@ -332,7 +332,7 @@ func TestModuleDriftGuardVerdicts(t *testing.T) {
 		f := moduleFolderFor(t, root, key, nil)
 		fresh := &api.Module{ID: "module-1", Lifecycle: api.LifecycleDraft, Name: "emab_tracker"}
 		seeded := map[string]string{"__init__.py": ""}
-		verdict, err := checkModuleDrift(f, fresh, seeded, false, headAgreement{})
+		verdict, err := checkModuleDrift(f, fresh, seeded, nil, false, headAgreement{})
 		if err != nil {
 			t.Fatalf("an untouched first push must resume rather than refuse: %v", err)
 		}

@@ -128,6 +128,11 @@ type DataApp struct {
 	// see the same field on Workflow for why, and for why an empty value is
 	// normal, silent, and must not be filled in with a guess.
 	URL string `json:"url,omitempty"`
+	// ManagedBy names the repository folder that deploys this data app, when one
+	// does (backend/api/v2/dataapp/view.go). Only the
+	// single-row GET carries it; nil on every other route, on a row no
+	// repository manages, and on an instance older than the field.
+	ManagedBy *ManagedBy `json:"managedBy,omitempty"`
 }
 
 // DataAppAccess is a data app's capability surface: what its bundle may reach.

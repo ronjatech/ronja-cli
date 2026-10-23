@@ -160,7 +160,7 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 	if err != nil {
 		return nil, err
 	}
-	files, enumeration, err := readLocalFiles(f.Root, wfdir.WorkflowKind)
+	files, enumeration, err := readLocalFiles(f.Root, f.Kind)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +173,7 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 	// the command people run FIRST, so it is the worst place to skip it — and
 	// the server's own validate cap (1 MiB per file) is the same number, so a
 	// folder this refuses is one the server would refuse anyway, less helpfully.
-	if err := checkPushable(files, wfdir.WorkflowKind, maxFileBytes); err != nil {
+	if err := checkPushable(files, f.Kind, maxFileBytes); err != nil {
 		return nil, err
 	}
 	// The alias pre-flight, and its refusals are part of the VERDICT rather than
@@ -204,7 +204,7 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 	// being resolved.
 	params := existing.Parameters()
 	if f.Manifest.ManagesParameters() {
-		params = f.Manifest.DeclaredParameters()
+		params = f.wireParameters()
 	}
 	// The runtime the FOLDER declares, so a candidate is checked against the
 	// rules its author wrote for — and, when it declares none, the runtime the
@@ -214,6 +214,9 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 	// Manifest.RuntimeForValidate.
 	runtime := f.Manifest.RuntimeForValidate(existing.Workflow)
 	if f.Binding.WorkflowID == "" {
+		if err := requireLanguageSupport(ctx, client, f); err != nil {
+			return out, err
+		}
 		if runtime, err = createRuntimeFor(ctx, client, f); err != nil {
 			return out, err
 		}
@@ -224,6 +227,7 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 		Parameters:     params,
 		Files:          validateFilesOf(f.Codec, files),
 		RuntimeVersion: runtime,
+		Language:       languageOnTheWire(f.Manifest),
 	})
 	if err != nil {
 		if message, ok := explainFeatureUnreachable(err, featureID, f.Resolved); ok {

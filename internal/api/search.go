@@ -60,7 +60,7 @@ const SearchScoreExact = 3
 
 // The kinds a hit can carry, mirrored from search.Hit's own list.
 //
-// Only the six `bind` can resolve are named. The full set the endpoint can
+// Only the nine `bind` can resolve are named. The full set the endpoint can
 // return is `feature`, `table`, `workflow`, `note`, `dataapp`, `agent`,
 // `scheduledjob`, `secret`, `mcpserver` and `mailbox` — and the omission that
 // matters is on the other side: there is NO `codex` hit, because the endpoint
@@ -77,6 +77,10 @@ const (
 	// `bind` does not ask about: an automation's reference set declares
 	// kind="note" for either.
 	SearchKindNote = "note"
+	// The three an automation's `references` can name beyond the marker kinds.
+	SearchKindDataApp   = "dataapp"
+	SearchKindMCPServer = "mcpserver"
+	SearchKindFeature   = "feature"
 )
 
 // MinSearchTermLen mirrors minQueryLen in backend/api/v2/search/handler.go: a

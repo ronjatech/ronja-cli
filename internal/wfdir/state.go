@@ -125,6 +125,63 @@ type InstanceState struct {
 	// and managed checks on a folder with no named stack. The fork is spelled
 	// once, in the commands package's liveHashes.
 	Checks map[string]ChecksState `json:"checks,omitempty"`
+	// StagedNames is the NAME this checkout staged on its own open DRAFT of a
+	// table or a metric, keyed by the file's slash-separated relative path (a
+	// `.sql` file or a `metrics/<stem>.json`) — the third name a pipeline push
+	// must recognise as this folder's own, beside the declared one and the
+	// baseline. Without it a `-- @name` (or a metric's "name") changed between a
+	// push and its publish read the folder's own staged rename as somebody
+	// else's, and refused it as drift.
+	//
+	// LOCAL-ONLY, on a named stack too, for DraftID's reason exactly: a draft is
+	// per-user, so "my draft holds the name I staged" is true for one person on
+	// one machine, and a colleague inheriting it from git would be handed a
+	// fact about a row they cannot see. See StagedName for why it carries the
+	// draft's id.
+	StagedNames map[string]StagedName `json:"stagedNames,omitempty"`
+	// Aliases is the alias layer the Files hashes were taken under, for a
+	// workflow or data-app baseline: each declared alias the folder resolved,
+	// with its kind and the id it was bound to. The hashes are of DISK form —
+	// the remote de-aliased — so the remote can only be compared with them
+	// rendered through the SAME aliases. Without it, re-pointing a binding in
+	// ronja.json made the server's untouched file read as changed since the
+	// last sync: its old id no longer turned back into the alias.
+	//
+	// Read with AliasesRecorded: an absent map with it set is a baseline that
+	// resolved no alias, and compares the remote as it is stored.
+	Aliases map[string]BaselineAlias `json:"aliases,omitempty"`
+	// AliasesRecorded says Aliases is a record, so an absent map means "this
+	// baseline resolved no alias" rather than "nothing was recorded". Without
+	// it the two read alike, and a folder whose baseline resolved none that
+	// then gained a binding read the server's untouched files as changed. A
+	// state file written before the record existed has neither key, and
+	// compares through the folder's current aliases, as every baseline did
+	// before.
+	AliasesRecorded bool `json:"aliasesRecorded,omitempty"`
+}
+
+// AliasesUnrecorded reports a workflow or data-app baseline that says nothing
+// of the aliases it was taken under — one an older CLI wrote.
+func (i *InstanceState) AliasesUnrecorded() bool {
+	return i != nil && !i.AliasesRecorded && i.Aliases == nil
+}
+
+// BaselineAlias is one alias a baseline was taken under: its declared kind,
+// whether it is a write target (`"write"` or `"output"`, for a table), and the
+// id it resolved to.
+type BaselineAlias struct {
+	Kind  string `json:"kind"`
+	ID    string `json:"id"`
+	Write bool   `json:"write,omitempty"`
+}
+
+// StagedName is one rename a push staged on a draft. DraftID is the draft it
+// was written to, and the name is ONLY ever compared against that draft: a
+// draft committed, discarded or replaced since is a different row, and its name
+// says nothing about this one.
+type StagedName struct {
+	DraftID string `json:"draftID"`
+	Name    string `json:"name"`
 }
 
 // ChecksState is one checks file's recorded state in a LEGACY folder's local
@@ -155,6 +212,11 @@ type MetricState struct {
 	// folder is named.
 	TagsApplied []AppliedTag `json:"tagsApplied,omitempty"`
 	TagsRefused *TagsRefusal `json:"tagsRefused,omitempty"`
+	// Name is the name this folder last agreed the live metric held — the
+	// legacy half of LockMetric.Name, on the same fork as the recipe fields.
+	Name string `json:"name,omitempty"`
+	// Stem is the legacy half of LockMetric.Stem.
+	Stem string `json:"stem,omitempty"`
 }
 
 // TableDocsState is one docs sidecar's recorded state in a LEGACY folder's local
@@ -256,6 +318,13 @@ type TableState struct {
 	// covers it unchanged: it is taken from the live row's prose and compared
 	// against the live row's prose. Empty disarms its leg.
 	MetaSHA256 string `json:"metaSHA256,omitempty"`
+	// Name is the name this folder last agreed the live table held — the
+	// LEGACY half of LockTable.Name, kept here for a folder with no named stack
+	// for LiveSHA256's reason exactly. Empty is "no answer": the stem.
+	Name string `json:"name,omitempty"`
+	// Stem is the legacy half of LockTable.Stem: the stem a `moved` entry
+	// carried, empty for the current file's.
+	Stem string `json:"stem,omitempty"`
 }
 
 // FileState is one file as the server last had it. UpdatedAt is diagnostics

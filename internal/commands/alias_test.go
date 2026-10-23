@@ -1077,3 +1077,228 @@ func firstTableDrift(t *testing.T, out string) string {
 	drift, _ := tables[0].(map[string]any)["drift"].(string)
 	return drift
 }
+
+// rebindOrders re-points `orders` on stack "dev" in ronja.json, the one edit a
+// person makes to deploy the folder against another table.
+func rebindOrders(t *testing.T, root string, kind wfdir.Kind, id string) {
+	t.Helper()
+	m, err := wfdir.LoadManifest(root, kind)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	stack := m.Stacks["dev"]
+	stack.Bind = map[string]string{"orders": id}
+	m.Stacks["dev"] = stack
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+}
+
+// assertRebindIsALocalChange: a rebind the push has not deployed yet is a
+// LOCAL change — never clean, since the server still holds the old id and the
+// next push changes it, and never drift made in Ronja. status is the kind's own
+// `status --json` after the rebind.
+func assertRebindIsALocalChange(t *testing.T, root, status string) {
+	t.Helper()
+	rebound, _ := decodeJSON(t, status)["rebound"].([]any)
+	if len(rebound) != 1 {
+		t.Fatalf("status names no re-pointed binding:\n%s", status)
+	}
+	if got := rebound[0].(map[string]any); got["alias"] != "orders" || got["from"] != "table-orders" || got["to"] != "table-orders-2" {
+		t.Errorf("status names the rebind as %v", got)
+	}
+	out, err := runCLI(t, root, "sync", "status", "--stack", "dev", "--json")
+	if err == nil {
+		t.Errorf("sync status exited zero on a rebind the server does not hold yet:\n%s", out)
+	}
+	payload := decodeJSON(t, out)
+	if payload["verdict"] == verdictClean {
+		t.Fatalf("sync status says clean on a rebind the server does not hold yet:\n%s", out)
+	}
+	detail := fmt.Sprint(payload["folders"].([]any)[0].(map[string]any)["detail"])
+	if !strings.Contains(detail, "binding `orders` re-pointed from table-orders to table-orders-2") || !strings.Contains(detail, "here") || strings.Contains(detail, "on the server since") {
+		t.Errorf("sync status does not name the rebind as a local change: %s", detail)
+	}
+}
+
+// A binding re-pointed in ronja.json is a LOCAL change, and the push deploys it.
+// The drift guard rendered the server's file through the NEW binding, where its
+// old id no longer turned back into the alias — so a file nobody touched read
+// as changed on the server since the last sync, status said so, and the push
+// refused to overwrite it. The baseline now records the aliases it was taken
+// under, and the server's file is compared in those.
+func TestRebindingAnAliasIsALocalChangeThePushDeploys(t *testing.T) {
+	t.Run("workflow", func(t *testing.T) {
+		f := newFakeInstance(t)
+		signIn(t, f)
+		root := aliasWorkflowFolder(t, f, "read(\"{{ ref('orders') }}\")\n")
+		if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+			t.Fatalf("first push: %v", err)
+		}
+		rebindOrders(t, root, wfdir.WorkflowKind, "table-orders-2")
+
+		out, err := runCLI(t, root, "wf", "status", "--json")
+		if err != nil {
+			t.Fatalf("status: %v\n%s", err, out)
+		}
+		if drift := decodeJSON(t, out)["remote"].(map[string]any)["drift"]; drift != nil && strings.Contains(fmt.Sprint(drift), "main.py") {
+			t.Errorf("status reports the server's untouched file as drift: %v", drift)
+		}
+		assertRebindIsALocalChange(t, root, out)
+		if out, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+			t.Fatalf("push after the rebind: %v\n%s", err, out)
+		}
+		if got := f.FileContents(workflowIDOf(t, root))["main.py"]; got != "read(\"{{ ref('table-orders-2') }}\")\n" {
+			t.Fatalf("the server holds %q, want the new binding", got)
+		}
+		if out, err := runCLI(t, root, "wf", "push", "--json"); err != nil || decodeJSON(t, out)["upToDate"] != true {
+			t.Fatalf("the push after it was not up to date: %v\n%s", err, out)
+		}
+	})
+	t.Run("data app", func(t *testing.T) {
+		f := newFakeAppInstance(t)
+		signInApp(t, f)
+		root := aliasAppFolder(t, f, tableDep(), map[string]string{"orders": "table-orders"}, api.DataAppAccess{},
+			map[string]string{"App.tsx": "const q = \"{{ ref('orders') }}\";\n"})
+		if _, err := runCLI(t, root, "app", "push", "--json"); err != nil {
+			t.Fatalf("first push: %v", err)
+		}
+		rebindOrders(t, root, wfdir.DataAppKind, "table-orders-2")
+
+		out, err := runCLI(t, root, "app", "status", "--json")
+		if err != nil {
+			t.Fatalf("status: %v\n%s", err, out)
+		}
+		if drift := decodeJSON(t, out)["remote"].(map[string]any)["drift"]; drift != nil && strings.Contains(fmt.Sprint(drift), "App.tsx") {
+			t.Errorf("status reports the server's untouched file as drift: %v", drift)
+		}
+		assertRebindIsALocalChange(t, root, out)
+		if out, err := runCLI(t, root, "app", "push", "--json"); err != nil {
+			t.Fatalf("push after the rebind: %v\n%s", err, out)
+		}
+		if got := f.FileContents(appDraftIDOf(t, root, f))["App.tsx"]; got != "const q = \"{{ ref('table-orders-2') }}\";\n" {
+			t.Fatalf("the server holds %q, want the new binding", got)
+		}
+		if out, err := runCLI(t, root, "app", "push", "--json"); err != nil || decodeJSON(t, out)["upToDate"] != true {
+			t.Fatalf("the push after it was not up to date: %v\n%s", err, out)
+		}
+	})
+}
+
+// A baseline taken while the folder resolved no alias records that it resolved
+// none, so a binding added since is not read as the server's untouched file
+// having changed. The two used to be one absent key: the remote was then
+// rendered through the NEW binding, its id turned into the alias, and a file
+// nobody touched on either side was listed as changed on the server.
+func TestABaselineThatResolvedNoAliasSeesNoServerDriftWhenABindingIsAdded(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	root := aliasWorkflowFolder(t, f, "read(\"{{ ref('table-orders') }}\")\n")
+	m, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	m.Dependencies = nil
+	stack := m.Stacks["dev"]
+	stack.Bind = nil
+	m.Stacks["dev"] = stack
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+	if out, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+		t.Fatalf("first push: %v\n%s", err, out)
+	}
+
+	m.Dependencies = tableDep()
+	stack.Bind = map[string]string{"orders": "table-orders"}
+	m.Stacks["dev"] = stack
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+	out, err := runCLI(t, root, "wf", "status", "--json")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+	if drift := decodeJSON(t, out)["remote"].(map[string]any)["drift"]; drift == nil || strings.Contains(fmt.Sprint(drift), "main.py") {
+		t.Errorf("status reports the server's untouched file as drift: %v", drift)
+	}
+}
+
+// Removing a write-only output's binding is a rebind like any other: the
+// output is then written by its name, which is its true new state, and the
+// server still holds the old id until the next push. Classic and adopted
+// alike — the address_stack_mismatch refusal advises exactly this edit.
+func TestRemovingAWriteOnlyOutputsBindingIsALocalChange(t *testing.T) {
+	outputDep := map[string]wfdir.Dependency{"orders": {Kind: markers.KindTable, Output: true}}
+	source := "# {{ write('orders') }}\n"
+	for _, adopted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "classic", true: "adopted"}[adopted], func(t *testing.T) {
+			var root, stack, tree string
+			var stored func() string
+			if adopted {
+				fx := workflowIdempotenceFixture(t)
+				adoptFixture(t, fx)
+				root, stack, tree = fx.root, "prod", fx.tree
+				m, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m.Dependencies = outputDep
+				s := m.Stacks[stack]
+				s.Bind = map[string]string{"orders": "table-orders"}
+				m.Stacks[stack] = s
+				if err := wfdir.SaveManifest(root, m); err != nil {
+					t.Fatal(err)
+				}
+				writeLocal(t, root, "main.py", source)
+				if code, line, _, out := applyOnce(t, fx); code != syncExitClean {
+					t.Fatalf("apply: exit %d %+v\n%s", code, line, out)
+				}
+				stored = fx.draftKind.liveMain
+			} else {
+				f := newFakeInstance(t)
+				signIn(t, f)
+				root = aliasWorkflowFolder(t, f, source)
+				stack, tree = "dev", root
+				m, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m.Dependencies = outputDep
+				if err := wfdir.SaveManifest(root, m); err != nil {
+					t.Fatal(err)
+				}
+				if out, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
+					t.Fatalf("push: %v\n%s", err, out)
+				}
+				stored = func() string { return f.FileContents(workflowIDOf(t, root))["main.py"] }
+			}
+			if got := stored(); got != "# {{ write('table-orders') }}\n" {
+				t.Fatalf("the server holds %q", got)
+			}
+			m, err := wfdir.LoadManifest(root, wfdir.WorkflowKind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := m.Stacks[stack]
+			s.Bind = nil
+			m.Stacks[stack] = s
+			if err := wfdir.SaveManifest(root, m); err != nil {
+				t.Fatal(err)
+			}
+
+			out, err := runCLI(t, root, "wf", "status", "--stack", stack, "--json")
+			if err != nil {
+				t.Fatalf("status: %v\n%s", err, out)
+			}
+			rebound, _ := decodeJSON(t, out)["rebound"].([]any)
+			if len(rebound) != 1 || rebound[0].(map[string]any)["from"] != "table-orders" || rebound[0].(map[string]any)["to"] != nil {
+				t.Fatalf("status does not name the removed binding: %v\n%s", rebound, out)
+			}
+			out, err = runCLI(t, tree, "sync", "status", "--stack", stack, "--json")
+			if err == nil || decodeJSON(t, out)["verdict"] == verdictClean {
+				t.Fatalf("sync status is clean while the server holds the old id: %v\n%s", err, out)
+			}
+		})
+	}
+}

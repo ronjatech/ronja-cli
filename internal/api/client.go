@@ -437,6 +437,9 @@ func (c *Client) do(ctx context.Context, timeout time.Duration, method, path str
 		defer cancel()
 	}
 
+	if err := checkGuard(ctx, method, path); err != nil {
+		return err
+	}
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)

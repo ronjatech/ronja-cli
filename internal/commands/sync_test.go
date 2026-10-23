@@ -369,6 +369,13 @@ func TestSyncStatusNeverDeployedIsNotClean(t *testing.T) {
 			kind:    wfdir.DataAppKind,
 			content: map[string]string{"App.tsx": "export default () => null;\n"},
 		},
+		{
+			name:    "module",
+			kind:    wfdir.ModuleKind,
+			content: map[string]string{"__init__.py": "\n"},
+			// A module syncs .py and skips everything else, like a pipeline.
+			noise: map[string]string{"README.md": "# notes\n"},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

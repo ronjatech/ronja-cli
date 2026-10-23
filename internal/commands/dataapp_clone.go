@@ -1,11 +1,13 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
 )
@@ -99,96 +101,16 @@ flow.`,
 				}
 			}
 
-			files, err := client.ListDataAppFiles(cmd.Context(), source.ID)
-			if err != nil {
-				return fmt.Errorf("read files of data app %s: %w", source.ID, err)
-			}
-			// Checked BEFORE anything is created, and fatal rather than per-file:
-			// the baseline written below claims every one of these paths is on disk,
-			// and a set that cannot all be written produces a folder whose baseline
-			// lies from birth — status invents deletions and a push acts on them.
-			// The KIND is what makes this correct for a data app: a remote
-			// dist/bundle.js is a legal server-side path that this folder's walk
-			// would never see again.
-			if err := wfdir.CheckLocalPaths(appPathsOf(files), wfdir.DataAppKind); err != nil {
-				return err
-			}
-
-			if err := os.MkdirAll(root, 0o755); err != nil {
-				return fmt.Errorf("create %s: %w", root, err)
-			}
-			for _, f := range files {
-				// Validated once more inside WriteFile: the path arrives from the
-				// server, and writing it is a local filesystem operation that must
-				// not be able to escape the folder.
-				if err := wfdir.WriteFile(root, f.Path, f.Content); err != nil {
-					return fmt.Errorf("write %s: %w", f.Path, err)
-				}
-			}
-
-			entrypoint := source.Entrypoint
-			if entrypoint == "" {
-				entrypoint = wfdir.DataAppKind.DefaultEntrypoint
-			}
-			// The binding is keyed by organization as well as instance, so it has to
-			// be known before one is written.
-			if err := ensureTenant(cmd.Context(), resolved); err != nil {
-				return err
-			}
-			key := wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID}
-			manifest := &wfdir.Manifest{
-				Kind:       wfdir.KindDataApp,
-				Title:      source.Name,
-				Entrypoint: entrypoint,
-			}
-			// The STABLE identity, not source.ID: when the files came from a draft,
-			// the draft's id dies at commit while the binding lives in the
-			// customer's git.
-			lock, err := recordFirstBinding(manifest, key, wfdir.Binding{
-				DataAppID: app.IdentityID(),
-				FeatureID: source.FeatureID,
-			})
+			files, entrypoint, err := writeDataAppClone(cmd.Context(), client, resolved, app, source, root, cloneHooks{})
 			if err != nil {
 				return err
 			}
-			// The committed anchor — the same decision as `wf clone`'s (a clone
-			// taken from a DRAFT never anchors on the current head), through a
-			// DIFFERENT resolver: rdataapp's base_version_id usually holds the
-			// live app's own id rather than a version, so the workflow function
-			// would record an anchor that can never match. See
-			// dataAppCloneAnchor's ⚠️.
-			if flagStack != "" {
-				anchor, err := dataAppCloneAnchor(cmd.Context(), dataAppHeadReader(client), app.IdentityID(), source.ID, source.BaseVersionID)
-				if err != nil {
-					return err
-				}
-				if anchor == "" {
-					fmt.Fprintf(os.Stderr,
-						"  Note: cloning your open draft of an app that has published versions, and the server does not record which one that draft forked from — so no version anchor was written. A fresh checkout of this folder will ask for a baseline; re-clone from the live app to get one.\n")
-				}
-				lock.SetHeadVersion(flagStack, anchor)
-			}
-			// Always written, even when the app grants nothing: a clone is a
-			// faithful copy, and a folder that came down without the key would
-			// silently not manage the allowlists it can plainly see — so the next
-			// push would leave them alone while `status` showed them.
-			manifest.SetAccess(source.DataAppAccess)
-			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
-				return err
-			}
-			state := &wfdir.State{}
-			// The baseline records the row the files actually came from, which may
-			// be the draft even though the binding names the live app.
-			// No codec: `clone` refuses a destination that is not empty, so the
-			// folder it writes declares no dependencies. An empty codec is the
-			// identity — see alias.go.
-			state.Set(key, baselineFromApp(aliasCodec{}, source, files))
-			if err := wfdir.SaveState(root, state); err != nil {
-				return err
-			}
+			notices := appendManagedNotice(nil,
+				noticeManagedBy(nil, wfdir.DataAppKind, wfdir.ManagedDataApp, app.IdentityID(), app.ManagedBy, noticeForClone))
+			printManagedNotices(notices)
 
 			if flagJSON {
-				return emitJSON(map[string]any{
+				return emitJSON(withManagedInGit(map[string]any{
 					"root":            root,
 					"url":             resolved.URL,
 					"dataAppID":       app.IdentityID(),
@@ -203,7 +125,7 @@ flow.`,
 					// No skipped count: a clone that could not write every file
 					// fails, so this is always the whole set.
 					"files": len(files),
-				})
+				}, notices))
 			}
 			printAppCloneReport(root, resolved.URL, app, source, entrypoint, len(files))
 			return nil
@@ -225,4 +147,104 @@ func printAppCloneReport(root, url string, app, source *api.DataApp, entrypoint 
 	fmt.Fprintf(out, "  Files:      %d\n", written)
 	fmt.Fprintf(out, "  Instance:   %s\n", url)
 	fmt.Fprintf(out, "\n  Next: cd %s && ronja app status\n", filepath.Base(root))
+}
+
+// writeDataAppClone lays a data app down in root — files, ronja.json with its
+// access block, the lock with its head-version anchor and the local baseline.
+// Shared by `app clone` and `import feature` (cloneHooks).
+func writeDataAppClone(ctx context.Context, client *api.Client, resolved *config.Resolved, app, source *api.DataApp, root string, hooks cloneHooks) ([]api.DataAppFile, string, error) {
+	files, err := client.ListDataAppFiles(ctx, source.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("read files of data app %s: %w", source.ID, err)
+	}
+	// Checked BEFORE anything is created, and fatal rather than per-file:
+	// the baseline written below claims every one of these paths is on disk,
+	// and a set that cannot all be written produces a folder whose baseline
+	// lies from birth — status invents deletions and a push acts on them.
+	// The KIND is what makes this correct for a data app: a remote
+	// dist/bundle.js is a legal server-side path that this folder's walk
+	// would never see again.
+	if err := wfdir.CheckLocalPaths(appPathsOf(files), wfdir.DataAppKind); err != nil {
+		return nil, "", err
+	}
+
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, "", fmt.Errorf("create %s: %w", root, err)
+	}
+	for _, f := range files {
+		// Validated once more inside WriteFile: the path arrives from the
+		// server, and writing it is a local filesystem operation that must
+		// not be able to escape the folder.
+		if err := wfdir.WriteFile(root, f.Path, hooks.codec.toDisk(f.Content)); err != nil {
+			return nil, "", fmt.Errorf("write %s: %w", f.Path, err)
+		}
+	}
+
+	entrypoint := source.Entrypoint
+	if entrypoint == "" {
+		entrypoint = wfdir.DataAppKind.DefaultEntrypoint
+	}
+	// The binding is keyed by organization as well as instance, so it has to
+	// be known before one is written.
+	if err := ensureTenant(ctx, resolved); err != nil {
+		return nil, "", err
+	}
+	key := wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID}
+	manifest := &wfdir.Manifest{
+		Kind:       wfdir.KindDataApp,
+		Title:      source.Name,
+		Entrypoint: entrypoint,
+	}
+	// The STABLE identity, not source.ID: when the files came from a draft,
+	// the draft's id dies at commit while the binding lives in the
+	// customer's git.
+	lock, err := recordFirstBinding(manifest, key, wfdir.Binding{
+		DataAppID: app.IdentityID(),
+		FeatureID: source.FeatureID,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	// The committed anchor — the same decision as `wf clone`'s (a clone
+	// taken from a DRAFT never anchors on the current head), through a
+	// DIFFERENT resolver: rdataapp's base_version_id usually holds the
+	// live app's own id rather than a version, so the workflow function
+	// would record an anchor that can never match. See
+	// dataAppCloneAnchor's ⚠️.
+	if flagStack != "" {
+		anchor, err := dataAppCloneAnchor(ctx, dataAppHeadReader(client), app.IdentityID(), source.ID, source.BaseVersionID)
+		if err != nil {
+			return nil, "", err
+		}
+		if anchor == "" {
+			fmt.Fprintf(os.Stderr,
+				"  Note: cloning your open draft of an app that has published versions, and the server does not record which one that draft forked from — so no version anchor was written. A fresh checkout of this folder will ask for a baseline; re-clone from the live app to get one.\n")
+		}
+		lock.SetHeadVersion(flagStack, anchor)
+	}
+	// Always written, even when the app grants nothing: a clone is a
+	// faithful copy, and a folder that came down without the key would
+	// silently not manage the allowlists it can plainly see — so the next
+	// push would leave them alone while `status` showed them.
+	if hooks.access != nil {
+		manifest.SetAccess(*hooks.access)
+	} else {
+		manifest.SetAccess(source.DataAppAccess)
+	}
+	hooks.finishManifest(manifest)
+	hooks.appliedTitle(lock, source.Name)
+	if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
+		return nil, "", err
+	}
+	state := &wfdir.State{}
+	// The baseline records the row the files actually came from, which may
+	// be the draft even though the binding names the live app.
+	// De-aliased by the codec the files were written through (empty, and so
+	// the identity, for a clone — see alias.go).
+	state.Set(key, baselineFromApp(hooks.codec, source, files))
+	if err := wfdir.SaveState(root, state); err != nil {
+		return nil, "", err
+	}
+
+	return files, entrypoint, nil
 }

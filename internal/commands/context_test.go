@@ -31,8 +31,8 @@ func TestContextInlinesTheOrganizationPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("context: %v", err)
 	}
-	if !strings.Contains(out, "## Organization policy (version 7)") {
-		t.Errorf("no policy section with the version:\n%s", out)
+	if !strings.Contains(out, "\n## Organization policy\n\n") {
+		t.Errorf("no policy section:\n%s", out)
 	}
 	if !strings.Contains(out, "Report every amount in SEK.") {
 		t.Errorf("the content is not rendered verbatim:\n%s", out)
@@ -229,7 +229,7 @@ func TestContextPrintsThePolicyWhenMeIsRefused(t *testing.T) {
 	if strings.Contains(out, "Signed in: NO") || strings.Contains(out, "Run `ronja login`") {
 		t.Errorf("a working scoped token was told to sign in again:\n%s", out)
 	}
-	if !strings.Contains(out, "## Organization policy (version 3)") {
+	if !strings.Contains(out, "\n## Organization policy\n\n") {
 		t.Errorf("a refused /me suppressed the policy:\n%s", out)
 	}
 	if !strings.Contains(out, "Standing rules this organization's admins wrote") {
@@ -407,8 +407,10 @@ func TestContextJSONCarriesTheOrganizationPolicy(t *testing.T) {
 	if doc["content"] != testPolicy {
 		t.Errorf("organizationPolicy.content = %q, want the document verbatim", doc["content"])
 	}
-	if doc["version"] != float64(7) {
-		t.Errorf("organizationPolicy.version = %v, want 7", doc["version"])
+	// The applied view's general part: the whole document's version is not
+	// its CAS token.
+	if _, has := doc["version"]; has || doc["isGeneralPart"] != true {
+		t.Errorf("organizationPolicy = %v, want the general part with no version", doc)
 	}
 	// No error key: --json carries a closed-set status, never error text.
 	if _, present := payload["organizationPolicyError"]; present {
@@ -452,9 +454,11 @@ func TestContextJSONStatusTellsNoneFromForbidden(t *testing.T) {
 
 // An unwritten document is still carried at the served version: it is the
 // expectedVersion for the first write, 1 for genesis but any value once
-// blanked.
+// blanked. Only the whole document carries one: an instance older than
+// sections.
 func TestContextJSONCarriesAnUnwrittenPolicyAtItsVersion(t *testing.T) {
 	f := newFakeInstance(t)
+	f.failApplied = http.StatusNotFound
 	signIn(t, f)
 
 	out, err := runCLI(t, t.TempDir(), "context", "--no-docs", "--json")
@@ -487,10 +491,14 @@ func TestContextJSONCarriesAnUnwrittenPolicyAtItsVersion(t *testing.T) {
 	}
 }
 
+// The whole document (an instance older than sections) carries its version
+// into the recipe; the general part's recipe is
+// TestContextAdminRecipeWritesTheGeneralPartThroughThePartRoute.
 func TestContextOffersTheWriteRecipeToAnAdmin(t *testing.T) {
 	f := newFakeInstance(t)
 	f.privilegeLevel = adminPrivilegeLevel
 	f.policy = &api.Policy{Content: testPolicy, Version: 7}
+	f.failApplied = http.StatusNotFound
 	signIn(t, f)
 
 	out, err := runCLI(t, t.TempDir(), "context", "--no-docs")
@@ -535,16 +543,18 @@ func TestContextOffersTheWriteRecipeToASuperAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("context: %v", err)
 	}
-	if !strings.Contains(out, `"expectedVersion":2}`) {
+	if !strings.Contains(out, "ronja api -X PUT /api/v2/policy/org") {
 		t.Errorf("a super-admin was not given the write recipe:\n%s", out)
 	}
 }
 
-// The recipe carries the served version, never a literal 1.
+// The recipe carries the served version, never a literal 1 — on the whole
+// document, which an instance older than sections serves.
 func TestContextOffersAnAdminTheRecipeForAnUnwrittenPolicy(t *testing.T) {
 	f := newFakeInstance(t)
 	f.privilegeLevel = adminPrivilegeLevel
 	f.policy = &api.Policy{Content: "", Version: 4}
+	f.failApplied = http.StatusNotFound
 	signIn(t, f)
 
 	out, err := runCLI(t, t.TempDir(), "context", "--no-docs")
@@ -601,8 +611,8 @@ func TestContextJSONIsUnchangedForAnAdmin(t *testing.T) {
 	if !ok {
 		t.Fatalf("organizationPolicy missing from --json payload: %v", payload)
 	}
-	if len(doc) != 2 || doc["content"] != testPolicy || doc["version"] != float64(7) {
-		t.Errorf("organizationPolicy = %v, want exactly {content, version}", doc)
+	if len(doc) != 2 || doc["content"] != testPolicy || doc["isGeneralPart"] != true {
+		t.Errorf("organizationPolicy = %v, want exactly {content, isGeneralPart}", doc)
 	}
 	if strings.Contains(out, "expectedVersion") {
 		t.Errorf("the write recipe leaked into --json:\n%s", out)

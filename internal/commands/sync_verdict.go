@@ -45,6 +45,9 @@ const (
 type folderVerdict struct {
 	Verdict string
 	Detail  string
+	// Reason is a sync* constant, set where the folder could not be compared
+	// for a reason a script may branch on (an unresolved address dependency).
+	Reason string
 }
 
 func cleanVerdict() folderVerdict { return folderVerdict{Verdict: verdictClean} }
@@ -103,6 +106,9 @@ type pushDelta struct {
 	// Unchecked is everything that could not be compared at all, and it wins —
 	// see verdict.
 	Unchecked []string
+	// Pull is the command that takes Remote into the folder — `<kind> pull`,
+	// for an adopted folder — named beside it; empty where there is none.
+	Pull string
 }
 
 // verdict folds one folder's delta into its answer.
@@ -141,8 +147,12 @@ func (d pushDelta) changes() string {
 	}
 	if len(d.Remote) > 0 {
 		sort.Strings(d.Remote)
-		parts = append(parts, fmt.Sprintf("%d %s changed on the server since the last sync (%s)",
-			len(d.Remote), plural(len(d.Remote), "thing"), strings.Join(d.Remote, ", ")))
+		remote := fmt.Sprintf("%d %s changed on the server since the last sync (%s)",
+			len(d.Remote), plural(len(d.Remote), "thing"), strings.Join(d.Remote, ", "))
+		if d.Pull != "" {
+			remote += fmt.Sprintf(" — `%s` takes %s into this folder", d.Pull, agree(len(d.Remote), "it", "them"))
+		}
+		parts = append(parts, remote)
 	}
 	if len(d.Meta) > 0 {
 		sort.Strings(d.Meta)
@@ -326,6 +336,16 @@ func verdictOfPipelineStatus(r *pipelineStatusReport, localFiles int, undeployed
 		}
 	}
 	delta.Local = dedupe(localChanges(r.Local), r.WillCreate, undeployed, docsPending, metricsPending, checksPending)
+	// The address declarations, as `sync apply` reads them: a bound file gone
+	// with nothing declaring what happened, or a declaration that cannot be
+	// applied to this stack, is a folder apply refuses. A PENDING move or
+	// removal is not drift at all — it rewrites the lock, never a row.
+	if n := len(r.Gone); n > 0 {
+		delta.Refused = append(delta.Refused, fmt.Sprintf("%d bound %s gone with no \"moved\" or \"removed\" entry", n, plural(n, "file")))
+	}
+	if r.AddressProblem != "" {
+		delta.Refused = append(delta.Refused, "the \"moved\" / \"removed\" declarations in "+wfdir.ManifestName)
+	}
 	return delta.verdict()
 }
 
@@ -377,6 +397,9 @@ func verdictOfAutomationStatus(r *automationStatusReport, localFiles int) folder
 	// A file with no automation behind it is undeployed work, and it needs no
 	// baseline to say so — the pipeline arm's WillCreate, by the same argument.
 	delta.Local = dedupe(delta.Local, r.WillCreate)
+	if r.AddressProblem != "" {
+		delta.Refused = append(delta.Refused, "the \"moved\" / \"removed\" declarations in "+wfdir.ManifestName)
+	}
 	// A file that will not parse is a file nothing can be said about.
 	for _, problem := range r.Problems {
 		delta.Unchecked = append(delta.Unchecked, problem.Path)
@@ -424,19 +447,23 @@ func dedupe(lists ...[]string) []string {
 // `ronja wf status` has no verdict of its own (see the note above), so unlike
 // the pipeline one this is not a corrected copy of anything — it is the same
 // discipline applied to a report shape that never had one.
-func verdictOfWorkflowStatus(r *statusReport, localFiles int) folderVerdict {
+//
+// pull is the command that takes a change made on the server into the folder
+// (`ronja wf pull`, for an adopted folder), "" for none — and likewise below.
+func verdictOfWorkflowStatus(r *statusReport, localFiles int, pull string) folderVerdict {
 	if r == nil {
 		return unknownVerdict("no status was computed for this folder")
 	}
 	return verdictOfFileDrift(fileDriftInput{
 		Remote: r.Remote, Baseline: r.Baseline, NothingYet: reasonNoWorkflowYet,
-		LocalFiles: localFiles, Creates: "the workflow", Local: r.Local,
+		LocalFiles: localFiles, Creates: "the workflow", Local: r.Local, Rebound: r.Rebound,
 		Meta: workflowMetaChanges(r.Remote),
+		Pull: pull,
 	})
 }
 
 // verdictOfAppStatus is folderVerdict for a data-app folder.
-func verdictOfAppStatus(r *appStatusReport, localFiles int) folderVerdict {
+func verdictOfAppStatus(r *appStatusReport, localFiles int, pull string) folderVerdict {
 	if r == nil {
 		return unknownVerdict("no status was computed for this folder")
 	}
@@ -455,9 +482,71 @@ func verdictOfAppStatus(r *appStatusReport, localFiles int) folderVerdict {
 			Drift:            r.Remote.Drift,
 		},
 		Baseline: r.Baseline, NothingYet: reasonNoAppYet,
-		LocalFiles: localFiles, Creates: "the data app", Local: r.Local,
+		LocalFiles: localFiles, Creates: "the data app", Local: r.Local, Rebound: r.Rebound,
 		Meta: appMetaChanges(r.Remote),
+		Pull: pull,
 	})
+}
+
+// verdictOfModuleStatus is folderVerdict for a module folder: the workflow
+// discipline (verdictOfFileDrift) on `module status`'s own report, which is a
+// separate type carrying the same five remote fields — fed by hand for the
+// reason verdictOfAppStatus gives.
+//
+// Two things the other draft kinds do not have. The metadata a push would
+// change is the package NAME and the title, both compared against the live row
+// on the push's own rule (trimmed, as moduleMetadataPatch and titleLeg compare
+// them), so a manifest differing only by surrounding whitespace is not reported
+// as a change no push would make. And a folder without its __init__.py is one
+// every push REFUSES — folded in afterwards, like an automation's orphans,
+// because it is neither undeployed work nor a change over there. Only when the
+// folder holds files: an empty one has nothing to deploy, the same answer an
+// empty workflow folder gets.
+func verdictOfModuleStatus(r *moduleStatusReport, localFiles int, pull string) folderVerdict {
+	if r == nil {
+		return unknownVerdict("no status was computed for this folder")
+	}
+	if r.Remote == nil {
+		return unknownVerdict("no remote state was computed for this folder")
+	}
+	verdict := verdictOfFileDrift(fileDriftInput{
+		Remote: &remoteReport{
+			Checked:          r.Remote.Checked,
+			NotCheckedReason: r.Remote.NotCheckedReason,
+			Problem:          r.Remote.Problem,
+			Drift:            r.Remote.Drift,
+			TargetUnknown:    r.Remote.TargetUnknown,
+		},
+		Baseline: r.Baseline, NothingYet: reasonNoModuleYet,
+		LocalFiles: localFiles, Creates: "the module", Local: r.Local,
+		Meta: moduleMetaChanges(r.Remote),
+		Pull: pull,
+	})
+	if r.LocalProblem == "" || localFiles == 0 {
+		return verdict
+	}
+	refused := "a push would refuse this folder: " + r.LocalProblem
+	if verdict.Verdict == verdictClean {
+		return driftedVerdict("%s", refused)
+	}
+	verdict.Detail = refused + "; " + verdict.Detail
+	return verdict
+}
+
+// moduleMetaChanges is workflowMetaChanges for a module: the package name and
+// the title, each only when the push's own comparison would write it.
+func moduleMetaChanges(r *moduleRemoteReport) []string {
+	if r == nil {
+		return nil
+	}
+	var out []string
+	if n := r.Name; n != nil && strings.TrimSpace(n.Local) != n.Remote {
+		out = append(out, fmt.Sprintf("the package name (%s to %s)", n.Remote, strings.TrimSpace(n.Local)))
+	}
+	if t := r.Title; t != nil && !sameName(t.Local, t.Remote) {
+		out = append(out, "the title")
+	}
+	return out
 }
 
 // workflowMetaChanges names the declarations a push would change on the row.
@@ -519,8 +608,18 @@ type fileDriftInput struct {
 	Creates    string
 	LocalFiles int
 	Local      wfdir.Diff
-	Meta       []string
+	// Rebound is each binding re-pointed since the baseline: a local change,
+	// said beside the files this folder holds that the organization does not.
+	Rebound []reboundAlias
+	Meta    []string
+	// Pull is pushDelta.Pull.
+	Pull string
 }
+
+// noLocalBaselineDetail is the unknown verdict of a workflow, data-app or
+// module folder with no local baseline — which answeredByLive re-asks of an
+// adopted folder.
+const noLocalBaselineDetail = "no local baseline for this stack, so nothing could be compared — the drift below is every remote file reading as new, not a real comparison"
 
 // verdictOfFileDrift is the shared body of the workflow and data-app verdicts:
 // both compare a set of REMOTE file hashes against the local baseline, both
@@ -550,7 +649,7 @@ func verdictOfFileDrift(in fileDriftInput) folderVerdict {
 	// was never asked. Checked before the diff so the honest answer wins, and
 	// before the LOCAL leg so that leg never sees an absent baseline either.
 	if in.Baseline == nil {
-		return unknownVerdict("no local baseline for this stack, so nothing could be compared — the drift below is every remote file reading as new, not a real comparison")
+		return unknownVerdict("%s", noLocalBaselineDetail)
 	}
 	// Reached when the remote row was read and its files were not: remoteStatus
 	// records a note and leaves Drift nil rather than claiming no difference.
@@ -573,14 +672,22 @@ func verdictOfFileDrift(in fileDriftInput) folderVerdict {
 	// The baseline is known to exist by here, so Added is meaningful: these are
 	// files this folder holds and the last sync did not.
 	delta.Local = append(localChanges(in.Local), in.Local.Added...)
+	for _, r := range in.Rebound {
+		if r.Refused != "" {
+			delta.Refused = append(delta.Refused, fmt.Sprintf("%s, which an older CLI's record of the last sync reads as a change made in Ronja — %s", r.describe(), r.Refused))
+			continue
+		}
+		delta.Local = append(delta.Local, r.describe())
+	}
 	delta.Meta = in.Meta
+	delta.Pull = in.Pull
 	return delta.verdict()
 }
 
 // neverDeployedVerdict answers the one NotCheckedReason per loop that is a
 // CONCLUSION rather than a failure to look: the folder is bound here, it names a
 // feature, and the organization simply holds nothing this folder has pushed yet
-// (reasonNothingBound / reasonNoWorkflowYet / reasonNoAppYet).
+// (reasonNothingBound / reasonNoWorkflowYet / reasonNoAppYet / reasonNoModuleYet).
 //
 // ⚠️ THAT REASON WAS READ AS CLEAN, AND IT IS A FALSE GREEN. A folder bound to
 // this very organization, holding a table's whole SQL or a whole workflow, that

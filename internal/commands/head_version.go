@@ -346,9 +346,9 @@ func (f *folder) setHeadVersion(versionID string) {
 // cases: it has no local detail to offer, so the refusal names the two version
 // ids and the two ways out, and does NOT suggest --force — reaching for it here
 // would overwrite the very publish this refusal just found.
-func refuseHeadMoved(kind, resourceID string, h headAgreement, cloneCmd string) error {
-	return fmt.Errorf("%s %s has been published to since this folder last agreed with it: it was at version %s and is now at %s.\n  This checkout has no local sync baseline, so nothing here can tell your change from theirs.\n  Look at what they published, then %s to re-apply your work on top of it",
-		kind, resourceID, h.Recorded, h.Current, cloneCmd)
+func refuseHeadMoved(kind, resourceID string, h headAgreement, cloneCmd, pullHint string) error {
+	return fmt.Errorf("%s %s has been published to since this folder last agreed with it: it was at version %s and is now at %s.\n  This checkout has no local sync baseline, so nothing here can tell your change from theirs.\n  Look at what they published, then %s to re-apply your work on top of it%s",
+		kind, resourceID, h.Recorded, h.Current, cloneCmd, pullHint)
 }
 
 // noteHeadAnchored explains, once, that a baseline-less push proceeded on the

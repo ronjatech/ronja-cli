@@ -29,16 +29,6 @@ const (
 	// Reported rather than skipped, because a folder this command cannot open
 	// is precisely a folder it cannot vouch for.
 	syncReasonUnreadable = "unreadable"
-	// syncReasonKindNotCovered — a kind this build fully understands, that
-	// `ronja sync` has no leg for. Today that is `module` and nothing else.
-	//
-	// Distinct from syncReasonUnreadable on purpose. "This build does not
-	// understand your folder" and "this command does not cover your folder"
-	// send a reader to opposite places — the first to a CLI upgrade, the second
-	// to `ronja module status`, which answers for that folder perfectly well.
-	// Both are still NEVER GREEN: a module folder nobody checked is a module
-	// folder nobody checked, and the tree verdict has to say so.
-	syncReasonKindNotCovered = "kind_not_covered"
 	// syncReasonStackElsewhere — the folder declares the requested stack, and it
 	// points at a different instance or organization than this credential
 	// reaches. A repository legitimately holds folders belonging to several
@@ -212,29 +202,13 @@ func discoverFolders(dir string) ([]discoveredFolder, error) {
 			continue
 		}
 		folder.Kind = kind
-		// A module folder is understood and not covered, and it must not reach
-		// the dispatch below: both status and check end in a `default:` arm
-		// (workflow and pipeline respectively), so an uncaught module folder
-		// would not be skipped — it would be silently REPORTED ON as a workflow,
-		// against workflow endpoints, using a module's id.
+		// Every kind the registry knows is covered by every verb, a module folder
+		// included. ⚠️ Each verb's kind switch therefore needs an arm for EVERY
+		// kind: status ends in a workflow `default:` and check in a pipeline one,
+		// so a kind that reached them uncaught would be reported on as the wrong
+		// kind, against the wrong endpoints, using its own id. Module folders were
+		// held back here as not covered until each verb had its own arm.
 		//
-		// Answering for one is real work rather than a missing case: `status`
-		// would need a root-parameterised module status report and a verdict
-		// fold, and `check` would need to state that a marker-free kind makes no
-		// references at all. Until that exists, saying so is the honest answer.
-		//
-		// The Kind is KEPT rather than zeroed the way the unknown-kind branch
-		// above zeroes it: there the fallback is WorkflowKind and printing it
-		// would be a lie, whereas here the probe established the real kind and
-		// both report lines stamp Kind.Name, so the reader gets `"kind":
-		// "module"` beside the reason instead of an empty string.
-		if kind.Name == wfdir.KindModule {
-			folder.Reason = syncReasonKindNotCovered
-			folder.Detail = fmt.Sprintf("%s is a module folder, and `ronja sync` covers workflow, data-app and pipeline folders — run `ronja module status` in it instead",
-				wfdir.ManifestPath(root))
-			out = append(out, folder)
-			continue
-		}
 		// The kind probe reads one key and forgives everything else, so a
 		// manifest that will not decode, declares a format version this build
 		// cannot read, or carries the old-style "instances" object is still
@@ -247,9 +221,42 @@ func discoverFolders(dir string) ([]discoveredFolder, error) {
 			continue
 		}
 		folder.Manifest = manifest
+		folder.Kind = kind.ForManifest(manifest)
 		out = append(out, folder)
 	}
+	refuseSharedFolderIDs(out)
 	return out, nil
+}
+
+// refuseSharedFolderIDs rules out every folder whose id another folder in the
+// tree also carries — a `cp -r` of an adopted folder. One id is one set
+// of addresses on the server, so two folders sharing it would read and write
+// each other's claims: whichever ran second would adopt the first one's rows as
+// its own. Both are refused, each naming the other, because nothing local can
+// say which one the id belongs to.
+func refuseSharedFolderIDs(folders []discoveredFolder) {
+	byID := map[string][]int{}
+	for i, folder := range folders {
+		if folder.notChecked() || folder.Manifest == nil || !folder.Manifest.Adopted() {
+			continue
+		}
+		byID[folder.Manifest.ID] = append(byID[folder.Manifest.ID], i)
+	}
+	for id, indexes := range byID {
+		if len(indexes) < 2 {
+			continue
+		}
+		paths := make([]string, 0, len(indexes))
+		for _, i := range indexes {
+			paths = append(paths, folders[i].Rel)
+		}
+		for _, i := range indexes {
+			folders[i].Reason = syncReasonDuplicateFolderID
+			folders[i].Detail = fmt.Sprintf("%s carries folder id %s, and so does every one of %s — a copied folder keeps its id, and one id is one set of addresses on the server, so these folders would adopt each other's rows. Delete the \"id\" from the copy's %s and run `ronja sync adopt --stack <name>` there to give it its own",
+				folders[i].Rel, id, strings.Join(paths, ", "), wfdir.ManifestName)
+			folders[i].Manifest = nil
+		}
+	}
 }
 
 // skipWalkDir reports whether a directory NAME is pruned outright.

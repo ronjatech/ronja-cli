@@ -249,6 +249,11 @@ type Automation struct {
 	// so they are absent on get and list and must be reported at the moment they
 	// arrive or not at all.
 	Warnings []string `json:"warnings"`
+	// ManagedBy names the repository folder that deploys this automation, when one
+	// does (backend/resource/rscheduledjob/automation_dto.go). Only the
+	// single-row GET carries it; nil on every other route, on a row no
+	// repository manages, and on an instance older than the field.
+	ManagedBy *ManagedBy `json:"managedBy,omitempty"`
 }
 
 // Normalize replaces nil slices with empty ones.
@@ -367,6 +372,10 @@ type CreateAutomationInput struct {
 	ApprovedToolGroups []string              `json:"approvedToolGroups,omitempty"`
 
 	Action *AutomationActionInput `json:"action,omitempty"`
+	// Managed is the repository address this create claims, in the create's own
+	// transaction (backend resource/rmanaged). Nil — no key — for a folder that
+	// has no folder id, which is every create a legacy folder makes.
+	Managed *ManagedClaimInput `json:"managed,omitempty"`
 }
 
 // AutomationPatch is the body of PUT /automations/:jobID, mirroring the subset

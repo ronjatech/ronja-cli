@@ -82,6 +82,10 @@ type CreateTableInput struct {
 	// the push actually shows a reader is taken from the documentation write that
 	// follows the build. See UpdateTableDocs.
 	Fields []TableFieldInput `json:"fields,omitempty"`
+	// Managed is the repository address this create claims, in the create's own
+	// transaction (backend resource/rmanaged). Nil — no key — for a folder that
+	// has no folder id, which is every create a legacy folder makes.
+	Managed *ManagedClaimInput `json:"managed,omitempty"`
 }
 
 // TableFieldInput is one entry of a `fields` write, mirroring the subset of
@@ -280,6 +284,24 @@ func (c *Client) UpdateTableDocs(ctx context.Context, id string, in UpdateTableD
 		return nil, nil
 	}
 	return &out, nil
+}
+
+// RenameTable sets a table's — or a metric's — NAME through PUT
+// /feature/model/:id, and nothing else.
+//
+// `id` is the DRAFT's in the pipeline loop, for UpdateTableDocs' reason: a
+// commit lands the draft's name on the live row, so a rename written on the live
+// row while a draft is open is reverted by the next publish of that draft. The
+// rename then reaches the live row at publish, where the server checks the name
+// is free in the feature and answers 409 `name_taken` (api.AsNameTaken) when it
+// is not. A rename of a LIVE row is checked at once, with the same answer.
+//
+// Allowed for every role on the caller's own draft: `name` is on the non-admin
+// draft allowlist server-side.
+func (c *Client) RenameTable(ctx context.Context, id, name string) error {
+	return c.doSlow(ctx, "PUT", "feature/model/"+url.PathEscape(id), struct {
+		Name string `json:"name"`
+	}{Name: name}, nil)
 }
 
 // CheckoutTable gets-or-creates the CALLER'S OWN draft of a table and returns

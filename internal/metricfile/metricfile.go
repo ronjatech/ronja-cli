@@ -63,13 +63,16 @@ import (
 //	  },
 //	  "description": "Average order value, per day.",
 //	  "reportingTimezone": "Europe/Stockholm",
-//	  "tags": ["Finance", "Sales"]
+//	  "tags": ["Finance", "Sales"],
+//	  "name": "Average order value"
 //	}
 //
-// Four keys and no more. The metric's NAME is the file's stem, not a key here,
-// for the reason a .sql file's table name is its stem: one carrier, one name,
-// and a `name` key would be a second place to say it that a rename would leave
-// disagreeing with the filename.
+// Five keys and no more. `name` is OPTIONAL, and the two states mean different
+// things: ABSENT is a metric named after the file's stem at create and never
+// renamed by a push afterwards; PRESENT is a managed name — the push renames the
+// SAME metric to it, in place, after checking nobody renamed it elsewhere. The
+// stem stays the file's identity either way, so renaming the file is not
+// renaming the metric.
 //
 // `description` and `reportingTimezone` are POINTERS because both are
 // three-state, exactly as the docs sidecar's `description` is: an absent key is
@@ -90,6 +93,7 @@ type metricFile struct {
 	Description       *string         `json:"description,omitempty"`
 	ReportingTimezone *string         `json:"reportingTimezone,omitempty"`
 	Tags              json.RawMessage `json:"tags,omitempty"`
+	Name              *string         `json:"name,omitempty"`
 }
 
 // MaxTagNameBytes and MaxTagsPerMetric are the server's two tag caps
@@ -133,6 +137,15 @@ type File struct {
 	// edit into a re-staged, re-built draft of an unchanged definition. The tag
 	// half has its own record and its own pending question; see TagsFingerprint.
 	Tags *[]string
+	// Name is the metric's DECLARED name: nil is unmanaged (the stem it was
+	// created with stands, and a rename made in the web app is left alone), a
+	// value is managed. Trimmed; an empty one is refused at parse.
+	//
+	// ⚠️ NOT PART OF Fingerprint either, for Tags' reason one step removed: a
+	// rename is not a definition change, and folding it in would re-stage every
+	// metric whose file gained the key. The push decides "is a rename pending"
+	// against the row instead.
+	Name *string
 }
 
 // Parse decodes one metric file.
@@ -178,6 +191,13 @@ func Parse(body []byte) (File, error) {
 	if file.ReportingTimezone != nil {
 		trimmed := strings.TrimSpace(*file.ReportingTimezone)
 		out.ReportingTimezone = &trimmed
+	}
+	if file.Name != nil {
+		trimmed := strings.TrimSpace(*file.Name)
+		if trimmed == "" {
+			return File{}, fmt.Errorf("this file's \"name\" is empty — a metric cannot be renamed to nothing; remove the key to leave the metric's name alone, or write the name it should have")
+		}
+		out.Name = &trimmed
 	}
 	if len(file.Tags) > 0 {
 		tags, err := parseTags(file.Tags)

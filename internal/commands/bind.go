@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
@@ -37,12 +39,21 @@ import (
 // than inside `wf` / `app` / `pipeline`, and it works in whichever folder it is
 // run from.
 //
-// Three rules it does not bend:
+// Four rules it does not bend:
 //
-//   - ONLY AN EXACT NAME MATCH IS PROPOSED. A prefix or substring hit is a
-//     guess, and the cost of a wrong guess is not a failed command — it is a
-//     workflow silently deployed against somebody else's table. Near misses are
-//     reported and left alone.
+//   - A WRITE TARGET IS NEVER PROPOSED. A dependency declared "write": true is
+//     a row this folder writes, and the organization-wide exact-name match for
+//     it in a new stack is the table the FIRST stack writes — production, for a
+//     Dev copy. It is reported unresolved (write_target) and bound by hand,
+//     per stack. A RUN TARGET ("run": true) is not proposed for the
+//     same reason (run_target): the match is the workflow or agent
+//     the first stack runs. An address and an output are never looked up
+//     either; they are not bound at all.
+//   - ONLY A NAME MATCH IS PROPOSED: the same name up to case, or — when none
+//     is — up to case and separators (looseBindName). A prefix or substring hit
+//     is a guess, and the cost of a wrong guess is not a failed command — it is
+//     a workflow silently deployed against somebody else's table. Near misses
+//     are reported and left alone.
 //   - AMBIGUITY IS NEVER RESOLVED, --yes INCLUDED. `--yes` says "I trust the
 //     unambiguous ones"; it cannot say which of three tables called `orders` was
 //     meant, and picking one for a person who is not watching is the same wrong
@@ -69,15 +80,20 @@ the code says {{ ref('orders') }} everywhere, and the ids stay out of it.
 
 This command fills in the missing half. For every declared name with no binding
 on the selected stack it searches the organization for a resource of that kind
-called exactly that, and offers what it found:
+called that, and offers what it found:
 
   ronja bind --stack prod
 
-Only an EXACT name match is offered. If nothing is called that, or several
+A name matches when it is the same ignoring case, or — when nothing matches
+that way — the same ignoring case and the difference between "_", "-", "."
+and spaces, so qa_import_crm finds the secret "QA Import CRM". The plan says
+when a match was of that second kind. If nothing is called that, or several
 things are, it says so and leaves the name unbound — a near match is a guess,
 and a wrong binding deploys your code against the wrong row without failing.
 Codexes cannot be offered at all: the search does not cover them, so those are
-set by hand.
+set by hand. Nor is a write target (a dependency declared "write": true): which
+table a stack may WRITE is decided by hand for each stack, because the row
+called that name may be the one another stack writes.
 
 Nothing is written until you confirm; --yes accepts the unambiguous ones without
 asking, and still never picks between candidates. It exits non-zero while any
@@ -210,13 +226,12 @@ func folderKindHere() (wfdir.Kind, error) {
 // behind that way — see wfdir.KindByName.
 //
 // ⚠️ `known` means THE BUILD UNDERSTANDS THIS KIND, never "this command can act
-// on it". A module folder is known and neither caller acts on one: `bind`
-// refuses it because a module declares no dependencies (see
-// moduleDependenciesInert), and `ronja sync` reports it not_checked for
-// kind_not_covered. Answering `false` for module would have been the cheap way
-// to get both refusals, and it would have made both of them lie — sync would
-// tell the reader this build does not understand a kind it has a whole command
-// for.
+// on it". A module folder is known and `bind` does not act on one: it refuses
+// it because a module declares no dependencies (see moduleDependenciesInert).
+// Answering `false` for module would have been the cheap way to get that
+// refusal, and it would have made it lie — and it would have told `ronja sync`,
+// which covers module folders like every other kind, that this build does not
+// understand a kind it has a whole command for.
 func folderKindAt(root string) (kind wfdir.Kind, known bool, err error) {
 	raw, err := os.ReadFile(wfdir.ManifestPath(root))
 	if err != nil {
@@ -267,6 +282,18 @@ func folderKindLabels() string {
 // two it means or the reader goes looking for the binding they are missing.
 const moduleDependenciesInert = "modules are marker-free, so a module folder's `dependencies` block resolves nothing — there is no marker in a module file for an alias to fill. Declare the dependency in the CONSUMER workflow, which does carry markers, and pass the resolved value into this module's function as an argument"
 
+// moduleInertDependenciesNote is the note `ronja sync check` and `sync apply`
+// carry for a module folder that commits a `dependencies` block, or "" when it
+// declares none. A note, never a refusal: the block stops nothing.
+func moduleInertDependenciesNote(m *wfdir.Manifest) string {
+	names := m.AliasNames()
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s declares the dependency name(s) %s, which will never resolve here — %s",
+		wfdir.ManifestName, strings.Join(names, ", "), moduleDependenciesInert)
+}
+
 // Why an alias could not be proposed. These strings are the `reason` field of
 // the --json output, so they are a contract with whatever reads it: each one
 // says something a reader would act on differently.
@@ -293,6 +320,15 @@ const (
 	// ADDING a dependency kind and forgetting searchKindOf a named refusal rather
 	// than a silent "not searchable".
 	bindReasonUnknownKind = "unknown_kind"
+	// bindReasonWriteTarget — a dependency declared "write": true. Never looked
+	// up: a row this folder WRITES is chosen by hand for each stack, because
+	// the exact-name match is the table another stack writes.
+	bindReasonWriteTarget = "write_target"
+	// bindReasonRunTarget — a dependency declared "run": true. Never looked up,
+	// for the write target's reason: a run edge out of the stack's
+	// feature runs with the target's own authority, and the exact-name match
+	// is the row another stack runs.
+	bindReasonRunTarget = "run_target"
 )
 
 // searchKindOf maps a DEPENDENCY kind onto the `kind` a search hit carries.
@@ -321,6 +357,12 @@ func searchKindOf(dependencyKind string) (kind string, ok bool) {
 		return api.SearchKindWorkflow, true
 	case markers.KindNote:
 		return api.SearchKindNote, true
+	case markers.KindDataApp:
+		return api.SearchKindDataApp, true
+	case markers.KindMCPServer:
+		return api.SearchKindMCPServer, true
+	case markers.KindFeature:
+		return api.SearchKindFeature, true
 	default:
 		return "", false
 	}
@@ -331,10 +373,16 @@ type bindProposal struct {
 	Alias string `json:"alias"`
 	Kind  string `json:"kind"`
 	ID    string `json:"id"`
-	// Title is the row's own name. It equals the alias (up to case), which is
-	// exactly why it is reported: seeing the two side by side is how a reader
-	// checks that the match is the one they meant.
+	// Title is the row's own name. It equals the alias up to case — or, when
+	// Loose, up to case and separators — which is exactly why it is reported:
+	// seeing the two side by side is how a reader checks that the match is the
+	// one they meant.
 	Title string `json:"title"`
+	// Loose is true when no row is called the alias exactly and this one is
+	// called it ignoring case and separators ("QA Import CRM" for
+	// `qa_import_crm`). Said in the plan, so a reader approving it sees that the
+	// two spellings differ.
+	Loose bool `json:"loose,omitempty"`
 }
 
 // bindUnresolved is one alias this command will not bind, and why.
@@ -345,7 +393,7 @@ type bindUnresolved struct {
 	// Detail is the sentence a person reads. It is in the JSON too, because the
 	// reason alone does not say WHICH rows collided.
 	Detail string `json:"detail"`
-	// Candidates are the ids that matched exactly, for bindReasonAmbiguous only.
+	// Candidates are the ids that matched, for bindReasonAmbiguous only.
 	// They are the whole answer for a reader picking one by hand.
 	Candidates []string `json:"candidates,omitempty"`
 }
@@ -544,11 +592,42 @@ func runBind(ctx context.Context, f *folder, yes bool, featureID string) (*bindR
 
 	client := api.New(f.Resolved.URL, f.Resolved.Token)
 	for _, alias := range aliases {
+		dep := f.Manifest.Dependencies[alias]
+		// An ADDRESS dependency resolves through the other folder's claim and
+		// an OUTPUT through its name — neither is ever bound by search, and an
+		// output must not be: the exact-name match for it would be the same
+		// output in ANOTHER target, which is the one row it must never write.
+		if dep.ByAddress() || dep.Output {
+			continue
+		}
 		if f.Bind[alias] != "" {
 			result.AlreadyBound = append(result.AlreadyBound, alias)
 			continue
 		}
-		dep := f.Manifest.Dependencies[alias]
+		// A WRITE TARGET is never proposed. The search is
+		// organization-wide, so the exact-name match for `ledger` in a new
+		// stack is the very table the folder's first stack writes — production,
+		// when the new stack is a Dev Space of the same organization — and
+		// binding it there turns every run of the copy into a write to the
+		// original. Which table a stack may write is a decision a person makes
+		// per stack, by hand, and it is reported as such.
+		if dep.Write {
+			result.Unresolved = append(result.Unresolved, bindUnresolved{
+				Alias: alias, Kind: dep.Kind, Reason: bindReasonWriteTarget,
+				Detail: fmt.Sprintf("write target — bound by hand, per stack: this folder writes it, so a match by name could be the table another stack writes. Set it in %s under this stack's \"bind\"", wfdir.ManifestName),
+			})
+			continue
+		}
+		// A RUN EDGE is never proposed either, for the same reason:
+		// which workflow or agent outside its feature a stack runs — with that
+		// row's own authority, writes included — is decided per stack, by hand.
+		if dep.Run {
+			result.Unresolved = append(result.Unresolved, bindUnresolved{
+				Alias: alias, Kind: dep.Kind, Reason: bindReasonRunTarget,
+				Detail: fmt.Sprintf("run target — bound by hand, per stack: this folder runs it with its own authority, so a match by name could be the row another stack runs. Set it in %s under this stack's \"bind\"", wfdir.ManifestName),
+			})
+			continue
+		}
 		proposal, unresolved, err := proposeBind(ctx, client, alias, dep.Kind)
 		if err != nil {
 			return nil, err
@@ -635,31 +714,7 @@ func proposeBind(ctx context.Context, client *api.Client, alias, dependencyKind 
 		// output that would send a reader to change the wrong thing.
 		return nil, nil, fmt.Errorf("search %s for %q: %w", client.BaseURL, alias, err)
 	}
-
-	var matched []api.SearchHit
-	for _, hit := range hits {
-		if hit.Kind != hitKind || hit.Score != api.SearchScoreExact {
-			continue
-		}
-		// ⚠️ DO NOT DELETE THIS AS REDUNDANT WITH THE SCORE. It is not a second
-		// opinion about the score; it is the only thing checking the name at all.
-		//
-		// backend/api/v2/search/tags.go merges a TAG leg into the same result set
-		// and stamps each hit's Score from its matching TAG's score — "a
-		// tag-surfaced hit is indistinguishable from a name-match hit apart from
-		// Score provenance", in its own words. So a table merely TAGGED `orders`
-		// arrives here scoring 3 whatever it is actually called. A tag is a label
-		// somebody put on a row, not the row's name, and binding through one
-		// resolves `{{ ref('orders') }}` to a table called something else — under
-		// --yes, with no prompt, reported as a success.
-		//
-		// Folded, because the server's own exact-match test is ILIKE — case
-		// sensitivity here would silently reject the `Orders` that scored 3.
-		if strings.EqualFold(hit.Title, alias) {
-			matched = append(matched, hit)
-		}
-	}
-
+	exact, loose := matchBindHits(hits, hitKind, alias)
 	// A FULL PAGE is the only signal there is that the result set was cut, and
 	// without acting on it this command's own "AMBIGUITY IS NEVER RESOLVED, --yes
 	// INCLUDED" rule is a promise it cannot keep. It asks for exactly the server's
@@ -676,16 +731,57 @@ func proposeBind(ctx context.Context, client *api.Client, alias, dependencyKind 
 	// answer may be right and nothing here can show that it is.
 	truncated := len(hits) >= api.MaxSearchLimit
 
+	// At most TWO more requests, and only when no exact match turned up: the
+	// search escapes `_` and matches the term as a substring, so `qa_import_crm`
+	// never finds the secret called "QA Import CRM" — the name an imported
+	// folder's alias is most often a spelling of.
+	//
+	//   - The SPACED form first ("qa import crm"): it finds that display name,
+	//     and its page filling is truncation like the first one's.
+	//   - Then the alias's LONGEST WORD (looseBindTerm), only to rule out a
+	//     second loose match the spaced form cannot see — "qa import crm" is no
+	//     substring of "qa-import-crm", "QA.Import.CRM" or "QA  Import CRM", and
+	//     the one it missed would leave the other proposed as unambiguous. A
+	//     loose match it finds counts like any other; its page filling does
+	//     NOT block a proposal, because a common word ("orders") fills a page
+	//     in any organization, and that says nothing about the spelling the
+	//     spaced search saw whole.
+	//
+	// The hits are filtered here by looseBindName. Asked even when the first
+	// search found a loose match, because a second loose match the first search
+	// could not see is exactly the ambiguity that must not be resolved silently.
+	if term, ok := looseBindTerm(alias); len(exact) == 0 && ok {
+		spaced := looseBindName(alias)
+		for _, q := range slices.Compact([]string{spaced, term}) {
+			more, err := client.Search(ctx, q, api.MaxSearchLimit)
+			if err != nil {
+				return nil, nil, fmt.Errorf("search %s for %q: %w", client.BaseURL, q, err)
+			}
+			_, moreLoose := matchBindHits(more, hitKind, alias)
+			loose = appendNewHits(loose, moreLoose)
+			if q == spaced {
+				truncated = truncated || len(more) >= api.MaxSearchLimit
+			}
+		}
+	}
+
+	// An exact match wins outright, so a folder that bound before loose matching
+	// existed binds to the same row now. Only with none is a loose one offered.
+	matched, how := exact, "called"
+	if len(exact) == 0 {
+		matched, how = loose, "called, ignoring case and separators,"
+	}
+
 	switch {
 	case len(matched) == 1 && truncated:
 		return refuse(bindReasonAmbiguous,
-			fmt.Sprintf("the search filled its maximum of %d results, so this is not a complete list of what is called %q — %s looks right, but nothing here can rule out a second one. Set it by hand in %s if it is the one you mean",
-				api.MaxSearchLimit, alias, matched[0].ID, wfdir.ManifestName),
+			fmt.Sprintf("the search filled its maximum of %d results, so this is not a complete list of what is %s %q — %s looks right, but nothing here can rule out a second one. Set it by hand in %s if it is the one you mean",
+				api.MaxSearchLimit, how, alias, matched[0].ID, wfdir.ManifestName),
 			[]string{matched[0].ID})
 	case len(matched) == 1:
-		return &bindProposal{Alias: alias, Kind: dependencyKind, ID: matched[0].ID, Title: matched[0].Title}, nil, nil
+		return &bindProposal{Alias: alias, Kind: dependencyKind, ID: matched[0].ID, Title: matched[0].Title, Loose: len(exact) == 0}, nil, nil
 	case len(matched) == 0:
-		detail := fmt.Sprintf("no %s here is called exactly %q", dependencyKind, alias)
+		detail := fmt.Sprintf("no %s here is called %q, even ignoring case and separators", dependencyKind, alias)
 		if truncated {
 			// Nothing is written either way, so this is not the invariant above —
 			// it is the reader being told not to trust a flat "nothing is called
@@ -717,9 +813,98 @@ func proposeBind(ctx context.Context, client *api.Client, alias, dependencyKind 
 		}
 		sort.Strings(ids)
 		return refuse(bindReasonAmbiguous,
-			fmt.Sprintf("%d %ss here are called %q — pick the one you mean and set it by hand", len(matched), dependencyKind, alias),
+			fmt.Sprintf("%d %ss here are %s %q — pick the one you mean and set it by hand", len(matched), dependencyKind, how, alias),
 			ids)
 	}
+}
+
+// matchBindHits splits a search result into the hits of the dependency's kind
+// that are called alias EXACTLY (up to case) and those called it LOOSELY — the
+// same name once case and separators are ignored (see looseBindName).
+//
+// The two legs check different things, on purpose:
+//
+//   - An exact hit needs the server's exact score AND the title. ⚠️ DO NOT
+//     DELETE THE TITLE CHECK AS REDUNDANT WITH THE SCORE. It is not a second
+//     opinion about the score; it is the only thing checking the name at all.
+//     backend/api/v2/search/tags.go merges a TAG leg into the same result set
+//     and stamps each hit's Score from its matching TAG's score — "a
+//     tag-surfaced hit is indistinguishable from a name-match hit apart from
+//     Score provenance", in its own words. So a table merely TAGGED `orders`
+//     arrives here scoring 3 whatever it is actually called, and binding
+//     through one resolves `{{ ref('orders') }}` to a table called something
+//     else — under --yes, with no prompt, reported as a success. Folded,
+//     because the server's own exact-match test is ILIKE: case sensitivity here
+//     would silently reject the `Orders` that scored 3.
+//   - A loose hit is judged on its title alone, because the score is the
+//     server's verdict on whichever TERM was sent, and the term that finds
+//     "QA Import CRM" is not the alias. A title spelled exactly like the alias
+//     is never a loose hit: if the server did not score it exact, the two
+//     disagree, and a disagreement is not something to bind through.
+func matchBindHits(hits []api.SearchHit, hitKind, alias string) (exact, loose []api.SearchHit) {
+	want := looseBindName(alias)
+	for _, hit := range hits {
+		if hit.Kind != hitKind {
+			continue
+		}
+		switch {
+		case strings.EqualFold(hit.Title, alias):
+			if hit.Score == api.SearchScoreExact {
+				exact = append(exact, hit)
+			}
+		case looseBindName(hit.Title) == want:
+			loose = append(loose, hit)
+		}
+	}
+	return exact, loose
+}
+
+// looseBindName is the one definition of "the same name, ignoring case and
+// separators": lower-cased, every run of `_`, `-`, `.` and whitespace turned
+// into a single space, and none at either edge. So `qa_import_crm`,
+// "QA Import CRM", `qa-import-crm` and " QA  import.CRM " are one name, while
+// `qaimportcrm` is another — a separator that is missing in the middle is a
+// different word boundary, not a spelling of the same one.
+func looseBindName(s string) string {
+	return strings.ToLower(strings.Join(strings.FieldsFunc(s, isBindNameSeparator), " "))
+}
+
+// looseBindTerm is the last search's term: the alias's longest word (the
+// first, of equally long ones). The server matches a term as a substring, and
+// every spelling looseBindName folds to the alias's contains each of its words,
+// so one request reaches all of them while its page lasts. ok is false for an
+// alias that is its own loose name — the first search already asked for it
+// whole — or whose longest word is too short to search for.
+func looseBindTerm(alias string) (term string, ok bool) {
+	if looseBindName(alias) == strings.ToLower(alias) {
+		return "", false
+	}
+	for _, w := range strings.FieldsFunc(alias, isBindNameSeparator) {
+		if len(w) > len(term) {
+			term = w
+		}
+	}
+	return strings.ToLower(term), len(term) >= api.MinSearchTermLen
+}
+
+func isBindNameSeparator(r rune) bool {
+	return r == '_' || r == '-' || r == '.' || unicode.IsSpace(r)
+}
+
+// appendNewHits adds the hits of more that are not already in hits — the same
+// row found by both searches is one candidate, not two.
+func appendNewHits(hits, more []api.SearchHit) []api.SearchHit {
+	seen := make(map[string]bool, len(hits))
+	for _, hit := range hits {
+		seen[hit.ID] = true
+	}
+	for _, hit := range more {
+		if !seen[hit.ID] {
+			seen[hit.ID] = true
+			hits = append(hits, hit)
+		}
+	}
+	return hits
 }
 
 // bindTarget is the entry a run writes its answers into.
@@ -872,7 +1057,11 @@ func printBindPlan(r *bindResult, deps map[string]wfdir.Dependency) {
 		}
 	}
 	for _, p := range r.Proposed {
-		fmt.Fprintf(out, "    %-*s  %-8s  → %s  %q\n", width, p.Alias, p.Kind, p.ID, p.Title)
+		how := ""
+		if p.Loose {
+			how = "  (matched ignoring case and separators)"
+		}
+		fmt.Fprintf(out, "    %-*s  %-8s  → %s  %q%s\n", width, p.Alias, p.Kind, p.ID, p.Title, how)
 	}
 	for _, u := range r.Unresolved {
 		fmt.Fprintf(out, "    %-*s  %-8s  %s\n", width, u.Alias, u.Kind, u.Detail)

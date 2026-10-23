@@ -89,6 +89,7 @@ func dataAppStatusReportAt(ctx context.Context, root string, resolved *config.Re
 	f.noteAliases()
 
 	report := &appStatusReport{
+		opened:        f,
 		Root:          f.Root,
 		URL:           resolved.URL,
 		Title:         f.Manifest.Title,
@@ -108,6 +109,7 @@ func dataAppStatusReportAt(ctx context.Context, root string, resolved *config.Re
 	}
 	baseline := f.State.For(f.Key)
 	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
+	report.Rebound = f.reboundSinceBaseline()
 	report.Skipped = enumeration.Skipped
 	if baseline != nil {
 		report.Baseline = &baselineReport{
@@ -118,6 +120,9 @@ func dataAppStatusReportAt(ctx context.Context, root string, resolved *config.Re
 	}
 
 	report.Remote, report.AppURL = appRemoteStatus(ctx, resolved, f)
+	if report.Remote != nil {
+		report.Rebound = append(report.Rebound, report.Remote.rebound...)
+	}
 	return report, nil
 }
 
@@ -153,17 +158,24 @@ type appStatusReport struct {
 	// signed out, unbound, or unreachable. Reporting a link in those cases would
 	// mean guessing at both the origin and the row, so the local-only half of a
 	// status is now silent about the URL rather than confidently wrong.
-	AppURL   string           `json:"appURL,omitempty"`
-	Local    wfdir.Diff       `json:"local"`
+	AppURL string     `json:"appURL,omitempty"`
+	Local  wfdir.Diff `json:"local"`
+	// Rebound is statusReport.Rebound for a data app.
+	Rebound  []reboundAlias   `json:"rebound,omitempty"`
 	Skipped  []wfdir.Skipped  `json:"skipped,omitempty"`
 	Baseline *baselineReport  `json:"baseline,omitempty"`
 	Remote   *appRemoteReport `json:"remote"`
+	// opened is the folder the report was computed from, for `sync status`
+	// to ask more of without opening it again.
+	opened *folder
 }
 
 // appRemoteReport is deliberately shaped so "we did not look" and "we looked and
 // it is fine" are different states. Problem is the one field a caller should
 // branch on: it is set whenever the binding cannot be used as it stands.
 type appRemoteReport struct {
+	// rebound is remoteReport.rebound for a data app.
+	rebound []reboundAlias
 	Checked bool `json:"checked"`
 	// NotCheckedReason is why the remote half was not looked at. Deliberately
 	// NOT called "skipped": appStatusReport.Skipped already means "a local file
@@ -322,8 +334,9 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 	out.ComparedAgainst = &comparedReport{ID: row.ID, Lifecycle: row.Lifecycle}
 	out.SQLSemanticsNotice = sqlSemanticsNotice(sqlSemanticsSubject(row.Name, row.ID), row.SQLSemantics)
 	baseline := f.State.For(f.Key)
-	drift := wfdir.DiffHashes(hashAppFiles(f.Codec, files), baseline.Hashes())
+	drift := wfdir.DiffHashes(hashAppFiles(f.baselineCodec(), files), baseline.Hashes())
 	out.Drift = &drift
+	out.rebound = f.unrecordedRebind(out.Drift, appContentByPath(f.Codec, files))
 	// Reported only for a folder that manages the allowlists: for one that does
 	// not, the row's grants are not the folder's business and flagging a
 	// difference would be advising a change push deliberately will not make.
@@ -410,14 +423,7 @@ func printAppStatus(r *appStatusReport) {
 	printResourceURL(out, statusKeyWidth, r.AppURL)
 
 	fmt.Fprintf(out, "\n  Local changes\n")
-	if !r.Local.Dirty() {
-		fmt.Fprintf(out, "    clean (%d file(s) match the last sync)\n", r.Local.Unchanged)
-	} else {
-		printPathList(out, "new", r.Local.Added)
-		printPathList(out, "modified", r.Local.Modified)
-		printPathList(out, "deleted", r.Local.Deleted)
-		fmt.Fprintf(out, "    %d unchanged\n", r.Local.Unchanged)
-	}
+	printLocalChanges(out, r.Local, r.Rebound)
 	for _, s := range r.Skipped {
 		fmt.Fprintf(out, "    skipped  %s — %s\n", s.Path, s.Reason)
 	}

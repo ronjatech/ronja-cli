@@ -58,6 +58,17 @@ type Stack struct {
 	// out of the value a deploy records. Selection.Bind is how a command reads
 	// it.
 	Bind map[string]string `json:"bind,omitempty"`
+	// Unmanaged marks a stack of an ADOPTED folder that `ronja sync unmanage`
+	// released while the folder id had to stay (another stack still holds
+	// claims under it, or could not be checked). The stack then runs legacy —
+	// off the lock, claiming nothing — exactly as if the folder had no id, so
+	// its next apply does not quietly re-claim every row. `ronja sync adopt
+	// --stack <name>` clears it; removing the id clears every one.
+	//
+	// CONFIG, committed beside the stack: which stacks a repository deploys
+	// from the server's state is a decision a person made, not state a deploy
+	// discovered.
+	Unmanaged bool `json:"unmanaged,omitempty"`
 
 	// unknown is this stack's forward-compatibility sidecar, for the reasons on
 	// Manifest.unknown. A stack entry is an object in a committed file, so it has
@@ -104,6 +115,14 @@ type Selection struct {
 	// bound yet. Manifest.CheckBind is what tells those apart, at the point a
 	// command is about to act on one.
 	Bind map[string]string
+	// AddressBind is what the folder's ADDRESS dependencies resolved to for
+	// this stack (alias → the row the other folder's claim names), and
+	// AddressErrors why the rest did not. Both are filled by the command layer,
+	// which can ask the server; neither is ever written anywhere. Kept apart
+	// from Bind because Bind is config a person wrote, and CheckBind's rules are
+	// about that.
+	AddressBind   map[string]string
+	AddressErrors map[string]AddressError
 }
 
 // Named reports whether this selection is a stack rather than the legacy

@@ -345,6 +345,13 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 			existing.Workflow.ID)
 	}
 
+	// 1b. The WRITE GATE over the draft about to RUN: in an adopted folder a
+	// run of code writing outside this stack's feature is the slip the gate
+	// exists for, and a run is a write, whatever --write-live says.
+	if err := gateWorkflowRow(ctx, client, f, draft); err != nil {
+		return nil, err
+	}
+
 	// 2. Test what you are looking at. A dirty folder means the draft holds
 	// older code, and a green run of code you have since changed is the most
 	// expensive kind of false confidence.
@@ -597,7 +604,7 @@ func noteRemoteDrift(ctx context.Context, client *api.Client, f *folder, row *ap
 // not this folder". A folder with no baseline at all reads as entirely
 // unpushed, which is the honest answer for a copy cloned from git.
 func checkStale(f *folder, staleOK bool) error {
-	enumeration, err := wfdir.Enumerate(f.Root, wfdir.WorkflowKind)
+	enumeration, err := wfdir.Enumerate(f.Root, f.Kind)
 	if err != nil {
 		return err
 	}

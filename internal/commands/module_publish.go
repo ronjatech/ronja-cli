@@ -60,7 +60,7 @@ folder has local changes that are not in the draft.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.ModuleKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.ModuleKind)
 			if err != nil {
 				return err
 			}
@@ -68,7 +68,9 @@ folder has local changes that are not in the draft.`,
 			// Emitted even on failure, exactly like `wf publish`: a refusal that
 			// carries a result is one the caller has to be able to READ, and the
 			// conflict refusal is the whole reason.
+			printManagedNotices(f.notices)
 			if result != nil {
+				result.ManagedInGit = f.notices
 				if flagJSON {
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
@@ -120,6 +122,9 @@ type modulePublishResult struct {
 	// every ordinary publish, which is what makes its presence meaningful: it is
 	// the record that somebody else's work was discarded, and by which version.
 	OverwroteVersionID string `json:"overwroteVersionID,omitempty"`
+	// ManagedInGit is the module's `managedBy`, when a repository folder other
+	// than this one deploys it (managed_notice.go).
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 func runModulePublish(ctx context.Context, f *folder, opts publishOptions) (*modulePublishResult, error) {
@@ -377,6 +382,7 @@ func resolveModuleDraft(ctx context.Context, client *api.Client, f *folder, noun
 	if err := refuseUnclonableModule(mod); err != nil {
 		return nil, nil, err
 	}
+	f.noteManagedBy(wfdir.ManagedModule, mod.IdentityID(), mod.ManagedBy)
 	if moduleIsUnpublished(mod) {
 		// The binding names the module itself — a parentless draft or a proposal.
 		// The row IS the draft, and publishing it is what makes the module exist

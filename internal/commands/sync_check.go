@@ -289,6 +289,9 @@ func syncCheckTree(ctx context.Context, dir string, resolved *config.Resolved) (
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", dir, err)
 	}
+	// A folder in no git work tree may name by address only folders of this
+	// tree (addressBoundary).
+	ctx = withAddressWalkRoot(ctx, base)
 
 	// Resolved ONCE, before the loop, and swallowed — see syncStatusTree, where
 	// the reason is that a lazy lookup would leave folder one compared on URL
@@ -401,6 +404,9 @@ func checkOneFolder(ctx context.Context, line *syncCheckFolderReport, folder dis
 
 	edges, findings, warnings, reason, detail := folderReferences(ctx, f, checker)
 	line.Edges = append(line.Edges, edges...)
+	// The address dependencies that RESOLVED, each asked of the instance like
+	// any other id; the ones that did not are already among the refusals.
+	line.Edges = append(line.Edges, checker.apply(ctx, addressDependencyEdges(f))...)
 	line.Findings, line.Warnings = findings, warnings
 	// A folder-level reason WINS over whatever the edges add up to, and the
 	// edges are still reported. Both halves matter: the reason is why this
@@ -424,12 +430,19 @@ func checkFolderLocalOnly(ctx context.Context, line *syncCheckFolderReport, fold
 	if err != nil {
 		return
 	}
+	if f.Kind.Name == wfdir.KindModule {
+		// Every module leg is local, but its `dependencies` block is inert rather
+		// than a set of aliases to report as unbound — see moduleReferences.
+		_, line.Findings, line.Warnings, _, _ = moduleReferences(f)
+		return
+	}
 	_, aliases, err := folderSourceAndAliases(f)
 	if err != nil {
 		return
 	}
 	line.Edges = append(line.Edges, dependencyEdges(f.Manifest, aliases)...)
 	line.Warnings = aliases.Warnings
+	line.Findings = addressFormatFindings(f.Manifest)
 }
 
 // notBoundHereDetail says what the folder DOES name, so the reader can choose a
@@ -464,9 +477,44 @@ func folderReferences(ctx context.Context, f *folder, checker *edgeChecker) (
 		return dataAppReferences(ctx, f, checker)
 	case wfdir.KindAutomation:
 		return automationReferences(ctx, f, checker)
+	case wfdir.KindModule:
+		// Its own arm, never the `default:` below: the pipeline leg would scan a
+		// module's files for markers and read its `dependencies` block as aliases
+		// to bind, neither of which a module has.
+		return moduleReferences(f)
 	default:
 		return pipelineReferences(ctx, f, checker)
 	}
+}
+
+// moduleReferences answers for a module folder, which makes NO references: a
+// module is marker-free by rule (it receives its handles, data and
+// configuration as function arguments from the workflow that imports it), so
+// there is nothing here to resolve and nothing to ask the instance — the folder
+// is clean with no edges, signed in or not.
+//
+// Two things are still said, both local. A file that DOES carry a marker is a
+// finding, in `module validate`'s own wording: the server refuses it at save,
+// so the folder does not deploy, which is exactly a shape refusal of the kind a
+// finding reports. And a committed `dependencies` block is a WARNING rather than
+// edges: it can never resolve, and reporting each alias as `unresolved` would
+// send the reader to `ronja bind`, which refuses a module folder outright.
+func moduleReferences(f *folder) (
+	edges []syncEdgeReport, findings, warnings []string, reason, detail string) {
+	files, _, err := readLocalFiles(f.Root, f.Kind)
+	if err != nil {
+		return nil, nil, nil, syncReasonFolderRefused, err.Error()
+	}
+	for _, path := range sortedPaths(files) {
+		if verb := firstRonjaMarkerVerb(files[path]); verb != "" {
+			findings = append(findings, moduleMarkerProblem(path, verb))
+		}
+	}
+	findings = append(findings, addressFormatFindings(f.Manifest)...)
+	if note := moduleInertDependenciesNote(f.Manifest); note != "" {
+		warnings = append(warnings, note)
+	}
+	return nil, findings, warnings, "", ""
 }
 
 // automationReferences resolves each automation file's id-bearing FIELDS and
@@ -479,10 +527,8 @@ func folderReferences(ctx context.Context, f *folder, checker *edgeChecker) (
 // every automation folder as having no references whatever, which is `clean` for
 // a folder whose note reference is dangling.
 //
-// The kinds with no alias (dataapp, mcpserver, feature) are reported as
-// `unresolved` rather than looked up: resolveAutomationRefs refuses them at push
-// time, so a check that answered `ok` for one would send somebody to a push that
-// cannot succeed.
+// A `feature` reference written "@feature" is the stack's own feature, and is
+// checked as that id — the same substitution resolveAutomationRefs makes.
 func automationReferences(ctx context.Context, f *folder, checker *edgeChecker) (
 	edges []syncEdgeReport, findings, warnings []string, reason, detail string) {
 	files, aliases, err := folderSourceAndAliases(f)
@@ -511,6 +557,13 @@ func automationReferences(ctx context.Context, f *folder, checker *edgeChecker) 
 				edge.Kind = "dependency"
 				edge.Verdict = edgeUnresolved
 				edge.Detail = "this reference kind has no alias, so it could only be named by one organization's raw id — a push refuses it"
+			case field.Kind == markers.KindFeature && field.Value == featureSelfRef:
+				if f.Binding.FeatureID == "" {
+					edge.Verdict = edgeUnresolved
+					edge.Detail = fmt.Sprintf("%q names the feature this stack deploys to, and the stack names none", featureSelfRef)
+					break
+				}
+				edge.ID = f.Binding.FeatureID
 			case markers.IsResourceID(field.Kind, field.Value):
 				// Left undecided, so checker.apply asks the instance about it.
 				edge.ID = field.Value
@@ -526,7 +579,7 @@ func automationReferences(ctx context.Context, f *folder, checker *edgeChecker) 
 			edges = append(edges, edge)
 		}
 	}
-	return checker.apply(ctx, edges), nil, warnings, "", ""
+	return checker.apply(ctx, edges), addressFormatFindings(f.Manifest), warnings, "", ""
 }
 
 // workflowReferences asks the INSTANCE, because the answer already exists there
@@ -619,7 +672,21 @@ func pipelineReferences(ctx context.Context, f *folder, checker *edgeChecker) (
 	// no longer deploys, which is exactly the question this command asks.
 	fromMetrics, metricFindings := metricEdges(f, pipe, f.live(f.State.For(f.Key)))
 	edges = append(edges, fromMetrics...)
-	return checker.apply(ctx, edges), append(docsFindings, metricFindings...), aliases.Warnings, "", ""
+	findings = append(append(docsFindings, metricFindings...), addressFormatFindings(f.Manifest)...)
+	return checker.apply(ctx, edges), findings, aliases.Warnings, "", ""
+}
+
+// addressFormatFindings is a `moved` declaration in a manifest that does not
+// declare the format version that means it — a finding about the folder rather
+// than about one reference, and one no stack needs to be asked about: every
+// command that applies the declaration refuses the folder, and a CLI older than
+// the format ignores the key and creates a second row. See
+// wfdir.Manifest.CheckAddressFormat.
+func addressFormatFindings(m *wfdir.Manifest) []string {
+	if err := m.CheckAddressFormat(); err != nil {
+		return []string{err.Error()}
+	}
+	return nil
 }
 
 // dataAppReferences checks what a data app DECLARES, and compares it against

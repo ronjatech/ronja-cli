@@ -54,6 +54,8 @@ Then edit locally and check where you stand:
   ronja wf publish                 take the draft live (or ask an admin to)
   ronja wf run                     run the live workflow and report what happened
   ronja wf discard                 throw your draft away
+  ronja wf pull                    take a change made in Ronja back into a
+                                   folder that keeps its records in Ronja
 
 Bindings are per-instance, so the same folder can target a local backend and
 production without either overwriting the other's binding.`,
@@ -62,6 +64,7 @@ production without either overwriting the other's binding.`,
 		newWorkflowInitCmd(), newWorkflowCloneCmd(), newWorkflowStatusCmd(),
 		newWorkflowValidateCmd(), newWorkflowPushCmd(), newWorkflowTestCmd(),
 		newWorkflowPublishCmd(), newWorkflowRunCmd(), newWorkflowDiscardCmd(),
+		newPullCmd(wfdir.WorkflowKind),
 	)
 	addStackFlag(wf)
 	return wf
@@ -332,7 +335,7 @@ type folder struct {
 	// featureID — advice to add a key the file already had. openFolder now
 	// refuses it by name; `status` reads it deliberately, to degrade.
 	BindingErr error
-	// OrgErr is set only by openFolderForStatus, and only when asking the server
+	// OrgErr is set only by openFolderForStatusAt, and only when asking the server
 	// which organization this credential belongs to FAILED — a revoked or expired
 	// token, a 5xx, no network.
 	//
@@ -342,6 +345,55 @@ type folder struct {
 	// answering when your token turns out to be dead. The acting commands go
 	// through openFolder and still refuse — there the answer is load-bearing.
 	OrgErr error
+
+	// addresses / addressesErr cache resolveAddresses: the `moved` / `removed`
+	// evaluation is made ONCE per command and in memory, so `sync apply`'s plan
+	// pass and the push its execute pass runs on the same folder agree, and
+	// only an acting push writes it back. See addresses.go.
+	addresses    *addressOutcome
+	addressesErr error
+
+	// managed is an ADOPTED folder's server state for the selected stack (see
+	// managed.go); nil for a legacy folder, which is every folder with no id.
+	managed *managedState
+
+	// addressBind / addressErrors / addressEdges are what this folder's
+	// ADDRESS dependencies resolved to for the selected stack, why the rest did
+	// not, and the resolved edges — see address_deps.go. Nil for a folder that
+	// declares none, which is every folder that does not reference another.
+	addressBind   map[string]string
+	addressErrors map[string]wfdir.AddressError
+	addressEdges  []addressEdge
+	// addressPending are the address dependencies that did not resolve only
+	// because the other folder has no claim at the address yet — what `sync
+	// apply` may defer to a row the same run creates (addressPending).
+	addressPending map[string]addressPending
+	addressStack   string
+	// outputBind are the unbound `output` dependencies the code reads with
+	// `{{ ref() }}`, resolved in memory to the table the workflow's runs made
+	// in this stack's feature (resolveOwnOutputs).
+	outputBind map[string]string
+	// outputErrs are the outputs whose lookup failed (also in addressErrors);
+	// outputsFor is the workflow id they were resolved for, once
+	// outputsResolved — see resolveOutputs.
+	outputErrs      map[string]wfdir.AddressError
+	outputsFor      string
+	outputsResolved bool
+	// gateNotes are the write gate's notes about this folder (noteGate): an
+	// admitted write or run bind that lands outside the stack's feature.
+	// gateNotesCollected is set by `sync apply`, which reports them on the
+	// folder's line instead of printing them as they happen.
+	gateNotes          []string
+	gateNotesCollected bool
+	// notices are the classic-loop notices this command collected: a row it
+	// read whose single-row GET says another repository folder deploys it
+	// (managed_notice.go). A single-folder command prints them and carries
+	// them in --json; `sync apply` does neither.
+	notices []managedNotice
+	// ctx is the context the folder was opened under, kept for the one thing
+	// that has to make a request from inside a save: recording the anchor that
+	// save changed (recordManagedAnchors). Nil on the local-only openers.
+	ctx context.Context
 }
 
 // openFolder finds the folder root from the working directory, loads both
@@ -354,8 +406,37 @@ type folder struct {
 // happen at one site rather than at fourteen — and a command added later
 // inherits them. The two shallower openers below exist for the callers that
 // legitimately want less, and each says which.
+//
+// For an ADOPTED folder it reads the server's state in memory only (see
+// openFolderForDeploy for the commands that may write it): `wf run`, the
+// validators, `bind` and `discard` act on a row, and none of them is a deploy,
+// so none of them settles a `moved`, releases a `removed`, claims a row or
+// records an anchor on the server.
 func openFolder(ctx context.Context, resolved *config.Resolved, kind wfdir.Kind) (*folder, error) {
-	f, err := openFolderLocally(resolved, kind)
+	return openActingFolder(ctx, resolved, kind, false)
+}
+
+// openFolderForDeploy is openFolder for the commands that DEPLOY — push and
+// publish of every kind (`sync apply` settles through its own pass): an
+// adopted folder settles what its server state says is pending (applyManaged),
+// writes back a lock the server disagreed with, and records the anchors each
+// lock save changes. Only a deploy writes server state.
+func openFolderForDeploy(ctx context.Context, resolved *config.Resolved, kind wfdir.Kind) (*folder, error) {
+	return openActingFolder(ctx, resolved, kind, true)
+}
+
+func openActingFolder(ctx context.Context, resolved *config.Resolved, kind wfdir.Kind, deploy bool) (*folder, error) {
+	root, err := folderRootHere(kind)
+	if err != nil {
+		return nil, err
+	}
+	return openActingFolderAt(ctx, root, resolved, kind, deploy)
+}
+
+// openActingFolderAt is openActingFolder for a root the caller already knows —
+// `ronja <kind> pull [dir]`.
+func openActingFolderAt(ctx context.Context, root string, resolved *config.Resolved, kind wfdir.Kind, deploy bool) (*folder, error) {
+	f, err := openFolderLocallyAt(root, resolved, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -370,6 +451,31 @@ func openFolder(ctx context.Context, resolved *config.Resolved, kind wfdir.Kind)
 	}
 	if err := f.adoptStack(); err != nil {
 		return nil, err
+	}
+	if err := f.requireAdoptedStackFeature(); err != nil {
+		return nil, err
+	}
+	// Address dependencies resolve through OTHER folders' server state, read
+	// here once so every loop's codec already speaks them.
+	f.resolveAddressDependencies(ctx)
+	// An ADOPTED folder's state is the server's: read it — and, for a deploy,
+	// settle what it says is pending — and only then hand the folder to a
+	// loop. A legacy folder skips this entirely.
+	f.ctx = ctx
+	if !deploy {
+		if err := f.refreshManaged(ctx); err != nil {
+			return nil, err
+		}
+		if f.managed != nil {
+			f.managed.readOnly = true
+		}
+		return f, nil
+	}
+	if err := f.settleManagedForActing(ctx); err != nil {
+		return nil, err
+	}
+	if f.managed != nil {
+		managedFolders = append(managedFolders, f)
 	}
 	return f, nil
 }
@@ -405,7 +511,7 @@ func (f *folder) requireNamedStack() error {
 // would otherwise resolve through the stack, sync every file, and leave the file
 // on disk in the old shape — the flag doing nothing visible, for ever.
 //
-// On openFolder and NOT on openFolderForStatus: `status` is the command you run
+// On openFolder and NOT on openFolderForStatusAt: `status` is the command you run
 // when you are already suspicious, and it does not get to rewrite committed
 // files. Acting commands do, and this is idempotent.
 //
@@ -448,27 +554,19 @@ func (f *folder) adoptStack() error {
 	return nil
 }
 
-// openFolderForStatus is openFolder without the refusals, for the three
-// `status` commands. It TRIES to resolve the organization, and neither an
-// ambiguous binding nor a failed lookup stops it: both are recorded and
-// reported, and the local half of the report is delivered either way.
+// openFolderForStatusAt is openFolder without the refusals, for the commands
+// that report: every `status`, and the tree commands. It TRIES to resolve the
+// organization, and neither an ambiguous binding nor a failed lookup stops it:
+// both are recorded and reported, and the local half of the report is
+// delivered either way.
 //
-// That is the whole point of a command you run when you are already suspicious.
-// A CI pre-flight running `status --json` under a rotated token used to print
-// the local diff plus a reason; aborting instead would make the one command that
-// could explain the situation the one that says nothing.
-func openFolderForStatus(ctx context.Context, resolved *config.Resolved, kind wfdir.Kind) (*folder, error) {
-	root, err := folderRootHere(kind)
-	if err != nil {
-		return nil, err
-	}
-	return openFolderForStatusAt(ctx, root, resolved, kind)
-}
-
-// openFolderForStatusAt is openFolderForStatus for a root the caller already
-// knows, rather than the one the PROCESS happens to be standing in.
+// That is the whole point of a command you run when you are already
+// suspicious. A CI pre-flight running `status --json` under a rotated token
+// used to print the local diff plus a reason; aborting instead would make the
+// one command that could explain the situation the one that says nothing.
 //
-// It exists for `ronja sync`, which reports on every folder beneath a
+// It takes the folder's root rather than the one the PROCESS happens to be
+// standing in, for `ronja sync`, which reports on every folder beneath a
 // directory and therefore cannot use the working directory as the answer. The
 // obvious alternative — chdir per folder — is not one: the working directory is
 // process-global, so it cannot be combined with any concurrency and would
@@ -492,6 +590,22 @@ func openFolderForStatusAt(ctx context.Context, root string, resolved *config.Re
 	// heading would describe a problem the reader does not have.
 	if f.BindingErr != nil && !errors.Is(f.BindingErr, wfdir.ErrAmbiguousInstance) {
 		return nil, f.BindingErr
+	}
+	// An ADOPTED folder's state is read from the server here too — in memory,
+	// and nothing is written: a status of an adopted folder compares against
+	// the server's anchor, not a stale lock. A refusal (a claim that is lost,
+	// trashed, unreadable or moved out) is the report; a read that got no
+	// answer degrades like an organization lookup that failed.
+	f.ctx = ctx
+	if f.OrgErr == nil {
+		f.resolveAddressDependencies(ctx)
+		if err := f.refreshManaged(ctx); err != nil {
+			var unread *managedReadError
+			if !errors.As(err, &unread) {
+				return nil, err
+			}
+			f.OrgErr = err
+		}
 	}
 	return f, nil
 }
@@ -551,7 +665,7 @@ func openFolderLocallyAt(root string, resolved *config.Resolved, kind wfdir.Kind
 	if err != nil {
 		return nil, err
 	}
-	f := &folder{Root: root, Kind: kind, Manifest: manifest, Lock: lock, State: state, Resolved: resolved}
+	f := &folder{Root: root, Kind: kind.ForManifest(manifest), Manifest: manifest, Lock: lock, State: state, Resolved: resolved}
 	f.matchBinding()
 	return f, nil
 }
@@ -671,11 +785,18 @@ func (f *folder) matchBinding() {
 	if err != nil {
 		f.Stack, f.Key, f.Binding, f.Bound, f.Bind = "", key, wfdir.Binding{}, false, nil
 	}
+	// What the address dependencies resolved to belongs to the stack it was
+	// resolved for; a match onto another stack drops it, and
+	// resolveAddressDependencies asks again.
+	if f.Stack != f.addressStack {
+		f.addressBind, f.addressErrors, f.addressEdges, f.addressPending, f.outputBind = nil, nil, nil, nil, nil
+		f.outputErrs, f.outputsResolved, f.outputsFor = nil, false, ""
+	}
 	// Rebuilt whenever the match is, because it is a function OF the match: a
 	// folder that resolved to a different stack answers to a different set of
 	// ids, and a codec left over from the previous answer would resolve this
 	// organization's names to the last one's rows.
-	f.Codec = newAliasCodec(f.Manifest.Dependencies, f.Bind)
+	f.Codec = newAliasCodec(f.Manifest.Dependencies, f.codecBind())
 }
 
 // selection is this folder's resolved stack, in the shape wfdir writes back
@@ -686,7 +807,8 @@ func (f *folder) selection() wfdir.Selection {
 	// it stands. Manifest.Record ignores the field — a bind map is config no
 	// deploy ever writes, which is exactly why it lives on Stack and not on
 	// Binding (see Stack.Bind).
-	return wfdir.Selection{Name: f.Stack, Key: f.Key, Binding: f.Binding, Bound: f.Bound, Bind: f.Bind}
+	return wfdir.Selection{Name: f.Stack, Key: f.Key, Binding: f.Binding, Bound: f.Bound, Bind: f.Bind,
+		AddressBind: f.addressBind, AddressErrors: f.addressErrors}
 }
 
 // recordBinding writes a binding back into whichever pair of files this folder
@@ -701,7 +823,16 @@ func (f *folder) recordBinding(b wfdir.Binding) {
 
 // saveFolder writes both committed files. See wfdir.SaveFolder for why they are
 // one write and why the lock goes first.
-func (f *folder) saveFolder() error { return wfdir.SaveFolder(f.Root, f.Manifest, f.Lock) }
+//
+// An adopted folder then records whatever anchor the save changed on the
+// server — best-effort, see recordManagedAnchors.
+func (f *folder) saveFolder() error {
+	if err := wfdir.SaveFolder(f.Root, f.Manifest, f.Lock); err != nil {
+		return err
+	}
+	f.recordManagedAnchors()
+	return nil
+}
 
 // bindingFiles names the committed file(s) a newly created resource id is
 // recorded in, for the refusal a failed save has to print.
@@ -765,6 +896,16 @@ func (f *folder) adoptLiveHashes() {
 	}
 	for path, tableID := range f.Binding.Tables {
 		recorded := inst.TableStateFor(path)
+		// The applied NAME first, and on its own condition: it is a separate
+		// recording, and a folder that agreed on a name but never on the SQL
+		// still knows which name it last saw. Same row only, empty slot only.
+		if recorded.Name != "" && recorded.TableID == tableID && f.Lock.TableName(f.Stack, path) == "" {
+			f.Lock.SetTableName(f.Stack, path, tableID, recorded.Name)
+		}
+		// The stem a `moved` entry carried, on the same terms.
+		if recorded.Stem != "" && recorded.TableID == tableID && f.Lock.TableStem(f.Stack, path) == "" {
+			f.Lock.SetTableStem(f.Stack, path, tableID, recorded.Stem)
+		}
 		if recorded.LiveSHA256 == "" || recorded.TableID != tableID {
 			// No fingerprint, or one taken from a DIFFERENT row: a hash is only
 			// ever compared against the row it was taken from, so a mismatched
@@ -799,6 +940,12 @@ func (f *folder) adoptLiveHashes() {
 		if recorded.TagsRefused != nil {
 			f.Lock.SetMetricTagsRefused(f.Stack, path, recorded.MetricID, recorded.TagsRefused)
 		}
+		if recorded.Name != "" {
+			f.Lock.SetMetricName(f.Stack, path, recorded.MetricID, recorded.Name)
+		}
+		if recorded.Stem != "" {
+			f.Lock.SetMetricStem(f.Stack, path, recorded.MetricID, recorded.Stem)
+		}
 	}
 }
 
@@ -826,7 +973,11 @@ func (f *folder) saveBaseline() error {
 	if err := wfdir.SaveLock(f.Root, f.Lock); err != nil {
 		return err
 	}
-	return wfdir.SaveState(f.Root, f.State)
+	if err := wfdir.SaveState(f.Root, f.State); err != nil {
+		return err
+	}
+	f.recordManagedAnchors()
+	return nil
 }
 
 // recordFirstBinding writes a brand-new folder's binding into the shape --stack
@@ -1469,6 +1620,8 @@ func baselineFrom(codec aliasCodec, source *api.Workflow, files []api.WorkflowFi
 		Parameters:        baselineParameters(source),
 		ReportingTimezone: baselineReportingTimezone(source),
 		Files:             map[string]wfdir.FileState{},
+		Aliases:           codec.baselineAliases(),
+		AliasesRecorded:   true,
 	}
 	for _, f := range files {
 		inst.Files[f.Path] = wfdir.FileState{
@@ -1485,13 +1638,14 @@ func baselineFrom(codec aliasCodec, source *api.Workflow, files []api.WorkflowFi
 // Re-fetching every file to build the baseline instead would be a second full
 // round trip to learn something we already know.
 //
-// It takes NO codec, and that is the invariant rather than an omission: `files`
-// is the folder's own content, already in disk form, and the baseline is a
+// The codec is applied to NOTHING, and that is the invariant: `files` is the
+// folder's own content, already in disk form, and the baseline is a
 // fingerprint of exactly that. Running toDisk over it would be de-aliasing
-// something that was never aliased away. Per-file UpdatedAt is left
+// something that was never aliased away. It is recorded (Aliases), because the
+// hashes are of content in its aliases' terms. Per-file UpdatedAt is left
 // empty — the field is diagnostics only (drift is decided on the hash), and
 // inventing timestamps we did not receive would be worse than saying nothing.
-func baselineFromLocal(source *api.Workflow, files map[string]string) *wfdir.InstanceState {
+func baselineFromLocal(codec aliasCodec, source *api.Workflow, files map[string]string) *wfdir.InstanceState {
 	inst := &wfdir.InstanceState{
 		SourceID:          source.ID,
 		SourceLifecycle:   source.Lifecycle,
@@ -1501,6 +1655,8 @@ func baselineFromLocal(source *api.Workflow, files map[string]string) *wfdir.Ins
 		Parameters:        baselineParameters(source),
 		ReportingTimezone: baselineReportingTimezone(source),
 		Files:             map[string]wfdir.FileState{},
+		Aliases:           codec.baselineAliases(),
+		AliasesRecorded:   true,
 	}
 	for path, content := range files {
 		inst.Files[path] = wfdir.FileState{SHA256: wfdir.HashString(content)}

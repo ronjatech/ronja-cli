@@ -55,14 +55,16 @@ folder has local changes that are not in the draft.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.DataAppKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.DataAppKind)
 			if err != nil {
 				return err
 			}
 			result, err := runAppPublish(cmd.Context(), f, noRequestReview)
+			printManagedNotices(f.notices)
 			if err != nil {
 				return err
 			}
+			result.ManagedInGit = f.notices
 			if flagJSON {
 				return emitJSON(result)
 			}
@@ -102,6 +104,9 @@ type appPublishResult struct {
 	// Omitted when the server did not supply it (an older instance, or a
 	// hydration failure). The publish still happened.
 	Audience *api.DataAppAudience `json:"audience,omitempty"`
+	// ManagedInGit is the app's `managedBy`, when a repository folder other
+	// than this one deploys it (managed_notice.go).
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPublishResult, error) {
@@ -115,6 +120,12 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 	// stands is a perfectly reasonable thing to want. But it is also the one way
 	// to publish something other than what you are looking at.
 	if err := warnIfAppDirty(f); err != nil {
+		return nil, err
+	}
+
+	// The WRITE GATE over the access the draft would put live — the server's
+	// copy, which the web app may have changed since this folder pushed it.
+	if err := gateAppAccess(ctx, client, f, draft.DataAppAccess); err != nil {
 		return nil, err
 	}
 
@@ -320,7 +331,10 @@ func refreshAppBaselineFromLive(ctx context.Context, client *api.Client, f *fold
 	if anchor != anchorOnLive {
 		return nil
 	}
-	return reanchorOnLive(ctx, dataAppHeadReader(client), f, liveID)
+	// The applied TITLE, at the moment it is true: the publish just landed the
+	// draft's title on the live app, and when that is the manifest's, it is the
+	// title this folder now agrees with. Read off the row, not assumed.
+	return reanchorTitleAndHead(ctx, dataAppHeadReader(client), f, liveID, live.Name)
 }
 
 func printAppPublishReport(r *appPublishResult) {

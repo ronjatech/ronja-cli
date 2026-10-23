@@ -269,13 +269,17 @@ func TestPublishReanchorsTheLock(t *testing.T) {
 	if _, err := runCLI(t, root, "wf", "push"); err != nil {
 		t.Fatalf("push: %v", err)
 	}
-	// The commit lands, and the server's history moves with it.
-	f.versions["wf-1"] = []api.Workflow{{ID: "wfv-2"}, {ID: "wfv-1"}}
+	// The commit lands, and the server's history moves with it: the fake files
+	// a version per commit, as rworkflow does.
 	if _, err := runCLI(t, root, "wf", "publish"); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
+	head := f.versions["wf-1"][0].ID
+	if head == "wfv-1" {
+		t.Fatalf("the commit filed no version: %+v", f.versions["wf-1"])
+	}
 	lock := readFile(t, wfdir.LockPath(root))
-	if !strings.Contains(lock, `"wfv-2"`) {
+	if !strings.Contains(lock, `"`+head+`"`) {
 		t.Errorf("publish must re-anchor onto the version it just committed:\n%s", lock)
 	}
 }

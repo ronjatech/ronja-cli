@@ -550,10 +550,13 @@ func TestPushAcceptsARemoteTitleChangeItAgreesWith(t *testing.T) {
 	}
 }
 
-// A state file written before the metadata was recorded must not start refusing
-// pushes: no recorded title means no guard, and the first push to write a
-// baseline arms it.
-func TestPushWithALegacyBaselineHasNoMetadataGuard(t *testing.T) {
+// A state file written before the metadata was recorded: with no recorded title
+// there is nothing to tell this folder's rename from somebody else's, and a
+// workflow's head cannot vouch for a title (a private workflow is retitled in
+// place). So the title is neither written blind (it used to be, reverting the
+// draft's "Their name") nor recorded to be reverted by the NEXT push: the push
+// is refused, on every push, and --force writes it.
+func TestPushWithALegacyBaselineRefusesAnUnrecordedTitleMismatch(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, Title: "Monthly report"},
 		api.WorkflowFile{Path: "main.py", Content: "M\n"})
@@ -575,19 +578,20 @@ func TestPushWithALegacyBaselineHasNoMetadataGuard(t *testing.T) {
 
 	f.workflows["draft-1"].Title = "Their name"
 	retitle(t, root, "My name")
-	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
-		t.Fatalf("a folder with no recorded metadata was refused: %v", err)
+	for push := 1; push <= 2; push++ {
+		_, err := runCLI(t, root, "wf", "push", "--json")
+		if err == nil || !strings.Contains(err.Error(), "Their name") {
+			t.Fatalf("push %d: want a refusal naming the draft's title, got %v", push, err)
+		}
+		if _, patched := f.titlePatches["draft-1"]; patched {
+			t.Fatalf("push %d wrote a title with no baseline: %+v", push, f.titlePatches)
+		}
 	}
-	if f.titlePatches["draft-1"] != "My name" {
-		t.Errorf("title patches = %+v", f.titlePatches)
+	if _, err := runCLI(t, root, "wf", "push", "--force", "--json"); err != nil {
+		t.Fatalf("push --force: %v", err)
 	}
-	// And the baseline it just wrote arms the guard for the next one.
-	after, err := wfdir.LoadState(root)
-	if err != nil {
-		t.Fatalf("load state: %v", err)
-	}
-	if got := after.For(f.Key()); got.Title != "My name" || got.Entrypoint != "main.py" {
-		t.Errorf("baseline = %+v, want the metadata recorded", got)
+	if got := f.titlePatches["draft-1"]; got != "My name" {
+		t.Errorf("--force patched %q, want the declared title", got)
 	}
 }
 
@@ -1118,12 +1122,12 @@ func TestPushUpToDateStillRefusesADroppedBinding(t *testing.T) {
 func TestPushValidatesAgainstTheTargetsSavedParameters(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive,
-		Parameters: []api.WorkflowParameter{{Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('tbl-live') }}"}}},
+		Parameters: []api.WorkflowParameter{{Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('table-live') }}"}}},
 		api.WorkflowFile{Path: "main.py", Content: "M\n"})
 	draft := f.AddDraft("wf-1", "draft-1", api.WorkflowFile{Path: "main.py", Content: "M\n"})
 	// The draft's are the ones a push writes against, so they are the ones that
 	// have to be sent — not the live row's.
-	draft.Parameters = []api.WorkflowParameter{{Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('tbl-draft') }}"}}
+	draft.Parameters = []api.WorkflowParameter{{Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('table-draft') }}"}}
 	signIn(t, f)
 	root := cloneFolder(t, f, "wf-1")
 
@@ -1135,7 +1139,7 @@ func TestPushValidatesAgainstTheTargetsSavedParameters(t *testing.T) {
 		t.Fatalf("validate calls = %d, want 1", len(f.validated))
 	}
 	params := f.validated[0].Parameters
-	if len(params) != 1 || params[0].OptionsQuery != "SELECT r FROM {{ ref('tbl-draft') }}" {
+	if len(params) != 1 || params[0].OptionsQuery != "SELECT r FROM {{ ref('table-draft') }}" {
 		t.Errorf("validated parameters = %+v, want the draft's", params)
 	}
 }
@@ -1259,12 +1263,12 @@ func TestPushClearsParametersWhenTheManifestDeclaresNone(t *testing.T) {
 func TestPushValidatesTheDeclaredParametersNotTheRows(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive,
-		Parameters: []api.WorkflowParameter{{Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('tbl-old') }}"}}},
+		Parameters: []api.WorkflowParameter{{Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('table-old') }}"}}},
 		api.WorkflowFile{Path: "main.py", Content: "M\n"})
 	signIn(t, f)
 	root := cloneFolder(t, f, "wf-1")
 	setManifestParameters(t, root, api.WorkflowParameter{
-		Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('tbl-new') }}"})
+		Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('table-new') }}"})
 
 	writeLocal(t, root, "main.py", "M2\n")
 	if _, err := runCLI(t, root, "wf", "push", "--json"); err != nil {
@@ -1274,7 +1278,7 @@ func TestPushValidatesTheDeclaredParametersNotTheRows(t *testing.T) {
 		t.Fatalf("validate calls = %d, want 1", len(f.validated))
 	}
 	got := f.validated[0].Parameters
-	if len(got) != 1 || got[0].OptionsQuery != "SELECT r FROM {{ ref('tbl-new') }}" {
+	if len(got) != 1 || got[0].OptionsQuery != "SELECT r FROM {{ ref('table-new') }}" {
 		t.Errorf("validated parameters = %+v, want the manifest's declaration", got)
 	}
 }

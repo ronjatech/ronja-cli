@@ -95,7 +95,7 @@ folder has local changes that are not in the draft.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolder(cmd.Context(), resolved, wfdir.WorkflowKind)
+			f, err := openFolderForDeploy(cmd.Context(), resolved, wfdir.WorkflowKind)
 			if err != nil {
 				return err
 			}
@@ -105,7 +105,9 @@ folder has local changes that are not in the draft.`,
 			// the conflict refusal is the whole reason. Returning only the
 			// error left `--json` with empty stdout and nothing but stderr
 			// prose to tell a conflict from a permission failure.
+			printManagedNotices(f.notices)
 			if result != nil {
+				result.ManagedInGit = f.notices
 				if flagJSON {
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
@@ -166,6 +168,9 @@ type publishResult struct {
 	// a draft submitted for review put nothing live, and the honest close there
 	// is "an admin must approve it", not a link to what has not changed.
 	URL string `json:"-"`
+	// ManagedInGit is the workflow's `managedBy`, when a repository folder
+	// other than this one deploys it (managed_notice.go).
+	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
 func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishResult, error) {
@@ -181,6 +186,14 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 	// draft from the web builder). But it is also the one way to publish
 	// something other than what you are looking at, so it is said out loud.
 	if err := warnIfDirty(f); err != nil {
+		return nil, err
+	}
+
+	// The WRITE GATE over what this publish would put live: the draft as the
+	// server holds it, which the web app may have edited since this folder
+	// pushed it. Before every write this command can make — the commit, the
+	// first publish, and a review request alike.
+	if err := gateWorkflowRow(ctx, client, f, draft); err != nil {
 		return nil, err
 	}
 
@@ -350,6 +363,9 @@ func resolveDraft(ctx context.Context, client *api.Client, f *folder, noun strin
 	if err := refuseUnclonable(wf); err != nil {
 		return nil, nil, err
 	}
+	// The single-row GET of the ROOT carries the claim; the /draft route does
+	// not, and a parentless draft is its own root.
+	f.noteManagedBy(wfdir.ManagedWorkflow, wf.IdentityID(), wf.ManagedBy)
 	if wf.Lifecycle == api.LifecycleDraft {
 		// The binding names a parentless draft: a workflow created by a first
 		// push and never published. The row IS the draft.
@@ -438,7 +454,7 @@ func refreshBaselineFromLive(ctx context.Context, client *api.Client, f *folder,
 	if anchor != anchorOnLive {
 		return nil
 	}
-	return reanchorOnLive(ctx, workflowHeadReader(client), f, liveID)
+	return reanchorTitleAndHead(ctx, workflowHeadReader(client), f, liveID, live.Title)
 }
 
 // noteBaselineRefresh degrades a failed baseline refresh into a note.

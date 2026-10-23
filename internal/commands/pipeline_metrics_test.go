@@ -388,7 +388,9 @@ func TestPipelineMetricPushAdoptsAMetricTheNameAlreadyHolds(t *testing.T) {
 	f := newFakePipelineInstance(t)
 	signInPipeline(t, f)
 	root := seedMetricFolder(t, f)
-	f.AddMetric("table-aov", "average_order", `{"source":"table-orders","value":"revenue","version":1}`)
+	// The row a lost create of THIS file made: it holds this file's definition,
+	// which is what makes it provably this file's row (aovResolved).
+	f.AddMetric("table-aov", "average_order", aovResolved)
 	f.nameTakenOnMetricCreate = `a table or metric called "average_order" already exists in this feature`
 
 	out, stderr, err := runPipelineCLI(t, root, "pipeline", "push", "--json")
@@ -404,6 +406,49 @@ func TestPipelineMetricPushAdoptsAMetricTheNameAlreadyHolds(t *testing.T) {
 	}
 	if got := metricStateOf(t, root, f.Key(), "metrics/average_order.json").MetricID; got != "table-aov" {
 		t.Errorf("the adoption was not recorded: %q", got)
+	}
+}
+
+// aovResolved is aovRecipe with its source alias resolved to the id — exactly
+// what a create of that file sends.
+const aovResolved = `{"value":"revenue / orders","source":"table-orders","base_measures":[{"name":"revenue","agg":"sum","column":"amount"}]}`
+
+// A METRIC OF THE SAME NAME WITH ANOTHER DEFINITION is somebody else's, not a
+// create of this file whose answer was lost — whether the name came from the
+// stem or from a declared "name". Adopting it would mark it created, skip every
+// drift leg and stage this file's recipe over theirs; it is refused, naming the
+// metric, and nothing is written to it.
+func TestPipelineMetricPushRefusesToAdoptAMetricWithAnotherDefinition(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		f := newFakePipelineInstance(t)
+		signInPipeline(t, f)
+		root := seedMetricFolder(t, f)
+		name := "average_order"
+		if declared {
+			name = "Revenue per order"
+			if err := wfdir.WriteFile(root, "metrics/average_order.json",
+				`{"recipe":`+aovRecipe+`,"name":"`+name+`"}`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		theirs := f.AddMetric("table-theirs", name, `{"source":"table-orders","value":"count(*)","version":1}`)
+		theirs.FeatureID = "collection-1"
+		f.nameTakenOnMetricCreate = `a table or metric called "` + name + `" already exists in this feature`
+
+		out, _, err := runPipelineCLI(t, root, "pipeline", "push", "--json")
+		if err == nil {
+			t.Fatalf("declared=%v: a colleague's metric of the same name was adopted", declared)
+		}
+		entry := decodeJSON(t, out)["metrics"].([]any)[0].(map[string]any)
+		if entry["metricID"] == "table-theirs" || entry["outcome"] != metricOutcomeRefused {
+			t.Fatalf("declared=%v: entry = %v", declared, entry)
+		}
+		if msg, _ := entry["error"].(string); !strings.Contains(msg, "table-theirs") || !strings.Contains(msg, "metrics/average_order.json") {
+			t.Errorf("declared=%v: the refusal does not name the colliding metric and the file: %v", declared, entry["error"])
+		}
+		if got := f.RecipeOf("table-theirs"); !strings.Contains(got, "count(*)") {
+			t.Errorf("declared=%v: their definition was overwritten: %s", declared, got)
+		}
 	}
 }
 

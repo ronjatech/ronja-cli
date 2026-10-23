@@ -43,55 +43,14 @@ With --json, one object carrying all of the above.`,
 			if err != nil {
 				return err
 			}
-			f, err := openFolderForStatus(cmd.Context(), resolved, wfdir.ModuleKind)
+			root, err := folderRootHere(wfdir.ModuleKind)
 			if err != nil {
 				return err
 			}
-
-			report := &moduleStatusReport{
-				Root:      f.Root,
-				URL:       resolved.URL,
-				Name:      f.Manifest.Name,
-				Title:     f.Manifest.Title,
-				Stack:     f.declaredStack(),
-				Bound:     f.Bound,
-				Ambiguous: f.BindingErr != nil,
-				ModuleID:  f.Binding.ModuleID,
-				FeatureID: f.Binding.FeatureID,
-			}
-
-			enumeration, err := wfdir.Enumerate(f.Root, wfdir.ModuleKind)
+			report, err := moduleStatusReportAt(cmd.Context(), root, resolved)
 			if err != nil {
 				return err
 			}
-			baseline := f.State.For(f.Key)
-			report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
-			report.Skipped = enumeration.Skipped
-			if baseline != nil {
-				report.Baseline = &baselineReport{
-					SourceID:        baseline.SourceID,
-					SourceLifecycle: baseline.SourceLifecycle,
-					UpdatedAt:       baseline.BaselineUpdatedAt,
-				}
-			}
-			// The package's own file, reported as a PROBLEM rather than as a
-			// missing local file: a folder without it cannot be pushed at all
-			// (the reconcile would try to delete the server's seed, which the
-			// server refuses), and "status is clean but push refuses" is the shape
-			// this line exists to prevent.
-			if _, ok := enumeration.Files[moduleInitFile]; !ok {
-				report.LocalProblem = fmt.Sprintf(
-					"%s is missing — it is what makes this folder an importable package, and a push is refused without one",
-					moduleInitFile)
-			}
-
-			// Nothing refuses a `dependencies` block on a module manifest at
-			// load, and nothing ever fills one, so an author who committed one
-			// gets silence from every command. Say so here, where they are
-			// already looking.
-			report.InertDependencies = f.Manifest.AliasNames()
-
-			report.Remote = moduleRemoteStatus(cmd.Context(), resolved, f)
 
 			// The one line a row still on the old SQL escape handling earns,
 			// on STDERR in both modes: the report on stdout is a document a
@@ -108,6 +67,64 @@ With --json, one object carrying all of the above.`,
 		},
 	}
 	return cmd
+}
+
+// moduleStatusReportAt computes the report for ONE module folder at an explicit
+// root, and prints nothing. See pipelineStatusReportAt for why the status
+// computations were hoisted out of their RunE closures: `ronja sync status`
+// folds this same report into its verdict, so the two cannot disagree about
+// what a module folder's state IS.
+func moduleStatusReportAt(ctx context.Context, root string, resolved *config.Resolved) (*moduleStatusReport, error) {
+	f, err := openFolderForStatusAt(ctx, root, resolved, wfdir.ModuleKind)
+	if err != nil {
+		return nil, err
+	}
+
+	report := &moduleStatusReport{
+		opened:    f,
+		Root:      f.Root,
+		URL:       resolved.URL,
+		Name:      f.Manifest.Name,
+		Title:     f.Manifest.Title,
+		Stack:     f.declaredStack(),
+		Bound:     f.Bound,
+		Ambiguous: f.BindingErr != nil,
+		ModuleID:  f.Binding.ModuleID,
+		FeatureID: f.Binding.FeatureID,
+	}
+
+	enumeration, err := wfdir.Enumerate(f.Root, wfdir.ModuleKind)
+	if err != nil {
+		return nil, err
+	}
+	baseline := f.State.For(f.Key)
+	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
+	report.Skipped = enumeration.Skipped
+	if baseline != nil {
+		report.Baseline = &baselineReport{
+			SourceID:        baseline.SourceID,
+			SourceLifecycle: baseline.SourceLifecycle,
+			UpdatedAt:       baseline.BaselineUpdatedAt,
+		}
+	}
+	// The package's own file, reported as a PROBLEM rather than as a missing
+	// local file: a folder without it cannot be pushed at all (the reconcile
+	// would try to delete the server's seed, which the server refuses), and
+	// "status is clean but push refuses" is the shape this line exists to
+	// prevent.
+	if _, ok := enumeration.Files[moduleInitFile]; !ok {
+		report.LocalProblem = fmt.Sprintf(
+			"%s is missing — it is what makes this folder an importable package, and a push is refused without one",
+			moduleInitFile)
+	}
+
+	// Nothing refuses a `dependencies` block on a module manifest at load, and
+	// nothing ever fills one, so an author who committed one gets silence from
+	// every command. Say so here, where they are already looking.
+	report.InertDependencies = f.Manifest.AliasNames()
+
+	report.Remote = moduleRemoteStatus(ctx, resolved, f)
+	return report, nil
 }
 
 // moduleStatusReport is the --json shape, and the same struct the human
@@ -158,6 +175,9 @@ type moduleStatusReport struct {
 	Skipped           []wfdir.Skipped     `json:"skipped,omitempty"`
 	Baseline          *baselineReport     `json:"baseline,omitempty"`
 	Remote            *moduleRemoteReport `json:"remote"`
+	// opened is the folder the report was computed from, for `sync status`
+	// to ask more of without opening it again.
+	opened *folder
 }
 
 // moduleRemoteReport is shaped so "we did not look" and "we looked and it is
@@ -195,7 +215,19 @@ type moduleRemoteReport struct {
 	// row's differs — i.e. only when a push would change something.
 	Name  *metadataFieldReport `json:"name,omitempty"`
 	Title *metadataFieldReport `json:"title,omitempty"`
+	// TargetUnknown is remoteReport.TargetUnknown for a module: the draft lookup
+	// failed, so the drift above was measured against the live row while a push
+	// would write to the open draft. A field rather than a DriftNotes substring
+	// for the reason that one gives. Additive: `module status` reads nothing from
+	// it and `ronja sync status` reads it as "could not tell".
+	TargetUnknown bool `json:"targetUnknown,omitempty"`
 }
+
+// reasonNoModuleYet is this loop's reasonNoWorkflowYet: the folder is bound here
+// and the module it will own does not exist yet — a conclusion, not a failure to
+// look, which is what neverDeployedVerdict turns on. The string is unchanged
+// from the literal it replaced.
+const reasonNoModuleYet = "no module exists on this instance yet — the first push will create it"
 
 // metadataFieldReport is one metadata field on each side — enough to see what a
 // push would do.
@@ -237,7 +269,7 @@ func moduleRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folde
 		return out
 	}
 	if f.Binding.ModuleID == "" {
-		out.NotCheckedReason = "no module exists on this instance yet — the first push will create it"
+		out.NotCheckedReason = reasonNoModuleYet
 		return out
 	}
 
@@ -276,6 +308,7 @@ func moduleRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folde
 			// Load-bearing: everything below otherwise measures drift against the
 			// LIVE row while a draft a push would actually write to exists.
 			out.note("could not check for an open draft (%v) — drift below is against the live version", err)
+			out.TargetUnknown = true
 		} else if draft != nil {
 			target = draft
 		}

@@ -78,7 +78,75 @@ var ErrNoManifest = errors.New("no ronja.json found")
 // map, on the rule 2 already follows: a folder that declares none round-trips at
 // whatever version its content requires, so nobody is pushed onto a newer CLI by
 // a change that did not reach their file.
-const ManifestFormatVersion = manifestVersionDependencies
+//
+// **4 is a JavaScript workflow** (`"language": "js"`), and it clears the bar for
+// the reason 3 did: the key is preserved by an older CLI, but what the FOLDER
+// means is not. That CLI reads the folder as Python — it pushes node_modules/,
+// and a first push creates a PYTHON workflow out of JavaScript source, because
+// the create body it builds has no language in it. `wf init` writes the key
+// only for js, and an explicit "python" means what absence means, so only a js
+// folder is stamped 4.
+//
+// **5 is declared moves** (`moved`), and it clears the bar for the same reason
+// 3 did: an older CLI keeps the key, ignores it, and deploys something else
+// while reporting success. `moved: [{from: orders.sql, to: sales_orders.sql}]`
+// says the table bound to orders.sql is now built by sales_orders.sql. A CLI
+// that cannot read that sees a bound file gone and a new file with no table,
+// notes the first as "left alone", and CREATES A SECOND TABLE for the second —
+// the exact duplicate the declaration exists to prevent.
+//
+// `removed` requires 5 in an AUTOMATION folder and not in a pipeline folder,
+// because an older CLI ignoring it does different things in each. In a pipeline
+// folder it sees a bound file gone and leaves the row alone, which is precisely
+// what `removed` asks for, so moving the number there would cost every colleague
+// an upgrade for a key that was already safe to ignore. In an automation folder
+// it refuses the gone file as an orphan and tells the reader to run
+// `ronja automation push --prune` — which soft-deletes and pauses the very
+// automation `removed` says to keep running. A harmful remedy in a refusal is
+// below the bar of a wrong deploy, but it is cheap to close: at 5, that CLI
+// refuses by version instead.
+//
+// Unlike 2, 3 and 4, a person usually ADDS these keys by hand, and nothing in a
+// push rewrites a stack folder's ronja.json to stamp them. So the stamp is
+// demanded rather than only written: CheckAddressFormat refuses either key in a
+// file that declares less than it needs, naming the line to add — the same rule
+// CheckDeclarations applies to `dependencies`.
+//
+// **6 is the folder `"id"`** (an adopted folder, whose state lives on the
+// server), and it clears the bar because adopting changes what the LOCK means.
+// In an adopted folder the server holds the state and the committed lock is a
+// cache that goes stale by design: CI deploys without committing it, so a row a
+// CI run created, and a `moved` a CI run applied, are recorded on the server and
+// nowhere in the repository. An older CLI keeps the id (the sidecar), ignores
+// it, and runs the folder in legacy mode off that stale lock — so it CREATES A
+// SECOND ROW for every file whose row the lock never heard of, and reports
+// success. That is a wrong deploy reported as a good one, which is the bar.
+//
+// The id is written by `ronja sync adopt` and `init --stack`, whose save stamps
+// 6; one written by hand is refused at LOAD below 6, naming the line to add, on
+// the same rule as `moved` — a folder that says it is adopted and claims a
+// format an older CLI opens is the hazard itself. Removing the id (`ronja sync unmanage`) is the one
+// removal that lowers the number, and only from 6 (RemoveFolderID): 6 means
+// nothing but the id, and unmanage has written the server's state into the
+// lock first, so the classic folder left behind is one an older CLI reads
+// correctly.
+//
+// **7 is a dependency declared by address, as a write target, as an output,
+// or as a run edge** (`from` / `address`, `write`, `output`, `run` on a
+// dependency). An older
+// CLI keeps the keys and reads each one as an ordinary alias: an address
+// dependency then has no bind and is refused (safe), but a write-capable one is
+// worse — that CLI does not resolve aliases inside `{{ write(...) }}`, so it
+// sends the alias as a table NAME, and the runtime creates a new table by that
+// name in the stack's feature instead of writing the bound one. A wrong deploy
+// reported as a good one, which is the bar. Stamped only when a dependency
+// carries one of the keys, and demanded at acceptance (CheckDeclarations).
+//
+// `run` is a key of version 7 too rather than an 8: 7 never shipped
+// without it, so no CLI exists that reads 7 and not `run`, and a CLI below 7
+// has no write gate at all — the stamp is what tells it the file was written
+// for a gate it does not have.
+const ManifestFormatVersion = manifestVersionAddressDeps
 
 // The versions the CONTENT of a manifest can require, named rather than spelled
 // as bare integers at the two places that compare them. See
@@ -88,6 +156,10 @@ const ManifestFormatVersion = manifestVersionDependencies
 const (
 	manifestVersionStacks       = 2
 	manifestVersionDependencies = 3
+	manifestVersionLanguage     = 4
+	manifestVersionMoves        = 5
+	manifestVersionFolderID     = 6
+	manifestVersionAddressDeps  = 7
 )
 
 // Manifest is ronja.json — the committed half of a workflow folder.
@@ -118,7 +190,18 @@ type Manifest struct {
 	// best-effort read — see LoadManifest.
 	FormatVersion int    `json:"formatVersion,omitempty"`
 	Kind          string `json:"kind"`
-	Title         string `json:"title"`
+	// ID is the FOLDER ID: a UUID that makes this folder ADOPTED, so its state
+	// lives on the server and the lock is only a cache of it. Empty is a legacy
+	// folder, which runs exactly as it always did. Written only by `init` (for a
+	// new folder) and `ronja sync adopt`, never by clone, push or apply — see
+	// managed.go for why. It makes the file format version 6 — see
+	// ManifestFormatVersion.
+	//
+	// Not a secret: it is committed, and nothing treats it as a credential. The
+	// server keys an address by (the stack's feature, this id, the file), so a
+	// copy of the folder pointed at another feature is a different address.
+	ID    string `json:"id,omitempty"`
+	Title string `json:"title"`
 	// Name is a MODULE folder's Python package name — the identifier a consumer
 	// workflow writes in import position (`from {{ module('module-X') }} import
 	// tracker` inlines to it). It is the one piece of module metadata that is
@@ -138,6 +221,14 @@ type Manifest struct {
 	// data-app or pipeline manifest must not grow a `"name": ""` key that
 	// belongs to a kind it is not.
 	Name string `json:"name,omitempty"`
+	// Language is a WORKFLOW folder's language: "js", or absent for python. It
+	// is fixed at create — the first push sends it, and a push to a row of the
+	// other language is refused.
+	//
+	// omitempty, and written only for js, so every python manifest stays
+	// byte-identical; presence is what makes the format version 4 (see
+	// ManifestFormatVersion). An explicit "python" is accepted and kept.
+	Language string `json:"language,omitempty"`
 	// Entrypoint is the ONE file the server runs, and it is omitempty because a
 	// pipeline folder has no such file at all: a folder of .sql tables has no
 	// distinguished member, so `"entrypoint": ""` in a committed manifest would be
@@ -280,6 +371,21 @@ type Manifest struct {
 	// older CLI refuses the file rather than sending the alias to the server as
 	// a literal id — see ManifestFormatVersion.
 	Dependencies map[string]Dependency `json:"dependencies,omitempty"`
+	// Moved and Removed are the folder's ADDRESS declarations: the only two ways
+	// a per-file row's path in the lock (orders.sql, metrics/revenue.json,
+	// nightly.json) may change or end. See moves.go.
+	//
+	// Instance-independent, like Dependencies: a rename has to reach EVERY
+	// stack, and each stack is applied at a different time, often by a
+	// different runner. A declaration travels with the commit and is evaluated
+	// by each stack's own apply, against that stack's own lock entry.
+	//
+	// Only pipeline and automation folders key rows by file; LoadManifest
+	// refuses either key anywhere else. `moved` makes the file version 5, and
+	// so does `removed` in an automation folder — see ManifestFormatVersion for
+	// why, and why `removed` in a pipeline folder does not.
+	Moved   []MovedEntry `json:"moved,omitempty"`
+	Removed []string     `json:"removed,omitempty"`
 	// Stacks are the named environments this folder deploys to — "dev", "prod" —
 	// each saying where it points and which feature its resources live in. See
 	// Stack for what belongs here and what belongs in ronja.lock.json.
@@ -371,6 +477,11 @@ func (m Manifest) MarshalJSON() ([]byte, error) {
 		// migration that needed it. See unknownKeys.ensureLeading.
 		m.unknown = m.unknown.ensureLeading("formatVersion")
 	}
+	if m.ID != "" {
+		// An id `sync adopt` writes into an existing file goes beside the kind,
+		// where a reader looks for what the folder IS, rather than on the end.
+		m.unknown = m.unknown.ensureAfter("id", "kind")
+	}
 	body, err := json.Marshal(plainManifest(m))
 	if err != nil {
 		return nil, err
@@ -411,7 +522,18 @@ func (m Manifest) StampedFormatVersion() int {
 // folder can perfectly well have both stacks and dependencies, and the answer is
 // the higher of the two.
 func (m Manifest) requiredFormatVersion() int {
+	for _, dep := range m.Dependencies {
+		if dep.NeedsAddressDepsVersion() {
+			return manifestVersionAddressDeps
+		}
+	}
 	switch {
+	case m.ID != "":
+		return manifestVersionFolderID
+	case len(m.Moved) > 0, len(m.Removed) > 0 && m.Kind == KindAutomation:
+		return manifestVersionMoves
+	case m.IsJS():
+		return manifestVersionLanguage
 	case len(m.Dependencies) > 0:
 		return manifestVersionDependencies
 	case len(m.Stacks) > 0:
@@ -887,16 +1009,67 @@ func LoadManifest(root string, kind Kind) (*Manifest, error) {
 		return nil, fmt.Errorf("%s declares \"runtime\": %d, which this CLI does not know — the runtimes it understands are %s. Upgrade the CLI — run: ronja update — or set a runtime from that list",
 			path, m.Runtime, JoinInts(Runtimes))
 	}
+	if err := m.checkLanguage(path); err != nil {
+		return nil, err
+	}
+	if m.ID != "" {
+		id, err := NormalizeFolderID(m.ID)
+		if err != nil {
+			return nil, fmt.Errorf("%s: \"id\" %w", path, err)
+		}
+		m.ID = id
+		if m.FormatVersion < manifestVersionFolderID {
+			return nil, fmt.Errorf("%s has a folder \"id\" but says \"formatVersion\": %d. A CLI older than version %d of this format ignores the id and runs the folder off %s, which an adopted folder stops committing — so it creates a second row for every file a deploy elsewhere created. Add \"formatVersion\": %d to %s by hand",
+				path, declaredFormatVersion(m.FormatVersion), manifestVersionFolderID, LockName, manifestVersionFolderID, ManifestName)
+		}
+	}
 	if err := m.checkStacks(path); err != nil {
 		return nil, err
 	}
 	if err := m.checkDependencies(path); err != nil {
 		return nil, err
 	}
+	if err := m.checkAddressDeclarations(path); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(m.Entrypoint) == "" {
-		m.Entrypoint = kind.DefaultEntrypoint
+		m.Entrypoint = kind.ForManifest(&m).DefaultEntrypoint
 	}
 	return &m, nil
+}
+
+// checkLanguage refuses a language this build does not know, a language on a
+// folder that is not a workflow, and a js folder pinned to a runtime other than
+// 4 — each one a folder whose first push would create something its author did
+// not write.
+func (m *Manifest) checkLanguage(path string) error {
+	switch m.Language {
+	case "":
+		return nil
+	case LanguagePython, LanguageJS:
+	default:
+		return fmt.Errorf("%s declares \"language\": %q, which this CLI does not know — it understands %q and %q. Upgrade the CLI — run: ronja update — or fix the value",
+			path, m.Language, LanguagePython, LanguageJS)
+	}
+	if m.Kind != KindWorkflow {
+		return fmt.Errorf("%s declares \"language\", and only a workflow folder has one — remove the key", path)
+	}
+	if m.IsJS() && m.Runtime != 0 && m.Runtime != RuntimeMain {
+		return fmt.Errorf("%s declares \"language\": %q on runtime %d, and a JavaScript workflow runs on runtime %d only — set \"runtime\": %d",
+			path, LanguageJS, m.Runtime, RuntimeMain, RuntimeMain)
+	}
+	return nil
+}
+
+// IsJS reports a JavaScript workflow folder.
+func (m *Manifest) IsJS() bool { return m.Language == LanguageJS }
+
+// LanguageName is the folder's language with absence resolved to python.
+func (m *Manifest) LanguageName() string {
+	if m.Language == "" {
+		return LanguagePython
+	}
+	return m.Language
 }
 
 // checkFormatVersion refuses a file whose declared format this build does not
@@ -1107,4 +1280,19 @@ func (m *Manifest) SetBinding(key InstanceKey, b Binding) {
 		}
 		return m.Instances[a].TenantID < m.Instances[b].TenantID
 	})
+}
+
+// RemoveFolderID takes the folder id out of the manifest — `ronja sync
+// unmanage`'s last step — and lowers the format version when the id was its
+// only cause. Version 6 means nothing but the id, and `sync unmanage` has just
+// written everything the server's state named into the lock, so a CLI older
+// than 6 reads the classic folder that is left exactly as it should. The save
+// re-stamps whatever the remaining content requires (requiredFormatVersion: 5
+// for `moved`, 4 for a js folder); a version above 6 stays, as does any
+// version this build does not own.
+func (m *Manifest) RemoveFolderID() {
+	m.ID = ""
+	if m.FormatVersion == manifestVersionFolderID && m.requiredFormatVersion() < manifestVersionFolderID {
+		m.FormatVersion = 0
+	}
 }

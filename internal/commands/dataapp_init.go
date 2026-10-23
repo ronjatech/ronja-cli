@@ -169,6 +169,12 @@ silently and the app would fail in the browser.`,
 				Title:      title,
 				Entrypoint: entrypoint,
 			}
+			// A folder INITIALIZED onto a stack is born adopted: its id is minted
+			// here, locally, so its first push claims its address on the server and
+			// CI never needs the lock. See mintFolderIDAtInit.
+			if err := mintFolderIDAtInit(manifest); err != nil {
+				return err
+			}
 			// No dataAppID: nothing exists server-side yet. The first push creates
 			// the app and fills it in.
 			lock, err := recordFirstBinding(manifest,

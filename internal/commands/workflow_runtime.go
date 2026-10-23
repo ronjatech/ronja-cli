@@ -105,7 +105,13 @@ func createRuntimeFor(ctx context.Context, client *api.Client, f *folder) (int, 
 	if f.Manifest.Runtime != 0 {
 		return f.Manifest.Runtime, nil
 	}
-	defaults, err := workflowDefaults(ctx, client, f.Resolved, 0)
+	var defaults *api.WorkflowDefaults
+	var err error
+	if f.Manifest.IsJS() {
+		defaults, err = jsWorkflowDefaults(ctx, client, f.Resolved, 0)
+	} else {
+		defaults, err = workflowDefaults(ctx, client, f.Resolved, 0, "")
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -123,18 +129,46 @@ func unknownDefaultRuntime(resolved *config.Resolved, runtime int, advice string
 		describeTarget(resolved), runtime, advice)
 }
 
+// requireLanguageSupport refuses to create — or rehearse the create of — a js
+// folder on an instance that does not create JavaScript workflows. Such an
+// instance ignores the create body's language and would make a Python workflow
+// out of JavaScript source, reporting success.
+func requireLanguageSupport(ctx context.Context, client *api.Client, f *folder) error {
+	if !f.Manifest.IsJS() {
+		return nil
+	}
+	_, err := jsWorkflowDefaults(ctx, client, f.Resolved, f.Manifest.Runtime)
+	return err
+}
+
+// jsWorkflowDefaults is workflowDefaults for a JavaScript workflow, refusing an
+// answer that does not say "language": "js": an instance that predates
+// JavaScript workflows ignores ?language and answers its Python defaults.
+func jsWorkflowDefaults(ctx context.Context, client *api.Client, resolved *config.Resolved, runtime int) (*api.WorkflowDefaults, error) {
+	defaults, err := workflowDefaults(ctx, client, resolved, runtime, wfdir.LanguageJS)
+	if err != nil {
+		return nil, err
+	}
+	if defaults.Language != wfdir.LanguageJS {
+		return nil, fmt.Errorf("%s does not create JavaScript workflows — asked for one, it answered without \"language\": %q. Update the instance, or write the workflow in Python",
+			describeTarget(resolved), wfdir.LanguageJS)
+	}
+	return defaults, nil
+}
+
 // workflowDefaults reads GET /workflow/defaults for runtime (0: the instance's
-// default) once per invocation, instance and credential: a tree of folders asks
-// once, not once per folder. Only an answer is kept; a failure is asked again.
-func workflowDefaults(ctx context.Context, client *api.Client, resolved *config.Resolved, runtime int) (*api.WorkflowDefaults, error) {
-	key := defaultsKey{url: resolved.URL, token: resolved.Token, runtime: runtime}
+// default) and language ("": python) once per invocation, instance and
+// credential: a tree of folders asks once, not once per folder. Only an answer
+// is kept; a failure is asked again.
+func workflowDefaults(ctx context.Context, client *api.Client, resolved *config.Resolved, runtime int, language string) (*api.WorkflowDefaults, error) {
+	key := defaultsKey{url: resolved.URL, token: resolved.Token, runtime: runtime, language: language}
 	defaultsCache.Lock()
 	cached, ok := defaultsCache.answers[key]
 	defaultsCache.Unlock()
 	if ok {
 		return cached, nil
 	}
-	defaults, err := client.GetWorkflowDefaults(ctx, runtime)
+	defaults, err := client.GetWorkflowDefaults(ctx, runtime, language)
 	if err != nil {
 		if predatesDefaultsRoute(err) {
 			return nil, fmt.Errorf("%s has no GET /api/v2/workflow/defaults, so it predates this CLI — update the instance or use an older ronja (%w)",
@@ -168,8 +202,8 @@ func predatesDefaultsRoute(err error) bool {
 }
 
 type defaultsKey struct {
-	url, token string
-	runtime    int
+	url, token, language string
+	runtime              int
 }
 
 // defaultsCache is workflowDefaults' memory. Package-level because the folders

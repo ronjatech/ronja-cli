@@ -29,6 +29,10 @@ type fakeSearchInstance struct {
 	// no entry answers an empty result, which is what "nothing is called that"
 	// looks like on the wire.
 	hits map[string][]api.SearchHit
+	// catalog, when set, answers a term with no entry in hits the way the
+	// server does: every row whose title contains the term, case ignored and
+	// `_` literal, scored exact when the title IS the term.
+	catalog []api.SearchHit
 	// terms records every q the CLI asked for, in order — the only way to assert
 	// that an already-bound alias costs no request.
 	terms []string
@@ -94,6 +98,14 @@ func (f *fakeSearchInstance) serve(w http.ResponseWriter, r *http.Request) {
 		hits := f.hits[term]
 		if hits == nil {
 			hits = []api.SearchHit{}
+			for _, row := range f.catalog {
+				if strings.Contains(strings.ToLower(row.Title), strings.ToLower(term)) {
+					if strings.EqualFold(row.Title, term) {
+						row.Score = api.SearchScoreExact
+					}
+					hits = append(hits, row)
+				}
+			}
 		}
 		writeJSON(w, map[string]any{"result": hits})
 	default:
@@ -372,6 +384,181 @@ func TestBindIgnoresANearMatch(t *testing.T) {
 	}
 	if len(bindCmdStackBind(t, root, "prod")) != 0 {
 		t.Errorf("bind wrote something: %v", bindCmdStackBind(t, root, "prod"))
+	}
+}
+
+// looseBindName is the one definition of "the same name ignoring case and
+// separators", so it is pinned here case by case — including the two that keep it
+// from becoming a fuzzy match: a missing separator in the middle is a different
+// name, and so is a different word.
+func TestLooseBindNameIgnoresCaseAndSeparators(t *testing.T) {
+	same := []string{"qa_import_crm", "QA Import CRM", "qa-import-crm", "qa.import.crm", " QA  import._CRM_ ", "\tqa_-_import crm\n"}
+	for _, name := range same {
+		if got := looseBindName(name); got != "qa import crm" {
+			t.Errorf("looseBindName(%q) = %q, want %q", name, got, "qa import crm")
+		}
+	}
+	for _, name := range []string{"qaimportcrm", "qa_import_crm2", "qa_import", "qa import crms"} {
+		if looseBindName(name) == looseBindName("qa_import_crm") {
+			t.Errorf("looseBindName(%q) equals qa_import_crm's — a different name matched", name)
+		}
+	}
+}
+
+// The case an imported folder hits first: its alias is the snake_case spelling
+// of a display name. The search escapes `_`, so `qa_import_crm` finds nothing,
+// and bind asks ONCE more for its longest word — and says, in the plan
+// a person approves, that the match was not exact.
+func TestBindMatchesADisplayNameIgnoringCaseAndSeparators(t *testing.T) {
+	f := newFakeSearchInstance(t)
+	f.hits["import"] = []api.SearchHit{{Kind: api.SearchKindSecret, ID: "secret-crm", Title: "QA Import CRM", Score: 1}}
+	signInTo(t, f.URL())
+	root := bindCmdFolder(t, f, `{"qa_import_crm": {"kind": "secret"}}`, "")
+
+	out, err := runCLI(t, root, "bind", "--stack", "prod", "--yes")
+	if err != nil {
+		t.Fatalf("bind: %v\n%s", err, out)
+	}
+	if got := bindCmdStackBind(t, root, "prod")["qa_import_crm"]; got != "secret-crm" {
+		t.Errorf("bind[qa_import_crm] = %q, want secret-crm", got)
+	}
+	if want := []string{"qa_import_crm", "qa import crm", "import"}; fmt.Sprint(f.terms) != fmt.Sprint(want) {
+		t.Errorf("searched %q, want %q", f.terms, want)
+	}
+	if !strings.Contains(out, `"QA Import CRM"  (matched ignoring case and separators)`) {
+		t.Errorf("the plan does not say the match was loose:\n%s", out)
+	}
+}
+
+// An exact match wins, and costs no second request: a folder that bound before
+// loose matching existed must bind to the same row now, even with a row beside
+// it whose name differs only in its separators.
+func TestBindPrefersAnExactMatchToALooseOne(t *testing.T) {
+	f := newFakeSearchInstance(t)
+	f.hits["orders_eu"] = []api.SearchHit{
+		exactHit(api.SearchKindTable, "table-exact", "orders_eu"),
+		{Kind: api.SearchKindTable, ID: "table-loose", Title: "orders_eu.", Score: 2},
+	}
+	signInTo(t, f.URL())
+	root := bindCmdFolder(t, f, `{"orders_eu": {"kind": "table"}}`, "")
+
+	out, err := runCLI(t, root, "bind", "--stack", "prod", "--yes", "--json")
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if got := bindCmdStackBind(t, root, "prod")["orders_eu"]; got != "table-exact" {
+		t.Errorf("bind[orders_eu] = %q, want the exact match", got)
+	}
+	if len(f.terms) != 1 {
+		t.Errorf("searched %q — an exact match needs no second search", f.terms)
+	}
+	if proposed := decodeJSON(t, out)["proposed"].([]any)[0].(map[string]any); proposed["loose"] != nil {
+		t.Errorf("an exact match was reported as loose: %v", proposed)
+	}
+}
+
+// Two rows called the alias loosely — one from each search — are ambiguous, the
+// same as two exact ones. This is also why the second search runs even when the
+// first found a loose match: the one it could not see is the one that makes the
+// answer a guess.
+func TestBindRefusesToPickBetweenTwoLooseMatches(t *testing.T) {
+	f := newFakeSearchInstance(t)
+	f.hits["qa_import_crm"] = []api.SearchHit{
+		{Kind: api.SearchKindSecret, ID: "secret-trailing", Title: "qa_import_crm_", Score: 2},
+	}
+	f.hits["import"] = []api.SearchHit{{Kind: api.SearchKindSecret, ID: "secret-display", Title: "QA Import CRM", Score: 1}}
+	signInTo(t, f.URL())
+	root := bindCmdFolder(t, f, `{"qa_import_crm": {"kind": "secret"}}`, "")
+
+	out, err := runCLI(t, root, "bind", "--stack", "prod", "--yes", "--json")
+	if err == nil {
+		t.Fatal("bind exited zero with an unbound dependency")
+	}
+	if got := bindCmdStackBind(t, root, "prod"); len(got) != 0 {
+		t.Fatalf("bind picked one of two loose matches: %v", got)
+	}
+	entry := decodeJSON(t, out)["unresolved"].([]any)[0].(map[string]any)
+	if entry["reason"] != bindReasonAmbiguous {
+		t.Errorf("reason = %v, want %s", entry["reason"], bindReasonAmbiguous)
+	}
+	if got := fmt.Sprint(entry["candidates"]); got != "[secret-display secret-trailing]" {
+		t.Errorf("candidates = %v, want both ids", got)
+	}
+	if !strings.Contains(entry["detail"].(string), "ignoring case and separators") {
+		t.Errorf("detail does not say the matches were loose: %v", entry["detail"])
+	}
+}
+
+// Every loose spelling is found, whichever separators it uses: the second search
+// asks for the alias's longest word, which each of them contains, and not for
+// "qa import crm", which "qa-import-crm" in another feature does not. Searching
+// the spaced form saw only the display name and bound it as the one match.
+func TestBindFindsEveryLooseSpellingAcrossFeatures(t *testing.T) {
+	for _, other := range []string{"qa-import-crm", "QA.Import.CRM", "QA  Import CRM"} {
+		t.Run(other, func(t *testing.T) {
+			f := newFakeSearchInstance(t)
+			f.catalog = []api.SearchHit{
+				{Kind: api.SearchKindSecret, ID: "secret-sales", Title: "QA Import CRM"},
+				{Kind: api.SearchKindSecret, ID: "secret-ops", Title: other},
+			}
+			signInTo(t, f.URL())
+			root := bindCmdFolder(t, f, `{"qa_import_crm": {"kind": "secret"}}`, "")
+
+			out, err := runCLI(t, root, "bind", "--stack", "prod", "--yes", "--json")
+			if err == nil {
+				t.Fatalf("bind exited zero, binding one of two loose matches:\n%s", out)
+			}
+			if got := bindCmdStackBind(t, root, "prod"); len(got) != 0 {
+				t.Fatalf("bind picked one of two loose matches: %v", got)
+			}
+			entry := decodeJSON(t, out)["unresolved"].([]any)[0].(map[string]any)
+			if entry["reason"] != bindReasonAmbiguous || fmt.Sprint(entry["candidates"]) != "[secret-ops secret-sales]" {
+				t.Errorf("unresolved = %v, want ambiguous between both", entry)
+			}
+			if len(f.terms) != 3 {
+				t.Errorf("searched %q, want the spaced form and the longest word, and nothing more", f.terms)
+			}
+		})
+	}
+}
+
+// A common word fills the longest-word search's page, which says nothing about
+// the spaced spelling: the loose match the spaced search sees whole is still
+// proposed. Refused as ambiguous, `sales_orders` could not bind "Sales Orders"
+// in any organization with forty rows mentioning orders.
+func TestBindProposesALooseMatchACommonWordCannotHide(t *testing.T) {
+	f := newFakeSearchInstance(t)
+	f.catalog = []api.SearchHit{{Kind: api.SearchKindTable, ID: "table-sales-orders", Title: "Sales Orders"}}
+	for i := range api.MaxSearchLimit + 5 {
+		f.catalog = append(f.catalog, api.SearchHit{Kind: api.SearchKindTable, ID: fmt.Sprintf("table-%d", i), Title: fmt.Sprintf("orders archive %d", i)})
+	}
+	signInTo(t, f.URL())
+	root := bindCmdFolder(t, f, `{"sales_orders": {"kind": "table"}}`, "")
+
+	out, err := runCLI(t, root, "bind", "--stack", "prod", "--yes", "--json")
+	if err != nil {
+		t.Fatalf("bind: %v\n%s", err, out)
+	}
+	if got := bindCmdStackBind(t, root, "prod")["sales_orders"]; got != "table-sales-orders" {
+		t.Errorf("bind[sales_orders] = %q, want table-sales-orders", got)
+	}
+	if want := []string{"sales_orders", "sales orders", "orders"}; fmt.Sprint(f.terms) != fmt.Sprint(want) {
+		t.Errorf("searched %q, want %q", f.terms, want)
+	}
+}
+
+// The extra search is bounded: an alias with no separator to turn into a space
+// is searched once, as it always was.
+func TestBindSearchesOnceForAnAliasWithNoSeparators(t *testing.T) {
+	f := newFakeSearchInstance(t)
+	signInTo(t, f.URL())
+	root := bindCmdFolder(t, f, `{"Orders": {"kind": "table"}}`, "")
+
+	if _, err := runCLI(t, root, "bind", "--stack", "prod", "--yes", "--json"); err == nil {
+		t.Fatal("bind exited zero with an unbound dependency")
+	}
+	if len(f.terms) != 1 {
+		t.Errorf("searched %q, want one search", f.terms)
 	}
 }
 
@@ -685,7 +872,9 @@ func TestBindRefusesAManifestWhoseBindIsAlreadyBroken(t *testing.T) {
 func TestEverySearchableDependencyKindIsMapped(t *testing.T) {
 	// codex and module are the two kinds the endpoint has no leg for; both are
 	// listed here so ADDING a third is a decision somebody makes on purpose.
-	unsearchable := map[string]bool{markers.KindCodex: true, markers.KindModule: true}
+	// A folder is a PATH, declared only as a write scope — which `ronja bind`
+	// never proposes — so there is no row to search for.
+	unsearchable := map[string]bool{markers.KindCodex: true, markers.KindModule: true, markers.KindFolder: true}
 	for _, kind := range markers.Kinds() {
 		_, ok := searchKindOf(kind)
 		if unsearchable[kind] {

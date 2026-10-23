@@ -28,7 +28,7 @@ import (
 // A blank manifest field is skipped rather than sent as "": the server's Patch
 // fields are optionals, and an explicit empty string CLEARS the value rather
 // than leaving it alone.
-func metadataPatch(manifest *wfdir.Manifest, target *api.Workflow) api.WorkflowPatch {
+func metadataPatch(manifest *wfdir.Manifest, codec aliasCodec, target *api.Workflow) api.WorkflowPatch {
 	var patch api.WorkflowPatch
 	if manifest.Title != "" && manifest.Title != target.Title {
 		patch.Title = manifest.Title
@@ -40,7 +40,9 @@ func metadataPatch(manifest *wfdir.Manifest, target *api.Workflow) api.WorkflowP
 	// whole point of the absent/empty distinction, and it is what keeps a push
 	// from a pre-parameters folder off a workflow's declaration.
 	if manifest.ManagesParameters() {
-		declared := manifest.DeclaredParameters()
+		// Compared and sent in WIRE form: an optionsQuery naming a table by
+		// alias is the same parameter as the row's id-form one.
+		declared := codec.parametersToWire(manifest.DeclaredParameters())
 		if !sameParameters(declared, target.Parameters) {
 			// Normalized, so "declares none" always goes up as [] rather than
 			// null — the server reads null as absent, which would be a silent
@@ -163,6 +165,36 @@ func checkRuntimeDrift(f *folder, live *api.Workflow) error {
 	return fmt.Errorf("this folder declares runtime %d, but %s is already runtime %s on the server — the runtime is a one-way upgrade and cannot be lowered.\n  Set \"runtime\": %d in %s to match, or clone the workflow again into a fresh folder",
 		f.Manifest.RuntimeVersion(), live.ID, served,
 		live.RuntimeVersion, wfdir.ManifestPath(f.Root))
+}
+
+// checkLanguageDrift refuses a push of a folder whose language is not the
+// row's. The language is fixed at create, so there is no patch that could
+// reconcile them, and files of one language saved into a workflow of the other
+// are refused by the instance only file by file, mid-push. A row with no
+// language is an instance predating the field: python.
+func checkLanguageDrift(f *folder, live *api.Workflow) error {
+	if live == nil {
+		return nil
+	}
+	row := live.Language
+	if row == "" {
+		row = wfdir.LanguagePython
+	}
+	if row == f.Manifest.LanguageName() {
+		return nil
+	}
+	return fmt.Errorf("this folder is a %s workflow (%s), but %s is a %s workflow on the server — a workflow's language is fixed when it is created.\n  Clone %s into a fresh folder to work on it, or bind this folder to a new workflow",
+		f.Manifest.LanguageName(), wfdir.ManifestPath(f.Root), live.ID, row, live.ID)
+}
+
+// languageOnTheWire is the language a create or validate body carries: js, or
+// nothing — so a python request is byte-identical to what every instance,
+// including one predating the field, has always read.
+func languageOnTheWire(m *wfdir.Manifest) string {
+	if m.IsJS() {
+		return wfdir.LanguageJS
+	}
+	return ""
 }
 
 // retiredRuntimeAdvice is the way out of a retired-runtime refusal in a

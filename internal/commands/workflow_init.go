@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,7 +9,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
 )
@@ -34,6 +32,7 @@ func newWorkflowInitCmd() *cobra.Command {
 	var featureID string
 	var title string
 	var runtime int
+	var language string
 
 	cmd := &cobra.Command{
 		Use:   "init",
@@ -49,7 +48,7 @@ Point --from at a script you already have and it is copied in as the entrypoint:
 
   ronja wf init --from scripts/monthly_report.py --feature collection-abc
 
-Without --from you get an empty folder to write main.py into yourself:
+Without --from you get a main.py to start from, written for that runtime:
 
   ronja wf init --feature collection-abc --title "Monthly report"
 
@@ -69,9 +68,7 @@ SEND (email, event, upload, tools.http call), so a failed run can be resumed
 repeating what already went out — and runs in a container that holds no
 credential for Ronja's table storage: its code reads a table only through
 ` + "`tools.query(\"SELECT ... FROM {{ ref('tbl::...') }}\")`" + `, never by reading a
-parquet file itself.
-
-Without --from you also get a main.py to start from, written for that runtime.`,
+parquet file itself.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Only a runtime a new workflow can be created on. Runtime 1 and 2
@@ -79,6 +76,11 @@ Without --from you also get a main.py to start from, written for that runtime.`,
 			// instance would use at the first push — before a byte is written,
 			// rather than a folder that can never be created.
 			runtimeNamed := cmd.Flags().Changed("runtime")
+			lang, err := resolveInitLanguage(language, fromPath, runtimeNamed, runtime)
+			if err != nil {
+				return err
+			}
+			language = lang
 			if runtimeNamed {
 				if wfdir.RetiredRuntime(runtime) {
 					return fmt.Errorf("--runtime %d: runtime 1 and 2 are retired — a new workflow cannot be created on them. Omit --runtime (the folder then takes the instance's default) and read tables with tools.query (the {{ ref }} marker goes inside the SQL string)",
@@ -133,12 +135,14 @@ Without --from you also get a main.py to start from, written for that runtime.`,
 
 			// The runtime the folder is pinned to, and the starter written for
 			// it. Settled before anything is written too, for the same reason.
-			runtime, starter, err := initRuntime(cmd.Context(), resolved, runtime, runtimeNamed)
+			scaffold, err := initRuntime(cmd.Context(), resolved, runtime, runtimeNamed, language)
 			if err != nil {
 				return err
 			}
+			runtime = scaffold.runtime
+			starter := scaffold.starter
 
-			entrypoint := wfdir.DefaultEntrypoint
+			entrypoint := scaffold.entrypoint
 			copied := false
 			var warnings []string
 			if fromPath != "" {
@@ -182,6 +186,15 @@ Without --from you also get a main.py to start from, written for that runtime.`,
 					return err
 				}
 			}
+			// package.json is written beside the entrypoint whether or not it
+			// was scaffolded — --from brings code, not its dependency list — and
+			// an existing one is left alone, as an existing entrypoint is.
+			wrotePackageJSON := false
+			if scaffold.packageJSON != "" {
+				if wrotePackageJSON, err = writeStarter(root, packageJSONName, scaffold.packageJSON); err != nil {
+					return err
+				}
+			}
 
 			if strings.TrimSpace(title) == "" {
 				title = deriveTitle(fromPath, root)
@@ -190,7 +203,14 @@ Without --from you also get a main.py to start from, written for that runtime.`,
 			manifest := &wfdir.Manifest{
 				Kind:       wfdir.KindWorkflow,
 				Title:      title,
+				Language:   language,
 				Entrypoint: entrypoint,
+			}
+			// A folder INITIALIZED onto a stack is born adopted: its id is minted
+			// here, locally, so its first push claims its address on the server and
+			// CI never needs the lock. See mintFolderIDAtInit.
+			if err := mintFolderIDAtInit(manifest); err != nil {
+				return err
 			}
 			// ALWAYS pinned, named or not: the first push sends it, so the
 			// workflow is created on the runtime init settled — not on whatever
@@ -264,7 +284,11 @@ Without --from you also get a main.py to start from, written for that runtime.`,
 					// The runtime the manifest pins, which the first push
 					// creates the workflow on.
 					"runtime":    runtime,
+					"language":   manifest.LanguageName(),
 					"scaffolded": scaffolded,
+				}
+				if scaffold.packageJSON != "" {
+					payload["packageJSON"] = wrotePackageJSON
 				}
 				if len(warnings) > 0 {
 					payload["warnings"] = warnings
@@ -272,6 +296,9 @@ Without --from you also get a main.py to start from, written for that runtime.`,
 				return emitJSON(payload)
 			}
 			printInitReport(root, describeTarget(resolved), title, entrypoint, featureID, fromPath, copied, runtime, scaffolded)
+			if wrotePackageJSON {
+				fmt.Fprintf(os.Stdout, "  Wrote %s — declare npm packages under \"dependencies\", at exact versions.\n", packageJSONName)
+			}
 			for _, w := range warnings {
 				fmt.Fprintf(os.Stderr, "  Note: %s\n", w)
 			}
@@ -285,6 +312,8 @@ Without --from you also get a main.py to start from, written for that runtime.`,
 		"feature the workflow will be created in (required)")
 	cmd.Flags().StringVar(&title, "title", "",
 		"workflow title (default: derived from --from, or the directory name)")
+	cmd.Flags().StringVar(&language, "language", "",
+		"the workflow's language: python (default) or js; fixed once the workflow is created")
 	cmd.Flags().IntVar(&runtime, "runtime", 0,
 		"workflow runtime to pin in the manifest (default: the one the instance creates new workflows on); runtime 1 and 2 are retired")
 	_ = cmd.MarkFlagRequired("feature")
@@ -384,74 +413,6 @@ func deriveTitle(fromPath, root string) string {
 		return base
 	}
 	return string(unicode.ToUpper(first)) + base[size:]
-}
-
-// initRuntime decides the runtime a new folder is pinned to and the starter
-// written for it, by asking the instance: GET /workflow/defaults for the
-// runtime --runtime names, else for the instance's default. The instance is the
-// one place both are true — a runtime it offers, and an entrypoint written for
-// it — so the CLI keeps no copy of either to go stale.
-//
-// Every failure is init's, before a byte is written (see workflowDefaults): an
-// instance that predates the route, a runtime the instance does not create on
-// (its 400 names the ones it does, and is shown as it is), a failed read, and
-// an answer this build cannot pin — LoadManifest refuses a runtime it does not
-// know, so pinning one would write a folder no later command could open.
-func initRuntime(ctx context.Context, resolved *config.Resolved, named int, isNamed bool) (int, string, error) {
-	ask := 0
-	if isNamed {
-		ask = named
-	}
-	defaults, err := workflowDefaults(ctx, newClient(resolved.URL, resolved.Token), resolved, ask)
-	if err != nil {
-		return 0, "", err
-	}
-	switch {
-	case len(defaults.EntrypointStarter) > maxStarterBytes:
-		return 0, "", fmt.Errorf("%s sent a %d-byte starter %s, over the %d KiB this CLI writes — refusing it; pass --from with the code to start from, or report the instance",
-			describeTarget(resolved), len(defaults.EntrypointStarter), wfdir.DefaultEntrypoint, maxStarterBytes/1024)
-	case isNamed && defaults.RuntimeVersion != named:
-		// An instance that ignored the parameter answers its default, and
-		// pinning that would pin a runtime the author did not ask for.
-		return 0, "", fmt.Errorf("asked %s for runtime %d and it answered runtime %d — update the instance, or omit --runtime to take its default",
-			describeTarget(resolved), named, defaults.RuntimeVersion)
-	case !wfdir.CreatableRuntime(defaults.RuntimeVersion):
-		return 0, "", unknownDefaultRuntime(resolved, defaults.RuntimeVersion, "pass --runtime with one it knows")
-	}
-	return defaults.RuntimeVersion, defaults.EntrypointStarter, nil
-}
-
-// maxStarterBytes caps the starter an instance may have `wf init` write: a
-// starter is a page of code, and the instance's answer is written to disk as is.
-const maxStarterBytes = 256 << 10
-
-// errEmptyStarter is writeStarter's refusal to write an empty entrypoint; the
-// caller words it.
-var errEmptyStarter = errors.New("empty starter")
-
-// writeStarter writes the starter into the folder, reporting whether it wrote
-// anything. An empty starter is refused (errEmptyStarter) — but only when it
-// would be written: a folder adopting an existing entrypoint never needed one.
-//
-// An existing entrypoint is left ALONE rather than refused: `wf init` in a
-// directory that already holds main.py is the documented way to adopt a script
-// you have, and the one thing worse than an init that scaffolds nothing is one
-// that ate the file it found. Nothing else in init depends on the scaffold, so
-// there is no failure to report — only a note.
-func writeStarter(root, entrypoint, starter string) (bool, error) {
-	dest := filepath.Join(root, entrypoint)
-	if _, err := os.Stat(dest); err == nil {
-		return false, nil
-	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("read %s: %w", dest, err)
-	}
-	if strings.TrimSpace(starter) == "" {
-		return false, errEmptyStarter
-	}
-	if err := wfdir.WriteFile(root, entrypoint, starter); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func printInitReport(root, target, title, entrypoint, featureID, fromPath string, copied bool, runtime int, scaffolded bool) {

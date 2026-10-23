@@ -595,7 +595,7 @@ func TestAutomationFileRefusesUnknownKeys(t *testing.T) {
 	if _, err := parseAutomationFile("a.json", `{"cronExpression": "0 2 * * *"}`); err == nil {
 		t.Error("an unknown key must be refused rather than dropped")
 	}
-	for _, key := range []string{"name", "private", "id", "featureID", "webhookSigningSecret"} {
+	for _, key := range []string{"private", "id", "featureID", "webhookSigningSecret"} {
 		_, err := parseAutomationFile("a.json", `{"`+key+`": "x"}`)
 		if err == nil {
 			t.Errorf("%q must be refused with its own reason", key)
@@ -617,7 +617,7 @@ func TestAutomationDeltaIgnoresUnmanagedFields(t *testing.T) {
 		Model: "opus", Description: "set in the web app",
 	}
 	row.Normalize()
-	changed, patch := automationDelta("nightly", file, row)
+	changed, patch := automationDelta(file, row)
 	if len(changed) != 0 {
 		t.Errorf("undeclared fields were reported as changes: %v", changed)
 	}
@@ -642,7 +642,7 @@ func TestAutomationDeltaCrossesTheSpellingGap(t *testing.T) {
 		EmailAllowedFromAddrs: []string{"a@example.com"},
 	}
 	row.Normalize()
-	if changed, _ := automationDelta("t", file, row); len(changed) != 0 {
+	if changed, _ := automationDelta(file, row); len(changed) != 0 {
 		t.Errorf("a matching declaration read as drift across the spelling gap: %v", changed)
 	}
 }
@@ -713,7 +713,7 @@ func TestAutomationDeltaIgnoresAnUnmanagedActionConfigField(t *testing.T) {
 		},
 	}
 	row.Normalize()
-	changed, patch := automationDelta("nightly", file, row)
+	changed, patch := automationDelta(file, row)
 	if len(changed) != 0 {
 		t.Errorf("an undeclared action config field read as drift: %v", changed)
 	}

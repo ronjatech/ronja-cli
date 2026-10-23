@@ -847,3 +847,48 @@ func TestLockAnchorRoundTrips(t *testing.T) {
 		t.Errorf("HeadVersion of an unrecorded stack = %q, want empty", got)
 	}
 }
+
+// TestLockWithoutAppliedNamesStillReads: a lock written before the applied-name
+// fields existed reads with every name empty — "no answer", which the commands
+// fall back from — and is re-emitted without inventing a name key.
+func TestLockWithoutAppliedNamesStillReads(t *testing.T) {
+	root := t.TempDir()
+	old := `{"stacks":{"prod":{"dataAppID":"app-1","tables":{"orders.sql":{"tableID":"table-1","liveSHA256":"abc"}},"metrics":{"metrics/aov.json":{"metricID":"table-2"}},"automations":{"nightly.json":{"automationID":"job-1","updatedAt":"2026-01-01T00:00:00Z"}}}}}`
+	if err := os.WriteFile(LockPath(root), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := LoadLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lock.TableName("prod", "orders.sql"); got != "" {
+		t.Errorf("TableName = %q", got)
+	}
+	if _, got := lock.MetricName("prod", "metrics/aov.json"); got != "" {
+		t.Errorf("MetricName = %q", got)
+	}
+	if got := lock.AutomationName("prod", "nightly.json"); got != "" {
+		t.Errorf("AutomationName = %q", got)
+	}
+	if got := lock.AppliedTitle("prod"); got != "" {
+		t.Errorf("AppliedTitle = %q", got)
+	}
+	if err := SaveLock(root, lock); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(LockPath(root))
+	if strings.Contains(string(raw), `"name"`) || strings.Contains(string(raw), `"title"`) {
+		t.Errorf("an old lock grew name keys on a round trip:\n%s", raw)
+	}
+	// And a recorded name survives the other setters, which are read-edit-store.
+	lock.SetTableName("prod", "orders.sql", "table-1", "Sales orders")
+	lock.SetTableLive("prod", "orders.sql", "table-1", "def")
+	if got := lock.TableName("prod", "orders.sql"); got != "Sales orders" {
+		t.Errorf("SetTableLive dropped the name: %q", got)
+	}
+	// A rebound path keeps nothing, by the lock's invariant.
+	lock.SetTableLive("prod", "orders.sql", "table-9", "ghi")
+	if got := lock.TableName("prod", "orders.sql"); got != "" {
+		t.Errorf("a rebound table kept the old row's name: %q", got)
+	}
+}

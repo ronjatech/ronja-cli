@@ -147,6 +147,12 @@ func (r pipelineChecksResult) settled() bool {
 type checksApplyOptions struct {
 	Prune bool
 	Force bool
+	// Pull is `ronja pipeline pull`'s anchor step: each entry a live check
+	// matches is recorded as owned, nothing is refused, created, updated or
+	// silenced, and an entry no live check matches is left pullPending.
+	Pull bool
+	// PullHint is the adopted folder's pull remedy (folder.pullHint).
+	PullHint string
 }
 
 // pushChecksFiles is the push's checks pass: each file whose table satisfies the
@@ -236,6 +242,68 @@ func checksQualify(ctx context.Context, client *api.Client, f *folder, codec pip
 		return tableID, fmt.Sprintf("the live table %s does not hold %s as it stands — push and publish it; its checks are applied once it does", tableID, sqlPath), nil
 	}
 	return tableID, "", nil
+}
+
+// managedChecksOf is what the folder owns of a checks file's table — a copy, and
+// only if it was recorded against THIS table.
+func managedChecksOf(store liveHashes, path, tableID string) map[string]wfdir.LockCheckEntry {
+	managed := map[string]wfdir.LockCheckEntry{}
+	if recordedTable, recorded := store.checksSeen(path); recordedTable == tableID {
+		for name, entry := range recorded {
+			managed[name] = entry
+		}
+	}
+	return managed
+}
+
+// checksPlanWritesNothing reports that applying a checks file would send its
+// table nothing: every entry resolves to a check that is there, of its kind,
+// saying what the entry says (decideCheckWrite), and no check this folder
+// created has left the file — asked without writing, for `sync apply
+// --dry-run`.
+func checksPlanWritesNothing(entries []checkfile.Entry, plan checksPlan) bool {
+	if plan.dup != "" || len(plan.orphans) > 0 {
+		return false
+	}
+	for i, e := range entries {
+		if write, _ := decideCheckWrite(e, plan.targets[i]); write != checkWriteNone {
+			return false
+		}
+	}
+	return true
+}
+
+// checkWrite is what applying one checks-file entry sends its table.
+type checkWrite int
+
+const (
+	// checkWriteNone: the check is there, of its kind, saying what the entry
+	// says.
+	checkWriteNone checkWrite = iota
+	// checkWriteCreate: no check on the table has the entry's name.
+	checkWriteCreate
+	// checkWriteUpdate: it differs, in the fields returned beside it.
+	checkWriteUpdate
+	// checkWriteRefuse: a check of another kind holds the name, and a check's
+	// kind is fixed.
+	checkWriteRefuse
+)
+
+// decideCheckWrite is the ONE per-entry decision: applyTableChecks makes it
+// (a create, or updateOneCheck's refusal, update or nothing), and the dry run
+// asks it (checksPlanWritesNothing). row is the check the entry resolved to,
+// nil for none.
+func decideCheckWrite(e checkfile.Entry, row *api.TableCheck) (checkWrite, []string) {
+	switch {
+	case row == nil:
+		return checkWriteCreate, nil
+	case row.Kind != e.Kind():
+		return checkWriteRefuse, nil
+	}
+	if diff := e.Differs(liveCheckOf(row)); len(diff) > 0 {
+		return checkWriteUpdate, diff
+	}
+	return checkWriteNone, nil
 }
 
 // liveCheckOf is the part of a server row the checkfile projection compares.
@@ -337,13 +405,7 @@ func applyTableChecks(ctx context.Context, client *api.Client, store liveHashes,
 		out.unknown = noAnswer(err)
 		return whole(checksOutcomeRefused, "could not read the checks on %s: %v", tableID, err)
 	}
-	// What the folder owns, only if it was recorded against THIS table.
-	managed := map[string]wfdir.LockCheckEntry{}
-	if recordedTable, recorded := store.checksSeen(file.Path); recordedTable == tableID {
-		for name, entry := range recorded {
-			managed[name] = entry
-		}
-	}
+	managed := managedChecksOf(store, file.Path, tableID)
 	entries := file.File.Checks
 	declared := map[string]bool{}
 	for _, e := range entries {
@@ -356,6 +418,9 @@ func applyTableChecks(ctx context.Context, client *api.Client, store liveHashes,
 	targets := plan.targets
 	for _, key := range plan.gone {
 		delete(managed, key)
+	}
+	if opts.Pull {
+		return pullAnchorChecks(store, file, tableID, entries, targets, managed, out)
 	}
 
 	// --- 2. Drift, before anything is written ------------------------------
@@ -396,7 +461,7 @@ func applyTableChecks(ctx context.Context, client *api.Client, store liveHashes,
 				why = append(why, fmt.Sprintf("no longer in %s and changed in the app since this folder last applied it: %s — push --prune --force silences them anyway, or put them back in the file",
 					file.Path, quoteNames(movedOrphans)))
 			}
-			return whole(checksOutcomeDrift, "%s", strings.Join(why, "; and "))
+			return whole(checksOutcomeDrift, "%s%s", strings.Join(why, "; and "), opts.PullHint)
 		}
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting checks changed in the app: %s (%s).\n", quoteNames(append(drifted, movedOrphans...)), file.Path)
 	}
@@ -447,7 +512,7 @@ func applyTableChecks(ctx context.Context, client *api.Client, store liveHashes,
 	}
 	var creates []int
 	for i := range entries {
-		if targets[i] == nil {
+		if write, _ := decideCheckWrite(entries[i], targets[i]); write == checkWriteCreate {
 			creates = append(creates, i)
 			continue
 		}
@@ -676,18 +741,17 @@ func planTableChecks(entries []checkfile.Entry, rows []api.TableCheck, managed m
 // caller attempts nothing more on this table.
 func updateOneCheck(ctx context.Context, client *api.Client, path, tableID string, e checkfile.Entry, row *api.TableCheck, owned bool) (_ pipelineCheckResult, wholeTable bool) {
 	r := pipelineCheckResult{Name: e.Name, CheckID: row.ID}
-	if row.Kind != e.Kind() {
+	write, diff := decideCheckWrite(e, row)
+	if write == checkWriteRefuse {
 		r.Outcome = checksOutcomeRefused
 		r.Error = fmt.Sprintf("refused — %q on the table is a %s check and the file declares a %s one; a check's kind is fixed — give it a new name, and --prune the old one", row.Name, row.Kind, e.Kind())
 		return r, false
 	}
-	live := liveCheckOf(row)
 	silencedNote := ""
 	if !row.Enabled && e.Enabled == nil {
 		silencedNote = "exists but is silenced — add \"enabled\": true to the entry to bring it back"
 	}
-	diff := e.Differs(live)
-	if len(diff) == 0 {
+	if write == checkWriteNone {
 		switch {
 		case silencedNote != "":
 			r.Outcome, r.Detail = checksOutcomeSilenced, silencedNote

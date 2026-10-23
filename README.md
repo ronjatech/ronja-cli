@@ -21,7 +21,7 @@ do for itself — an interactive browser sign-in — and then hands over:
 
 ```
 ronja login    # device flow through the browser
-ronja context       # instance + identity + the organization's policy + how to load the credential + the live API index
+ronja context       # instance + identity + the organization's policy and your own + how to load the credential + the live API index
 ronja env           # export lines for RONJA_URL / RONJA_TOKEN — meant for eval
 ronja profile list  # which logins this machine holds
 ```
@@ -37,11 +37,16 @@ at (`/llms.txt`, `/docs/api/endpoints.md`, `/docs/api/skills.md`,
 `/docs/api/openapi.json`) is served unauthenticated.
 
 `context` also **inlines the organization's policy** — the standing rules its
-admins wrote for how work here is done (`GET /api/v2/policy/org`), which
+admins wrote for how work here is done (`GET /api/v2/policy/applied`), which
 Ronja's own agent is given on every turn and a coding agent working from
-outside was never told existed. It prints as `## Organization policy (version
-N)` right after the `Signed in:` line, one framing sentence then the content
-verbatim, so it is read before the first request is composed. The read goes
+outside was never told existed. It prints as `## Organization policy` right
+after the `Signed in:` line, one framing sentence then the content verbatim,
+so it is read before the first request is composed. The content is the
+document's organization-wide part (see "Only the rules that apply to you"
+below), so no version is printed beside it: the version is the whole
+document's, and a PUT of the part shown at that version would drop every
+people-property section. Only an instance older than sections, which serves
+the whole document, still prints `## Organization policy (version N)`. The read goes
 out whenever a token is present and **independently of `/me`**: a role-bound
 scoped API token cannot call `/api/v2/authentication/me` at all (that group is
 admin-scoped) but reads the policy fine with `analytics:read`, and it is
@@ -51,20 +56,23 @@ rules":
 
 ```
 Organization policy: none written yet.
+Organization policy: no organization-wide rules yet; it holds policies for people properties.
 Organization policy: you are in no organization, so there is no policy to read.
 Organization policy: not readable with this token (needs analytics:read) — ask an admin for the rules.
 Organization policy: this instance does not serve GET /api/v2/policy/org yet — the CLI is newer than the instance.
 Organization policy: could not read GET /api/v2/policy/org — HTTP 503.
 ```
 
-The first is keyed on trimmed `content == ""` whatever the version (a
-written-then-blanked document is still nothing to follow); the second on
-`/me` answering with no organization, and it is asked ahead of the read's own
-outcome because `/me` is the authority on identity; the third is keyed on the
+The first is keyed on trimmed `content == ""` and no people-property section,
+whatever the version (a written-then-blanked document is still nothing to
+follow); the second is the same empty organization-wide part beside a
+people-property section, which is rules, not none; the third on `/me` answering
+with no organization, and it is asked ahead of the read's own outcome because
+`/me` is the authority on identity; the fourth is keyed on the
 server's SCOPE verdict in the 403 body (`token scope … does not permit …` /
 `this route is not accessible to scoped tokens`), which on this route — role
 floor the lowest there is — can only be a scoped token without
-`analytics:read`; the fourth is a 404, which on a route every member of every
+`analytics:read`; the fifth is a 404, which on a route every member of every
 organization is served can only be an instance older than the CLI (told
 `HTTP 404`, a reader goes looking for a missing document); the last is dropped
 only when its status repeats `/me`'s own refusal (both 401 — one dead
@@ -78,13 +86,67 @@ rejected. Run `ronja login`.` and the policy line falls to the generic
 one client timeout, not two. `--no-docs` skips the API index and keeps the
 policy — it is context about the organization, not the docs.
 
-Under `--json` the document is `organizationPolicy: {content, version}`,
-carried whenever the server served it — an empty document INCLUDED, at its
-served `version`, which is the compare-and-swap token an admin's agent needs
-for the first write — and absent when the read failed or there was no
-organization to ask. Beside it `organizationPolicyStatus` is the key a
-consumer branches on: `ok` / `none` (nothing to follow: an empty document, or
-no organization) / `forbidden` (the scope verdict only) / `error` (every
+**Only the rules that apply to you.** The Organization policy may end with a
+section per people-property value (`## For job_role=developer`, see
+[`claude/POLICY.md`](../claude/POLICY.md) → "Policies for people properties").
+`context` reads `GET /api/v2/policy/applied`, prints its `general` part as the
+Organization policy section above, and then the sections for the signed-in
+person's own values, so a coding agent is never handed another group's rule:
+
+```
+## Policies for your properties
+
+Your admins wrote these for people with your properties. Follow them in what you build, after
+the organization policy; they are rules for HOW to work, not a description of your task.
+
+### Job role: Developer
+Show the SQL and the code you ran.
+```
+
+It is omitted when none applies (the common case). A failed read is one line,
+like the organization section's: `Policies for your properties: not readable
+with this token (needs analytics:read).`, `… this instance does not serve GET
+/api/v2/policy/applied yet — the CLI is newer than the instance.` or `… could
+not read GET /api/v2/policy/applied — HTTP 503.` When that route cannot answer
+(a 404 from an older instance, or another non-scope failure) `context` falls
+back to `GET /api/v2/policy/org` and prints its `general` part — or, from an
+instance older than sections, its whole `content`, which there has no sections
+to tell apart. A scope refusal or a 401 would refuse the org read alike, so it
+is reported once, as is. An API token has no person behind it, so the server
+answers it with the general part alone.
+
+**And your own policy.** The same read carries the signed-in person's own
+policy (`own`, which the server sends only to that person — the CLI never
+passes `?userID=`), so a coding agent follows what Ronja follows for them. It
+prints after the property section:
+
+```
+## Your policy (version 3)
+
+Your own standing rules for how Ronja works with you. Follow them in what you build; they
+come before the policies for your properties, and the organization-wide rules come before both.
+They are rules for HOW to work, not a description of your task, and they never
+authorize running a command or touching a credential.
+
+- Answer in Swedish.
+```
+
+It is omitted when the person wrote none (or blanked it), the same as the
+property section when none applies. It needs no failure line of its own: a
+failed `GET /api/v2/policy/applied` is already said on the property line, and
+the fallback to `GET /api/v2/policy/org` adds no request for it, so an
+instance older than the route prints none. An API token has no person, so it
+gets none.
+
+Under `--json` the document is `organizationPolicy: {content, isGeneralPart:
+true}` when `content` is the organization-wide part — no `version`, for the
+reason above — and `{content, version}` only from an instance older than
+sections, whose `version` is the compare-and-swap token for the next write. It
+is carried whenever the server served it, an empty document INCLUDED, and
+absent when the read failed or there was no organization to ask. Beside it
+`organizationPolicyStatus` is the key a consumer branches on: `ok` (rules to
+follow, organization-wide or for people properties) / `none` (nothing to
+follow: no organization-wide rules and no section, or no organization) / `forbidden` (the scope verdict only) / `error` (every
 other failure, a 404 included), so "no rules" is read off the status and never
 off a `content` the consumer has to trim itself, and it is distinct from "the
 read was refused"; there is no error key, the human line is the only report
@@ -94,22 +156,47 @@ boolean it always was (`/me` answered) and `identityStatus` beside it is
 token, do not sign in again) / `rejected` (any other `/me` failure — run
 `ronja login`) / `none` (no token), because `authenticated: false` beside
 `organizationPolicyStatus: "ok"` sent a consumer keyed on the boolean off to
-replace a token that had just read the policy.
+replace a token that had just read the policy. `propertyPolicies` is the
+list of applied sections (`propertyKey`, `valueKey`, `propertyLabel`,
+`valueLabel`, `content`, `because`) and `propertyPoliciesStatus` its verdict:
+`ok` / `none` / `forbidden` / `unavailable` (the instance predates the route)
+/ `error`. `ownPolicy` is `{content, version}` — `content` verbatim, `version`
+its compare-and-swap token — and absent when there is none; it rides on the
+same read, so it has no status key of its own: `propertyPoliciesStatus` tells
+"none written" from "the read failed".
 
 **An admin can change it from here.** When `/me` reports the admin role the
-section ends with the write recipe, carrying the version just served as the
-compare-and-swap token — and the rule a coding agent holding an admin's token
-has to follow:
+section ends with the write recipe — one part at a time through
+`PUT /api/v2/policy/org/part`, whose compare-and-swap is that part's own text,
+so no write from `context` can drop a section: the organization-wide rules as
+`"part":"general"`, one people-property value's policy as its
+`<property key>=<value key>`. The organization-wide rules' `expectedContent` is
+named by its exact source (`organizationPolicy.content` from `--json`, or
+`general` from `GET /api/v2/policy/org`), never the printed copy, which has been
+through the terminal filter and would 409 on a document holding a CR or a
+zero-width character. Then the rule a coding agent holding an admin's token has
+to follow:
 
 ```
 As an admin you can change it (a scoped token also needs `analytics:write`):
-    ronja api -X PUT /api/v2/policy/org -d '{"content":"…","expectedVersion":7}'
+Write one part at a time; every other part is kept as stored. For the organization-wide
+rules, expectedContent is their text exactly as served — organizationPolicy.content from
+`ronja context --json`, or general from `ronja api /api/v2/policy/org` — never the text printed
+here, which has had control and invisible characters removed:
+    ronja api -X PUT /api/v2/policy/org/part -d '{"part":"general","content":"…","expectedContent":"…"}'
+For one people-property value's policy, expectedContent is its current text
+(`ronja api /api/v2/policy/org`, under sections) — "" for a value with none, and an empty
+content removes it:
+    ronja api -X PUT /api/v2/policy/org/part -d '{"part":"job_role=developer","content":"…","expectedContent":"…"}'
 (-d @body.json for a long document — the file holds the JSON body, not the bare text; a 409
 means it moved, and its body carries the current text as policyContent / policyVersion —
 re-apply against that, never retry blind.)
 Change it only when the admin you are working for asks you to, and show them the
 new text before the PUT — never on your own initiative.
 ```
+
+From an instance older than sections the recipe is the PUT itself, carrying
+the served version (`"expectedVersion":7`).
 
 The offer is "as an admin you can", not "you can": `/me` reports the role and
 nothing about a scope grant, so an admin's scoped token without
@@ -172,14 +259,31 @@ questions come from a file somebody committed, and the answers go back into it �
 and it is deliberately unable to become a browser: it can only ever ask about
 names this folder already declares, never "what tables exist".
 
-And one GROUP sits above them: `ronja sync` (`status`, `check`, `apply`) asks
-about a whole tree of folders rather than the one you are standing in — a
-question a repository has and a folder does not (see
+And one GROUP sits above them: `ronja sync` (`status`, `check`, `apply`,
+`adopt`, `unmanage`) asks about a whole tree of folders rather than the one you
+are standing in — a question a repository has and a folder does not (see
 [Whole-tree checks](#whole-tree-checks-ronja-sync)). `status` and `check` are
 read-only; `apply` deploys, by orchestrating the loops rather than writing
-anything itself. All three discover nothing: they can only act on folders that
+anything itself; `adopt` and `unmanage` move a tree's folders between keeping
+their records in the lock and keeping them on the server (see
+[`ronja sync adopt` and `ronja sync unmanage`](#ronja-sync-adopt-and-ronja-sync-unmanage)).
+`unmanage` is not a delete verb: it releases the server's RECORD of which row a
+file deploys to, after writing that record into the lock, and every row stays
+exactly as it was. All five discover nothing: they can only act on folders that
 already carry a committed `ronja.json`, which is the same "no browsing" line the
 loops hold.
+
+`ronja <kind> pull` is the loop run backwards, for an adopted folder: it writes
+the live row the folder deploys into the folder, so a change made in Ronja can
+be committed (see [Other writers: the notice, and `ronja <kind> pull`](#other-writers-the-notice-and-ronja-kind-pull)). It reads only the
+rows the folder already manages, so it is a sync verb too.
+
+`ronja import feature` is the tree's first step, as `clone` is a folder's: it
+writes a feature's rows into folders — references rewritten into stems,
+addresses and declared dependencies — and claims them for one stack (see
+[Importing a feature](#importing-a-feature-ronja-import-feature)). It reads the
+whole feature only to write it, never to show it, so it is a sync verb and not a
+browser.
 
 One command sits outside the doctrine entirely rather than under it: `ronja
 update` is housekeeping of the binary itself, and touches no Ronja resource and
@@ -241,8 +345,11 @@ questions from an organization's data connects to the backend's MCP endpoint
 design: `claude/MCP-ENDPOINT.md`.
 
 Customer-facing documentation lives at
-[`docs-site/src/content/docs/guides/use-the-cli.md`](https://ronja.tech/docs/guides/use-the-cli/),
-published at <https://ronja.tech/docs/guides/use-the-cli/>.
+[`docs-site/src/content/docs/guides/use-the-cli.md`](https://ronja.tech/docs/guides/use-the-cli/)
+(getting started) and
+[`docs-site/src/content/docs/guides/work-from-your-editor.md`](https://ronja.tech/docs/guides/work-from-your-editor/)
+(the folder loops), deliberately short: every flag, refusal and edge case lives
+here and in each command's `--help`, not there.
 This file is for people working *on* the CLI.
 
 ## Install
@@ -536,6 +643,43 @@ variable merely restates the tag already on HEAD; on a `workflow_dispatch` run
 no such tag exists in the mirror checkout and GoReleaser's own validation would
 fail a perfectly correct release. The version is validated in the workflow
 instead.
+
+### A CLI that needs a newer server
+
+Because the CLI ships on the same tag as the backend, a release is only safe
+when every server route the new CLI depends on is already DEPLOYED — merged is
+not enough: `cli_release.yml` is deliberately a separate workflow, so it
+publishes the CLI even when that tag's backend deploy fails or is rolled back,
+and a self-hosted or lagging instance may run older code for weeks.
+
+The adopted-folder loops are the case in point. A folder with an `"id"` needs:
+
+- the **managed-state routes** (`/api/v2/managed`, claims and anchors — the
+  managed-state backend slice), which every adopted folder reads before it
+  acts; and
+- the **reference inventory and validate's `writeTargets`** (`GET
+  /api/v2/feature/:id/references`, and `writeTargets` plus `resolved.workflowIDs`
+  on `POST /api/v2/workflow/validate` — the reference-inventory backend slice),
+  which `ronja import feature` and the write gate read.
+
+So a CLI carrying the write gate must not be released before both backend slices
+are live in production — merge them first, and let a deploy carry them out,
+before the CLI change merges. On an instance older than that, an adopted folder
+does not deploy: the write gate refuses it `no_write_targets`, saying that
+the instance "does not report write targets" and "is older than this CLI", and
+nothing is written. A classic folder (no `"id"`) is unaffected. The remedy the
+refusal names — upgrade the instance, use a matching `ronja`, or `ronja sync
+unmanage` — is the user's; the ordering is the maintainers'. `ronja import
+feature` against such an instance refuses by name too: the inventory route
+answers the router's plain-text 404, read as "older than this CLI", and nothing
+is written.
+
+`ronja <kind> pull` needs nothing more than an adopted folder already does: it
+reads the rows' own single-row GETs and records its anchors through the
+managed-state routes. The classic-loop notice reads `managedBy` off those GETs
+(the managed-by backend slice); an instance that sends none simply prints no
+notice, so it degrades to silence rather than to a refusal and needs no
+ordering of its own.
 
 ### When a release fails part-way
 
@@ -2089,7 +2233,11 @@ and `pipeline` share one manifest format:
   Write it as a bare number: `"2"`, `true` or anything else that is not a number
   is refused too, naming the file, because a manifest whose format cannot be
   established is better refused than half-read. Leaving the key out — or writing
-  `null` — means version 1. **Version 2 is stacks**, below.
+  `null` — means version 1. **Version 2 is stacks**, below; **3 is
+  `dependencies`**; **4 is a JavaScript workflow** (`"language": "js"`); **5 is
+  `moved`**, and `removed` in an automation folder (see "Addresses: `moved` and
+  `removed`"); **6 is the folder `"id"`**; **7 is a dependency by address, as a
+  write target, as an output or as a run edge**.
 
 - **`stacks` and `ronja.lock.json`.** See the next section.
 
@@ -2098,6 +2246,12 @@ and `pipeline` share one manifest format:
 A **stack** is one named environment this folder deploys to — `dev`, `staging`,
 `prod`. It is what `--stack` selects, and it is the unit the committed files are
 keyed by.
+
+⚠️ The local `.ronja/state.json` is NOT keyed by stack but by instance and
+organization (BL-4e71): two stacks of the same organization share one local
+baseline, so deploy each from its own checkout — switching stacks in one
+checkout is refused as a repointed binding (see "Deploying it to a second
+feature of the same organization" under `ronja import feature`).
 
 The word is `stack` and not `workspace` (a Ronja primitive) or `env` (which
 collides with `ronja env` and with "environment" meaning the shell's). And it is
@@ -2149,6 +2303,7 @@ drift baseline for the first time.
 | a pipeline's `metaSHA256` and its `tableDocs` entries | `ronja.lock.json` | same test, about the row's **documentation**: which table a docs sidecar names, and what its prose looked like when everybody last agreed with it |
 | a pipeline's `metrics` entries | `ronja.lock.json` | same test, about a metric's **definition**: which row a `metrics/<name>.json` file is, what that row's recipe hashed to when everybody last agreed with it, and what the file itself last declared. ⚠️ A metric's id lives here and **never** in `ronja.json` — that map is keyed by `.sql` path, and the SQL half of the loop walks it |
 | a workflow's / app's `headVersionID` | `ronja.lock.json` | "this folder forked from that published version" is true for everybody |
+| the applied **name** of a table, metric or automation (`name` on its entry), and the applied **title** of a workflow, app or module (`title` on the stack) | `ronja.lock.json` | "the live row was called this when everybody last agreed with it" — the baseline the name rule compares against (see **Names are declared attributes** below). Optional: a lock written before the field existed reads as "no answer" and falls back to the file's stem or filename, and an older CLI keeps the key through the lock's forward-compatibility sidecar |
 | draft ids, draft fingerprints | `.ronja/state.json` | a draft is **yours**; a colleague inheriting one from git would be pointed at a row they cannot see |
 
 **The head-version pointer, and why it is not a fingerprint.** A pipeline can
@@ -2306,7 +2461,9 @@ Four behaviours are deliberate and easy to undo by accident:
   The metadata patch does **not**: `PUT /workflow/:id` takes no precondition, so
   the title/entrypoint/parameters half of this guard is the local drift check
   alone, and a rename landing between that check and the patch still wins
-  silently.
+  silently. The **title** is additionally held to the lock's applied title, so
+  a fresh checkout (no `.ronja/`) refuses a title renamed in the web app rather
+  than writing it back — see **Names are declared attributes**.
 
   **A fresh checkout is not drift, and `--force` is not the way through it.**
   `.ronja/` is git-ignored, so a CI job and a colleague's `git clone` both start
@@ -2599,12 +2756,45 @@ module's function as an argument. `ronja module status` says the same thing
 about a `dependencies` block already committed to a module folder, which nothing
 else refuses and nothing ever fills.
 
-Five rules, and each one is a wrong deploy that does not fail:
+Seven rules, and each one is a wrong deploy that does not fail:
 
-- **Only an exact name match is proposed.** The search endpoint scores 3 exact,
-  2 prefix, 1 substring, and only the exact bucket is acted on. A near match is a
-  guess, and a wrong bind deploys a workflow against somebody else's table while
-  reporting success. Near misses are *reported*, not applied.
+- **A write target is never proposed.** A dependency declared `"write": true`
+  is a row the folder's code CHANGES, and the organization-wide exact-name
+  match for it in a new stack is the very table another stack writes —
+  production, when the new stack is a Dev copy in the same organization. It is
+  reported unresolved with reason `write_target` ("write target — bound by
+  hand, per stack") and left for a person to bind, stack by stack.
+- **A run target is never proposed.** A dependency declared `"run": true` is a
+  workflow or saved agent outside the stack's feature that the folder RUNS —
+  with that row's own authority — and its exact-name match is the row another
+  stack runs. Reported unresolved with reason `run_target` ("run target — bound
+  by hand, per stack").
+
+- **Only a name match is proposed — exact, or the same name ignoring case and
+  separators.** The search endpoint scores 3 exact, 2 prefix, 1 substring, and
+  an exact match is a hit in the exact bucket whose title equals the alias up
+  to case. Only when there is none does a LOOSE match count: a title equal to
+  the alias once case is ignored and every run of `_`, `-`, `.` and whitespace
+  is one separator, with none at the edges (`looseBindName`, the one
+  definition) — so `qa_import_crm` binds the secret "QA Import CRM". The
+  endpoint escapes `_` and matches substrings, so `qa_import_crm` never finds
+  that secret; when the alias has a separator and no exact match turned up,
+  `bind` searches at most TWICE more: for the alias with its separators as
+  spaces ("qa import crm"), whose full page proposes nothing, then for its
+  longest word, which every loose spelling contains (`qa-import-crm` and
+  "QA.Import.CRM" as well as "QA Import CRM"), only to rule out a second loose
+  match — that word's page filling does not block a proposal, since a common
+  word ("orders") fills one in any organization and says nothing about the
+  spelling the spaced search saw whole. It keeps the hits that are the same
+  name (and with a loose match already in hand too, since a second one is the
+  ambiguity below). A
+  loose match is judged on its title alone, the score being about whichever
+  term was sent; a title spelled exactly like the alias still needs the exact
+  score. An exact match always wins over loose ones, so a folder that bound
+  before binds to the same row now, and the plan marks a loose match
+  `(matched ignoring case and separators)` (`"loose": true` in `--json`).
+  Anything nearer than that is a guess, and a wrong bind deploys a workflow
+  against somebody else's table while reporting success.
 - **The title is checked as well as the score.** The endpoint merges a tag leg
   that stamps a matching **tag**'s score onto whatever it is attached to, so a
   table *tagged* `orders` arrives as an exact hit whatever it is called. A tag is
@@ -2612,8 +2802,9 @@ Five rules, and each one is a wrong deploy that does not fail:
 - **Ambiguity is never resolved, `--yes` included.** `--yes` says "I trust the
   unambiguous ones"; it is not an answer to "which of these three tables called
   `orders`". Zero matches and three matches are reported as different things,
-  because "no exact match for `orders`" and "three tables are called `orders`"
-  send the reader somewhere completely different.
+  because "no match for `orders`" and "three tables are called `orders`"
+  send the reader somewhere completely different. Two loose matches are just
+  as ambiguous as two exact ones.
 - **A TRUNCATED result set proposes nothing.** `bind` asks for exactly the
   endpoint's hard cap (`maxTotalCap`, 40) and there is no paging, so a request
   that comes back FULL is a prefix of the answer rather than the answer — and the
@@ -2625,6 +2816,13 @@ Five rules, and each one is a wrong deploy that does not fail:
 - **A codex or a module cannot be proposed at all.** The search endpoint fans
   out to neither, so an empty result there means "nobody looked", not "nothing is
   called that". Reported as exactly that, and set by hand.
+
+A dependency declared **by address** or as an **output** is skipped altogether:
+the first resolves through the other folder's claim and the second through its
+name (see "Dependencies by address" and "Write-capable data sources and outputs"
+below), and neither is ever bound by a search. A **write target** is not
+searched for either (the first rule above), but it IS bound, by hand, so it is
+reported unresolved until it is.
 
 Two smaller edges worth knowing. An alias shorter than two characters is below
 the endpoint's minimum term and is reported as *not looked up* rather than as not
@@ -2695,6 +2893,224 @@ The code does not change between the two pushes, and no id from either
 organization appears in a file anybody edits by hand. What a reviewer sees in the
 diff is one stack and one `bind` map: the list of decisions, stated once.
 
+#### Select-parameter queries resolve aliases too
+
+A workflow's `parameters[].optionsQuery` is SQL the server binds `{{ ref }}`
+markers in, exactly as it does in a file. It goes through the same codec: an
+alias there is sent as its id, the row's id comes back as the alias (so a
+second push sends no parameter patch), and the pre-flight reads each
+`optionsQuery` beside the folder's files — an alias used only there is not dead
+config, and a bare table name there is refused like one in a file.
+
+#### Dependencies by address
+
+A folder can name a row ANOTHER FOLDER OF THE SAME REPOSITORY manages — a table
+or metric a pipeline folder builds, a workflow, an app, a module — by where that
+folder declares it, instead of by an id and a bind:
+
+```json
+"dependencies": {
+  "orders":  {"kind": "table",    "from": "../../pipelines/sales", "address": "orders.sql"},
+  "aov":     {"kind": "table",    "from": "../../pipelines/sales", "address": "metrics/aov.json"},
+  "report":  {"kind": "workflow", "from": "../../workflows/report"},
+  "helpers": {"kind": "module",   "from": "../../modules/helpers"}
+}
+```
+
+`from` is the other folder's path relative to this one; `address` is its key
+there — a `.sql` file, `metrics/<name>.json`, or nothing at all for a workflow,
+data-app or module folder, whose one row is the folder. A metric is declared
+`table`, as everywhere else. No `bind` entry is needed, and one beside an
+address dependency is refused: they would be two answers to one question.
+
+**How it resolves**, per stack, every time a command opens the folder
+(`resolveAddressDependencies`):
+
+1. The other folder's `ronja.json` is read, and its stack of the **same name** as
+   the one being applied.
+2. That stack must point at the same `url` and `tenantID`, or the dependency is
+   refused `address_stack_mismatch` — an address never resolves across
+   organizations or instances. The same-Space half of that rule has
+   its hook in `addressSameSpace`, which answers nothing until a stack can name a
+   Space.
+3. The other folder must be ADOPTED (have a folder id) for that stack, or it is
+   refused `address_not_adopted`: only an adopted folder keeps the server state
+   an address is resolved through.
+4. Its claim at the address is read — `GET /managed?feature=<that stack's
+   feature>&folder=<that folder's id>` — and the claim's row is what the alias
+   resolves to. No claim there (nothing applied yet), or a claim that is not
+   `ok`, is `address_unresolved`, naming the folder and the address: apply that
+   folder first, then this one. A `from` that names no folder this CLI can open,
+   or one of a kind that cannot hold the declared kind, is
+   `address_folder_unreadable`.
+
+Before any of that, `from` must stay inside the repository the folder belongs
+to, or it is refused `address_outside_repository`: the folder's git work tree
+(the nearest ancestor holding a `.git` entry, symlinks resolved); without one,
+the tree a `ronja sync` command walks; without either, the folder itself. A
+committed folder cannot resolve an alias through some other folder on the
+runner's disk. A tree not yet under git resolves its addresses when `ronja sync`
+runs from its root.
+
+A resolved address joins the folder's alias codec like a bind, so every loop —
+push, status, the drift legs — reads it exactly as it reads a bound alias. An
+unresolved one is refused by the pre-flight of every acting command, reported
+`unknown` with its reason by `sync status`, and `unresolved` with its reason (and
+`from` / `address`) by `sync check`; `sync apply` refuses the folder under the
+same reason. A resolved table read is recorded as a cross-folder build edge
+(`folder.crossFolderTableReads`).
+
+**A table a WORKFLOW folder writes** is named with the workflow folder as
+`from` and, as `address`, the name of a dependency that folder declares
+`"write": true` or `"output": true`:
+
+```json
+"weekly_revenue": {"kind": "table", "from": "../../workflows/compute-weekly-revenue", "address": "weekly_revenue"}
+```
+
+Steps 1–3 above apply as they are; step 4 is `resolveWorkflowTable`: for a
+`write` dependency, the workflow folder's binding of it in the stack of the same
+name (a write source is always bound; none is `address_unresolved`); for an
+`output`, its binding if the stack has one — a table of THAT STACK'S FEATURE,
+or `address_stack_mismatch`: a stack block copied from prod binds prod's table,
+and the dev reader would read production. That is checked on the table itself
+(`GET /feature/model/:id`, one read per bound output — never the feature's
+listing, which leaves out a hidden or archived table), so a bound output, like
+an unbound one, needs a credential (`no_credential` without one) — else the table the workflow's runs
+made under that logical name IN THAT STACK'S FEATURE — the workflow's id from
+the run's overlay or its claim at "", then `GET /feature/model?featureID=` and
+the row whose `workflowID` and `workflowLogicalName` match. The listing is read
+once per feature per folder resolution, however many outputs ask it. Never a table of
+that name in another feature: that is how a second stack's app read
+production's table while its own workflow wrote a copy, with `bind` proposing
+the production row and `status` silent. Before the workflow exists in the
+stack, or before its first run has made the output, it is
+`address_unresolved` with the remedy — run the workflow on that stack once
+(`ronja wf run --stack S`), then apply again — and it is never deferred (a run
+of the same apply creates the workflow, not its output). An `address` naming no
+dependency of the workflow folder, or one it does not write (a plain read, a
+`from` of its own), is `address_not_written`. The read is in-stack, so no
+`write` or `run` binding is needed; the edge carries the stack's feature for an
+unbound output and none for a bound row. It is a READ and nothing more
+(`addressEdge.Written`): unlike a row another folder manages, it gives this
+folder no authority to write the table, which the workflow folder may bind to
+another team's feature. A docs sidecar (`tables/<alias>.json`) on it is gated
+as on any table — admitted in the stack's own feature, or bound by this
+folder's own `"write": true` source — and refused `writes_outside_target`
+otherwise. `ronja import feature` writes this
+form for every folder of the tree that reads a table a workflow folder of the
+tree writes (`featureImport.writtenBy`) — a workflow folder too, whatever
+order the folders are planned in, two workflows reading each other's tables
+included: `planPortability` plans the workflow folders once to fill
+`writtenBy`, then every folder with it whole — and reports it under Addresses. Format 7 already carries `from` / `address`; a
+CLI that predates this form refuses the folder (`address_folder_unreadable`)
+rather than misreading it, so no new format version is needed.
+
+**Inside one `sync apply --allow-create`, a row the same run creates resolves in
+memory**. An address whose only problem is that the other folder holds
+no claim there YET is not refused at plan time but deferred (`addressPending`),
+and the deferral is kept only when the same run deploys a unit of that folder at
+that address (`resolveDeferredAddresses`, to a fixed point — a folder refused
+for any reason takes its units away from every folder waiting on them). The
+folders then run in dependency order (see `sync apply`), and just before a
+folder with deferred addresses runs, they are resolved through the run's own
+record of the rows it made or confirmed (`addressOverlay`, keyed by the other
+folder's feature, folder id and address — its stack of the same name), the
+declared kind checked against the row's as against a claim's. A deferred address
+nothing in the run deploys is refused `address_unresolved` before any write,
+saying so. Without `--allow-create` nothing is created, so nothing is deferred
+and the refusal stands; every other command resolves through the claims the
+server holds and nothing else.
+
+#### Write-capable data sources and outputs
+
+Two more keys on a dependency say what the folder's code does to the row:
+
+```json
+"dependencies": {
+  "events":       {"kind": "table", "write": true},
+  "orders_daily": {"kind": "table", "output": true}
+},
+"stacks": {"main": {"…": "…", "bind": {"events": "table-…", "orders_daily": "table-…"}}}
+```
+
+- **`"write": true` — a write-capable data source.** A row outside this folder
+  that its code changes: a table written by `{{ write(...) }}` or by a
+  `tools.replaceTable("table-…")`-style output literal, a codex the workflow may
+  upsert into. It is bound per stack like any dependency, and an unbound one is
+  refused like any other: a stack has to decide, deliberately, which row it
+  writes. The alias also resolves inside `{{ write(...) }}`, which no other
+  dependency does — and a `{{ write(...) }}` naming a dependency declared
+  neither `write` nor `output` is refused, since it would go out as the name of
+  a NEW table. ⚠️ An output literal is a call argument no codec rewrites: it
+  stays an id in the code and writes THAT table whatever the stack binds. In an
+  adopted folder the write gate (see "The write gate" under adopted folders)
+  is what makes that safe: a stack whose feature does not hold the table and
+  that does not bind THAT id as a write source is refused
+  `writes_outside_target` — so binding the dependency to another row in a new
+  stack refuses rather than silently redirecting nothing. Turn the literal into
+  `{{ write('<alias>') }}` and the bind is what it writes. An unused-alias
+  warning is never raised for a write dependency. `ronja bind` never proposes
+  one: which row a stack may write is bound by hand, per stack.
+- **`"kind": "feature", "write": true` — another feature an agent automation
+  is given.** A `feature` entry in an agent action's `references` other than
+  `"@feature"` (the stack's own): the run expands it to every live table of that
+  feature and may write each one (`rscheduledjob.LoadReferencesExpanded`; the
+  inventory reports it `read_write`). So it is a write source like any other —
+  bound per stack on purpose, never proposed by `ronja bind`, and refused
+  `writes_outside_target` by the write gate when the stack has not bound it.
+- **`"run": true` — a run edge out of the stack's feature**. A
+  workflow (`"kind": "workflow"`) or saved agent (`"kind": "agent"`) outside
+  this repository that the folder RUNS: a `{{ workflow() }}` / `{{ agent() }}`
+  in workflow code, an app's `allowedWorkflowIDs` / `allowedAgentIDs`, an
+  automation's `workflow` / `saved_agent` action or `workflow` reference.
+  Running a row acts with that row's authority, writes included, so in an
+  adopted folder a run of one in another feature is as deliberate as a write
+  there: the write gate refuses it `runs_outside_target` unless a `"run": true`
+  dependency binds it IN THIS STACK. A target in the stack's own feature, or a
+  row this repository manages in the stack (an address dependency), needs no
+  flag. Refused beside `write`, `output` or `from`, and on any other kind.
+- **`"kind": "folder", "write": true` — a folder write scope.** A path in the
+  organization's file system the code writes files into (`{{ file('/exports',
+  'write') }}`, `tools.saveFile(…, folder='/exports')` — a write-mode `file`
+  marker's argument IS the folder scope). A folder belongs to no feature —
+  every feature of the organization shares it — so the write gate admits a
+  write into it only for a stack that binds this dependency to that path
+  (`"bind": {"exports": "/exports"}`), compared EXACTLY in the server's
+  normalized form (one leading `/`, no trailing `/`, duplicate slashes
+  collapsed; `wfdir.NormalizeFolderPath`): there is no prefix match, so
+  `/exports/daily` needs a bind of its own. Nothing is substituted into the code: the bind
+  is the stack's permission, not a rewrite. A folder is declared only with
+  `write`, and its bind must be a path, not the root, with no `.` or `..`.
+- **`"output": true` — the folder's OWN output, by logical name.** The alias is
+  the name the workflow writes the table under (`{{ write('orders_daily') }}`),
+  which the runtime creates in the stack's own feature. A stack that already
+  holds the row MAY bind it, so the marker round-trips the id the live row's code
+  carries; a stack that binds nothing sends the name. Unlike every other
+  dependency, an unbound output is legal in a `{{ write(...) }}` marker. A
+  workflow that also READS its own output with `{{ ref(...) }}` would send the
+  name there, which the server resolves and stores as an id — permanent drift.
+  So in an adopted folder an unbound output the code reads by `ref` is resolved
+  IN MEMORY to the table the workflow's runs made under that name in the stack's
+  feature (`resolveOwnOutputs`, off the feature's table listing): it goes out as
+  that id — in its `{{ write() }}` markers too, exactly as a bound output does —
+  and reads back as the name. ⚠️ Before the workflow's first run in a
+  stack there is no such table, and the server refuses a `{{ ref }}` naming a
+  table that does not exist (`unresolved_ref`), so a workflow that reads its own
+  output by `ref` can be pushed to a NEW stack only once that output exists
+  there. `ronja bind` never proposes an output — the exact-name match would be
+  the same output in another target, the one row it must never write.
+
+Neither key may be combined with `from`, and they may not be combined with each
+other.
+
+**Format version 7.** A dependency carrying `from`, `address`, `write`, `output`
+or `run` stamps `"formatVersion": 7`, and one that says less is refused naming the
+line to add: an older CLI would read a write-capable alias as an ordinary one and
+send it inside `{{ write() }}` as a NEW table's name. `run` is a version-7 key
+rather than an 8: version 7 never shipped without it, so no CLI reads 7 and not
+`run`, and one below 7 has no write gate at all.
+
 ### `wf run` — the step after publish
 
 `run` is the only verb that touches the **live** workflow, and it is a sync verb
@@ -2724,6 +3140,9 @@ not obvious enough to lose by accident:
   maintainer commits it the folder names a draft that is gone and holds files that are usually
   exactly what went live. Telling that author to re-clone a perfectly good
   folder is what the split exists to stop.
+- **Then the write gate, in an adopted folder**, over the LIVE row's code as
+  the server holds it — the code that is about to run, which a republish may
+  have changed since this folder synced — exactly as `wf test` gates the draft.
 - **Then the legacy approval gate**, refused with the same wording `test` uses
   and, like it, naming the conversion to a mid-run approval rather than the
   off-switch.
@@ -3464,7 +3883,7 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
 | `clone` | copies an app's files down into a new folder, `access` included. Prefers your open draft over live. Creates nothing server-side | — |
 | `status` | local changes, remote lifecycle/draft, whether the draft compiles, allowlist differences, drift, and how many updates Ronja recommends for the app. Read-only, works signed out for the local half | `--json` |
 | `fork` | copies one built-in kit file into the folder at the same path, so it shadows the kit's. Local only — changes nothing server-side, and never overwrites an existing file | `--json` |
-| `push` | ensures a draft, syncs allowlists then files, then compiles | `--no-validate`, `--force` |
+| `push` | ensures a draft, syncs allowlists then files, then compiles. A `"title"` renamed in the web app since this folder last agreed with it is refused, not reverted (see **Names are declared attributes**) | `--no-validate`, `--force` |
 | `validate` | recompiles your draft and reports diagnostics | `--json` |
 | `test` | renders the draft in a headless browser and writes `report.json` + the frames into `.ronja/test/`; a report, never a verdict | `--route`, `--viewport`, `--timeout`, `--steps`, `--out-dir`, `--fail-on-errors`, `--json` |
 | `publish` | commits the draft, or submits it for review. Refuses a draft that does not compile | `--no-request-review` |
@@ -3790,11 +4209,15 @@ it passes the same test `wf` does.
   removing the `ronja.json` entry is the whole of the cleanup for a table this
   folder no longer manages.
 
-A table's display name is the file stem, stamped once at create. Renames are
-unmanaged in v1: push never writes the name again, so a rename in the web app
-survives.
+A table's name is the file stem, stamped once at create, unless the file
+DECLARES one with a `-- @name` header line (see **Names are declared
+attributes**): then the name is managed, and a push renames the same row in
+place. With no `-- @name`, push never writes the name again, so a rename in the
+web app survives. The file's path stays its identity either way — renaming the
+FILE is not renaming the table; it unbinds the file and the next push creates a
+second table.
 
-That makes the name a **round trip**, which is why `clone` derives filenames
+The stem is still a **round trip**, which is why `clone` derives filenames
 with `wfdir.FileSlug` rather than the `wfdir.Slug` the other loops use for their
 clone *directories*: `FileSlug` keeps underscores **and case**. Folding either
 away gave `orders-clean.sql` back for the `orders_clean.sql` git was already
@@ -4061,8 +4484,18 @@ There are two places to write it and they are deliberately disjoint.
 SELECT ...
 ```
 
+A `-- @name <text>` line may sit in the same header — after `-- @table`, or on
+its own when the file documents nothing. **Write it after `-- @table`, never
+before.** This CLI also reads a header that opens with `-- @name`, but an older
+one opts in only when the first line is `-- @table`, so a teammate on an older
+CLI would silently stop sending the documentation of a file that opens with
+`-- @name`. It is not documentation: it
+declares the table's NAME, and is read by its own rule (see **Names are
+declared attributes**). A header that names its table and documents nothing
+arms no documentation leg and sends no `fields`.
+
 **Opt-in is the whole design.** The block is read only when the *first* comment
-line of the file opens with `-- @table`; a leading comment that does not is
+line of the file opens with `-- @table` (or `-- @name`); a leading comment that does not is
 ordinary commentary and nothing is read, judged or reported. Without that rule
 every pipeline folder in existence would start pushing its first comment as a
 table description on the next release, silently, over prose an admin may have
@@ -4181,6 +4614,10 @@ either, because a documented name the table does not have is stored server-side
 and never reported back, so such a file would read as pending for ever and be
 re-sent on every push.
 
+In an adopted folder both are also kept on the server, on the folder's own
+anchor rather than on any claim, so a runner with no lock still has them — see
+**The folder anchor holds the docs-sidecar and health-checks baselines** below.
+
 **`status` and `sync status` understand both.** A `.sql` file's header shows as
 a `docs:` line beside its `drift:` and `live:` legs. Each sidecar gets its own
 entry saying which table it names, whether a push would write anything
@@ -4275,8 +4712,13 @@ the dimension list, the compiled SQL, the source closure — and none for
 verification state: a file that could set either could contradict its own
 recipe, or mint a metric asserting somebody else had vetted it.
 
-**Names.** The file's stem is the metric's name, or an alias a stack binds to a
-metric that already exists. `recipe.source` resolves exactly as a `{{ ref }}`
+**Names.** The file's stem is the metric's identity: the name a new metric is
+created under, or an alias a stack binds to a metric that already exists. A file
+may also declare `"name": "…"`, which manages the metric's name on the same
+rule as a table's `-- @name` (see **Names are declared attributes**) and is the
+name a new metric is created under; absent, the name is stamped once and never
+written again. The name is not part of the definition's fingerprint, so a file
+that only gained a `"name"` still stages the rename. `recipe.source` resolves exactly as a `{{ ref }}`
 does — a sibling `.sql` stem first, then a declared alias, then a literal
 `table-…` id — which is what lets one committed folder define the same number in
 several organizations.
@@ -4325,7 +4767,8 @@ author caused and would otherwise meet in the UI.
 ⚠️ **A LEGACY unnamed `instances[]` folder keeps a metric's id in the git-ignored
 local baseline**, exactly as it keeps everything else from before stacks existed.
 So a colleague's fresh clone of such a folder has no id, tries to create by name,
-and is recovered by adopt-by-name below. A `--stack` folder commits the id and
+and is recovered by adopt-by-name below when its file still holds the metric's
+definition (`ronja bind` otherwise). A `--stack` folder commits the id and
 never meets this.
 
 **Recovery when the binding is not recorded.** The likelier failure is not a
@@ -4333,10 +4776,16 @@ crash but a 200 the CLI failed to persist: the metric exists, the lock does not,
 and the next push tries to create the same name — which the store refuses with a
 `name_taken` the author cannot act on from the folder. So on a `name_taken` at
 create the loop looks the name up in the target feature, and if it resolves to a
-`kind=metric` row THERE it adopts it into the lock and carries on; anything else
-is reported as the collision it is, with `ronja bind` as the manual route. Same
+single `kind=metric` row THERE that holds **exactly this file's definition** it
+adopts it into the lock and carries on. A metric of that name with any other
+definition is somebody else's — a colleague's, or one a declared `"name"`
+collides with — and adopting it would skip every drift leg and stage this
+file's recipe over theirs, so it is refused naming that metric; anything else is
+reported as the collision it is, with `ronja bind` as the manual route. Same
 shape as `reconcileTimedOutCreate`, and adopting only on a positive
-identification is the whole of its safety.
+identification is the whole of its safety. The equality is exact (a file that
+leaves out a key the server defaults does not match), which keeps it on the
+refusing side: such a file is pointed at its row with `ronja bind`.
 
 ⚠️ **Known limitation, documented rather than fixed.** `GET /api/v2/search`
 reports a metric as kind `table` (`search.Hit.IsMetric` is `json:"-"`), so
@@ -4721,12 +5170,12 @@ has really created tables and staged drafts and "which ones" is the first thing
 anyone needs to know. The baseline is saved after **every** file, success or
 failure, for the same reason.
 
-A `.sql` file deleted from the folder is **not** a table this loop deletes. It is
-reported on stderr and left alone — there is no delete verb here on purpose, and
-quietly dropping a colleague's table because a merge removed a file is exactly
-what a sync loop must not do. The note says how to stop it being reported for
-ever: remove the file's entry from `tables` in `ronja.json`, and the baseline
-entry is pruned with it.
+A `.sql` (or `metrics/*.json`) file deleted from the folder is **not** a row this
+loop deletes. It is reported on stderr and left alone — there is no delete verb
+here on purpose, and quietly dropping a colleague's table because a merge removed
+a file is exactly what a sync loop must not do. The note is rename detection (see
+"Addresses: `moved` and `removed`"): it names the new file when there is one and
+asks for a `moved` or `removed` entry, which is also how it stops being reported.
 
 **`status` exits non-zero on REMOTE drift AND on "not checked", so it works as a
 CI gate without parsing** — the same contract `db migrate status` has, and for
@@ -4779,8 +5228,15 @@ API guide (`backend/lib/api/openapi/guides/build-a-data-pipeline.md`, served at
 ## Automation folders (`ronja automation`)
 
 `ronja automation` keeps a feature's automations as one `.json` file each. The
-filename is the automation's name; everything that is not a `.json` file is
+filename is the file's identity and, unless the file declares a `"name"`, the
+name the automation is created under; everything that is not a `.json` file is
 ignored, so the folder can sit inside an ordinary repository.
+
+A file may declare `"name": "…"`, which manages the automation's name on the
+name rule (see **Names are declared attributes**), with the filename as the
+baseline when the lock records none. ⚠️ With **no** `"name"`, the name is
+stamped at create and **never written again** — every push used to re-patch it
+to the filename, which reverted any rename made in the web app.
 
 ```bash
 ronja automation init --feature collection-abc123 --cron "0 2 * * *" --workflow nightly
@@ -4933,10 +5389,23 @@ references[2].resourceID: alias "policy" has no bind in stack "prod"
 A `{{ … }}` marker **anywhere** in one of these files is refused rather than
 sent. Nothing on the server reads a marker out of an automation, so one sent
 literally would be stored as a resource id, resolve to nothing, and fail at the
-first unattended run — which is the failure this loop exists to prevent. Three
-reference kinds (`dataapp`, `mcpserver`, `feature`) have no alias at all, so
-naming one would mean committing a raw id; those are refused too, and the message
-says to manage that automation in the web app until the alias layer covers it.
+first unattended run — which is the failure this loop exists to prevent.
+
+Every reference kind has an alias kind: `model` is declared `table`, and
+`workflow`, `note`, `secret`, `mailbox`, `dataapp`, `mcpserver` and `feature`
+are declared under their own names (`ronja bind` searches all of them). A
+`feature` reference to the automation's OWN feature is written `"@feature"`,
+which the CLI resolves to the selected stack's `featureID` before sending — so
+the same file references whichever feature each stack deploys to. A stack with
+no `featureID` refuses it rather than send the token.
+
+```json
+"references": [
+  {"kind": "dataapp",   "resourceID": "sales_dashboard"},
+  {"kind": "mcpserver", "resourceID": "crm"},
+  {"kind": "feature",   "resourceID": "@feature"}
+]
+```
 
 ### There is no local baseline
 
@@ -4957,12 +5426,13 @@ Each is a silent wrong answer without it.
 
 | refusal | why |
 |---|---|
-| the row moved since the recorded `updatedAt` | there is no version and no compare-and-set here, so this anchor is the only drift guard there is. `--force` overwrites |
+| the row moved since the recorded `updatedAt` | there is no version and no compare-and-set here, so this anchor is the only drift guard there is. `--force` overwrites. ⚠️ A row that already holds **every field the file declares** is not drift, however far `updatedAt` moved: it is reported `unchanged` and the anchor is re-taken — the likeliest history is this folder's own write whose anchor was lost |
+| a declared `"name"` the row holds neither as declared nor as the recorded name (or, with none recorded, the filename) | it was renamed somewhere else; `--force` renames it back |
 | a file turns an automation back **on** that somebody paused after that anchor | a human pause is clearable server-side, so without this the automation is live again with nobody in the loop |
 | a change to `triggerKind`, `referenceBased` or `eventName` | the update body carries **none of the three**, so sending the change answers `200` for a write that never happened |
 | an `action` with no `kind` | the server reads a missing kind as the back-compat inline `agent` shape, so the action it stores is not the one the file describes |
 | an `agent` action declared against a row that runs a `workflow` or a `saved_agent` | the update route writes a child action row for those two kinds only, so the switch back answers `200`, changes nothing, and leaves `action.kind` reporting drift for ever |
-| a file this folder is bound to is gone | those automations are LIVE, and a bad rebase must not stop one. `--prune` is the explicit opt-in, and it obeys the drift anchor too: a row somebody has been editing is the last one to delete because a file went missing |
+| a file this folder is bound to is gone, with no `moved` or `removed` entry covering it | those automations are LIVE, and a bad rebase must not stop one. A `moved` entry keeps the automation under the new file; a `removed` entry stops managing it and leaves it running. `--prune` is the explicit opt-in to DELETE, and it obeys the drift anchor too: a row somebody has been editing is the last one to delete because a file went missing |
 | a mailbox trigger or reference without the admin role | binding a mailbox needs admin **and** an `admin:write` token, while this loop's scope is `automation` |
 | the feature holds more automations than one page carries | a listing that saw a prefix cannot say which rows are missing, and a row it cannot see reads as gone. Against a Ronja older than this CLI the same refusal fires for a different reason — that instance ignores `featureID`, so the count is the organization's — and the message says which of the two happened, because "split the feature" is unactionable advice for a feature holding three |
 | a `rateLimitPerMinute` or `rateLimitPerDay` of `0` | an update reads 0 as "use the organization's default" and stores NULL, so the file and the row can never agree; a create refuses it outright as not a positive integer. Leaving the key out is the spelling that means what a 0 looks like it means |
@@ -5032,8 +5502,11 @@ The lock is saved after every file, so the retry is the same push again.
 
 Stacks, `--stack`, `dependencies` + `bind`, the alias collision rules and the
 `--json` shapes are the same as everywhere else in this file. One asymmetry worth
-knowing: because the binding is keyed by **path**, renaming a file is an orphan
-plus a create rather than a rename — the same property `ronja pipeline` has.
+knowing: because the binding is keyed by **path**, renaming a file without a
+`moved` entry is an orphan plus a create rather than a rename — the same property
+`ronja pipeline` has. A `moved` entry re-keys the binding and keeps the
+automation; a `removed` entry stops managing it without deleting or pausing it
+(see "Addresses: `moved` and `removed`").
 
 ## Module folders (`ronja module`)
 
@@ -5320,6 +5793,86 @@ from {{ module('module-abc123') }} import tracker   # → from emab_tracker impo
 in a workflow folder. That is the whole point — one copy, one id, one version
 history, and a graph that can answer "what does editing this affect".
 
+### `sync` covers module folders — an upgrade effect on classic trees
+
+Builds before this one left a module folder out of the tree commands: `sync
+apply` over a tree holding a module folder with no folder id exited 2
+`kind_not_covered` and wrote nothing (and `sync check` answered `unknown` for
+it). This build covers modules in every tree command, so the same tree,
+unchanged, behaves differently after a CLI upgrade alone: `sync check` gives the
+module folder a real verdict, an unchanged one applies as `applied`, and **`sync apply` pushes and
+publishes it** when its files differ from the live module — a classic folder
+(no `"id"`) included. That is a deliberate exception to "a classic folder
+behaves exactly as before", kept because a tree that cannot deploy one of
+its kinds is the bug. What it means in practice: a CI job that ran `sync apply`
+over a tree with an edited module folder used to fail and now publishes the
+module. Consumers are protected by pinning — a workflow runs the module version
+it was last published with, and picks a new one up only when it is saved and
+published again — so the publish changes no running workflow by itself. A tree
+that must not publish its modules from CI keeps them out of the directory
+`sync apply --dir` walks. `sync status` gives the folder a real verdict too
+(`clean` exit 0, `drifted` exit 1, or a refusal), and the `kind_not_covered`
+reason no longer appears in any tree command's output — a script that matched
+on it sees the module folder's own verdict instead.
+
+### Other upgrade effects on classic folders
+
+Four more changes reach a folder with no `"id"`, on a CLI upgrade alone:
+
+- **Re-pointing a binding is a local change the push deploys** (a bug fix).
+  A workflow or data-app folder that edited only `stacks.<s>.bind` in
+  ronja.json was refused by its own push ("the draft changed on the server
+  since your last sync") and `status` listed the server's untouched file as
+  drift: the remote was de-aliased through the NEW binding, where its old id no
+  longer turned back into the alias the baseline was hashed in. The local
+  baseline (`.ronja/state.json`) now records the aliases it was taken under
+  (`aliases`, with `aliasesRecorded: true` so a baseline that resolved none
+  says so rather than reading as unrecorded), and the drift guard, its
+  per-file preconditions (`onTheWire`, which accepts either rendering) and
+  `status`'s drift line render the remote through them (`baselineCodec`).
+  Until the push deploys it, the rebind is a LOCAL change: `wf status` and
+  `app status` list it under Local changes (`rebound` in --json: alias, kind,
+  from, to — for each binding a file uses), and `sync status` reports the
+  folder `drifted` ("binding `orders` re-pointed from table-orders to
+  table-orders-2", among the changes here never deployed), never `clean`
+  while the server still holds the old id. A binding REMOVED counts too: an
+  output then written by its name has resolved to nothing as its true state.
+  Only an address or an unbound output whose lookup was owed and got no
+  answer (`lookupMissed`: a recorded address error, or a signed-out run
+  `resolveOwnOutputs` would have asked) is left out. A baseline written by an
+  older CLI records none and compares as before: a binding re-pointed before
+  this CLI has pushed or pulled the folder once still refuses — and when the
+  refused files differ from the baseline only by that binding's ids
+  (`reboundUnrecorded`), the refusal says so and names the way past it
+  (`reboundWayPast`): put the binding back, push (or pull, for an adopted
+  folder), then re-point it. `wf status`, `app status` and `sync status` say
+  the same (`unrecordedRebind`): those files leave the drift — `pull` would
+  write the old id into the folder and lose the rebind — and the rebind is
+  listed with `refused` naming the way past, which `sync status` reports as
+  something a push would refuse. `sync apply --dry-run` takes the push's
+  refusal (below).
+
+- **`<kind> init --stack` creates an ADOPTED folder.** It mints the folder id
+  (`mintFolderIDAtInit`) and stamps `"formatVersion": 6`, where earlier builds
+  wrote a classic stack folder. The first push therefore needs an instance that
+  serves `/managed`, and a token with the `structure:read` and
+  `structure:write` scopes beside the kind's own — an existing scoped CI token
+  that carried only `automation:write` is refused by name — and a teammate on an
+  older CLI cannot open the folder. `init` without `--stack` is unchanged, and
+  `ronja sync unmanage` turns an adopted folder back into a classic one.
+- **`{{ write('x') }}` of an alias declared only for READING is refused**
+  (`misusedAliases`), on push, validate, `sync check` and `sync apply`. Earlier
+  builds sent the alias as the name of a new table the run created in the
+  stack's feature — the declared row was never written, and the push was green.
+  The remedy is `"write": true` or `"output": true` on the dependency, which
+  stamps format 7. A folder that read its own name-form output through a
+  same-named read alias was correct before and is refused now; declaring the
+  alias `"output": true` is the fix.
+- **A bare table name in a select parameter's `optionsQuery` is refused**
+  (`unresolvedTableNames`, which now reads the `optionsQuery` beside the files).
+  It takes away nothing that pushed: the server binds an optionsQuery's tables
+  by id and refused the name at save as an unresolved table.
+
 ## SQL escapes (`sqlSemantics`)
 
 Ronja used to hand your SQL to DuckDB through a non-raw Python string, so
@@ -5363,7 +5916,7 @@ a thing to guard.
 
 ## Whole-tree checks (`ronja sync`)
 
-A repository holds many folders. The six loops each answer "is this folder in
+A repository holds many folders. The loops each answer "is this folder in
 step with the organization?" for themselves, and answering it forty times by
 hand is how a broken edge sits in a repo for a month. `ronja sync` asks two
 questions of a whole tree at once, and answers a third:
@@ -5375,23 +5928,31 @@ ronja sync apply                       # push AND publish all of it
 ronja sync status --dir apps --stack prod --json
 ```
 
-All three walk **down** from `--dir` for every `ronja.json` — workflow, data-app,
-pipeline and automation folders alike.
+Two more move a tree between the two patterns — see "Server-side state:
+adopted folders":
 
-⚠️ **Module folders are discovered and not covered**, reported `not_checked`
-with the reason `kind_not_covered`. That is deliberately a different reason from
-`unreadable`: this build understands the kind perfectly well and has a whole
-command for it, so telling the reader otherwise would send them to a CLI upgrade
-they do not need. Run `ronja module status` in one instead. The reason is still
-never green — a folder nobody checked is a folder nobody checked, and the tree
-verdict has to say so. (Covering them means a root-parameterised module status
-report and a verdict fold for `status`, and for `check` a statement that a
-marker-free kind makes no references at all; until that exists, saying so is the
-honest answer.)
+```bash
+ronja sync adopt --stack prod [dir]     # give folders an id and claim their rows on the server
+ronja sync unmanage --stack prod [dir]  # release the claims; back to running off the lock
+```
+
+All three walk **down** from `--dir` for every `ronja.json` — workflow, data-app,
+pipeline, automation and module folders alike.
+
+**Module folders are covered like the other draft kinds.** `status` compares the
+folder with the module row (files, package name and title, trimmed the way the
+push compares them) through `moduleStatusReportAt`, the report `ronja module
+status` prints; a fresh clone has only the committed `headVersionID` pointer, as a
+workflow does. `check` makes no request: a module's files are marker-free, so a
+module folder makes no references — a marker in one is a finding, and a
+`dependencies` block is a warning (nothing ever fills it; declare the dependency
+in the consumer workflow). `apply` pushes and publishes it like a workflow (one
+creation unit, gated by `--allow-create`), and `adopt` and `unmanage` claim and
+release its row (resource kind `module`, address `""`).
 
 `status` computes each folder's report
 with the same function `ronja wf status` / `ronja app status` /
-`ronja pipeline status` / `ronja automation status` run, so
+`ronja pipeline status` / `ronja automation status` / `ronja module status` run, so
 the two surfaces cannot drift about what a folder's state IS — but the VERDICT it
 folds that report into is the tree's own, and it reads signals the per-folder
 commands deliberately leave out of theirs (see below). There is no repo-level
@@ -5435,12 +5996,20 @@ rather than discovered:
 | what the tree holds | `sync status` | `sync check` |
 |---|---|---|
 | workflow folders | `automation:read` | `automation:read` (it is `POST /workflow/validate`) |
+| module folders | `automation:read` | — (a module makes no references) |
 | data-app folders | `analytics:read` | — (the declared `access` ids are read by kind, below) |
 | pipeline folders | `data:read` | `data:read` |
 | any `{{ agent }}` reference | — | `agents:read` |
 | any `{{ secret }}` reference, or an app granting one | — | `secrets:read` |
 | any `{{ ref }}` / table grant | — | `data:read` |
 | any `{{ workflow }}` reference | — | `automation:read` |
+| any ADOPTED folder (one with an `"id"`) | `structure:read` (`GET /managed`) | `structure:read` |
+
+`sync apply` needs each row kind's write scope (`automation:write` for workflow,
+module and automation folders, `analytics:write` for apps, `data:write` for
+pipelines). On an adopted folder it also needs `structure:write`: a create that
+claims its address, a lazy claim, a move, an unmanage and an anchor write are
+all writes of repository state, on top of each row's own kind scope.
 
 `sync check` needs strictly more because it follows what the content points AT,
 not just what the folder is bound to. Route groups: `/workflow` is
@@ -5525,8 +6094,7 @@ Every per-folder `status` is right to leave it out of its own drift verdict —
 locally is exactly what a push is for"* (`pipeline_status.go`). That is the
 semantic of an interactive one-folder command. A repository gate asks a different
 question — *would a push from this tree change the organization?* — and a local
-edit is a yes. **The tree verdict changed; the three per-folder commands did
-not.**
+edit is a yes. **The tree verdict changed; the per-folder commands did not.**
 
 So `pushDelta` reads every signal the reports already compute:
 
@@ -5574,7 +6142,7 @@ shipped command for a verdict only this one computes.
 ### What a FRESH CLONE can and cannot be told, per kind
 
 This is the paragraph to read before putting `sync status` in a CI gate, because
-the answer is **not the same for all four kinds** and the difference is
+the answer is **not the same for every kind** and the difference is
 permanent by design.
 
 A checkout straight from git has no `.ronja/` — it is git-ignored, correctly, and
@@ -5588,16 +6156,17 @@ What the lock carries differs by kind, and `lock.go` explains why:
 | pipeline, legacy `instances[]` | nothing — its live fingerprints stay in `.ronja/` | neither; `undeployedAgainstLock` returns nothing for it, deliberately |
 | workflow | `LockStack.HeadVersionID`, a **pointer** to the published version this folder was taken from | only: has somebody published since |
 | data app | the same `HeadVersionID` pointer | only: has somebody published since |
+| module | the same `HeadVersionID` pointer | only: has somebody published since |
 | automation | `LockAutomation.AutomationID` **and** the row's `updatedAt` | **everything.** There is no per-user half at all — see below |
 
-So **`ronja sync status` cannot tell, on a fresh clone, whether a workflow's or a
-data app's committed files have been deployed.** It reports the folder `unknown`
+So **`ronja sync status` cannot tell, on a fresh clone, whether a workflow's, a
+data app's or a module's committed files have been deployed.** It reports the folder `unknown`
 rather than clean (there is no baseline, and the no-baseline branch answers
 first), so it never *claims* they are in step — but it cannot turn that into the
 `drifted` a pipeline folder gets.
 
 **That is a consequence of a deliberate decision, and the decision is right.**
-Those two kinds sync their files into the **caller's own draft**, so any per-file
+Those kinds sync their files into a **draft**, so any per-file
 fingerprint they have is a fingerprint of one person's row — and `lock.go` is
 explicit: *"committing it would hand a colleague a baseline for a row they cannot
 see."* A pipeline's live hash is a different number about a different row, the
@@ -5611,15 +6180,27 @@ the comparison is committed-file-against-server and is the same on every machine
 A fresh clone of one is vouched for exactly as strongly as the author's own
 checkout, which is the property the other three kinds cannot have.
 
+**An ADOPTED workflow, data-app or module folder is answered by the live row**
+(`answeredByLive`): where the no-baseline branch would answer `unknown`,
+`sync status` asks the comparison `sync apply --dry-run` asks of it —
+`liveHoldsFolder`, reads only, through `openFolderForStatusAt` — and reports
+`clean` when the live row holds the folder ("`sync apply` changes nothing for
+it") and `drifted` when it does not. A classic folder, a read that fails and a
+folder bound to no row keep `unknown`. That is not a per-file baseline: it
+cannot say whether a difference was made here or in Ronja, only that a deploy
+would change something, and the detail names `sync apply --dry-run` and
+`<kind> pull`.
+
 The practical reading for a CI gate: on a fresh clone, a **pipeline** or
-**automation** folder is fully vouched for, and a **workflow** or **data-app**
-folder is vouched for against the published version only. Run `ronja wf push` /
-`ronja app push` to find out whether their files differ — those loops read the
+**automation** folder is fully vouched for, and so is an adopted folder of the
+other three kinds; a classic **workflow**, **data-app** or
+**module** folder is vouched for against the published version only. Run `ronja wf
+push` / `ronja app push` / `ronja module push` to find out whether their files differ — those loops read the
 row's files directly and do not depend on a baseline.
 
 ### Two things `sync status` does not claim
 
-A **workflow or data-app** folder that is bound and has no baseline for the
+A classic **workflow, data-app or module** folder that is bound and has no baseline for the
 selected stack is `unknown`, not clean — the fresh-`git clone` case, where
 `.ronja/` is correctly absent and its files could not be compared against
 anything. (A **pipeline** folder that names a stack is the exception, and it is
@@ -5630,6 +6211,20 @@ lock entry is still `unknown`, and `ronja pipeline status` deliberately exits
 And `sync status` compares the folder's **content and its declarations**: a change made in Ronja to something the folder does not describe
 at all is not drift here.
 
+**An open draft of your own is a note, not drift.** A workflow's, data app's or
+module's status measures the folder against the row a classic push writes to —
+your own open draft, when there is one — so a pull taken with an unrelated draft
+open (pull leaves the baseline, which describes that draft, alone) read as "never
+been deployed" against the draft while live held the folder and `sync apply` sent
+nothing. The tree verdict asks what apply would do: an ADOPTED folder (a
+classic one keeps its verdict) that `drifted` against the caller's draft is re-asked the apply's own first question
+(`heldByLive` → `liveHoldsFolder`), and when the live row holds it exactly it is
+`clean`, with a detail naming the draft and what `status` / `push` / `discard`
+do with it. A folder live does not hold stays `drifted`; a read that fails leaves
+the verdict as it was. ⚠️ The converse is unchanged and still open: a folder
+whose content sits only in an open draft (pushed, not published) reads `clean`
+against that draft though `sync apply` would publish it.
+
 `ronja wf status` and `ronja app status` still exit 0 unconditionally, exactly
 as they always have. The verdict helper computes their answer for `sync` without
 touching their exit codes; changing those is a scripting-visible break and is a
@@ -5637,10 +6232,10 @@ separate decision.
 
 #### And a folder that has never been deployed is not clean either
 
-⚠️ **This was a false green, on all three kinds, and it is the one worth
+⚠️ **This was a false green, on every kind, and it is the one worth
 remembering.** Each loop has exactly one `NotCheckedReason` that is a
 *conclusion* rather than a failure to look — `reasonNothingBound` /
-`reasonNoWorkflowYet` / `reasonNoAppYet`: the folder is bound to this very
+`reasonNoWorkflowYet` / `reasonNoAppYet` / `reasonNoModuleYet`: the folder is bound to this very
 organization, it names a feature, and the organization simply holds nothing it
 has pushed. The tree verdict mapped all three to **clean**, so a folder holding a
 whole table's SQL or a whole workflow that had **never been deployed** reported a
@@ -5661,8 +6256,8 @@ The message says so in those terms ("has never been deployed here … a first pu
 would create …") rather than reusing the drift wording, which would claim a
 comparison that never happened.
 
-This lives in `neverDeployedVerdict` and is reached from all three verdict
-functions. Note what it is **not** about: an *unbound* folder was already
+This lives in `neverDeployedVerdict` and is reached from every verdict
+function. Note what it is **not** about: an *unbound* folder was already
 non-green (each loop's `if !f.Bound` branch sets a different reason, which falls
 through to `unknown`). Bound-with-nothing-deployed is a different state, and it
 was the green one.
@@ -5810,6 +6405,18 @@ that **does** resolve an entry here and has an alias with no bind — is unchang
 which is why the guard is on `Selection.Bound` rather than on the alias report:
 being bound here is exactly "there is a target to be unbound *for*".
 
+**Module folders make no references.** Their files are marker-free, so `check`
+sends no request for one: a marker found in a module file is a finding (the
+module push refuses it), and a `dependencies` block is a warning rather than an
+unbound edge.
+
+**Address dependencies are edges too.** Each one that resolved is checked like
+any id (its row must still resolve), and one that did not is `unresolved` with
+its reason — `address_unresolved`, `address_stack_mismatch`,
+`address_not_adopted`, `address_folder_unreadable` or
+`address_outside_repository` — and the edge carries
+`from` and `address`. See "Dependencies by address" under `ronja bind`.
+
 **Two kinds cannot be verified by id at all, and say so rather than passing.**
 Codex's route group carries **no `AccessScope`**, and `requireScope` fail-closes
 on a route that declares none ("this route is not accessible to scoped tokens"),
@@ -5834,11 +6441,19 @@ a failure or a silent skip.
 
 ### `sync apply` — the deploy
 
-`ronja sync apply` runs each folder's own **push and then its publish**, in path
-order. Push alone stages a draft for three of the four kinds — every push report
-ends `Next: ronja … publish` — so an apply that stopped there would be a
-repository of unpublished drafts reported as a deploy. ⚠️ The fourth kind has no
-draft at all: the automation loop writes production directly, so "apply
+`ronja sync apply` runs each folder's own **push and then its publish**, in
+dependency order (below) — the report's `order` says `"dependency"`, where
+builds before this one said `"path"`. Two more `--json` fields arrived with it,
+both ADDITIVE, and a consumer that compares output exactly sees them on a
+classic folder (no `"id"`) too: `sync apply --json` carries `sequence`, the
+folders' paths in the order they ran (`folders` stays in path order); and a
+workflow push's `--json` (`wf push`, classic included) carries
+`bindings.workflowIDs`, the saved workflows the pushed code runs as validate
+resolved them, `null` when it runs none. A `--dry-run` may also list a unit's
+`action` as `unchanged` (see `--dry-run` below). Push alone stages a draft for four of the five kinds (workflow, data app,
+pipeline, module) — every push report ends `Next: ronja … publish` — so an apply
+that stopped there would be a repository of unpublished drafts reported as a
+deploy. ⚠️ The automation kind has no draft at all: the automation loop writes production directly, so "apply
 publishes" must not be read as "everything goes through a reviewable draft".
 
 **It adds no writer.** Every byte it sends is sent by a loop that already exists,
@@ -5850,9 +6465,57 @@ prints, so the preview and the run cannot disagree about what apply will attempt
 
 | refusal | why |
 |---|---|
-| `would_create` | nothing is bound to this unit, so a push would MAKE a row. There is no delete verb to undo one (cascade and purge are `HumanOnly`), and a CI runner that discards its checkout loses the created ids in `ronja.lock.json` and creates again next run |
+| `would_create` | nothing is bound to this unit — a `.sql` file, a `metrics/*.json` file, an automation `.json`, or a draft-kind folder — so a push would MAKE a row. There is no delete verb to undo one (cascade and purge are `HumanOnly`), and a CI runner that discards its checkout loses the created ids in `ronja.lock.json` and creates again next run — unless the folder is ADOPTED, whose ids the server keeps (see "Server-side state: adopted folders"), so a lost lock is never a create there |
 | `no_drift_anchor` | an automation the folder is bound to and has never recorded agreeing with. An empty `LockAutomation.UpdatedAt` disarms **both** guards at once, so the write would overwrite whatever moved AND flip `enabled` false→true on a row somebody paused during an incident |
 | `manifest_rewrite` | acting here would rewrite a committed `ronja.json` — `adoptStack` adopting a stranded lock stack, or `Manifest.Record` dropping an `instances[]` entry superseded by the **named** stack. Migration stays a per-folder act somebody watched |
+| `orphaned_file` | rename detection: a table, metric or automation this stack binds whose file is gone, with no `moved` or `removed` entry covering it. Apply never infers a rename (which would be a create plus an orphan) or a delete from a missing file; the single-folder pipeline push only NOTES it |
+| `address_unresolved`, `address_stack_mismatch`, `address_not_adopted`, `address_folder_unreadable`, `address_not_written` | a dependency declared by address did not resolve for this stack — see "Dependencies by address" under `ronja bind`. Under `--allow-create` an address whose row the same run deploys is deferred instead (below) |
+| `writes_outside_target` | an ADOPTED folder would write outside its stack's feature through something no write source of that stack binds — a docs sidecar's table prose included — see "The write gate". At plan time for a workflow or app the run would create (so a refused folder leaves no row behind), for a pipeline's docs sidecars, and for every folder in a `--dry-run`; inside the push for every write |
+| `no_write_targets` | an ADOPTED workflow folder's validate came back with no `writeTargets` at all: the instance is older than this CLI, so nothing can say where the code writes, and the gate refuses rather than admit it — upgrade the instance, use a matching `ronja`, or `sync unmanage` the stack. Its own reason so a script does not read "writes another feature" for "instance too old" |
+| `runs_outside_target` | an ADOPTED folder would run a workflow or saved agent outside its stack's feature that no `"run": true` dependency of that stack binds — see "The write gate" → run edges. Same timing as `writes_outside_target` |
+| `no_feature` | an ADOPTED folder whose selected stack names no `featureID`: it would deploy unclaimed and ungated. Add the feature, or mark the stack `"unmanaged": true` |
+| `cyclic_dependency` | a pipeline folder's files read each other in a loop (`topoOrder`), or two pipeline FOLDERS read each other's tables by address — neither has an order to build in |
+| `module_marker`, `no_module_name` | a module folder whose file carries a marker, or whose manifest names no package; a module with no `__init__.py` is `missing_entrypoint` |
+| `address_conflict` | the folder's `moved` / `removed` cannot be applied to this stack: an old file still on disk, a removed file still on disk, both ends of a move already bound, a table moved without its `checks/<stem>.json`, or `moved` below format 5. A folder that could not be READ while evaluating them is `unreadable` instead |
+
+**Dependency order, and a fresh stack in one apply** (`sync_apply_order.go`).
+Every folder is PLANNED first; then the folders run in this order,
+path order within each group, and the report names it (`"order":
+"dependency"`, the folders in `sequence` as they ran; `folders` stays in path
+order so two runs diff line for line):
+
+1. **modules** — they reference nothing;
+2. **pipelines, in build order.** A table one pipeline folder reads by address
+   from another (`folder.crossFolderTableReads`, and a deferred one) is a build
+   edge: a draft builds against its inputs, so the input's folder runs first.
+   Ties break by path; a cycle of such reads refuses every folder on it
+   `cyclic_dependency` before anything is written;
+3. **pass one: every workflow another workflow of the run names by address
+   that does not exist yet is CREATED**, with its claim and nothing else
+   (`createWorkflowFirst` — no files, no parameters, which may read a table by an
+   address still pending). A `{{ workflow }}` marker then always names a row that
+   exists, so two workflows that run each other need no order at all. Which rows
+   it makes is decided to a fixed point (`passOne`): only a workflow whose own
+   addresses all resolve by now — the tables and modules it reads were made — and
+   that a workflow in the same state names. One waiting on a row that never
+   appeared (a pipeline that failed) is not made early, and neither is a chain
+   onto it; every workflow nothing names creates its row in its own push, which
+   validates first — so a folder its push refuses leaves no empty row behind;
+4. **pass two: each workflow's code**, pushed and published as usual — the push
+   finds the row pass one made as the CLI's own half-finished first push
+   (`isUntouchedFirstPush`) and goes on from there;
+5. **data apps**, then **automations** — nothing a pipeline or a workflow writes
+   names either, and everything they name exists by now.
+
+Just before a folder whose address dependencies were deferred runs, they are
+resolved in memory to the rows the run has made (see "Dependencies by address").
+That is what stands a FRESH stack up in one `sync apply --allow-create`: no
+`ronja bind` of the rows the repository manages, no commit, no second apply. A
+failure part way is safe — every create carries its claim, so the next
+apply finds the rows through the server's state and writes them instead of
+creating second copies (`TestFreshStackCrashBetweenPassesThenRerun`). Pass one
+runs only for adopted folders; a classic folder's push creates its row as it
+always has.
 
 ⚠️ **A plain legacy `instances[]` folder is NOT a `manifest_rewrite`, and deploys.**
 `Manifest.Record` takes its `!sel.Named()` branch for an unnamed selection —
@@ -5871,6 +6534,16 @@ one new one "bound", and `runPipelinePush` would then `CreateTable` the seventh 
 a live empty table in a live organization, out of a command that promised to
 create nothing. `TestSyncApplyRefusesACreateAtFileGrainInABoundFolder` is
 mutation-proved on exactly that: remove the gate and the fake records the create.
+
+⚠️ **A metric file is a creation unit too**, and that was a hole: the units used
+to come from the `.sql` files alone, the metric pass ran later in the same push,
+and nothing on that path asked the gate — so an apply without `--allow-create`
+created metrics, never listed them in the dry-run and never counted them. A
+pipeline folder's units are now its `.sql` files plus its `metrics/*.json` files
+(checks stay sub-units of their table), and the gate is ALSO enforced inside the
+push (`pipelinePushOptions.NoCreate`), on the path that actually creates, so the
+property does not rest on the plan and the push agreeing about which files are
+units.
 
 **`--allow-create` opts into the first refusal, and only the first.** It counts
 **files, not folders** — `Tables` and `Automations` are per-file maps, so a merge
@@ -5941,11 +6614,13 @@ changed in the app stays a per-folder `ronja pipeline push` decision. ⚠️ So 
 tree run against an **older server** that has no check-authoring route
 publishes the SQL and exits non-zero on every run until the server is upgraded.
 
-**Order is path order and the report names it.** That is for determinism and
-diffable CI logs, nothing more: a derived table's draft always builds against its
-inputs' LIVE data and a commit cascades server-side, so a folder deployed "too
-early" self-heals on the next run — the symptom is a spurious build failure, not
-a wrong table. Do not build dependency ordering for a problem that does not exist.
+**Order is dependency order and the report names it** (see "Dependency order,
+and a fresh stack in one apply" above). For a tree whose rows all exist it
+changes nothing a path order would not — a derived table's draft builds against
+its inputs' LIVE data and a commit cascades server-side, so a folder deployed
+"too early" self-heals on the next run. It exists for the rows that do NOT exist
+yet: an input table, a workflow a marker runs, an app an automation names has to
+be there before the folder that names it is pushed.
 
 **An interrupt finishes the report.** Ctrl-C 20 folders into 30 leaves a tree
 that is part live and part not, which is exactly the state that needs a report:
@@ -5977,25 +6652,123 @@ no failure at all by a developer running `ronja wf push` before CI runs apply.
 So the question is put to the record that knows, per kind. Pipeline: the files
 the baseline records a draft id for — `pipelineStagedDrafts`, extracted from the
 publish's own no-argument target selection so there is one definition of what a
-publish targets. Workflow / data app: a draft that **pre-existed this push** and
-**holds something the live row does not**. Both halves are load-bearing, and each
-is a separate mutation test:
+publish targets. Workflow / data app / module: a draft that **pre-existed this push** —
+which is a sufficient answer only because of the rule below, and was not before
+it: "is a draft open" could not answer it (a push that goes on checks one out on
+the way past), and "did it pre-exist" could not either, because the draft an
+up-to-date apply used to leave behind pre-existed the NEXT run identical to live,
+so publishing on that alone minted a version every second run.
 
-- "is a draft open" cannot answer it, because `resolvePushTarget` checks one out
-  on the way past — after any push a draft always exists;
-- "did it pre-exist" cannot answer it either, and this one is subtle: the draft an
-  up-to-date apply leaves behind pre-exists the NEXT run and is identical to live,
-  so pre-existence alone publishes on every second run — a version per folder per
-  two runs rather than per run. Halving the regression is not fixing it.
+**An unchanged tree writes nothing and leaves nothing behind.** Apply runs
+the workflow, data-app and module pushes with `LiveFirst`: before anything is checked
+out, the folder is compared with the **live** row — files, and every piece of
+metadata the push writes (title, entrypoint, declared parameters, declared
+calendar, a runtime upgrade; a data app's title and `access`; a module's
+package name and title). When live already
+holds it, the push ends there: no checkout, no file write, no patch, no validate
+(a candidate save that is not going to happen — `sync check` is the verb that
+verifies an unchanged tree's references), and the folder reports `nothing to
+push`. The drift legs do not need to run there: live equal to desired is never
+drift, and the two anchors re-take it instead — the applied title becomes
+the live one and the head pointer moves onto the live version. The local sync
+baseline is left alone, since it describes a draft and none was written.
 
-A parentless draft is the third leg: it has no live row to compare against, so it
-awaits publication by definition. Without it a workflow created under
-`--allow-create` whose publish failed stays unpublished for ever.
+- **Asked whether or not a draft is open**, and that is load-bearing. A draft
+  open over a live row that already holds the folder is the author's own — a
+  single-folder `push` that wrote nothing still checks one out — or a web edit in
+  progress, and neither is this deploy's to write to or publish. Asked only when
+  no draft was open, that copy of live would reach the publish gate pre-existing
+  and up to date, and committing it would mint an empty version
+  (`TestSyncApplyAfterAClassicPushThatWroteNothingMintsNoVersion`).
+- **Parity is the contract.** `workflowRowHoldsFolder` / `appRowHoldsFolder` /
+  `moduleRowHoldsFolder` are
+  the push's own write rule read off the same functions (`filesAgree`,
+  `metadataPatch` with the title compared the way `titleLeg` compares it, and
+  `diffAccess`). A row they called different while the push then wrote nothing
+  to a copy of it would leave a draft identical to live for the next run to
+  publish. Anything the push learns to write goes there in the same change.
+- **Metadata is a change.** A folder whose only edit is its title deploys — as
+  long as the title leg can tell it is this folder's own rename: a workflow or
+  module folder whose lock records no applied title (a fresh checkout of a lock
+  written before the title was recorded, or a lock a build server never
+  committed) refuses a title change; see "Names are declared attributes". A
+  draft whose only difference from live is a title, an entrypoint or a calendar —
+  staged by an earlier run whose publish failed — is published by the next one.
+  The old files-only comparison read that draft as nothing staged.
+- **The single-folder push is unchanged.** `ronja wf push`, `ronja app push` and
+  `ronja module push` still check a draft out when they have nothing to write: that is the classic
+  check-out gesture, and `wf test` runs the draft and refuses without one.
 
-⚠️ **Files only**, the honest edge of the claim: a draft whose only difference
-from live is METADATA — a title, an entrypoint, a declared calendar — reads as
-nothing staged. Publish that folder from its own directory. The comparison costs
-two listings, and only on a folder that has a draft lying about.
+A pipeline folder gets the same question per file, because its fresh-checkout
+case was worse: the local baseline that tells a bare push which `.sql` files
+changed lives in the git-ignored `.ronja/`, and the committed lock's fingerprints
+go stale at the first publish nobody commits back, so every CI run targeted every
+file and apply checked out, rebuilt and published every table in the tree on
+every run. Under `LiveFirst`, with no draft open:
+
+- a bound table whose live row already holds its SQL, its documented header and
+  its declared name is left alone;
+- a metric whose live recipe is the same JSON as the file's, whose prose agrees,
+  and whose declared calendar the row already holds is left alone. The calendar
+  is compared on the recipe route's own rule (`metricZoneHeld`): an absent key
+  writes nothing and so always agrees, an explicit `""` is stored as the literal
+  `UTC`, and a name is stored trimmed — read off the row's `reportingTimezone`;
+- a docs sidecar (`tables/<alias>.json`) whose live row already says exactly what
+  it declares is up to date, whatever the lock's recording says. Its drift guard
+  has run first, as before.
+
+Documentation agrees only when every column the carrier documents is one the row
+has **measured** (`docsHeldExactly`), not under the join rule's exemption that
+`docsLanded` grants: prose for a column the table does not have yet is stored
+against the name and never reported back, so a skip granting the exemption would
+never send it.
+
+**A recorded draft that is gone is not a draft to publish.** `pl push` stages an
+edit and records its draft; an admin publishes it in the web app; the file is
+unchanged since, so it is not a target. Apply's pipeline push asks the server
+about every recorded draft of an unchanged file (one GET each, on the apply path
+only — `withGoneDraftPointers`), and handles one that is gone as `discard`
+would: no pointer, the file's baseline re-pointed at live, the file made a
+target, so a published draft is skipped and a discarded one is pushed again.
+Without it the publish went after the gone draft and refused the folder ("1 of 1
+draft(s) were not published"). The LiveFirst table skip also drops a pointer it
+finds standing, which a push whose build never finished leaves behind.
+
+**A drift refusal leaves no draft behind.** A workflow, data-app or module push resolves
+its target before its drift guard runs, so a refused apply had checked out a
+copy of live — and a draft left standing is one every later fresh-checkout apply
+finds pre-existing, which the head anchor cannot vouch for, so the folder was
+refused ("you already have a draft … run discard") long after the author had
+absorbed the change. On the apply path, a refusal before the first write — or a
+stop where the server refused every write the push sent, so nothing landed —
+discards a draft THIS push checked out (`discardUnwrittenCheckout`) — never one
+that was already open, never one that holds anything but what live held when the
+push read it (the checkout is get-or-create, so a draft the same user opened
+between the push's inspection and its checkout comes back looking like this
+run's), never a created row's (discarding that is a delete), and never after a
+write whose outcome is unknown (a workflow PUT that timed out, a
+data-app write in `uncertain`). A discard that fails keeps the refusal as the
+error and names the leftover draft. The single-folder push keeps its draft
+either way.
+
+Automations needed nothing: that loop already compares the file against the row
+and writes nothing when they agree. `TestSyncApplyTwiceSendsNoWriteTheSecondTime`
+applies each kind twice — module included — after a real deploy and without one, in the same
+checkout and in a fresh one per run, the pipeline fixture carrying a table, a
+metric declaring its calendar, health checks and a docs sidecar — and fails on
+any non-GET request in the second run. `TestSyncApplyDeploysAMetadataOnlyChange`
+pins the parity, one row per attribute the skips compare.
+
+⚠️ **Residue: prose for an unmeasured column is re-sent on every fresh-checkout
+apply.** The cost of `docsHeldExactly`: a carrier documenting a column the table
+does not have yet never reads as held, so a sidecar is PUT again and a `.sql`
+table is checked out, rebuilt and published again — a version per run — until
+the column exists. The server reports no way to tell the prose already landed.
+
+A parentless draft is its own leg: it has no live row to compare against, so it
+pre-exists by construction and awaits publication by definition. Without it a
+workflow created under `--allow-create` whose publish failed stays unpublished
+for ever.
 
 **The local guards inside the loops are part of the preview too.** An orphaned
 automation file, a dependency cycle and a positional ref all refuse before the
@@ -6011,11 +6784,1354 @@ is the honest edge of the claim.
 updates** — a folder is only previewed once every gate cleared, so a create it
 lists is one `--allow-create` let through and apply is about to make. ⚠️ It deliberately does **not**
 promise a clean remote: that is a network read whose answer can move between the
-preview and the run, and promising it is what makes a dry-run a liar. ⚠️ And
-there is no `no-op` action, uniformly: it is knowable locally for a pipeline file
-and not for a workflow or a data app, whose files compare against a listing of
-the caller's own draft. A unit apply may find unchanged is reported as `update`,
-which is what apply will attempt.
+preview and the run, and promising it is what makes a dry-run a liar. For a
+**workflow, data app or module** whose one unit is an `update`, the dry-run does
+make apply's FIRST comparison, for an ADOPTED folder only (a classic one
+previews as it always did) — does the live row already hold the folder
+(`liveHoldsFolder`, by the same `*RowHoldsFolder` parity functions as
+`pushNothingLiveHolds` and its twins; reads only) — and reports such a unit
+`unchanged` with the line "nothing to push or publish", or the line "would push
+and publish the …" when live differs. When live differs, a workflow or data
+app with a local baseline and no draft open is then asked the drift guard apply
+asks before its checkout (`compareWithLive` → `checkDrift` / `checkAppDrift`),
+and a folder that guard refuses is `refused` (`not_deployed`, exit 1) with the
+apply's own refusal as its detail — "the live … changed in Ronja since stack
+… last applied it", or the re-pointed binding over an older CLI's baseline.
+That is exact as of the read, and it is
+one of the two places `unchanged` (`applyActionUnchanged`) appears: the
+decision apply executes never carries it. The other is a **pipeline** or
+**automation** folder (classic or adopted — apply runs both LiveFirst), compared
+per FILE by `sync_apply_dryrun.go` through each push's own skip, never a second
+copy of it: a `.sql` file by `tableHeldLive` (one unchanged since this checkout
+last pushed it, with no staged draft, is skipped without a read, as the push
+skips it), a metric by `metricHeld` plus `metricTagStatus` (and
+`metricDefinitionMoved`, which apply refuses), and an automation by
+`automationHeldLive` over the push's own one listing of the stack's feature
+(`automationRowsOf`) — so a row no longer in that feature ("binding broken")
+and a file declaring a field the server cannot patch
+(`refuseUnpatchableAutomation`) are asked as the push asks them, then
+`automationDelta`. A pipeline dry run also lists each
+docs file (`docsUnchangedSinceRecorded` / `docsHeldExactly`) and checks file
+(`checksPlanWritesNothing`, over `decideCheckWrite` — the per-entry decision
+`applyTableChecks` makes) as a unit — never counted as creates; the docs files'
+write gate runs at plan time (`planWriteGate`), in a dry run too. A unit apply
+would REFUSE is `refuse` (a file apply refuses as it stands, a metric whose live
+definition moved, the two automation refusals above), and the folder is then
+`refused` with the reason the apply would report (`not_deployed`, or
+`checks_not_applied` for a checks file) — exit 1, as the apply exits. A checks
+file holds nothing else back (apply publishes the tables, then reports
+`checks_not_applied`), so a folder whose only refused units are checks files
+says what would publish and then "the checks would not apply", never that
+apply would refuse its files. A unit
+that could not be compared — a read failed, a draft is open (the publish may
+commit it), the file does not parse — stays `update` with a `detail` saying
+why. ⚠️ A documented column the table has not measured yet
+never comes out `unchanged`: its prose is stored and never reported back, so
+apply re-sends it every run, and the detail says so. The line then reads
+"nothing to push or publish: the live rows already hold this folder" ("nothing
+to write" for automations), or "would push and publish N of its M files, which
+differ from what is live". A declared move is listed as a `move` unit
+(`path` the old address, `to` the new one) and a declared removal as a `remove`
+unit; neither writes to a row, so neither is counted among the files that
+differ — the line names them for what they are ("records 1 declared move",
+"stops managing 1 declared removal"). In an ADOPTED folder whose lock names a
+row Ronja holds no claim for (the lazy backfill, `managedBackfill`), apply
+claims it before anything else: a write to Ronja's records, not to a row. The
+folder's line says so after its verdict ("nothing to push or publish …; apply
+records 1 claim in Ronja for a row this folder's lock names (no row is
+written)"), any kind, and the folder's `claims` and the summary's `claims` count
+them (the human summary adds a line). A dry run's human summary line reads
+"would apply — N would apply, N would be refused, …", and a folder-kind unit is
+labelled by its kind's label ("the data app").
+
+## Addresses: `moved` and `removed`
+
+For the two kinds that bind one row per FILE — a pipeline's `.sql` and
+`metrics/<stem>.json` files, an automation folder's `.json` files — the
+folder-relative path is the row's **address**: it is what `ronja.lock.json`
+(`instances[]` plus `.ronja/state.json` on a folder with no stack) keys the id
+by. A renamed file therefore changes the address, and the only two ways an
+address may change or end are declared in `ronja.json`:
+
+```json
+"moved":   [{ "from": "orders.sql", "to": "sales_orders.sql" }],
+"removed": ["legacy_rollup.sql"]
+```
+
+**Declarative, not a `ronja mv` command**, because a rename has to reach EVERY
+stack and each stack is applied at a different time, often by a different
+runner. The declaration travels with the commit; each stack's own push or apply
+evaluates it against that stack's own lock entry when it runs.
+
+**Validated at load** (`wfdir/moves.go`), because no stack could apply any of
+these: a key other than `from`/`to` in an entry, a path that is not an address
+of the folder's kind or not in the lock's exact spelling (`./a.sql`, `../a.sql`,
+a backslash), a move onto itself or across kinds (`.sql` → metric), two entries
+moving one path or onto one path, a **cycle**, a chain listed **backwards**
+(entries apply in declared order, so `[{B,C},{A,B}]` against a stack at A would
+end at B with the file at C), a path both moved FROM and removed, and either key
+in a workflow, data-app or module folder (those are keyed by the folder, so moving
+the folder is all a rename takes). A cycle and a backwards chain are also what
+REUSING a path looks like (`[{A,B},{C,A}]`: A renamed to B, and later C renamed
+to A), so both refusals end with the one remedy for that: delete the earlier
+entry once no stack in `ronja.lock.json` still binds its old path.
+
+`removed` MAY name a move's destination, and that is the rename-then-retire
+lifecycle: `orders.sql` was moved to `sales.sql`, and later `sales.sql` is
+dropped. Keep the `moved` entry and add `"sales.sql"` to `removed`; removals
+evaluate after every move, so a stack still at `orders.sql` is moved and then
+dropped in the same apply, and one already at `sales.sql` is dropped. Deleting the
+`moved` entry instead would leave the lagging stack bound at a path that is gone.
+
+**Evaluated per stack, in declared order** (`commands/addresses.go`,
+`folder.resolveAddresses`), against a simulation first so every refusal comes
+before any edit:
+
+| `from` | `to` | outcome |
+|---|---|---|
+| bound | not bound | re-key: everything recorded under the path moves — id, live/meta fingerprints, automation anchor, tags, recorded name, and a table's `checks/<stem>.json` entry |
+| bound | bound | refused (`address_conflict`): one address, two rows |
+| not bound | either | no-op — already applied on this stack, or never created here |
+| still a file on disk | — | refused as ambiguous, whatever the state |
+| bound (a table) | not bound | refused when `checks/<old stem>.json` is still on disk and `checks/<new stem>.json` is not: re-keyed alone, the checks record would sit at a file nothing holds, every check on the table would read as an orphan of a deleted checks file, and the `--prune` that suggests would SILENCE them |
+
+A chain `[{A,B},{B,C}]` against a stack at A lands at C (reported as one move).
+`removed` drops the entry (and a table's checks entry, so a later `--prune` cannot
+silence checks on a row the folder promised to leave alone); a removed path still
+on disk is refused, since dropping its entry would make the next push create a
+second row. `removed` deletes nothing. In a LEGACY folder nothing is sent to the
+server for either; in an ADOPTED one the state is the server's, so the same
+evaluation runs against the server's claims (refreshed into the lock first) and
+an acting run sends the result BEFORE the push: a move re-keys the claim
+(`POST /managed/move`, one statement, the row untouched) and a removal releases
+it (`DELETE /managed/:id`). A `removed` entry also releases a claim the server
+refuses to deploy — its row lost, trashed, unreadable or moved out — since
+letting the address go is all it asks.
+
+**A table's checks file is part of its address.** `checks/<stem>.json` is named
+by the `.sql` stem, so a moved table's checks file is renamed with it (the
+refusal above enforces it), and a removed table's checks file is deleted with the
+`.sql` — left behind, its stem names no `.sql` file and the checks pass refuses
+it. The checks themselves are not touched by either: a move hands them to the new
+file, a removal leaves them running, unmanaged.
+
+Each still-on-disk refusal names the reuse remedy as well: a NEW file at a path a
+declaration still names is a reuse, and the declaration may go only once no stack
+in `ronja.lock.json` still binds the old row there (on a folder with no stack,
+once `ronja.json` no longer binds it). Taken out sooner, a stack still at the
+path reads the new file as its old row.
+
+**A move changes only the address.** The row's name is an attribute (see "Names
+are declared attributes"). A row with no recorded name has the file STEM as its
+name baseline, so the move carries the OLD stem with the row before the stem
+changes under it — otherwise the new stem would make the row's own name read as
+somebody else's rename. It is carried as a STEM (`stem` beside `name` in the lock
+entry, or in `.ronja/state.json` on a folder with no stack), never as a recorded
+name: the rule compares against both the same way, but a drift refusal says which
+it compared against, and only the stem's wording tells the reader the folder
+never saw that name on the row — so to declare the current one first. A chain
+keeps the first stem. ⚠️ A folder with no stack has nowhere to record anything
+about an automation (the anchor layer is off there), so its baseline after a move
+is the NEW filename: a declared `"name"` that differs from both the live name and
+the new filename then reads as drift. Naming a stack is the remedy.
+
+**In memory until an acting command writes it.** `resolveAddresses` mutates the
+folder's lock, local baseline and (legacy) manifest binding in memory, cached on
+the `folder`, so every later read in the same command sees the re-keyed state.
+`runPipelinePush` and `runAutomationPush` call `saveAddresses` after their local
+guards pass, and `runPipelinePublish` — which evaluates the declarations too, so a
+draft staged before a rename is published as the renamed file's — calls it before
+its first commit, and only when it has something to publish, since that is when a
+publish writes the lock at all. `sync apply`'s plan evaluates on the same
+`*folder` its execute pass pushes with, so the push finds the work cached and
+persists it; a dry-run, `sync status`, `sync check` and the `status` commands
+never write. A stack folder writes only `ronja.lock.json` and `.ronja/`; a folder
+with no stack also writes `ronja.json`, because that is where its ids live
+(`instances[]`). `.ronja/state.json` is written FIRST: a save that fails between
+the two writes then heals on the next run (the binding still names the old path,
+so the move applies again and the baseline's re-key is a no-op), where the other
+order would leave the baseline's drift anchor and name stranded at the old path.
+
+**Rename detection** runs after the declarations, over every address the STATE
+binds — not the local baseline, which a fresh checkout does not have, and which
+never listed a lock metric whose file was gone (that metric used to be orphaned in
+silence). A bound path with no file and no declaration is a **note** in a classic
+`pipeline push` (which still creates the new file's row, as it always has),
+**refused** as `orphaned_file` by `sync apply`, and the automation push's
+existing refusal without `--prune`. One sentence for all three, naming the new
+file only when there is one:
+
+```
+orders.sql is bound but gone, and sales_orders.sql is new — add a "moved" entry to ronja.json if this is a rename, or a "removed" entry if orders.sql was dropped on purpose
+```
+
+A sibling still reading the old stem (`{{ ref('orders') }}`) is refused by the
+existing alias check before anything is sent; the move adds no machinery for it.
+
+⚠️ **`moved` is format version 5, and is demanded, not just stamped.** An older
+CLI keeps the key, ignores it, reads the renamed file as new, and creates a second
+row — the bar `ManifestFormatVersion` exists for. A person adds `moved` by hand
+and a stack folder's push never rewrites `ronja.json`, so
+`Manifest.CheckAddressFormat` refuses `moved` below 5 at every command that applies
+it, naming the line to add — `dependencies`' precedent — and `sync check` reports
+it as a finding on the folder.
+
+`removed` is format 5 in an **automation** folder and needs no version in a
+**pipeline** folder, because an older CLI ignoring it does different things in
+each. In a pipeline folder it leaves the row alone, which is what `removed` asks.
+In an automation folder it refuses the gone file as an orphan and suggests
+`ronja automation push --prune` — which pauses and soft-deletes the automation
+`removed` says to keep running — so the version makes that CLI refuse the folder
+by version instead, and `CheckAddressFormat` demands it the same way. The
+residual is the one stacks and dependencies carry: a CLI older than the gate
+itself has no gate to trip.
+
+**Entries are safe to keep for ever — unless a path is reused.** An entry whose
+`from` is not bound is a no-op, so an applied entry does nothing again; the one
+thing it blocks is a new file at a path it names (the still-on-disk refusals, and
+a cycle or backwards chain at load). Delete it once no stack in
+`ronja.lock.json` still binds the old path, never sooner: a stack that has not
+applied it is then left at a path that is gone, which `sync apply` refuses as
+`orphaned_file` but a classic single-folder `pipeline push` only NOTES — and then
+creates the new file's row beside the old one.
+
+⚠️ **Rollout: a long-deleted file now stops `sync apply`.** Rename detection
+reads the lock rather than the local baseline, so a pipeline folder whose lock
+still binds a `.sql` or metric file deleted before this release is refused as
+`orphaned_file` on the first `sync apply` after upgrading. A `removed` entry is
+the fix, and in a pipeline folder it needs no format bump.
+
+## Names are declared attributes
+
+A name is an ATTRIBUTE, never an identity. Which row a file or a folder is comes
+from the lock; the name is something a push converges like any other field. One
+rule for every kind:
+
+- **A declared name is managed.** It is written when the row does not hold it,
+  and drift-checked first.
+- **An absent name is unmanaged.** It is stamped once, at create, and never
+  written afterwards — a rename made in the web app stands.
+
+| kind | declared in | baseline when the lock records none |
+|---|---|---|
+| table | a `-- @name <text>` line in the `.sql` header | the file's stem (what a create with no declared name stamped); `pipeline clone` and a create under a declared name record the exact name instead |
+| metric | `"name"` in `metrics/<stem>.json` | the same |
+| automation | `"name"` in the `.json` | the filename (what every push before the key wrote) |
+| workflow, data app, module | `"title"` in `ronja.json` | the local baseline's title; with neither, none |
+
+A live name that merely *slugs* to the stem is not a baseline: `clone` writes
+"Sales orders" to `Sales-orders.sql`, but "Sales: orders" slugs there too, and
+reading it as the folder's own would revert a colleague's rename. A folder
+cloned before clone recorded names therefore refuses its first `-- @name` (or
+`"name"`) on such a row; declare the current name and push once to adopt it, or
+push `--force`.
+
+**The drift rule**, with B the baseline (the applied name the lock records, else
+the column above), L the live name and D the declared one:
+
+- **L = D** — nothing to write, and the lock's applied name becomes D. Live equal
+  to desired is never drift, whatever the anchor said.
+- **L = B** — the folder's own last state, so D is a rename to send.
+- **otherwise** — the row was renamed somewhere else: refused as drift, with the
+  loop's usual `--force` override (which also acknowledges L, so the next push
+  does not re-report it before the rename is published).
+
+**Where the rename goes.** For the draft kinds — tables, metrics, workflows, data
+apps — the rename is written on the push's **draft**, never on the live row: a
+commit lands the draft's name on the live row, so a rename written on live while
+a draft is open is reverted by the next publish. It reaches the live row at
+`publish`, in place (same id, same references) — which is not the same as no
+build: a `-- @name` line is part of the `.sql` file, so adding or changing it
+changes the SQL the draft holds and the draft builds like any other edit, and a
+metric's rename lands through a publish that rebuilds the metric. The server checks the name
+is free in the feature there — a taken name is refused at publish with
+`name_taken`, pointing at `-- @name` / `"name"`. An automation (no draft) and a
+module (patched on its live row) are renamed directly. The applied name is
+recorded only when it is TRUE that the live row holds it: a create, a publish
+that read it back, a push that found L = D, or a `--force` acknowledging L.
+
+**A folder kind with no recorded title** (a data app, workflow or module whose
+lock predates the applied title, on a fresh checkout) has one other witness:
+the committed head anchor (`headVersionID`).
+- **A data app** cannot be retitled on its live row without a publish — a
+  rename in the web app opens a draft and lands through a commit, which files a
+  version — so when the anchor still matches the live app's head, the live title
+  is this folder's own and a different `title` is a rename to send. When the
+  head has moved, or the app has never been published, the push is refused.
+- **A workflow or a module** can be retitled in place (a workflow in a private
+  feature, any module), which files no version, so the anchor cannot vouch for
+  a title. A mismatch is refused.
+
+Either refusal names the live title; set `"title"` to match it, remove the key,
+or push `--force` to rename. A refused push records nothing, so a colleague's
+rename is never adopted as this folder's own and reverted one push later. A
+draft holding this folder's own staged rename does not make the still-old live
+title drift, so a rename can be pushed twice before it is published — and the
+same is true of a table's `-- @name` and a metric's `"name"`, which are
+remembered against the draft they were staged on (in `.ronja/`, since a draft is
+per-user).
+
+**In an adopted folder the applied name lives on the server**, with the rest of
+the anchor (`applied` on the address's claim), so a CI runner that never commits
+its lock renames a table twice with no `--force`: the second rename's baseline
+is the first rename's name, read back from the server
+(`TestManagedSecondRenameFromALockDiscardingCI`). A name or title refusal there
+is therefore always a rename made elsewhere, and names `pull` beside `--force`
+(`nameRemedy`) rather than the lock remedy below.
+
+⚠️ **In a LEGACY folder the applied name and title live in `ronja.lock.json`, so
+commit it after any deploy that renamed something — a build server's
+included.** A CI runner that throws its checkout away records nothing: its
+first rename lands (live still holds the stem), but its second compares the
+first new name against the stem (or, for a workflow or module title, against
+nothing at all), reads it as a rename made in Ronja, and refuses. `sync apply`
+has no `--force`. The refusal names the way out (`lockRemedy`): run the
+folder's own push with `--stack <stack> --force` from a checkout — it renames
+the row as declared and records the name — then commit `ronja.lock.json` (or
+adopt the folder). The `moved` cleanup rule ("delete the entry once no stack in
+`ronja.lock.json` still binds the old path") depends on the same commit. See
+BL-8519.
+
+### Live equals desired is never drift, on every leg
+
+An anchor (a lock fingerprint, a head version, a local baseline) is written in a
+separate step after a push or a publish, so a crash, a dropped lock commit or a
+discarded CI checkout leaves it behind a server this same folder wrote. Every
+drift leg therefore asks whether the server already holds what the push would
+leave there before it calls a difference drift, and re-anchors when it does:
+pipeline SQL (live table and own draft), header documentation and docs sidecars
+(under the join rule), the metric recipe (the file is put into the server's stored
+form — every key present, `version` defaulted to 1, `source` trimmed, unknown keys
+dropped — and compared with the row; a key the row holds that this CLI does not
+know keeps them different), names and titles,
+automation fields, module metadata, and workflow / data-app / module files. A
+file is excused when the server holds the local bytes, or neither side holds it;
+with NO local baseline, a moved head over a row that holds exactly the folder's
+files **and** metadata is let through and re-anchored (files alone are not
+enough). Health checks already worked this way.
+
+## Server-side state: adopted folders
+
+A folder whose `ronja.json` carries an `"id"` is **adopted**: its state — which
+row each address manages — lives on the server (`managed_resources`,
+`/api/v2/managed`), and `ronja.lock.json` is a **cache** of it. A folder with no
+id is **legacy** and runs exactly as it always has, off the lock alone, sending
+no request to `/managed` and no `managed` key on a create
+(`TestLegacyFolderNeverTouchesManagedState`). The id is the whole switch between
+the two patterns: the classic one — clone, edit, push, test, publish — and the
+serious one, a repository deployed by `sync apply` from CI.
+
+```json
+{ "kind": "pipeline", "id": "0b6f7c2e-3a41-4f0e-9d4c-7a5e2b9c1d08", "title": "Sales", "stacks": { … } }
+```
+
+**An address is (the stack's feature, the folder id, the file).** `""` for a
+workflow, data-app or module folder; the folder-relative path for a table
+(`orders.sql`), a metric (`metrics/aov.json`) or an automation (`nightly.json`) —
+the keys the lock already uses. The feature half is the created row's own, never
+a value the CLI sends, so a copy of the folder pointed at another feature is a
+different address, and only someone who may write a feature can claim inside it.
+A stack's NAME is not part of the address: two stacks targeting one feature from
+one folder deploy the same thing to the same place. Checks and docs sidecars are
+not claimed (a check is its table's child; a sidecar documents a row the folder
+does not build).
+
+### Only a local command mints an id
+
+`init --stack <name>` (workflow, data app, pipeline, automation, module), `ronja
+sync adopt` and `ronja import feature`. Never `clone`, `push` or `sync apply` — an
+id minted on a CI runner and lost with its checkout would make the next run mint
+another and duplicate every row. `init` WITHOUT `--stack` mints nothing: that
+folder is written in the legacy `instances[]` shape and has no stack to key state
+by. A module folder's create claims its address like any other
+(`TestManagedModuleCreateClaims`).
+
+⚠️ **The id is format version 6, and is demanded, not just stamped.** In an
+adopted folder the committed lock goes stale by design — CI deploys without
+committing it — so a row a CI run created, or a `moved` it applied, is recorded
+on the server and nowhere in the repository. An older CLI would keep the id,
+ignore it, run the folder in legacy mode off that stale lock, and create a second
+row for every file whose row the lock never heard of. So `sync adopt` and `init
+--stack` stamp `"formatVersion": 6` when they write the id, an older CLI refuses
+the file, and an id written by hand into a file that declares less is refused at
+load, naming the line to add by hand — the rule `moved` and `dependencies`
+follow (`sync adopt` loads the same file and is refused by the same check, so it
+is not the remedy there).
+
+`sync unmanage` removing the id is the one removal that lowers the number, and
+only from 6 (`Manifest.RemoveFolderID`): 6 means nothing but the id, and
+unmanage first writes everything the server's state names into the lock, so the
+classic folder it leaves is one an older CLI reads correctly. It lowers to what
+the remaining content still needs — 5 for `moved`, 4 for a JavaScript workflow —
+and a 7, for an address, write, output or run dependency, stays (`TestSyncUnmanageLowersTheFormatTheIDRaised`). Editing the
+number down by hand while the id is there is refused at load.
+
+`sync adopt` reads the server BEFORE it writes the id: a stack with no
+`featureID` (`no_feature`), an instance without `/managed`, or a token without
+`structure:read` is reported with nothing written, so a failed adopt never
+leaves a working classic folder adopted and refusing every deploy
+(`probeManagedState`, `TestSyncAdoptWritesNothingTheServerCannotHold`).
+
+A folder id is a lowercase UUID, validated at load. Two folders in one walked
+tree carrying the same id — a `cp -r` — are both refused
+(`duplicate_folder_id`, each naming the other): one id is one set of addresses,
+so the two would adopt each other's rows.
+
+### The server wins
+
+Before any loop runs, an adopted folder that targets a stack reads `GET
+/managed?feature=<stack feature>&folder=<id>` and rewrites its in-memory lock to
+match (`folder.refreshManaged`). Every loop then runs unchanged, because each
+already reads the lock and `f.Binding`. The outcomes, as built:
+
+| server says | outcome |
+|---|---|
+| claim → X, `ok` | proceed on X, with the anchor from `applied` — the drift guard is armed with no lock at all. A lock that said otherwise (or nothing) is rewritten by an acting run, with a note; the unit is listed as **`adopt`** |
+| claim → X, `not_readable` | refused `not_readable`, naming the claimant (typically their unpublished draft). They publish it or run `ronja sync unmanage`; anyone else who may write the feature needs `ronja sync unmanage --force`, since their lock cannot record a row they may not read (see below) |
+| claim → X, `trashed` | refused `trashed`: restore it, unmanage, or declare it `removed` |
+| claim → X, `lost` | refused `lost`: `sync unmanage` (which drops the dead id from the lock), `sync adopt`, then `sync apply --allow-create` recreates it |
+| claim → X, `moved_out` | refused `moved_out`. Almost always the claim is a **tombstone** (`departedAt`): an admin moved the row to another feature, and the move left the claim at its address so nothing is created there in the row's place. The refusal names both features (the destination only when this credential may read the row) and both remedies: move the row back into the stack's feature, which revives the claim with its address and anchor, or `sync unmanage` (which drops the moved row from the lock, so a classic push never writes into another feature), `sync adopt`, then `sync apply --allow-create` to create the file's row here anew (`TestManagedTombstone`). Where the server can tell, the destination is said exactly: a tombstone whose row is gone (it reads unreadable with its id kept, like a `lost` claim) says the row or its feature no longer exists and offers no move back; an unreadable one says "one you may not read, or one that no longer exists" (`TestManagedTombstoneNamesWhereItsRowWent`). A tombstone whose row is **already back** in the stack's feature — the move back raced the move out, so the claim was not revived — says to unmanage the address instead: `sync unmanage` keeps that row in the lock and `sync adopt` claims it again (`TestManagedTombstoneWhoseRowCameBack`) |
+| no claim; the lock has X | the **lazy claim**: an acting run claims X (`POST /managed/claim`) before it pushes — refused `claimed_elsewhere` (naming the other address), `moved_out`, `trashed` or `lost` when the server says so |
+| no claim; no lock entry | create, claiming the address in the create's own transaction |
+| a claim this folder's kind cannot hold at its address | refused `claim_mismatch` — two folders share the id |
+| a lock entry naming a row an `ok` claim holds at ANOTHER address | the entry is dropped (its checks record carried to the new stem): a `moved` another run applied and never committed. Without this a run that restored an older committed lock read the declaration as one row at two addresses and refused `address_conflict` for good (`TestManagedMovedFromAStaleCommittedLock`) |
+
+**The server wins both ways**: address → row (a claim rewrites the lock entry at
+its address) and row → address (a lock entry whose row the server holds
+elsewhere is dropped). Every rewrite is a note on an acting run and in memory on
+a read-only one.
+
+A **read-only path rewrites nothing**: `status`, `sync status`, `sync check` and
+`sync apply --dry-run` refresh in memory, report what they found (a dry-run lists
+the `adopt` units and notes which bound rows the apply would claim), and send no
+write to the server or the disk (`TestManagedReadOnlyPathsWriteNothing`). A
+`GET /managed` that gets no answer degrades a status like a failed organization
+lookup and stops an acting command.
+
+**Only a deploy writes server state.** Push and publish of every kind open the
+folder with `openFolderForDeploy`, which settles what the refresh found pending
+— `moved`, `removed`, `--adopt-foreign`, the lazy claims — writes back a lock
+the server disagreed with, and records the anchors each lock save changes;
+`sync apply` does the same in its execute pass. Every other acting command — `wf
+run`, `wf`/`app validate`, `bind`, `discard` — refreshes in memory and writes no
+claim, move, release or anchor (`TestManagedNonDeployCommandsWriteNoServerState`).
+A create such a command makes still carries its claim: a create and its claim
+are one transaction whoever sends them.
+
+**Token scopes.** The `/managed` routes are `structure`-scoped: an adopted folder
+needs `structure:read` for `status`, `sync status` and `sync check` (a refusal
+names the scope), and `structure:write` to deploy — every managed create, claim,
+move, release and anchor — beside each row kind's own scope (`automation` for
+workflows, modules and automations, `analytics` for apps, `data` for tables and
+metrics). A row whose kind scope the token lacks at read reads `not_readable`.
+Claiming, anchoring or creating a table or metric needs the admin role.
+
+**CI no longer needs to commit the lock.** An adopted folder applied from a
+checkout with no lock — or with the lock committed at adopt time, gone stale
+since — creates nothing, rewrites the lock from the server, arms its drift guard
+from `applied`, and on an unchanged tree sends no write at all
+(`TestManagedLostLock`, the touchstone scenario `managed/lost-lock`, per kind, after a real
+deploy and without one, with the lock deleted and with it restored). A `moved`
+or `removed` one run applied is already applied for every later run, whatever
+lock it restores (`TestManagedMovedFromAStaleCommittedLock`). Commit `ronja.json`
+— the id is what tells every runner where the state lives. A `sync apply` that
+rewrote an adopted folder's lock says so once, after its summary (and lists the
+folders under `locksRewritten` in `--json`): the lock is a local cache of the
+records in Ronja, so a deploy never needs it, and a merge conflict in it is
+settled by taking either side and then running `sync apply`, which rewrites it
+from Ronja — until then the dry run and status read the side taken, which can
+name a deployed `.sql` file as never deployed (a false red) or plan rows as
+`adopt`. It is
+still COMMITTED, because two read-only answers in a fresh checkout read it
+rather than Ronja's record (BL-e7b3): with no lock, `sync apply --dry-run`
+plans every bound row as an `adopt` unit it does not compare, so an unchanged
+tree reads "would push and publish", and a pipeline folder's `sync status`
+loses the leg that names a `.sql` file holding SQL never deployed
+(`undeployedAgainstLock`, which opens the folder locally).
+
+### Creates claim their address
+
+Every create an adopted folder sends — `POST /workflow`, `/dataapp`, `/module`,
+`/automations`, `/feature/model`, `/feature/model/metric` — carries
+`managed: {folderID, address, stackLabel, sourceLabel}`, and the server inserts
+the claim in the create's own transaction. Two concurrent applies at one address
+therefore converge on ONE row:
+
+- **`409 address_claimed`**: the create was rolled back whole, and the body
+  names the holder (`claim`, beside `error` and `code` — the server renders an
+  error's details at the top level, not under `details`). When its `state` is
+  `ok`, that row is this file's: adopted BY ID, and the push continues as the
+  update it now is, drift guards and all (a workflow, data-app or module push
+  runs once more; a table, metric or automation continues in place). Any other
+  state refuses with that state's outcome and adopts nothing — a tombstone
+  (`state: moved_out`) refuses `moved_out`, and `sync apply` reports the folder
+  under that reason even where a pipeline push folds the refusal into its
+  per-file count.
+- **`409 name_taken`** (tables and metrics only — their name gate runs before the
+  claim): the folder re-reads its state. A claim now at this address is the
+  winner, adopted by id; none means the name belongs to a row this folder does
+  not manage, refused with the remedy (record its id in the lock and run `sync
+  adopt`, or rename).
+- **Metric adopt-by-name is retired for adopted folders.** A legacy folder still
+  adopts a `name_taken` metric holding exactly its file's definition (its ids
+  live in a git-ignored baseline there); an adopted folder never takes a row
+  over by its name (`TestAdoptedFolderNeverAdoptsAMetricByName`, with the legacy
+  control beside it).
+- A table create that **timed out** asks its address, not its name.
+
+### Anchors live in `applied`
+
+The anchor is exactly what the lock carries beside each id: a workflow's, data
+app's or module's `headVersionID` and applied `title`; a table's `liveSHA256`,
+`metaSHA256`, applied `name` and carried `stem`; a metric's `liveSHA256`,
+`declaredSHA256`, `name`, `stem` and tag record; an automation's `updatedAt`,
+`name` and `stem` (`wfdir.Lock.Anchor` / `SetManaged`, one translation each
+way). A table's **checks** record (the table its checks file last applied to and
+each owned check's projection) is on the FOLDER's anchor, not the table's — see
+below. So a lock-less run still refuses a check re-severitied in the app
+(`TestManagedLocklessApplyKeepsTheChecksDriftGuard`). Every lock save in an adopted folder records the anchors it changed with
+`PUT /managed/:id/applied`, a compare-and-set on the claim's `revision`, merged
+over the claim's current anchor so a key a newer CLI recorded survives. On a
+`409 stale_revision` it re-reads once: the claim still holding the anchor this
+write was based on (only its revision moved — a relabel) is retried; one already
+holding this anchor is done; one holding a different anchor was written by
+another apply meanwhile, and is surfaced as `anchor_not_recorded` rather than
+overwritten. A `404` is the server's answer both for a claim released meanwhile
+and for a row this credential may no longer write, so the claim is re-read and
+its state named: none left is `lost` (with `ronja sync adopt` as the remedy), a
+refusing state is that state's outcome. A `409 moved_out` — the row was moved to
+another feature while the run went on, and the claim is a tombstone — is
+`moved_out`. Either way the change itself landed, and live equal to desired is
+never drift, so the next run re-anchors. An anchor write also fills in the
+claim's `sourceLabel` when it is empty or names this repository at another path
+(a folder moved inside it); a different repository is left to
+`--adopt-foreign`.
+
+An **automation** whose claim carries no anchor — a crash or a failed anchor
+write right after its create — would otherwise refuse `no_drift_anchor` on every
+lock-less apply, with a per-folder push as the only remedy, which CI does not
+run. In an adopted folder `sync apply` reads the row, and when it already holds
+everything the file declares the unit is an update that writes nothing but the
+anchor (live equals desired is never drift); one that differs still refuses
+(`TestManagedAnchorlessAutomationAtDesiredIsReanchored`). The plan's read is not
+what keeps the write safe, though: the push runs after every earlier folder, and
+with no anchor both of its guards are off, so an operator who paused the
+automation in between would have it turned back on. The push therefore decides
+again on the row **it** reads (`RequireAnchor`): still equal to the file, it
+records the anchor and writes nothing else; different, it refuses
+`no_drift_anchor` and sends no write
+(`TestManagedAnchorlessAutomationReDecidedAtWriteTime`). A single-folder
+`automation push` keeps writing such a row — that write is how a folder earns its
+anchor. An anchor failure never fails the save that triggered it (its local
+half landed); a single-folder command reports it as its error at the end, and
+`sync apply` as the folder's verdict.
+
+### The folder anchor holds the docs-sidecar and health-checks baselines
+
+A docs sidecar (`tables/<alias>.json`) documents a table the folder does **not**
+build, so it has no claim, and its record (`tableDocs` in the lock) belongs to no
+row. It lives on the folder's own anchor instead — one per feature and folder
+id, read from the same `GET /managed?feature=&folder=` as the claims (its
+`folder` object) and written with `PUT /managed/folder/applied`, a compare-and-set
+on the anchor's own `revision` (0 creates it). The health-checks records
+(`checks` in the lock, keyed by checks file) live there too: one entry per check,
+about 160 bytes each, which on the table's own claim anchor — capped at 16 KiB —
+failed every anchor write of a table with a hundred checks
+(`TestManagedTableWithManyChecksRecordsItsAnchor`). That is the whole of what the
+folder anchor holds, by decision: everything else the lock records has a claim
+to ride on, and a folder's configuration is in `ronja.json`, which every runner
+has.
+
+- It depends on no claim. A folder that builds nothing, a host file declared
+  `removed`, an address refused a claim at adopt, and any number of sidecars
+  (the server's cap is 256 KiB, thousands of them) all keep their baselines, so
+  a lock-less run still refuses prose rewritten in the app
+  (`TestManagedDocsOnlyFolderKeepsItsDriftGuardWithoutALock`,
+  `TestManagedManySidecarsLoseNoBaseline`,
+  `TestManagedDocsBaselinesSurviveTheirFormerHost`,
+  `TestManagedLocklessApplyKeepsTheDocsDriftGuard`). A folder of docs sidecars
+  alone applies with no publish, since there is nothing to commit.
+- After every lock save it is written **before** the claims' anchors and
+  independently of them: a refused folder anchor never stops a claim's, nor the
+  reverse. The server wins for every sidecar it records; one only the lock
+  records is kept and written up by the next save. A key a newer CLI recorded is
+  carried through.
+- A `409 stale_revision` re-reads once: the anchor already holding this state is
+  done; one still holding the state this write was based on (only its revision
+  moved) is retried; another apply's different state is surfaced as
+  `anchor_not_recorded`, not written over. A `413 applied_too_large` writes
+  nothing and is refused as `folder_anchor_too_large`, naming the sidecar and
+  checks-file counts — split them across folders (`TestManagedFolderAnchorArms`).
+- A claim anchor an earlier build wrote with `tableDocs` on it is read once, while
+  the folder anchor holds none, and the key is cleared from the claim only after
+  the folder anchor has recorded it
+  (`TestManagedLegacyDocsOnAClaimMoveToTheFolderAnchor`). The same holds for a
+  table's `checks` record an earlier build kept on the table's claim: read as a
+  fallback (the folder anchor's record for the same file wins), and cleared from
+  the claim once the folder anchor has recorded it.
+
+### `ronja sync adopt` and `ronja sync unmanage`
+
+```bash
+ronja sync adopt --stack prod [dir]
+ronja sync unmanage --stack prod [dir]
+```
+
+**`adopt`** goes classic → serious, for every folder under `dir` (or `--dir`)
+that declares the stack: it mints an id where there is none (the one write to
+`ronja.json`), claims every row that stack's lock records in the stack's feature
+in one batch (each row reports its own outcome — `claimed`, `already_claimed`,
+or `refused` with the server's code), and records the lock's anchors on the
+claims, so the very first lock-less run is guarded. A folder that refuses does
+not stop the others. It is idempotent: run again, it claims nothing and writes
+nothing. Commit `ronja.json`. A legacy `instances[]` folder has no stack to adopt
+into; name one first (`--stack <name> push`).
+
+**`unmanage`** goes serious → classic. First it writes every `ok` claim's row
+and anchor into the lock, and the folder anchor's docs-sidecar baselines, and
+saves it — a row a lock-less CI run created is known to the server alone, and
+the lock is the classic pattern's only state, so without this the next classic
+push created a second one (`TestSyncUnmanageKeepsTheRowsCIMade`,
+`TestSyncUnmanageReturnsTheDocsBaselinesToTheLock`). Then it marks the stack
+`"unmanaged": true` in `ronja.json` and saves that **before releasing anything**,
+so a run that dies part way leaves a stack running from the lock it just wrote
+rather than an id whose next apply claims every row back; a second unmanage
+finishes (`TestSyncUnmanageMarksTheStackBeforeReleasing`). Then it releases every
+claim of the folder in the stack's feature (anyone who may write the feature
+may, including a claim on a row they cannot read) and the folder anchor, leaves
+the ROWS exactly as they are, drops from the lock the rows of `lost` claims (gone
+for good) and of tombstones (moved to another feature on purpose — a classic
+push must not write there), and removes the folder id and the mark. Commit both
+files.
+
+**A claim on a row this credential may not read** names no id, so unmanage
+cannot write it into the lock, and a classic push of that file afterwards would
+create a second row. Unless the lock already records the address, unmanage
+refuses `not_readable` before writing anything, naming each such address and its
+claimant: they publish the row (after which it is readable and recorded) or run
+unmanage themselves. `--force` releases it anyway and says what that costs — the
+alternative, releasing silently, is exactly the second-row bug the lock write
+exists to prevent (`TestSyncUnmanageRefusesARowItCannotRecord`).
+
+**The id stays when another stack of the folder still holds claims or a folder
+anchor under it** — removing it would strand that state under an id nothing
+carries: every row the claims hold would then refuse a later `adopt` as
+`claimed_elsewhere`, and the other stack's docs baselines would be lost to it.
+Another stack this credential cannot ask (another instance or organization)
+keeps the id too. The unmanaged stack then keeps its `"unmanaged": true` mark,
+so it STAYS released: it runs from the lock, claiming nothing, until `ronja sync
+adopt --stack <name>` clears the mark. Removing the id clears every mark.
+Unmanage each stack to return the folder to the classic pattern
+(`TestManagedTwoStacksKeepTheirOwnClaims`,
+`TestSyncUnmanageKeepsTheIDForAnotherStacksFolderAnchor`).
+
+Against an instance that does not serve `/api/v2/managed` at all — the refusal
+there names `sync unmanage` as the remedy — the route's plain-text 404 means no
+server state exists to strand, so unmanage removes the id and the folder runs
+from the lock (`TestSyncUnmanageOnAnInstanceWithoutManagedState`).
+
+### Other writers: the notice, and `ronja <kind> pull`
+
+A row an adopted folder deploys can still be changed by anyone who may change
+it — in the web app, through the agent, or from a cloned folder. Nothing is
+blocked. Two things make that coexist with the repository.
+
+**The classic-loop notice** (`managed_notice.go`). Each kind's single-row GET
+(`/workflow/:id`, `/dataapp/:id`, `/module/:id`, `/feature/model/:id`,
+`/automations/:jobID`) carries a `managedBy` object for a row with a live claim
+— `sourceLabel`, `stackLabel`, `folderID`, `address`, `featureID`, `updatedAt`;
+a draft answers its root's, a tombstone none
+(`backend/resource/rmanaged/managed_by.go`). `clone`, single-folder `push` and `publish` of a
+workflow, app, module and pipeline (tables and metrics), and `automation push`,
+read it from the GET they already make and print one line to stderr when the
+row is managed by a folder OTHER than this one — the same folder id deploying to
+the same feature is the managing folder, and prints nothing:
+
+```
+  Note: managed in git (github.com/acme/data, folder pipelines/sales, stack "prod") — this change will show as drift there; `ronja pipeline pull` in that repository absorbs it.
+```
+
+The label splits on the first `//` that is not a scheme's `://`
+(`api.SplitSourceLabel`, the web chip's rule). A deploy from a checkout with no
+git remote records the repository directory's name and the folder's path,
+marked `(local, no git remote)` — `roastery/apps/dashboard (local, no git
+remote)` — where an older CLI recorded nothing (and the line names the folder
+id instead, for such a claim). A local label names no repository: it is never
+foreign (`sourceRemote` reads no remote half in it), and an anchor write from a
+local checkout never replaces a label a checkout with a remote recorded
+(`relabelTo`) — only an empty one. A label is still refreshed only when an
+anchor is written (the quiet relabel); a claim no apply writes to keeps its old
+one, so a remote added to a repository reaches each row's label with the next
+change to it. See BL-7c2e. A clone says "a change
+made from this copy will show as drift there". One line per managing folder,
+however many of its rows the command touched; `--json` carries one entry per row
+under `managedInGit`. It is a notice, never a refusal, and an instance that
+sends no `managedBy` says nothing. The one command that pays a request for it is
+`automation push`, which compares against the feature's listing (no
+`managedBy`): it GETs each row it UPDATED, best-effort, and an adopted folder —
+whose every row is claimed at its own address — sends none.
+`sync apply` collects and prints none of it.
+
+**`ronja <kind> pull [dir]`** (`pull*.go`), for `wf`, `app`, `module`,
+`pipeline` and `automation`, in an ADOPTED folder only:
+
+```bash
+ronja wf pull                 # rewrite the folder from live, print the diff, record the anchor
+ronja pipeline pull --dry-run # print the diff, write nothing anywhere
+```
+
+1. **Opened read-only.** The refresh reads the server's state and refuses a
+   claim that is not `ok` with its 2b outcome (`not_readable`, `trashed`,
+   `lost`, `moved_out`, `foreign_claim`, `claim_mismatch`); nothing is settled —
+   no `moved`, `removed` or lazy claim is sent.
+2. **Refused before reading** when the folder has no id (`not_adopted`, naming
+   `clone` and `sync adopt`), a stack marked `"unmanaged"`, no claim for what it
+   would read (`not_claimed`: the stack never deployed it, or a lock row has no
+   claim — `sync adopt` claims it), or a `moved` / `removed` the server has not
+   applied (`pending_declarations`: deploy it first — a pull from the claims
+   would otherwise write the old path back). A draft kind whose row was never
+   published is refused `not_live`: there is no live version to pull. A
+   pipeline or automation claim whose ADDRESS the folder cannot hold as a file —
+   `ronja.json`, a dot-path like `.github/workflows/x.json`, a path
+   `wfdir.ValidatePath` refuses — is refused `inexpressible` before anything is
+   written (`refuseUnholdableClaims`): those pulls write each claim's file at its
+   address, the server checks an address only for its shape, and the folder id
+   is public with the repository.
+3. **The dirty rule** (`refuseUncommitted`, skipped by `--dry-run`, overridden
+   by `--force`): `git status --porcelain=v1 -z --untracked-files=all -- .` in
+   the folder; any modified, staged, deleted or untracked path in it refuses
+   (`uncommitted_changes`, naming them), except `ronja.lock.json` and `.ronja/`
+   — the lock is a cache of the server's state, which the pull rewrites from the
+   server anyway. **Outside a git work tree** (or with no git binary) it refuses
+   too (`outside_git`): inside git a committed file is recoverable and the dirty
+   check protects the rest, but outside it nothing can say which edits are work
+   and nothing could bring an overwritten one back, so the pull wants `--force`
+   — the author's word that there is nothing to lose. The printed diff is not a
+   way back.
+4. **Render** the folder from the LIVE row — never the author's draft — in the
+   folder's disk form, and check it before writing a byte:
+   - **workflow / app / module:** the file set (added, rewritten, deleted) via
+     the codec's `toDisk`, and the manifest metadata the folder ALREADY manages —
+     title, entrypoint, parameters (`parametersToDisk`), reporting timezone,
+     runtime; an app's title and `access` (each id its codec names written as
+     the alias); a module's title and package name. A key the manifest leaves
+     out stays out. The plan must pass the push's own parity function
+     (`workflowRowHoldsFolder` / `appRowHoldsFolder` / `moduleRowHoldsFolder`),
+     or the pull is refused `inexpressible` and nothing is written.
+   - **pipeline:** each claimed table's `.sql` is the live SQL canonicalized
+     and de-aliased with the file's own sibling spellings, then any other sibling
+     by its stem (an id the file spelled literally stays literal), then declared
+     aliases; its opt-in header keeps its lines, each DECLARED value taking the
+     row's current description, column note or `-- @name`
+     (`tabledocs.RewriteHeader`, which never adds a declaration and keeps a
+     column the row has not measured). Each claimed metric's file takes the live
+     recipe, its `source` spelled as the file spells it while that still names
+     the live table, and the `description`, `reportingTimezone`, `name` and
+     `tags` it declares; a file that already holds the live metric keeps its
+     bytes. Each claimed table's `checks/` file keeps its entries: one a live
+     check resolves to takes its body and declared fields, one the folder owned
+     whose check is gone (deleted in the app) is dropped, one never applied is
+     kept. Each `tables/` sidecar takes the row's prose for what it declares.
+   - **automation:** each claimed automation's file takes the row's values for
+     the keys it DECLARES — three-state kept, so an undeclared `enabled` stays
+     undeclared — with each reference field keeping its spelling while it still
+     resolves to the live id, else the codec's alias, `"@feature"`, or the
+     literal id; a claimed file gone from the folder is written whole, as import
+     writes one. Every file is parsed, resolved and compared with the row the
+     way a push does (`automationDelta` empty) before anything is written.
+
+   A claimed address whose file is gone is written back; a file the server holds
+   no claim for has never been deployed from here and is left alone.
+
+   **Undeployed changes** (`undeployed_changes`). Each unit is compared with
+   what its stack last APPLIED, so a change committed but never deployed is
+   never replaced silently. A unit the folder changed since then, whose live row
+   changed too, is refused, naming the files (`--force` replaces them, and the
+   report lists them under `replaced`; `--dry-run` lists them and does not
+   refuse). A unit only the folder changed, on a live row that has not moved,
+   has nothing to absorb: it is left as it is and listed under `kept`, and the
+   next apply deploys it.
+   - **workflow / app / module** — the unit is the row, read off the head-version
+     anchor: recorded == current means no publish since, else ONE GET of the
+     recorded version's files (`GET :id/files` on the version id), compared with
+     the folder in its disk form; the applied-title anchor stands for
+     `ronja.json`'s title. Live moved = a new head or a title the anchor does
+     not hold. A stack that records no head cannot be compared and pulls as
+     before; a failed read refuses (without `--force`) rather than guess. A
+     recorded head equal to the row's OWN id (the row had no committed version
+     when the stack applied it — an import of an unversioned row, or a row a
+     `sync apply` created and never updated) is not a snapshot: its files are
+     the live row's, rewritten by every publish, and the server keeps no copy of
+     what the row held before its first version (a commit turns the DRAFT into
+     the version). That case compares the folder with this checkout's local
+     baseline instead, used only when it was read off this live row (`sourceID`
+     the row, lifecycle live — not another stack's row, BL-4e71, and not a
+     draft) at least 2 s before the oldest version's `committedAt` (a discard
+     re-reads live after the publish, and such a baseline describes the
+     publish). With no such baseline (a fresh checkout) the pull refuses, saying
+     the comparison cannot be made and why, unless the folder already holds
+     every live file; `--force` takes what is live. A baseline read less than
+     2 s before that commit is refused the same way and the refusal says it was
+     too close to tell (both stamps are to the second, from two clocks).
+     Waiting does not help: neither stamp moves. Other
+     manifest metadata (entrypoint, parameters, runtime) has no applied anchor
+     and is not compared.
+   - **pipeline** — the unit is the file, against its recorded fingerprints: a
+     `.sql` file's bytes against the recorded live SQL hash (live moved = the
+     live SQL in the file's spelling hashes differently, or a declared header
+     value changed); a metric file's declared fingerprint against the recorded
+     one (live moved = the recipe hash moved, or a declared description,
+     timezone, name or tag is not held — the conservative side, since those
+     have no recorded value); a sidecar's fingerprint against the recorded one
+     (live moved = the row's prose hash moved); each owned check entry
+     (`checkfile.Entry.SHA256`) against its recorded `liveSHA256` (live moved =
+     the live check's projection moved, or it was deleted).
+   - **automation** — no comparison: its anchor is the row's `updatedAt`, which
+     records no content, so a pull replaces an automation file's declared keys
+     as before.
+
+   **Files git cannot bring back** (`unrecoverable_paths`, overridden by
+   `--force`). The dirty rule never lists a file git IGNORES, and the folder's
+   enumeration does not read `.gitignore`, so every path the pull would write or
+   delete must be tracked by git (`git ls-files -z -- .`) or absent; one that
+   is ignored or untracked (classified by `git status --ignored=matching`) is
+   refused, naming it.
+
+   **Symbolic links** (`symlinked_path`, NOT overridden by `--force`). A path
+   that passes through a link in any component, the file itself included, is
+   refused: the write would land wherever the link points.
+   **`ronja.json`'s `dependencies` and binds are never touched.** A live
+   reference the folder's aliases cannot express is written as the literal id and
+   listed per line (or per field, for a JSON file) under `literals` — never as a
+   new alias, so nothing is silently re-bound; a literal the folder already
+   spelled is its own choice and is not listed.
+   **The human report escapes what it prints from the server**
+   (`escapeTerminal`): the diff, notes and pending lines show every C0/C1
+   control character but tab and newline, and the bidi and zero-width
+   characters, as `\x1b` / `\r` / `\u202e` — the diff is what the author
+   reviews before committing, and an escape sequence in a live file could
+   otherwise hide a line the pull writes. `--json` is left to `encoding/json`.
+   **The write gate** (`plan.gate`, `pullGateRefusal`), last before anything is
+   written and in a `--dry-run` too: the same check the deploy makes, over the
+   live row the pull would take in — a workflow's stored files (`gateWorkflowRow`),
+   an app's live `access` when the folder manages it, the planned automation
+   files, a pipeline's docs sidecars. A live row that writes or runs outside the
+   stack's feature is refused `writes_outside_target` / `runs_outside_target`
+   with nothing written: the folder could not deploy it, and committing it would
+   make every later apply refuse. `--force` does not override it.
+5. **Write** the files and the manifest, then **anchor**: the kind's own deploy
+   push in its live-first mode — `runPush` / `runAppPush` / `runModulePush` with
+   `LiveFirst` (the head-version and applied-title anchors), `runPipelinePush`
+   with the new `Pull` option, `runAutomationPush` with `Pull` — run under an
+   `api.ReadOnlyGuard` on the context that refuses, before it is sent, every
+   request but `PUT /managed/:id/applied`, `PUT /managed/folder/applied` and
+   the write gate's `POST /workflow/validate`, which persists nothing
+   (`anchorWriteOnly`; the workflow push gates before its live-first check). So
+   the anchors are recorded through the same paths 2b's lock saves use, a
+   lock-less CI run sees them, and a pull that did not reproduce live exactly
+   cannot deploy anything: the guard names what it would have sent
+   (`would_write`). The guard covers `api.DoRaw` as well as `Do`. A
+   `would_write` pull has already WRITTEN its files and recorded nothing
+   (`anchored: false`): the files are the live version, to commit; if `status`
+   then shows no difference the next apply only re-anchors (live equal to
+   desired is never drift), and if it shows one that is what the next apply
+   would send — either way a bug worth reporting. Pipeline `Pull` mode records
+   each leg as seen from the live row — SQL, documentation, name, metric
+   definition, tags, checks — the acknowledgement a `--force` records without
+   its write, writes no row, and leaves the open draft and its pointer alone;
+   but it records a leg only where the file HOLDS the live row. A sidecar is
+   recorded when it holds the row exactly or is short only of unmeasured
+   columns, and otherwise reported `pending` with nothing recorded; a metric
+   file that does not hold the live definition records nothing and refuses the
+   pull `inexpressible` (a kept one is `pending`); a sidecar whose planning read
+   fails fails the pull before anything is written. Recording a leg the folder
+   never took in would let the next apply overwrite the web edit with no drift
+   refusal. Automation `Pull` mode leaves a never-deployed file `pending`
+   instead of creating it.
+6. **Report** the unified diff (`unified_diff.go`, Myers, git's format, pinned
+   against `git diff`) of what is now on disk — the files and `ronja.json` —
+   plus `literals`, `notes` and `pending`. **Pending** is what the committed
+   pull still deploys: a `.sql` header rewritten for a description or name
+   changed in the app is part of the table's SQL, so the next apply publishes
+   that table once; a file never deployed is created by the next `--allow-create`;
+   a kept file is deployed by the next apply. `replaced` and `kept` name the
+   undeployed changes the pull replaced (`--force`) or left.
+   Otherwise committing the diff and applying again sends no write, from the same
+   checkout and from a fresh one (`TestPullAbsorbsAWebEdit`, per kind, and
+   `TestPipelinePullAbsorbsEachLeg`).
+
+**The open draft.** Pull reads live and never touches a draft. A draft open
+when it runs keeps its files, and its drift guard is what it was: the draft
+kinds' local baseline is refreshed from live only when no draft is open (the
+baseline describes the draft a push writes to), and a pipeline table's draft
+pointer stays. Publishing that draft afterwards puts its content live over what
+was pulled, exactly as before. The JSON's `notes` say a draft was open.
+
+**The drift refusals name it.** In an adopted folder every drift refusal of
+push, publish and `sync apply` — the draft guard, a moved head, a folder with no
+baseline, a renamed title or name, a table's SQL or documentation, a metric's
+definition (verified or not), a check, an automation's anchor and its re-enable
+guard — adds "Or, to take the change made on the server into this folder
+instead: `ronja <kind> pull` rewrites the folder with what is live, and refuses if
+that would replace a change of this folder's that was never deployed"; the
+pipeline and automation summaries `sync apply` reports name it
+when a unit was refused for drift (`folder.pullHint`). A classic folder's
+refusals are unchanged.
+
+**The workflow and data-app drift guard leads with the action**
+(`baselineDriftRefusal`). Its first line says what changed — the live
+workflow or app, or the user's own open draft — and, for an adopted folder and
+the live row, the command that takes it in: `the live data app changed in Ronja
+since stack "prod" last applied it — run `ronja app pull` to take it into this
+folder`. The changed files follow, then how to see or overwrite it — under
+`sync apply`, which has no --force, "run `ronja app push --force` in this
+folder, then apply again" (`pushOptions.Apply`). `sync apply` indents every line
+of a folder's detail under it. Under `sync apply` the guard is also asked
+BEFORE the checkout when no draft is open (the checkout would only copy the
+live row it just read), so a refused folder opens and withdraws no draft and
+leaves no `draft_withdraw` in the audit log; the pull's anchor step keeps the
+guard after its checkout, where its read-only guard catches the write. A
+`sync status` drift line for an adopted folder names `<kind> pull` beside what
+changed on the server.
+
+### `--adopt-foreign`
+
+Each claim records a `sourceLabel`: the normalized git remote and the folder's
+path in it (`github.com/acme/data//pipelines/sales`). A claim whose REMOTE
+differs from this checkout's — a fork or a template copy that kept the folder
+ids and targets the SAME feature — is refused `foreign_claim`, naming both.
+`--adopt-foreign` (on every folder command and on `sync`) takes the addresses
+over: the claims are relabelled with `PUT /managed/:id/applied` and the run
+proceeds. Only the remote half decides — a folder moved inside its repository
+keeps its id and is not foreign — and a side with no git remote is never
+foreign, since nothing can tell it apart.
+
+The remote is normalized before it is compared (`normalizeGitRemote`, applied to
+the recorded label too): no scheme, credentials (a password holding an
+unencoded `/` included), port or `.git`; the scp form read as its URL; a host's
+aliases folded (`ssh.github.com`, `altssh.gitlab.com`, and Azure DevOps'
+HTTPS, SSH and `visualstudio.com` forms as `dev.azure.com/<org>/<project>/<repo>`);
+and the whole of it LOWERCASED. GitHub, GitLab, Bitbucket and Azure DevOps
+resolve paths case-insensitively, and a case-sensitive label made a CI checkout
+(`Acme/Data`) and a laptop clone (`acme/data`) refuse each other's claims, with
+`--adopt-foreign` handing them back and forth. A self-hosted server with two
+repositories that differ only in case reads as one source — the cheaper miss for
+a slip guard.
+
+### Rename detection refuses in an adopted folder
+
+A single-folder `pipeline push` in an adopted folder REFUSES a bound file gone
+with no `moved` or `removed`, as `sync apply` does — the address is server state,
+and a note would let the next create claim a second row beside it.
+
+Two runs applying one `moved` at once cannot both re-key it: the loser's `POST
+/managed/move` answers `404 not_claimed`, and when the claim already sits at `to`
+holding the same row that is the declaration applied, not a failure
+(`TestManagedConcurrentMovedIsAlreadyApplied`). A move that loses to a concurrent
+move of the same claim mid-request (an uncoded `409`) refuses the folder; re-run
+it.
+
+### The write gate: a stack writes only its own feature
+
+`write_gate.go`. A deployment to a stack writes only inside
+that stack's feature, except through a write-capable data source bound FOR THAT
+STACK. It closes the slip scenario: `import feature Sales` from Main, a
+`dev` stack added by hand, `sync apply --stack dev --allow-create` — the imported
+workflow's `tools.replaceTable(df, "table-<Main>")` is an output literal no codec
+rewrites, and without the gate the Dev deployment overwrites production on its
+first run, whatever dev binds.
+
+**Where.** Every stack of an ADOPTED folder (`folder.adoptedHere`: a folder id, a
+named stack with a feature, not `unmanaged`), on every path that puts code or a
+grant in front of that stack: `sync apply` (at PLAN time for a workflow or data
+app the run would create — so a refused folder leaves no empty, claimed row
+behind — for a pipeline folder's docs sidecars, and for every folder in a
+`--dry-run`, whose pushes never run; and inside the push for every write),
+`pipeline push` (its docs sidecars, before anything is written), `wf push` (also under
+`--no-validate`: the gate's request is not a check to skip), `wf publish` and
+`wf test` (over the DRAFT the server holds, which the web app may have edited),
+`wf run` (over the LIVE row it runs), `app push`, `app publish` and `app test`
+(over the access of the row it renders, whose grants the render runs with),
+`automation push`, and `ronja <kind> pull` (over the live row it would take
+in, before writing a file). A push gates BEFORE its live-first "the live row
+already holds this folder" check, so a folder that writes outside is refused
+whether or not it changed — an adopted workflow folder therefore sends one
+`POST /workflow/validate` on every deploy, unchanged or not (it persists
+nothing). A classic folder (no folder id) is checked exactly as before.
+Turning it off is one committed line — `"unmanaged": true` on the stack, or
+deleting `"id"` — so `sync apply` says so: a note on each folder it deploys
+unmanaged where the gate could apply (a stack marked `"unmanaged"`, or no id in
+a run whose other folders are adopted; `noteUnmanagedFolders`), whose first
+line names the `ronja sync adopt --stack <name>` that turns it back on. An
+all-classic tree gets none. An adopted folder whose selected stack names no `featureID` would have run
+classic — unclaimed and ungated — so it is refused `no_feature`, naming the line
+to add (or the `"unmanaged": true` that deploys the stack the classic way on
+purpose).
+
+**What, per kind.**
+
+- **A workflow:** POST `/workflow/validate`'s `writeTargets`, computed by the
+  server from the files the push is about to send — the WHOLE folder (the row's
+  output bindings derive from every file), after the stack's codec resolved it.
+  One scanner, the server's
+  (`backend/resource/rworkflow/validate_write_targets.go`): `{{ write() }}` markers, output
+  literals (the table argument of `tools.replaceTable` / `appendToTable` /
+  `saveAsTable` and their `…FromDir` forms), `{{ codex() }}` markers (a run may
+  upsert and delete), write-mode `{{ file() }}` markers and `saveFile` /
+  `saveTo…` `folder=` literals. An instance that answers no `writeTargets` key
+  at all is refused `no_write_targets`: an absence is not "writes nothing" (see
+  "A CLI that needs a newer server" under Releasing). Its RUN EDGES are the same answer's
+  `resolved.workflowIDs` and `resolved.agentIDs` — the server's resolution of the
+  `{{ workflow() }}` / `{{ agent() }}` markers in the posted files; the CLI only
+  finds the line each resolved id is on, to name it.
+- **A data app:** its `access.allowedCodexIDs` — the app token's codex grant
+  covers upsert and delete — and, as run edges, its `allowedWorkflowIDs` and
+  `allowedAgentIDs`. Its table and metric allowlists only read, and are not
+  gated. An app with the `write_external` capability writes an external
+  database through a secret in `allowedSecretIDs` (`CapWriteExternal`), as a
+  workflow does through a `{{ secret() }}`: a side effect outside Ronja, scoped
+  to the organization rather than to any feature, so the gate does not place it —
+  which secret, and so which database, a stack writes through is that stack's
+  bind of the secret dependency, decided per stack like every other.
+- **An automation:** the tables (`model`) in an agent action's reference set — a
+  headless run may write rows into any table it was given (a metric there is a
+  recipe nothing writes, and passes) — and the FEATURES there other than
+  `"@feature"`, whose every table the run is given. As run edges: a `workflow`
+  action's workflow, a `saved_agent` action's agent, and every `workflow`
+  reference.
+- **A pipeline:** its docs sidecars (`tables/<alias>.json`), each of which
+  writes its table's description and column prose. A sidecar documents a table
+  the folder does NOT build — an integration table, another feature's dynamic
+  table, a literal `table-…` stem — so nothing places it in the stack's feature,
+  and `ronja bind` would happily propose Main's table for a Dev stack's read
+  alias. The tables the folder builds are created in the stack's feature by
+  construction and are not gated.
+
+**The rule, per target.**
+
+| target | admitted when |
+|---|---|
+| a table or codex (a docs sidecar's table included) | it is in the stack's own feature (readable, and its feature is the stack's), or it is the id a `"write": true` dependency of its kind is bound to IN THIS STACK; a sidecar's table is also admitted when an address dependency resolved its alias (a table this repository manages in the stack) |
+| a feature (an automation reference) | it is the stack's own feature (`"@feature"`), or a `"kind": "feature", "write": true` dependency is bound to it IN THIS STACK |
+| a table written by name (`{{ write('orders_daily') }}`) | always — the runtime creates or reuses it in the run's own feature |
+| a folder write scope | a `"kind": "folder", "write": true` dependency is bound in this stack to that path |
+| anything this credential cannot read | never — nothing can say which feature it is in |
+
+An `output` dependency is not a write source: bound to a table in another
+feature (a bind copied from another stack), its `{{ write() }}` is refused like
+any foreign table. A stack inherits no write bind from another. Anything else is
+refused `writes_outside_target` — one refusal listing every write it found,
+each by file and line (or manifest field), the target, and its feature when
+readable — and nothing is written.
+
+**Run edges.** Checked after the writes, on the same paths. A
+workflow or saved agent the folder would run is admitted when it is in the
+stack's own feature, when it is a row this repository manages in the stack (an
+address dependency resolved to it — whatever feature that folder's stack
+names), or when a `"run": true` dependency binds it IN THIS STACK; anything
+else, an unreadable target included, is refused `runs_outside_target`, naming
+the position, the target and its feature. The edges FAIL CLOSED: validate drops
+a workflow or agent the caller cannot reach from `resolved` and reports it as an
+`unresolved_workflow` / `unresolved_agent` finding instead, so each such
+finding's marker is an edge too, and a run-edge leg over the binding cap (a
+`too_many_bindings` finding on `workflowIDs` / `agentIDs`) is refused outright.
+An address still pending in a fresh stack (its row is created by the same run)
+is admitted at plan time in its alias spelling; the push re-gates once it
+resolves. ⚠️ The gate decides WHETHER a stack
+runs a row, not what the row then does: a bound run edge runs with the target's
+own authority, writes included, by design — binding Main's workflow in a Dev
+stack lets Dev's runs start it, and it writes what it writes.
+
+**Notes on what the gate admitted.** An admitted write or run bind that lands
+in another feature is not refused (the stack decided it), but it is said:
+a note naming the position, the target and its feature, and — loudest — any
+other stack of the same folder that binds the very same row, which is what a
+bind copied between stacks looks like. A row an ADDRESS dependency resolved to
+is noted the same way when its claim is in another feature — the folder that
+manages it deploys this stack somewhere else, which a stack block copied from
+another stack also looks like. A single-folder command prints it (`Note:` on
+stderr); `sync apply` puts it on the folder's `notes`, a `--dry-run` included.
+
+**Folder writes, and why they are declared rather than flagged.** A folder is a
+path, shared by every feature of the organization, so it can never be "inside"
+a stack's feature, and a second stack in the same organization writes the same
+folder as the first. A per-run `--allow-folder-writes` would have to be passed
+on every push of the first stack too, and would wave through every folder at
+once; a declared `folder` write source is decided once per stack, in review,
+and never inherited — the same deliberate per-stack bind every write
+needs. `ronja import feature` declares each folder its workflows write and
+binds it in the importing stack, so the tree deploys back unchanged; a new stack
+binds its own path (or the same one, deliberately).
+
+### Limits
+
+- **The gate reads, then the write happens.** `wf publish`, `app publish` and
+  `wf test` gate the draft as the server holds it at that moment, and commit or
+  run it in a later request. An edit made in the web app between the two is
+  committed or run unchecked. Closing it needs the server itself to check a
+  managed row's commit, which it does not do today (BL-b3c7); the window is
+  the length of one command.
+- **Path reuse.** A `moved` / `removed` entry is evaluated by path, and the
+  server does not record which row a declaration took away from an address, so
+  reusing a path needs the old entry deleted first, as in a legacy folder.
+- **A copied folder pushed on its own.** Two folders sharing an id (a `cp -r`)
+  are refused by the tree walk, which sees both; a single-folder `push` inside
+  the copy sees one folder and is not refused — it deploys against the
+  original's claims. Give the copy its own id (delete `"id"`, run `sync adopt`).
+- **An anchor that did not record.** The change landed and the command exits
+  non-zero naming it; the next run re-reads the server's anchor. The one silent
+  consequence: an edit made in the web app that returns a table's SQL to exactly
+  the text the stale anchor recorded matches it, reads as no drift, and is
+  overwritten by the next apply.
+- **A row deleted by `discard --delete-workflow`** leaves its claim `lost`; the
+  next apply refuses it, and `sync unmanage` then `sync adopt` clears it.
+- **A pipeline header changed only on the server.** A `.sql` file's
+  documentation header is part of its SQL, so a description or name changed in
+  the web app is pulled into the header and the next apply publishes the table
+  once to write it (`pending`). The notice does not cover a docs sidecar's write
+  into a table another folder deploys.
+- **`sync status`'s undeployed-against-the-lock leg** reads the committed lock
+  with no refresh, so for an adopted pipeline folder whose committed lock is
+  stale it can name a file as undeployed that the server's anchor knows is live.
+
+## Importing a feature (`ronja import feature`)
+
+```bash
+ronja import feature Sales                      # into the current (empty) directory
+ronja import feature collection-abc123 ./sales --stack main --json
+```
+
+`import feature` turns what already runs in a feature into a repository tree of
+**adopted** folders, one per resource, whose references are written as stems,
+addresses and declared dependencies instead of this organization's ids — and
+claims every row for one stack, so the first `sync status` of the tree is clean
+and the first `sync apply` of it sends no write.
+
+**Defaults.** The name is matched EXACTLY among the organization's features (a
+private feature is imported by its id — a name could otherwise mean somebody's
+private one); a name matching none, several, or only a full page of search hits
+is refused. `--stack` defaults to `main`, pinned to the feature's id. The
+destination defaults to the current directory and must be empty but for a
+`.git` (a directory just `git init`ed, or a clone of an empty repository, is
+where a repository starts; the tree is moved in beside it): import never
+re-imports into a tree (`sync status` answers "what changed on the server"). A
+hidden `.ronja-import-…` directory an interrupted import left there is named on
+its own and not removed — nothing tells it from the staging directory of an
+import still running into the same place — so remove it and run again.
+
+**Who may import tables.** A table or metric claim needs the **Admin** role, so
+the import reads the caller's role (`/me`) before planning. For anyone else it
+writes no pipeline folder: every derived table and metric is listed under
+`notImported` ("tables and metrics need an Admin to manage; they were declared
+as data sources") and declared as a read data source — a write-capable one where
+it is written — wherever it is referenced, bound in the importing stack. A
+credential that cannot call `/me` (a scoped token) is planned as an Admin; a
+claim the server then refuses is withdrawn as step 5 describes.
+
+**The tree.**
+
+```
+pipelines/<feature>/     every derived table, its metrics and enabled checks (what `pipeline clone` writes)
+workflows/<name>/        one folder per workflow
+apps/<name>/             one folder per data app
+modules/<name>/          one folder per module
+automations/<feature>/   one .json file per automation
+```
+
+Names are slugged from the rows' names, collision-safe (`report`, `report-2`).
+Connector, foundation, manual and dynamic tables have no SQL a file could hold,
+and saved agents, notes, secrets, codexes and MCP servers are not folder kinds:
+none of them is imported, each is a data source wherever it is referenced, and
+each is listed under `notImported` with why.
+
+**Steps, in this order** (`import.go`):
+
+1. Read the feature's **reference inventory** (`GET /api/v2/feature/:id/references`,
+   every page until `next` is absent — a page can be short or empty and still have
+   a next one). A kind the token may not read (`omittedKinds`) refuses the import:
+   its rows would be left out and their references unrewritten.
+2. Read the feature's claims (`GET /managed?feature=`, no folder) **before
+   anything else**. A row another folder already manages is not imported;
+   references to it become data sources, and the report names it.
+3. Read each row through the clone readers — the LIVE row, never the caller's
+   draft, since the live row is what gets claimed and anchored — and run the
+   portability pass (below). Nothing has been written yet.
+4. Write each folder — into a hidden `.ronja-import-…` directory INSIDE the
+   destination, whose top-level entries are moved into the destination only
+   once every folder is written. A failure part way (the writers read each
+   workflow's, app's and module's files and head version as they go) removes
+   the staging directory and every entry already moved, so the destination is
+   left as it was: empty. The destination itself is never removed or replaced —
+   it is the current directory by default, and a shell standing in it keeps
+   standing in it — through its clone command's own writer (`writeWorkflowClone`,
+   `writeDataAppClone`, `writeModuleClone`, `writePipelineClone`; automations are
+   new, see below), mint its folder id (format version 6, 7 where a dependency
+   needs it), and record the anchors a push would record: head versions, applied
+   titles, a pipeline's live fingerprints and names, each automation's
+   `updatedAt`.
+5. Claim every row in `POST /managed/claim` batches of at most 200, each row
+   reporting its own outcome, then record the anchors on the claims. A row the
+   server REFUSES — one of the known refusal codes (`address_claimed`,
+   `resource_claimed`, `moved_out`, `trashed`, `not_root`, `not_claimable`,
+   `not_found`, `forbidden`, `insufficient_scope`, `invalid`) — leaves the tree,
+   as a row claimed elsewhere never entered it, and every folder that held or
+   referenced it runs the portability pass again without it and is written
+   again (into a staging directory inside the tree, then swapped in): a
+   reference to it becomes a data source bound in the importing stack, never an
+   address nothing will claim. A folder whose every row was refused is removed.
+   That second pass claims nothing, so it cannot be refused anything new and
+   the import converges in it. Any other answer — a batch with no per-row
+   answer (a refused or lost request), a per-item `internal_error` (a server
+   fault the server's docs say to retry), a code this build does not know —
+   says nothing about the row: it keeps its lock entry, is reported `unclaimed`
+   once, and `ronja sync adopt --stack <name>` in the tree claims it. The anchor
+   step leaves an unclaimed row alone rather than claim it behind the report's
+   back. Either way the import exits 1.
+6. Report.
+
+**The portability pass, from the inventory alone** (`import_plan.go`):
+
+| the reference is… | written as |
+|---|---|
+| a read of a table the same pipeline folder builds (a `{{ ref }}` in its SQL, a metric's source) | the sibling's stem: `{{ ref('orders') }}`, `"source": "orders"` |
+| a read or run of anything imported into ANOTHER folder: table, metric, workflow, app, module | an address dependency (`from` + `address`), no bind |
+| `{{ write('table-X') }}` where X is this workflow's own output (`ownOutput` with a logical name) | the name form `{{ write('orders_daily') }}`, declared `"output": true` and bound in the importing stack — own outputs choose their names first, so another table called the same takes `orders_daily_2` instead |
+| any other write position: a write marker naming a table the workflow does not own, a codex marker or a codex grant (`read_write`), a table in an agent automation's reference set, a feature there other than its own (`read_write` since the inventory widened it), any write whose target this credential cannot read | a write-capable data source, `"write": true`, bound in the importing stack |
+| a read of anything not imported — a connector table, another feature's row, a note, a row claimed by another folder, a row this credential cannot read | a read data source, bound in the importing stack (an unreadable row to the id the reference carries) |
+| a secret, a mailbox, an MCP server | a side-effect data source, bound in the importing stack |
+| a saved agent, a workflow outside the feature (a `{{ workflow }}` / `{{ agent }}` marker, an app's allowlist, an automation's action or reference) | a run data source, `"run": true`, bound in the importing stack — so the tree deploys back unchanged, and a new stack binds it, or another row, on purpose |
+| an automation `references` entry naming the automation's own feature | `"@feature"` |
+| an output literal (`tools.replaceTable("table-…")`) | LEFT IN PLACE and reported; its table is declared write-capable all the same |
+| an id literal in app source (`useQueue({tableID: "table-…"})`, `queryExternal("secret-…")`) | LEFT IN PLACE and reported |
+| a folder write (`{{ file('…', 'write') }}`, `saveFile(…, folder=…)`) | left as written (a path, not a row) and reported; the folder is declared a folder write source (`"kind": "folder", "write": true`) bound to its path in the importing stack, which is what the write gate admits it through |
+
+The alias form is produced two ways, both of which round-trip. In a position the
+codec reads both ways — a marker, an `optionsQuery`, a write marker — the
+dependency is declared and the server's content is de-aliased through the
+folder's own codec, the same `toDisk` every later status runs. In an
+outbound-only position — an app's `access` block, a metric's `recipe.source`, an
+automation's fields — the alias is written directly. Aliases are taken from the
+rows' names (slugged to the alias charset, kept clear of the folder's stems),
+falling back to the kind and the id's suffix for a row with no usable name. A
+binding with no position in a file — a workflow's explicit secret bindings, a
+binding column no marker explains, a folder write scope, a table's input-model
+leftovers — is not carried by the folder, exactly as a clone does not carry it,
+and each is listed under `notCarried` with what changes where the tree creates
+the resource anew (a workflow runs without that secret, a table does not list
+that input). Deploying back to the same row leaves such a binding as it is: a
+push never sends those fields.
+
+**Automations** are imported for the first time. Each becomes the automation
+loop's own curated `.json` file — every field the row holds a value for, ids in
+alias form — so `ronja automation status`, `ronja automation push` and `ronja
+sync` treat it like one `init` wrote. Each is checked the way a push checks it
+(parsed, resolved through the folder's codec, compared with the row) and one that
+would not read back with no delta refuses the import before anything is written.
+Its `updatedAt` anchor is in the lock, so the drift guard is armed from the first
+run.
+
+**The report** (`--json`): `folders` (each with its folder id and rows),
+`claims` (one outcome per row: `claimed`, `refused` or `unclaimed`), `literals` (each left-in-place literal with its
+folder, file, line, call and target, and the alias an output literal's table was
+declared under), `dataSources` (alias, kind, `read` / `write` / `run` /
+`side_effect`, and the id it is bound to in the importing stack), `addresses`,
+`outputs` (each own output declared by name, and the row the importing stack
+binds it to), `claimedElsewhere`, `notImported` (every resource the inventory
+lists and no folder holds — a non-derived table, a workflow's output, a saved
+agent, a note, a secret, a codex, an MCP server, a derived table or metric a
+non-Admin cannot manage, a metric the instance answered no recipe for — each
+with why), `notCarried` (each structured-field binding no file carries: folder,
+resource, field, target and effect), `problems` and `verdict`. The human report
+prints the same sections. Exit 0 when every row was claimed and anchored,
+1 otherwise — the tree is written either way.
+
+**What the tree is for.** Import prepares a tree that deploys back to the stack it
+was imported for: commit it, and `sync apply --stack main` keeps that feature in
+step with the repository.
+
+**Deploying it to a second feature of the same organization** is one `sync apply
+--allow-create`, once the new stack is declared. Two limits shape it, and both
+belong before the walk-through:
+
+- ⚠️ **One checkout per stack.** The local `.ronja/state.json` baseline is keyed
+  by instance and organization, not by stack (BL-4e71), so a checkout
+  that has deployed one stack reads another stack of the same organization
+  against that stack's baseline and refuses its rows as a repointed binding —
+  never writing over them. Switching stacks (dev, then main) in ONE checkout is
+  therefore refused; deploy each stack from its own clone. A CI checkout (no
+  `.ronja/`) is unaffected. Stacks in different organizations have separate
+  baselines and are unaffected too.
+- ⚠️ **One live module per organization.** A module's package name is unique
+  among an organization's live modules, so every stack deploys the module folder
+  to the feature it already lives in, and applying any stack publishes that one
+  copy (the `shared_module` warning below).
+
+The stack is declared by hand (one command for it is BL-6179)
+in EVERY folder's `ronja.json` — the same `url` and `tenantID` as `main`, the new
+feature's id — and its data sources are bound there:
+
+- every READ or side-effect source (a connector table, another feature's table,
+  a secret, an MCP server) — to the original rows, usually, or to the new
+  stack's own; `ronja bind --stack <new>` proposes name matches for these;
+- every WRITE source (`"write": true`, a folder or a feature included) — by
+  hand, to a row this stack may write. `ronja bind` never proposes one;
+- every RUN source (`"run": true`) — by hand, to the workflow or agent this stack
+  may run: the original only when the new stack should really start it.
+  `ronja bind` never proposes one either;
+- nothing for an address or an own output: those resolve in the new stack
+  through the run itself.
+
+Then `sync apply --stack <new> --allow-create` creates every row in the new
+feature in dependency order, each reference between imported resources resolving
+to the new copy as it is made. Two things in the tree still name the ORIGINAL
+feature's rows, and the import report lists both: an id literal in app source
+(edit it by hand), and an output literal — which the write gate refuses in the
+new stack, naming the line, until it is written as `{{ write('<alias>') }}` so
+the stack's bind is what it writes. A module's package name is unique in the
+organization, so its folder's new stack names the feature the module already
+lives in: every stack of one organization imports the same module.
+
+⚠️ **So applying the new stack publishes the organization's ONE module** — the
+copy every feature's workflows import, production's included. `sync apply`
+says so loudly whenever it would push a module folder into a feature its other
+folders do not all deploy to (or the run holds no other folder): a run-level
+warning, `shared_module`, at the top of the human report and under `warnings`
+in `--json` (`reason`, `path`, `detail`). It is a warning, not a refusal: one
+shared module is the only shape the tree can have, and an edit to it reaches
+every stack whichever one you deploy. The warning is computed AFTER the run, so
+it tells a planned change from a no-op: "This publishes …" when the module
+changes (or the dry run cannot tell), and "Nothing in module … changes in this
+run" when the dry run found the live module holding the folder or the apply's
+push had nothing to push (`moduleUnchangedIn`). Both say when a change reaches a
+consumer: a workflow pins a module version — resolved at its draft save, frozen
+at its commit (claude/primitives/MODULE.md, "Version pinning") — so a published
+module reaches a workflow only once that workflow is saved and published again.
+
+**Warnings and notes lead with the action.** The `shared_module` warning, the
+write gate's notes on a bind admitted outside the stack's feature
+(`noteBoundOutside`, `noteManagedOutside`) and the unmanaged-folder notes put
+one sentence first — what happened and what to do — and the explanation on the
+lines after it: in `--json` after a `\n` in `detail` or the note, and indented
+under the first line by the human report (`indentContinuation`). The
+`writes_outside_target` / `runs_outside_target` refusals do the same: the first
+line names the two ways out, the targets follow, then how to bind one and why.
+
+`TestImportedTreeStandsUpAFreshStackInOneApply` is the import proof's step 2:
+the fixture imported, a `dev` stack on an empty feature, one apply — every
+reference between imported resources points at the new copies, every data source
+at the original rows, every create is claimed, a second apply changes nothing,
+and the report named the one TSX literal. `TestSlipScenarioIsRefusedBeforeAnyWrite`
+is the slip scenario: refused `writes_outside_target` with no row created.
+
+`TestImportFeatureProof` is the import fixture end to end, against one fake
+instance holding every kind (`import_harness_test.go`: the four kind fakes behind
+one router, one managed ledger, and the reference inventory as 3a serves it,
+paging included): the tree's `sync status` and `sync check` are clean, `sync
+apply --stack main` sends no write, the report names exactly the two literals
+left in place, and every reference is a stem, an address, an own-output name or a
+data source bound in `main`. `TestImportLeavesNoUnreportedLiteral` scans every
+written file for an id the report does not name. One test per row of the
+table above is in `import_portability_test.go`.
 
 ## Design rules
 
@@ -6072,7 +8188,8 @@ These are load-bearing for the agent use case — please keep them true:
 ```
 cmd/ronja/           main package — its NAME is what makes the binary `ronja`
 internal/commands/   cobra command tree (root, auth, context, env, api, query,
-                     secret, stdin, bind, sync_*, workflow_*)
+                     secret, stdin, bind, sync_*, import*, pull*, managed*,
+                     write_gate, address_deps, workflow_*)
 internal/api/        HTTP client + the endpoint shapes it mirrors, plus raw.go
                      (transport only, mirrors nothing), query.go and search.go
 internal/config/     the CLI config file (os.UserConfigDir()/ronja/config.json),
@@ -6083,6 +8200,9 @@ internal/wfdir/      the synced folder: ronja.json, ronja.lock.json,
                      pipeline / module), and stacks in stack.go / lock.go
 internal/tablerefs/  the {{ ref('…') }} grammar: canonicalization to id form,
                      and the input list derived from it
+internal/markers/    the marker families the alias layer reads, mirrored from
+                     the server's patterns; writes.go is `{{ write() }}`, read
+                     on its own, and both rewrite through one splice
 ```
 
 The workflow commands are one file per verb (`workflow_push.go`,
@@ -6116,6 +8236,44 @@ from. Its mirror is `internal/api/search.go`, against
 of eleven, plus the two server constants whose absence would be misread
 (`minQueryLen`, which answers a short term with an empty result and no error, and
 the fact that the endpoint has no `codex` or `module` leg at all).
+
+`internal/commands/import*.go` is `ronja import feature`: `import.go` the
+command, its steps and the staged write, `import_plan.go` the folder plan and
+the portability pass, `import_rewrite.go` the references rewritten into the
+form the plan chose, `import_claim.go` the claims and the settle pass over the
+rows the server refused, `import_report.go` the report, and
+`import_automation.go` the automation files. It writes every folder
+through the clone commands' own writers (`cloneHooks` carries what it changes),
+and its one mirror is `internal/api/references.go`, against
+`backend/engine/erefs/view.go` and `backend/api/v2/feature/api_references.go`.
+`internal/commands/address_deps.go` resolves dependencies declared by address.
+`internal/commands/pull*.go` is `ronja <kind> pull`: `pull.go` the command,
+its plan, refusals and guarded anchor step, `pull_git.go` the git rules that
+keep a pull from overwriting work (and the one way the package runs git),
+`pull_report.go` the report, `pull_draftkinds.go` the skeleton the workflow,
+data-app and module pulls share (`pullDraftKind`, one adapter per kind),
+`pull_pipeline.go` and `pull_automation.go` the per-file kinds' renderers;
+`unified_diff.go` the diff it prints, and `internal/api/guard.go` the read-only
+request guard. `internal/commands/managed_notice.go` is the classic-loop notice,
+read off each kind's `managedBy` (mirrored in `internal/api/managed.go` against
+`backend/resource/rmanaged/managed_by.go`).
+
+`internal/commands/managed*.go` is an adopted folder's SERVER-SIDE STATE:
+`managed.go` reads it into the lock (`refreshManaged`) and settles what it
+finds pending (`applyManaged`, `settleManaged`); `managed_anchor.go` records the
+folder's and each claim's anchor after every lock save; `managed_describe.go`
+words its refusals and notes; `managed_source.go` is the source label and the
+foreign-repository check. `internal/api/managed.go` mirrors
+`backend/api/v2/managed`, and `internal/wfdir/managed.go` translates a lock
+entry to and from an anchor. `sync_adopt.go` is `ronja sync adopt` and
+`ronja sync unmanage`. `write_gate.go` is the write gate — every path that puts
+code or grants in front of an adopted stack calls one of its `gate*` functions.
+`sync_apply_order.go` is `sync apply`'s dependency order and the fresh stack in
+one apply; `sync_apply_managed.go` its adopted-folder steps,
+`sync_apply_modules.go` the shared-module warning, and `sync_apply_dryrun.go`
+the dry run's per-file comparison for pipeline and automation folders.
+`internal/wfdir/dependency_shape.go` holds the shape rules of a dependency
+declared by address, as a write target, an output or a run edge.
 
 `internal/api/raw.go` is the odd one out: it deliberately mirrors nothing, and
 its response body carries the request's context cancellation on `Close` so a
@@ -6220,6 +8378,20 @@ signing in once with `--with-token` instead of carrying a token on every command
 — keeps its login out of the shared store: `ronja login` makes the profile it
 creates current, so the same login without the variable re-points which
 organization the developer's own bare `ronja api` reaches.
+
+**A job that publishes is bound by the organization's self-approval policy.**
+`wf publish`, `app publish`, `module publish`, `pipeline publish` and `sync
+apply` all commit a draft, and the token counts as a person — a PAT as its user,
+an API token as the **Admin** who created it. Where the organization has turned
+self-approval off, the job cannot commit a draft that person authored, so on a
+shared resource one job cannot both push a change and take it live: a different
+Admin (or the feature's maintainer) publishes it, or the job submits it for
+review. Under the same policy, deleting the job's API token — or the Ronja API
+credential that holds it — strands whatever it filed and nobody has decided
+yet: a draft, proposal or move request filed by a token that no longer exists
+can be approved by no one. Rotating means create-new-then-delete-old, so publish
+or withdraw what the job filed first. A PAT files as its user, so deleting one
+strands nothing.
 
 ## Tests
 

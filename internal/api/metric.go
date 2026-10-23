@@ -96,6 +96,10 @@ type CreateMetricInput struct {
 	// viewer. omitempty for the same three-state reason: absent takes the
 	// organization default.
 	ReportingTimezone string `json:"reportingTimezone,omitempty"`
+	// Managed is the repository address this create claims, in the create's own
+	// transaction (backend resource/rmanaged). Nil — no key — for a folder that
+	// has no folder id, which is every create a legacy folder makes.
+	Managed *ManagedClaimInput `json:"managed,omitempty"`
 }
 
 // CreateMetricResult mirrors feature.MetricCreateResult.

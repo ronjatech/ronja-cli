@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -466,8 +467,16 @@ type pipelineMetricFileResult struct {
 	// purpose — that draft is where the work is.
 	DraftID string `json:"draftID,omitempty"`
 	Outcome string `json:"outcome"`
-	// Created reports that this push brought the metric into existence.
+	// Created reports that this push brought the metric into existence — or
+	// ADOPTED one (below), which the rest of the cycle treats the same way: the
+	// row holds this file's definition and has no earlier recording to guard.
 	Created bool `json:"created"`
+	// Adopted reports that the create was refused name_taken and the metric
+	// already holding the name was adopted, because it holds exactly this file's
+	// definition — a row an EARLIER push made and failed to record. Created is
+	// true beside it for the push's own logic, but no row was made by this
+	// push, so nothing that COUNTS rows made may count it.
+	Adopted bool `json:"adopted,omitempty"`
 	// Verdict is the build verdict, one of api.BuildVerdict*.
 	Verdict string `json:"verdict,omitempty"`
 	Error   string `json:"error,omitempty"`
@@ -490,7 +499,23 @@ type pipelineMetricFileResult struct {
 	// directions: a recipe refusal, a failed build or an up-to-date definition
 	// never skips the tag half, and a tag refusal never fails the recipe.
 	Tags *pipelineMetricTagResult `json:"tags,omitempty"`
-	URL  string                   `json:"-"`
+	// Rename is the rename this push STAGED from the file's `"name"`, on the
+	// draft — it reaches the live metric at publish. Absent when the file
+	// declares no name or the metric already holds it.
+	Rename *renameResult `json:"rename,omitempty"`
+	URL    string        `json:"-"`
+	// drift marks a refusal for drift — what `ronja <kind> pull` takes into an
+	// adopted folder — so the run's summary can name it.
+	drift bool
+}
+
+// metricCreateName is the name a metric file's create stamps: the DECLARED name
+// when the file has one, and the stem otherwise.
+func metricCreateName(file pipelineMetricFile) string {
+	if file.File.Name != nil {
+		return *file.File.Name
+	}
+	return file.Alias
 }
 
 // pushMetricFiles is the METRIC half of a pipeline push.
@@ -565,19 +590,50 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 	}
 
 	// --- 1. Create, for a file with no metric behind it yet -----------------
+	if out.MetricID == "" && opts.Pull {
+		out.Outcome = pullPending
+		out.Error = "not deployed yet; the next apply creates its metric (with --allow-create)"
+		return out
+	}
+	if out.MetricID == "" && opts.NoCreate {
+		// The create gate, on the path that creates. See NoCreate.
+		return refuse("%s", refuseCreateUnderApply(file.Path, "metric"))
+	}
 	if out.MetricID == "" {
 		// adoptedRow is the row a name_taken create adopted, nil on a create
 		// that succeeded — the tag half needs it, since an adopted row may be
 		// archived or hidden and a freshly created one is neither.
 		var adoptedRow *api.Table
 		created, err := client.CreateMetric(ctx, api.CreateMetricInput{
-			Name:              file.Alias,
+			Name:              metricCreateName(file),
 			FeatureID:         f.Binding.FeatureID,
 			Recipe:            file.Resolved,
 			Description:       valueOrEmpty(file.File.Description),
 			ReportingTimezone: valueOrEmpty(file.File.ReportingTimezone),
+			// The address this folder claims, in the create's own transaction —
+			// nil (no key) for a folder with no id.
+			Managed: f.managedClaim(file.Path),
 		})
+		// managedAdopted: see pushOneTable's — a create that found this folder's
+		// own address already holding a metric, adopted BY ID, continuing as the
+		// update it is.
+		managedAdopted := false
+		var managedErr error
+		if id, adopted, refusal := f.adoptOnAddressClaimed(ctx, file.Path, err); err != nil && adopted {
+			out.MetricID, managedAdopted, managedErr = id, refusal == nil, refusal
+		} else if err != nil && f.managed != nil && isNameTakenOnMetricCreate(err) {
+			// ⚠️ ADOPT-BY-NAME IS RETIRED FOR AN ADOPTED FOLDER (it locates a row only through the server's claims).
+			// The name gate runs before the claim, so a name_taken here is also a
+			// lost race to this folder's own address: the server's state says
+			// which, and a metric that merely carries the name is never taken over.
+			taken, _ := api.AsNameTaken(err)
+			id, aerr := f.adoptOnNameTaken(ctx, file.Path, metricCreateName(file), taken)
+			out.MetricID, managedAdopted, managedErr = id, aerr == nil, aerr
+		}
 		switch {
+		case managedErr != nil:
+			return refuse("creating the metric for %s was refused — %v", file.Path, managedErr)
+		case managedAdopted:
 		case err == nil:
 			out.MetricID = created.Metric.IdentityID()
 			out.Warnings = append(out.Warnings, created.Warnings...)
@@ -587,15 +643,32 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 			// failed to persist. The metric exists, the recording does not, and
 			// the next push tries to create the same name — which the server
 			// refuses with something the author cannot act on from the folder.
-			adopted, why := reconcileMetricNameTaken(ctx, client, f.Binding, file.Alias)
+			adopted, why := reconcileMetricNameTaken(ctx, client, f.Binding, metricCreateName(file))
+			fix := "Rename the file (its stem is the metric's name)"
+			if file.File.Name != nil {
+				fix = "Change the file's \"name\""
+			}
 			if adopted == nil {
 				taken, _ := api.AsNameTaken(err)
-				return refuse("creating the metric for %s in feature %s was refused — that name is taken:\n      %s\n    %s\n    Rename the file (its stem is the metric's name), rename whatever holds the name in the web app, or point this file at the existing row with `ronja bind`",
-					file.Path, f.Binding.FeatureID, taken, why)
+				return refuse("creating the metric for %s in feature %s was refused — that name is taken:\n      %s\n    %s\n    %s, rename whatever holds the name in the web app, or point this file at the existing row with `ronja bind`",
+					file.Path, f.Binding.FeatureID, taken, why, fix)
+			}
+			// ADOPTED ONLY WHEN IT IS PROVABLY THIS FILE'S ROW. The case the
+			// reconcile exists for is a create of THIS file whose answer was
+			// lost, and that row holds this file's definition. A metric of the
+			// same name holding anything else is somebody else's — a colleague's
+			// hand-made metric, or one a declared "name" happens to collide
+			// with — and adopting it would mark it Created, which skips every
+			// drift leg, and stage this file's recipe over theirs. Only an EXACT
+			// match counts, on the re-anchor's rule (sameRecipe).
+			if !sameRecipe(adopted.MetricRecipe, file.Resolved) {
+				return refuse("creating the metric for %s in feature %s was refused — the name %q is taken by metric %s, whose definition is not this file's, so it is not a metric this folder lost track of.\n    %s, or rename %s in the web app. If %s IS this file's metric, point the file at it with `ronja bind` and push again",
+					file.Path, f.Binding.FeatureID, metricCreateName(file), adopted.IdentityID(), fix, adopted.IdentityID(), adopted.IdentityID())
 			}
 			fmt.Fprintf(os.Stderr, "  Note: %s names a metric that already exists in this feature (%s) and this folder had no record of it — adopting it rather than refusing.\n",
 				file.Path, adopted.ID)
 			out.MetricID = adopted.IdentityID()
+			out.Adopted = true
 			liveBase = metricfile.RecipeSHA256(adopted.MetricRecipe)
 			adoptedRow = adopted
 		case api.StatusOf(err) == 403:
@@ -604,35 +677,51 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 			// path this file drives is open to any member. So a push that refuses
 			// here is one file that needs one of them once.
 			return refuse("creating the metric for %s in feature %s was refused (%v).\n    Creating a NEW metric needs an admin or a maintainer of the feature. Editing metrics that already exist does not — that is what your drafts are, and `ronja pipeline push` runs the whole cycle for them.\n    Ask an admin or a maintainer of that feature to create %q (or to run this one push), then push again",
-				file.Path, f.Binding.FeatureID, err, file.Alias)
+				file.Path, f.Binding.FeatureID, err, metricCreateName(file))
 		default:
 			return refuse("create the metric for %s in feature %s: %v", file.Path, f.Binding.FeatureID, err)
 		}
-		out.Created = true
-		// RECORDED IMMEDIATELY, before anything else is attempted, and this is the
-		// crash rule pushOneTable's create arm states in the same words. The
-		// create returns a LIVE row — colleagues can see it the moment it exists —
-		// so a push that died before saving would leave a metric nobody can find
-		// and the next push would create a second one beside it.
-		//
-		// The DECLARED fingerprint is deliberately NOT recorded here: the file has
-		// not finished being pushed (nothing has built), and claiming it had would
-		// let the next bare push skip a metric whose build never ran.
-		live.setMetricSeen(file.Path, out.MetricID, liveBase, "")
-		if err := f.saveBaseline(); err != nil {
-			out.Outcome = metricOutcomeRefused
-			// NOT f.bindingFiles(), which names ronja.json for a legacy folder: a
-			// metric's id never goes in the manifest. It goes in the lock on a named
-			// stack and in the git-ignored local baseline otherwise, and sending
-			// somebody to the wrong file is worse than sending them to none.
-			out.Error = fmt.Sprintf("metric %s was CREATED, but %s does not name it: %v",
-				out.MetricID, metricRecordingFile(f), err)
-			fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n  Add it by hand, or the next push will create a second metric for this file.\n", file.Path, out.Error)
-			return out
+		if managedAdopted {
+			// adoptManagedClaim recorded the row and its anchor in the lock;
+			// written now, and the drift baselines are read back from it so the
+			// guards below compare against the server's anchor.
+			if err := f.saveBaseline(); err != nil {
+				return refuse("adopted metric %s for this file, but %s does not name it: %v", out.MetricID, metricRecordingFile(f), err)
+			}
+			_, liveBase, declared = live.metricSeen(file.Path)
+		} else {
+			out.Created = true
+			// RECORDED IMMEDIATELY, before anything else is attempted, and this is the
+			// crash rule pushOneTable's create arm states in the same words. The
+			// create returns a LIVE row — colleagues can see it the moment it exists —
+			// so a push that died before saving would leave a metric nobody can find
+			// and the next push would create a second one beside it.
+			//
+			// The DECLARED fingerprint is deliberately NOT recorded here: the file has
+			// not finished being pushed (nothing has built), and claiming it had would
+			// let the next bare push skip a metric whose build never ran.
+			live.setMetricSeen(file.Path, out.MetricID, liveBase, "")
+			// A DECLARED name is what the live row now holds (an adopted row's
+			// name is the one the create asked for — that is how it was found), so
+			// it is the name this folder agrees with, recorded with the id.
+			if file.File.Name != nil {
+				live.setMetricName(file.Path, out.MetricID, *file.File.Name)
+			}
+			if err := f.saveBaseline(); err != nil {
+				out.Outcome = metricOutcomeRefused
+				// NOT f.bindingFiles(), which names ronja.json for a legacy folder: a
+				// metric's id never goes in the manifest. It goes in the lock on a named
+				// stack and in the git-ignored local baseline otherwise, and sending
+				// somebody to the wrong file is worse than sending them to none.
+				out.Error = fmt.Sprintf("metric %s was CREATED, but %s does not name it: %v",
+					out.MetricID, metricRecordingFile(f), err)
+				fmt.Fprintf(os.Stderr, "  Refused: %s — %s\n  Add it by hand, or the next push will create a second metric for this file.\n", file.Path, out.Error)
+				return out
+			}
+			// THE TAG HALF, straight after the create: the row exists and is a metric
+			// by construction, and nothing the recipe steps below do may stop it.
+			out.Tags = reconcileMetricTags(ctx, client, live, file, out.MetricID, adoptedRow, opts)
 		}
-		// THE TAG HALF, straight after the create: the row exists and is a metric
-		// by construction, and nothing the recipe steps below do may stop it.
-		out.Tags = reconcileMetricTags(ctx, client, live, file, out.MetricID, adoptedRow, opts)
 	}
 
 	// --- 2. Resolve the draft ----------------------------------------------
@@ -652,6 +741,10 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 	// precondition — no draft precondition speaks about the live row at all —
 	// so it is guarded here, before the first byte is written.
 	var liveRow *api.Table
+	// needRename is whether the row this push writes to — the draft — does not
+	// yet hold the declared name. It keeps a file whose definition is up to date
+	// from being reported up to date while a rename is still to be staged.
+	needRename := false
 	if !out.Created {
 		liveRow, err = client.GetTable(ctx, out.MetricID)
 		if err != nil {
@@ -670,16 +763,28 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 			return refuse("%s is bound to %s, which is a %s table rather than a metric — a metric file cannot define one.\n    `ronja bind` cannot tell a metric from a table of the same name (the search API reports both as \"table\"), so re-point the alias at the metric's own id, or rename the file",
 				file.Path, out.MetricID, liveRow.Kind)
 		}
+		f.noteTableManagedBy(liveRow)
 		// THE TAG HALF, once the row is known to exist and to BE a metric — so a
 		// plain table a stem was bound to is never tagged — and BEFORE the drift
 		// refusals and the up-to-date return below, neither of which is about
 		// tags. See pipeline_metric_tags.go.
 		out.Tags = reconcileMetricTags(ctx, client, live, file, out.MetricID, liveRow, opts)
 		liveNow := metricfile.RecipeSHA256(liveRow.MetricRecipe)
-		if liveBase != "" && liveNow != liveBase {
+		if opts.Pull {
+			return pullAnchorMetric(live, file, out, liveRow, liveNow)
+		}
+		if !metricDefinitionMoved(liveBase, liveRow, file) && liveBase != "" {
+			// LIVE EQUALS DESIRED IS NEVER DRIFT (see metricDefinitionMoved): a live
+			// recipe that moved since the recording TO exactly what this file
+			// resolves to is re-anchored rather than refused. A no-op when it did
+			// not move at all.
+			liveBase = liveNow
+		}
+		if metricDefinitionMoved(liveBase, liveRow, file) {
 			if !opts.Force {
-				return refuse("the definition of %s changed on the server since your last sync — pushing %s would overwrite it.\n    Run `ronja pipeline status` to see what the metric says now, or push --force to overwrite",
-					out.MetricID, file.Path)
+				out.drift = true
+				return refuse("the definition of %s changed on the server since your last sync — pushing %s would overwrite it.\n    Run `ronja pipeline status` to see what the metric says now, or push --force to overwrite%s",
+					out.MetricID, file.Path, opts.pullHint)
 			}
 			// THE ONE DESTRUCTIVE GATE IN THIS LOOP. Leg (a) firing on a metric is
 			// not "somebody edited a file": it is a colleague having committed a
@@ -689,8 +794,9 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 			// difference is PRINTED, and a metric an admin has VERIFIED is refused
 			// outright until a second flag is typed.
 			if liveRow.MetricStatus == api.MetricStatusVerified && !opts.ForceVerifiedMetric {
-				return refuse("%s is a VERIFIED metric whose definition changed on the server since your last sync, and --force alone will not overwrite it.\n%s    An admin verified the definition that is there now, and publishing over it retires that verification.\n    Pull their change into %s, or re-run with --force --force-verified-metric to overwrite it deliberately",
-					out.MetricID, describeRecipeOverwrite(liveRow.MetricRecipe, file.Resolved), file.Path)
+				out.drift = true
+				return refuse("%s is a VERIFIED metric whose definition changed on the server since your last sync, and --force alone will not overwrite it.\n%s    An admin verified the definition that is there now, and publishing over it retires that verification.\n    Pull their change into %s, or re-run with --force --force-verified-metric to overwrite it deliberately%s",
+					out.MetricID, describeRecipeOverwrite(liveRow.MetricRecipe, file.Resolved), file.Path, opts.pullHint)
 			}
 			fmt.Fprintf(os.Stderr, "  Note: --force — overwriting the definition of %s (%s):\n%s",
 				out.MetricID, file.Path, describeRecipeOverwrite(liveRow.MetricRecipe, file.Resolved))
@@ -707,26 +813,45 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 		if liveBase == "" {
 			liveBase = liveNow
 		}
+
+		// THE NAME, armed only by a file that declares one — the three arms in
+		// name_attr.go, against the live metric and then our own draft, which is
+		// what a publish lands. A name moved elsewhere is refused before the
+		// first byte, like a definition that moved; --force overwrites it and
+		// acknowledges the live name, so the next push does not re-report it
+		// before the rename is published.
+		if declared := file.File.Name; declared != nil {
+			base := nameBaseline{Recorded: live.metricName(file.Path, out.MetricID), Stem: file.Alias}.withCarried(live.carriedMetricStem(file.Path, out.MetricID))
+			var moved []string
+			action := decideName(declared, liveRow.Name, base)
+			if action == nameDrift {
+				moved = append(moved, nameDriftReason("the live metric", liveRow.Name, *declared, base))
+			}
+			if draft != nil && !draftNameIsOurs(draft.Name, *declared, liveRow.Name, base, live.stagedName(file.Path, draft.ID)) {
+				moved = append(moved, nameDriftReason("your draft "+draft.ID, draft.Name, *declared, base))
+			}
+			if len(moved) > 0 && !opts.Force {
+				out.drift = true
+				return refuse("the name of %s changed on the server since your last sync — pushing %s would overwrite it:\n      %s\n    Set \"name\" in the file to what it is now, or push --force to rename it back%s",
+					out.MetricID, file.Path, strings.Join(moved, "\n      "), nameRemedy(f, "pipeline push", "    "))
+			}
+			if len(moved) > 0 {
+				fmt.Fprintf(os.Stderr, "  Note: --force — renaming %s (%s) back to %q: %s\n", out.MetricID, file.Path, *declared, strings.Join(moved, "; "))
+			}
+			if action == nameAgrees || (action == nameDrift && opts.Force) {
+				if !sameName(live.metricName(file.Path, out.MetricID), liveRow.Name) {
+					live.setMetricName(file.Path, out.MetricID, liveRow.Name)
+				}
+			}
+		}
+		needRename = metricNeedsRename(file, liveRow, draft)
 	}
 
 	// --- 4. Nothing to do? --------------------------------------------------
-	// ONE condition: the FILE has not changed since the last push from this
-	// folder. Exactly what a bare push asks of a .sql file, and deliberately NOT
-	// widened with "and there is no draft open" — a draft staged and not yet
-	// published is the ordinary state between a push and a publish, and treating
-	// it as work to redo would re-stage and re-BUILD every metric in the folder
-	// on every run. `status` is where a staged draft is reported.
-	//
-	// It cannot be answered by comparing the file against the row. The row holds
-	// the recipe the server CANONICALIZED — its version defaulted, its source a
-	// real id — and the file holds aliases and may omit a defaultable key, so
-	// such a comparison would report every metric as pending for ever.
-	//
-	// Every path that leaves work undone CLEARS this fingerprint rather than
-	// relying on a second condition here: a failed build, a refused description
-	// write, a discard, and a publish whose commit did not land.
-	if !out.Created && declared != "" && declared == file.Declared {
-		live.setMetricSeen(file.Path, out.MetricID, liveBase, declared)
+	// See metricHeld, which is also the dry run's answer. What it records is what
+	// a clone records for a file live already holds.
+	if !out.Created && metricHeld(file, declared, needRename, draft, liveRow, opts.LiveFirst) {
+		live.setMetricSeen(file.Path, out.MetricID, liveBase, file.Declared)
 		out.Outcome = metricOutcomeUpToDate
 		return out
 	}
@@ -739,6 +864,24 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 	}
 	out.DraftID = draft.ID
 	out.URL = draft.URL
+
+	// --- 4b. The declared NAME, on the DRAFT --------------------------------
+	// On the draft for the table's reason: a commit lands the draft's name on
+	// the live metric, so a rename written on live while this draft is open
+	// would be reverted by the next publish. Before the recipe, so a name the
+	// server refuses stops this file before anything else is written to it.
+	if file.File.Name != nil {
+		renamed, err := renameDraft(ctx, client, live, file.Path, out.MetricID, draft, *file.File.Name, draftRenameWords{
+			noun: "metric", change: "the file's \"name\"", from: "this file's \"name\"",
+			taken: " (a metric and a table share one namespace)", holder: "what holds it",
+		})
+		if err != nil {
+			return refuse("%s", err)
+		}
+		if renamed != nil {
+			out.Rename = renamed
+		}
+	}
 
 	// --- 5. Stage the recipe ------------------------------------------------
 	// The server's compare-and-swap, and the ONE digest that may be sent as it:
@@ -881,6 +1024,80 @@ func describeMetricShape(r *api.MetricRecipeResult) string {
 	return strings.Join(parts, "; ")
 }
 
+// sameRecipe reports that a metric row's STORED recipe is this file's resolved
+// recipe — the same definition, not merely the same bytes.
+//
+// The two are never in the same form. The server stores
+// json.Marshal(rdb.MetricRecipeV1) of what it was sent: every key present (the
+// struct has no omitempty, so a file that leaves `dimensions` out is stored with
+// `"dimensions":null`), `version` defaulted to 1, `source` trimmed, and any key
+// the struct does not have dropped. A hand-written file rarely spells all of
+// that, so comparing it with the row as it stands would never find a metric
+// equal to its own file. The FILE side is therefore put through the same shape
+// first (canonicalMetricRecipe) and the stored side is compared as it is.
+//
+// Only the file side, deliberately: a key this CLI's mirror does not know is
+// dropped from the file but still present on a row a newer server wrote, so the
+// two read as different — the refusing side of every guard that asks, never the
+// overwriting one.
+func sameRecipe(stored, file json.RawMessage) bool {
+	if len(stored) == 0 || len(file) == 0 {
+		return false
+	}
+	canonical, ok := canonicalMetricRecipe(file)
+	if !ok {
+		return false
+	}
+	var left, right any
+	if json.Unmarshal(stored, &left) != nil || json.Unmarshal(canonical, &right) != nil {
+		return false
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+// metricRecipeShape mirrors rdb.MetricRecipeV1's JSON shape — key names and
+// emptiness only, no grammar. The grammar stays the server's
+// (rdb.ValidateMetricRecipe); this exists only so a file can be compared with
+// the form the server stores it in.
+type metricRecipeShape struct {
+	Version int    `json:"version"`
+	Source  string `json:"source"`
+	Time    struct {
+		Column      string `json:"column"`
+		NativeGrain string `json:"native_grain"`
+	} `json:"time"`
+	Dimensions []struct {
+		Name string `json:"name"`
+	} `json:"dimensions"`
+	BaseMeasures []struct {
+		Name   string `json:"name"`
+		Agg    string `json:"agg"`
+		Column string `json:"column"`
+	} `json:"base_measures"`
+	Value string `json:"value"`
+}
+
+// canonicalMetricRecipe is the server's canonicalization of a recipe it is sent
+// (parseMetricRecipe + decodeMetricRecipe + canonicalMetricRecipe in
+// backend/agent/tools/metric_core.go): decode into the typed shape, default a
+// missing or zero `version` to 1, trim `source`, marshal. false when the recipe
+// is not a JSON object the server could decode either.
+func canonicalMetricRecipe(raw json.RawMessage) (json.RawMessage, bool) {
+	var r metricRecipeShape
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return nil, false
+	}
+	if r.Version == 0 {
+		r.Version = 1
+	}
+	r.Source = strings.TrimSpace(r.Source)
+	out, err := json.Marshal(r)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
 // metricPublishConsequence is the one governance sentence a push of a VERIFIED
 // metric owes its author, said at push time rather than at publish time because
 // this is where they can still change their mind.
@@ -987,12 +1204,33 @@ func isNameTakenOnMetricCreate(err error) bool {
 // ⚠️ That legacy case has a real consequence worth knowing about: a colleague
 // cloning such a folder starts with no metric id, and their first push tries to
 // CREATE a metric that already exists. It converges rather than duplicating —
-// reconcileMetricNameTaken adopts it by name — but the smooth path is a stack.
+// reconcileMetricNameTaken adopts it by name when the file still holds its exact
+// definition, and refuses otherwise — but the smooth path is a stack.
 func metricRecordingFile(f *folder) string {
 	if f.Stack != "" {
 		return wfdir.LockPath(f.Root)
 	}
 	return wfdir.StatePath(f.Root)
+}
+
+// metricZoneHeld reports that a row whose declared calendar is `live` already
+// holds what a file declaring `declared` would write, on the recipe route's
+// three-state rule (rmodelv2.resolveDeclaredZonePatch): an ABSENT key writes
+// nothing, so any row holds it; an explicit "" is stored as the literal "UTC";
+// a name is stored trimmed, which metricfile.Parse already did to the file's.
+//
+// Exact, and so conservative: a zone the server would store under another
+// spelling (case, say) reads as not held, and the push writes it — the safe
+// side, since writing the zone the file declares is what a push is for.
+func metricZoneHeld(declared *string, live string) bool {
+	switch {
+	case declared == nil:
+		return true
+	case *declared == "":
+		return live == "UTC"
+	default:
+		return live == *declared
+	}
 }
 
 // valueOrEmpty flattens a three-state claim for a body whose field is
@@ -1115,6 +1353,68 @@ func diffLines(before, after []string) []string {
 		out = append(out, "+ "+after[j])
 	}
 	return out
+}
+
+// metricDefinitionMoved is the metric's LIVE drift leg: the live recipe moved
+// since this folder recorded it, and not to what this file resolves to.
+//
+// LIVE EQUALS DESIRED IS NEVER DRIFT: a live recipe that moved TO exactly what
+// this file resolves to has nothing for the push to overwrite — the likeliest
+// history is this folder's own publish whose recording was lost. Only the same
+// definition counts (sameRecipe: the file in the server's stored form, compared
+// with the row). Nothing recorded (liveBase empty) is never drift either.
+func metricDefinitionMoved(liveBase string, liveRow *api.Table, file pipelineMetricFile) bool {
+	return liveBase != "" && metricfile.RecipeSHA256(liveRow.MetricRecipe) != liveBase &&
+		!sameRecipe(liveRow.MetricRecipe, file.Resolved)
+}
+
+// metricNeedsRename is whether the row a push writes to — the draft when one is
+// open, the live metric otherwise — does not yet hold the name the file
+// declares. It keeps a file whose definition is up to date from being reported
+// up to date while a rename is still to be staged.
+func metricNeedsRename(file pipelineMetricFile, liveRow, draft *api.Table) bool {
+	declared := file.File.Name
+	if declared == nil || liveRow == nil {
+		return false
+	}
+	current := liveRow.Name
+	if draft != nil {
+		current = draft.Name
+	}
+	return !sameName(current, *declared)
+}
+
+// metricHeld is a metric push's "nothing to do" for a bound file — and the
+// answer `sync apply --dry-run` gives for it, so the two cannot disagree.
+// `declared` is the file fingerprint this folder recorded for this row.
+//
+// The ordinary condition is that the FILE has not changed since the last push
+// from this folder: exactly what a bare push asks of a .sql file, and
+// deliberately NOT widened with "and there is no draft open" — a draft staged
+// and not yet published is the ordinary state between a push and a publish.
+// It cannot be answered by comparing the file against the row: the row holds
+// the recipe the server CANONICALIZED, and the file holds aliases and may omit
+// a defaultable key. Every path that leaves work undone clears that
+// fingerprint rather than relying on a second condition here.
+//
+// liveFirst (`sync apply` only) adds the live row's answer, because the
+// recording can be STALE — a CI checkout carries the lock from before the last
+// apply's publish, and the metric would be re-staged, rebuilt and re-published
+// on every run. Asked only where the row can answer EXACTLY: the same recipe
+// (sameRecipe), the prose this file declares, and the calendar it declares
+// (metricZoneHeld). With a draft open the ordinary path stays: that draft may
+// hold a staged change still to be published.
+func metricHeld(file pipelineMetricFile, declared string, needRename bool, draft, liveRow *api.Table, liveFirst bool) bool {
+	if needRename {
+		return false
+	}
+	if declared != "" && declared == file.Declared {
+		return true
+	}
+	return liveFirst && draft == nil && liveRow != nil &&
+		sameRecipe(liveRow.MetricRecipe, file.Resolved) &&
+		metricZoneHeld(file.File.ReportingTimezone, liveRow.ReportingTimezone) &&
+		(file.File.Description == nil || *file.File.Description == liveRow.Description)
 }
 
 // pipelineMetricStatuses is the metric files' half of `pipeline status`: for

@@ -189,3 +189,40 @@ func TestSyncApplyDeploysAChecksOnlyChange(t *testing.T) {
 		t.Errorf("a checks-only change committed %v", f.committed)
 	}
 }
+
+// A checks file apply cannot use holds no table back: the dry run says the
+// tables publish and the checks would not apply — as the apply then does —
+// never that apply would refuse the folder's files.
+func TestSyncApplyDryRunSaysTheTablesPublishPastABrokenChecksFile(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	tree, _ := checksApplyTree(t, f, "SELECT * FROM raw WHERE shipped", glSQL, `{"checks": [`)
+
+	out, err := runCLI(t, tree, "sync", "apply", "--stack", "prod", "--dry-run", "--json")
+	if code := exitCodeOf(err); code != syncExitDrifted {
+		t.Fatalf("dry run: exit = %d (%v)\n%s", code, err, out)
+	}
+	line := applyFolderLine(t, applyReportOf(t, out), "sales")
+	if line.Verdict != verdictRefused || line.Reason != syncReasonChecksNotApplied {
+		t.Fatalf("dry run line = %+v", line)
+	}
+	for _, want := range []string{"would push and publish 1 of", "the checks would not apply", "checks/gl_lines.json"} {
+		if !strings.Contains(line.Detail, want) {
+			t.Errorf("dry run detail does not say %q: %q", want, line.Detail)
+		}
+	}
+	if strings.Contains(line.Detail, "apply would refuse") {
+		t.Errorf("dry run says apply refuses the files: %q", line.Detail)
+	}
+
+	out, err = runCLI(t, tree, "sync", "apply", "--stack", "prod", "--json")
+	if code := exitCodeOf(err); code != syncExitDrifted {
+		t.Fatalf("apply: exit = %d (%v)\n%s", code, err, out)
+	}
+	if line := applyFolderLine(t, applyReportOf(t, out), "sales"); line.Reason != syncReasonChecksNotApplied {
+		t.Fatalf("apply line = %+v", line)
+	}
+	if f.CodeOf("table-orders") != "SELECT * FROM raw WHERE shipped" {
+		t.Fatalf("the table was not published: %q", f.CodeOf("table-orders"))
+	}
+}

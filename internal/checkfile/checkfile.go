@@ -286,6 +286,13 @@ func (e Entry) LiveSHA256(l Live) string {
 	return hashProjection(project(l, e.declared()))
 }
 
+// SHA256 is the fingerprint of the entry itself, in the form LiveSHA256 takes
+// of a live check: equal to a recorded LiveSHA256 exactly when the entry says
+// what the check said when that was recorded.
+func (e Entry) SHA256() string {
+	return hashProjection(project(e.asLive(), e.declared()))
+}
+
 // Matches reports whether a live check already says everything this entry
 // declares.
 func (e Entry) Matches(l Live) bool {

@@ -125,7 +125,7 @@ func TestValidateWorksBeforeTheWorkflowExists(t *testing.T) {
 func TestValidateSendsTheBoundRowsParameters(t *testing.T) {
 	f := newFakeInstance(t)
 	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive,
-		Parameters: []api.WorkflowParameter{{Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('tbl-1') }}"}}},
+		Parameters: []api.WorkflowParameter{{Name: "region", Type: "select", OptionsQuery: "SELECT r FROM {{ ref('table-1') }}"}}},
 		api.WorkflowFile{Path: "main.py", Content: "M\n"})
 	signIn(t, f)
 	root := cloneFolder(t, f, "wf-1")
