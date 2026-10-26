@@ -48,6 +48,40 @@ type QueryResult struct {
 	// api/sqlsemantics.go); a query with advice succeeded, and Error is still
 	// the only failure field.
 	Advice []QueryAdvice `json:"advice"`
+	// TableHealth lists the referenced tables that are not updating; the query
+	// ran regardless. An older server never sends it.
+	TableHealth []QueryTableHealth `json:"tableHealth"`
+}
+
+// QueryTableHealth is one referenced table whose own build is failing, or that
+// is built on a broken input (backend/api/v2/duckdb/handler.go).
+type QueryTableHealth struct {
+	ID           string              `json:"id"`
+	Name         string              `json:"name"`
+	BuildFailing *QueryBuildFailing  `json:"buildFailing,omitempty"`
+	Upstream     []QueryUpstreamItem `json:"upstream"`
+	// UpstreamMore counts the upstream problems left out of Upstream.
+	UpstreamMore int `json:"upstreamMore"`
+}
+
+// QueryBuildFailing is a table's own failing build: its rows are its last good
+// data.
+type QueryBuildFailing struct {
+	Since  *time.Time `json:"since,omitempty"`
+	Reason string     `json:"reason"`
+}
+
+// QueryUpstreamItem is one upstream problem. For an input the reader cannot
+// open, Readable is false and only Problem and Reason are set; Reason is then
+// a whole clause ("an input you cannot open has a failing build").
+type QueryUpstreamItem struct {
+	ID          string     `json:"id,omitempty"`
+	Name        string     `json:"name,omitempty"`
+	Problem     string     `json:"problem"`
+	Readable    *bool      `json:"readable,omitempty"`
+	Reason      string     `json:"reason"`
+	Since       *time.Time `json:"since,omitempty"`
+	LastBuiltAt *time.Time `json:"lastBuiltAt,omitempty"`
 }
 
 // QueryAdvice is one non-fatal note about the SQL that was run. Every field but
@@ -76,10 +110,18 @@ func (c *Client) Query(ctx context.Context, in QueryInput, timeout time.Duration
 	if err := c.do(ctx, timeout, "POST", "duckdb/query", in, &out); err != nil {
 		return nil, err
 	}
-	// `--json` and `--jq` re-encode this struct, so an absent `advice` is
-	// normalised to `[]` rather than emitted as null.
+	// `--json` and `--jq` re-encode this struct, so an absent `advice` or
+	// `tableHealth` is normalised to `[]` rather than emitted as null.
 	if out.Advice == nil {
 		out.Advice = []QueryAdvice{}
+	}
+	if out.TableHealth == nil {
+		out.TableHealth = []QueryTableHealth{}
+	}
+	for i := range out.TableHealth {
+		if out.TableHealth[i].Upstream == nil {
+			out.TableHealth[i].Upstream = []QueryUpstreamItem{}
+		}
 	}
 	return &out, nil
 }

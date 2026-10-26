@@ -158,8 +158,8 @@ type DataAppAccess struct {
 	AllowedCodexIDs    []string `json:"allowedCodexIDs"`
 	AllowedMetricIDs   []string `json:"allowedMetricIDs"`
 	// Capabilities are the coarse switches the minted script-token carries
-	// alongside the id allowlists. Only four names ever belong here (ai,
-	// query_external, write_external, upload_file) — everything else is
+	// alongside the id allowlists. Only five names ever belong here (ai,
+	// embed, query_external, write_external, upload_file) — everything else is
 	// derived server-side from the allowlists. The list lives in
 	// commands.declarableCapabilities, which `app push` refuses against;
 	// `ronja app init --help` describes each one.

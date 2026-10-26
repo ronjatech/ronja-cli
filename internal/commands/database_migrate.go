@@ -50,15 +50,8 @@ edited a file after it ran. push refuses the whole set and names the file. The
 fix is always a new migration, never an edit to the old one: the ledger records
 what actually ran, and rewriting history would make it a lie.
 
---env dev runs against the database's DEV COPY instead — a schema-identical
-sandbox with its own ledger, which is where a migration you are unsure of
-belongs:
-
-  ronja db migrate push --env dev     apply to the dev copy
-  ronja db promote <database-id>      move what worked onto production
-
-You never name the copy: the server resolves it from the production id, which
-is the only id this CLI ever sees or records.`,
+To try a migration you are unsure of, push it to a dev Space's database first
+(--database <its id>), then to the real one.`,
 	}
 	migrate.AddCommand(newDatabaseMigrateStatusCmd(), newDatabaseMigratePushCmd())
 	return migrate
@@ -81,21 +74,19 @@ database's ledger and reports what it WOULD do. Nothing is applied, no
 transaction is opened, and no DDL runs, so it is safe to run as often as you
 like.
 
-Exits non-zero when anything has drifted — that is a broken state, not a
-status worth reporting quietly.
+Exits non-zero when anything has drifted, with or without --json (the JSON is
+printed in full first) — that is a broken state, not a status worth reporting
+quietly.
 
 When more than 40 migrations are not yet applied (and none has drifted), it
 also prints a note that push would refuse the set and names where to split it.
 That note does not change the exit code: it is a warning about the next push,
 not a broken state, so a passing status does not mean the next push will
-succeed.
-
---env dev asks the same question of the database's dev copy, which keeps its
-own ledger and therefore has its own answer.`,
-		Args: cobra.NoArgs,
+succeed.`,
+		Args: refusingRetiredEnv(&env, cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMigrate(cmd.Context(), migrateOpts{
-				dir: dir, database: database, env: env, timeout: timeout, dryRun: true,
+				dir: dir, database: database, timeout: timeout, dryRun: true,
 			})
 		},
 	}
@@ -127,15 +118,11 @@ push, then put them back and push again. The folder itself may hold up to 1000
 migrations.
 
 Refuses the whole set if any migration has drifted, before anything runs. Run
-` + "`status`" + ` first if you want to see what would happen.
-
---env dev applies to the database's dev copy instead, so a change can be tried
-where getting it wrong costs nothing. ` + "`ronja db promote`" + ` then moves what
-worked onto production.`,
-		Args: cobra.NoArgs,
+` + "`status`" + ` first if you want to see what would happen.`,
+		Args: refusingRetiredEnv(&env, cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMigrate(cmd.Context(), migrateOpts{
-				dir: dir, database: database, env: env, timeout: timeout, dryRun: false,
+				dir: dir, database: database, timeout: timeout, dryRun: false,
 			})
 		},
 	}
@@ -148,8 +135,7 @@ func bindMigrateFlags(cmd *cobra.Command, database, dir, env *string, timeout *t
 		"managed database id (remembered per instance after the first push)")
 	cmd.Flags().StringVar(dir, "dir", ".",
 		"folder holding the migrations/ directory")
-	cmd.Flags().StringVar(env, "env", string(api.EnvironmentProd),
-		`which copy to run against: "prod" or "dev" (the database's dev copy)`)
+	bindRetiredEnvFlag(cmd, env)
 	cmd.Flags().DurationVar(timeout, "timeout", api.DefaultMigrationTimeout,
 		"how long to wait (0 waits as long as it takes)")
 }
@@ -157,20 +143,13 @@ func bindMigrateFlags(cmd *cobra.Command, database, dir, env *string, timeout *t
 type migrateOpts struct {
 	dir      string
 	database string
-	// env is the raw flag value, validated in runMigrate so the failure names
-	// --env rather than a query parameter.
-	env     string
-	timeout time.Duration
-	dryRun  bool
+	timeout  time.Duration
+	dryRun   bool
 }
 
 func runMigrate(ctx context.Context, opts migrateOpts) error {
 	if opts.timeout < 0 {
 		return fmt.Errorf("--timeout cannot be negative (got %s) — pass 0 to wait for as long as it takes", opts.timeout)
-	}
-	env, err := parseEnvFlag(opts.env)
-	if err != nil {
-		return err
 	}
 	migrations, err := dbdir.ReadMigrations(opts.dir)
 	if err != nil {
@@ -191,14 +170,12 @@ func runMigrate(ctx context.Context, opts migrateOpts) error {
 	result, err := client.ApplyMigrations(ctx, databaseID, api.MigrationSetInput{
 		Migrations: migrations,
 		DryRun:     opts.dryRun,
-	}, env, opts.timeout)
+	}, opts.timeout)
 	if err != nil {
 		return err
 	}
 
-	// Bound only on a successful push, never by a dry run. The environment is
-	// deliberately not part of this: the binding is the production id, the only
-	// id this CLI holds, which a dev push names too.
+	// Bound only on a successful push, never by a dry run.
 	if !opts.dryRun && opts.database != "" {
 		binding, lerr := dbdir.Load(opts.dir)
 		if lerr == nil {
@@ -209,11 +186,11 @@ func runMigrate(ctx context.Context, opts migrateOpts) error {
 		}
 	}
 
-	// Which database this landed on, first and in every mode, --json included.
-	reportEnvironment(env, result.Environment, result.DatabaseID, result.ParentDatabaseID)
-
 	if flagJSON {
-		return emitJSON(result)
+		if err := emitJSON(result); err != nil {
+			return err
+		}
+		return migrationDriftError(result)
 	}
 	return reportMigrations(result)
 }
@@ -251,18 +228,8 @@ func resolveDatabaseBinding(ctx context.Context, resolved *config.Resolved, opts
 	return databaseID, key, nil
 }
 
-// reportMigrations prints the human summary on stderr and nothing on stdout,
-// for `db migrate status`, `db migrate push` and `db promote`. Callers run
-// reportEnvironment first, so the target is named before the verdicts.
+// reportMigrations prints the human summary on stderr and nothing on stdout.
 func reportMigrations(r *api.MigrationSetResult) error {
-	if len(r.Results) == 0 {
-		// Only promote gets here (an empty folder is refused before any
-		// request): the copy already matches production, a clean no-op.
-		fmt.Fprintln(os.Stderr, "  Nothing to do — there is no migration here that the target does not already have.")
-		reportMigrationNotes(r)
-		return nil
-	}
-
 	counts := map[string]int{}
 	for _, res := range r.Results {
 		counts[res.Outcome]++
@@ -290,19 +257,24 @@ func reportMigrations(r *api.MigrationSetResult) error {
 	}
 
 	reportMigrationNotes(r)
+	return migrationDriftError(r)
+}
 
-	// Drift reaches here only from a dry run (a real apply is refused
-	// server-side); non-zero makes `status` a CI gate.
-	if drifted := r.Drifted(); len(drifted) > 0 {
-		names := make([]string, 0, len(drifted))
-		for _, d := range drifted {
-			names = append(names, d.Name)
-		}
-		return fmt.Errorf("%s drifted: %s — already applied under different SQL. "+
-			"Add a new migration rather than editing one that has run; the ledger records what actually happened",
-			plural(len(names), "migration"), strings.Join(names, ", "))
+// migrationDriftError is the verdict of both output modes, called after the
+// report: an error on drift makes `status` a CI gate. Drift arrives only from a
+// dry run, since a real apply is refused server-side.
+func migrationDriftError(r *api.MigrationSetResult) error {
+	drifted := r.Drifted()
+	if len(drifted) == 0 {
+		return nil
 	}
-	return nil
+	names := make([]string, 0, len(drifted))
+	for _, d := range drifted {
+		names = append(names, d.Name)
+	}
+	return fmt.Errorf("%s drifted: %s — already applied under different SQL. "+
+		"Add a new migration rather than editing one that has run; the ledger records what actually happened",
+		plural(len(names), "migration"), strings.Join(names, ", "))
 }
 
 // reportMigrationNotes prints the server's advisory notes verbatim, one per

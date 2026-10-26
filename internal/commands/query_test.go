@@ -20,6 +20,9 @@ type queryServer struct {
 
 	// answer's zero value is an empty successful result.
 	answer api.QueryResult
+	// rawAnswer, when set, is sent instead of answer: an envelope whose keys
+	// are exactly the ones a given server version sends.
+	rawAnswer string
 	// status overrides the HTTP status; 0 is 200.
 	status int
 
@@ -54,6 +57,11 @@ func newQueryServer(t *testing.T) *queryServer {
 		q.raws = append(q.raws, m)
 		if q.status != 0 {
 			http.Error(w, `{"error":"boom"}`, q.status)
+			return
+		}
+		if q.rawAnswer != "" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, q.rawAnswer)
 			return
 		}
 		writeJSON(w, q.answer)

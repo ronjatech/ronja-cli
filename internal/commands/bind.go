@@ -44,7 +44,7 @@ import (
 //   - A WRITE TARGET IS NEVER PROPOSED. A dependency declared "write": true is
 //     a row this folder writes, and the organization-wide exact-name match for
 //     it in a new stack is the table the FIRST stack writes — production, for a
-//     Dev copy. It is reported unresolved (write_target) and bound by hand,
+//     Dev stack. It is reported unresolved (write_target) and bound by hand,
 //     per stack. A RUN TARGET ("run": true) is not proposed for the
 //     same reason (run_target): the match is the workflow or agent
 //     the first stack runs. An address and an output are never looked up

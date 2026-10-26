@@ -3,8 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"strings"
 	"time"
 )
 
@@ -20,47 +18,6 @@ const DefaultDatabaseSQLTimeout = slowRequestTimeout
 // transaction a set runs in: a client that gave up sooner would leave the
 // operator not knowing whether a still-committing set landed.
 const DefaultMigrationTimeout = 20 * time.Minute
-
-// Environment names WHICH COPY of a managed database a request runs against.
-// The client never learns the dev copy's id: it names the PRODUCTION database
-// and the server resolves the copy. That asymmetry is the safety property, so do
-// not "simplify" it into a second database id.
-type Environment string
-
-const (
-	// EnvironmentProd is the default everywhere.
-	EnvironmentProd Environment = "prod"
-	EnvironmentDev  Environment = "dev"
-)
-
-// ParseEnvironment validates a caller-typed environment name locally, so a typo
-// fails before anything is sent. It must trim and case-fold as the server does,
-// so a value accepted here is never one the server rejects.
-func ParseEnvironment(raw string) (Environment, error) {
-	switch env := Environment(strings.ToLower(strings.TrimSpace(raw))); env {
-	case "", EnvironmentProd:
-		return EnvironmentProd, nil
-	case EnvironmentDev:
-		return EnvironmentDev, nil
-	default:
-		return "", fmt.Errorf("must be %q or %q (got %q)", EnvironmentProd, EnvironmentDev, raw)
-	}
-}
-
-// withEnvironment appends ?environment= ONLY for dev, so a prod request stays
-// byte-identical to what an instance without dev copies answers. The separator
-// is chosen, not assumed: a second "?" would drop the parameter that says "not
-// production".
-func withEnvironment(path string, env Environment) string {
-	if env != EnvironmentDev {
-		return path
-	}
-	sep := "?"
-	if strings.Contains(path, "?") {
-		sep = "&"
-	}
-	return path + sep + "environment=" + string(EnvironmentDev)
-}
 
 // DatabaseSQLInput is the POST :id/sql body.
 type DatabaseSQLInput struct {
@@ -89,18 +46,12 @@ type DatabaseSQLResult struct {
 	// Truncated: Result is a prefix the row cap cut off.
 	Truncated  bool  `json:"truncated"`
 	DurationMs int64 `json:"durationMs"`
-	// Environment is which copy actually answered.
-	Environment string `json:"environment"`
-	// ParentDatabaseID is set ONLY when the request was redirected to the dev
-	// copy: the signal a redirect happened. No omitempty, unlike the server's.
-	ParentDatabaseID string `json:"parentDatabaseID"`
 }
 
-// DatabaseSQL runs one statement against a managed database or, with
-// EnvironmentDev, its dev copy.
-func (c *Client) DatabaseSQL(ctx context.Context, databaseID string, in DatabaseSQLInput, env Environment, timeout time.Duration) (*DatabaseSQLResult, error) {
+// DatabaseSQL runs one statement against a managed database.
+func (c *Client) DatabaseSQL(ctx context.Context, databaseID string, in DatabaseSQLInput, timeout time.Duration) (*DatabaseSQLResult, error) {
 	var out DatabaseSQLResult
-	if err := c.do(ctx, timeout, "POST", withEnvironment("database/"+databaseID+"/sql", env), in, &out); err != nil {
+	if err := c.do(ctx, timeout, "POST", "database/"+databaseID+"/sql", in, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -140,16 +91,12 @@ type MigrationResult struct {
 	Seq     int    `json:"seq"`
 }
 
-// MigrationSetResult is the POST :id/migrations and POST :id/promote response
-// (promote applies through the same server path). No omitempty: `--json` emits
-// it verbatim.
+// MigrationSetResult is the POST :id/migrations response. No omitempty:
+// `--json` emits it verbatim.
 type MigrationSetResult struct {
-	DatabaseID  string            `json:"databaseID"`
-	DryRun      bool              `json:"dryRun"`
-	Results     []MigrationResult `json:"results"`
-	Environment string            `json:"environment"`
-	// ParentDatabaseID is set only on a redirect, as on DatabaseSQLResult.
-	ParentDatabaseID string `json:"parentDatabaseID"`
+	DatabaseID string            `json:"databaseID"`
+	DryRun     bool              `json:"dryRun"`
+	Results    []MigrationResult `json:"results"`
 	// Notes are advisory and never block; print them verbatim.
 	Notes []string `json:"notes"`
 }
@@ -178,26 +125,9 @@ func (r *MigrationSetResult) Pending() []MigrationResult {
 }
 
 // ApplyMigrations applies (or, with DryRun, plans) an ordered migration set.
-func (c *Client) ApplyMigrations(ctx context.Context, databaseID string, in MigrationSetInput, env Environment, timeout time.Duration) (*MigrationSetResult, error) {
+func (c *Client) ApplyMigrations(ctx context.Context, databaseID string, in MigrationSetInput, timeout time.Duration) (*MigrationSetResult, error) {
 	var out MigrationSetResult
-	if err := c.do(ctx, timeout, "POST", withEnvironment("database/"+databaseID+"/migrations", env), in, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// PromoteInput carries no migration list by design: what promotes is the tail
-// the dev copy's ledger has past production's, which the server computes.
-type PromoteInput struct {
-	DryRun bool `json:"dryRun,omitempty"`
-}
-
-// Promote moves the migrations a database's dev copy has onto the database.
-// It takes no environment: redirecting it would promote the copy into itself
-// and report success.
-func (c *Client) Promote(ctx context.Context, databaseID string, in PromoteInput, timeout time.Duration) (*MigrationSetResult, error) {
-	var out MigrationSetResult
-	if err := c.do(ctx, timeout, "POST", "database/"+databaseID+"/promote", in, &out); err != nil {
+	if err := c.do(ctx, timeout, "POST", "database/"+databaseID+"/migrations", in, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

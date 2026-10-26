@@ -148,11 +148,11 @@ func checkAppPushable(files map[string]string) error {
 //
 // It is the backend's rscripttoken.dataAppAllowedCaps minus everything
 // dataAppCaps auto-grants, and that correspondence is pinned there by
-// TestDataAppCaps_DeclareOnlySetIsExactlyFour — whose failure message names
+// TestDataAppCaps_DeclareOnlySetIsExactlyFive — whose failure message names
 // this variable, because the CLI is a separate module and no compiler relates
-// the two. The same four names are also written out in `ronja app init --help`,
+// the two. The same five names are also written out in `ronja app init --help`,
 // in the post-init report, in cli/README.md and on the docs site.
-var declarableCapabilities = []string{"ai", "query_external", "write_external", "upload_file"}
+var declarableCapabilities = []string{"ai", "embed", "query_external", "write_external", "upload_file"}
 
 // checkDeclaredCapabilities refuses a manifest that grants a capability which
 // does not exist.

@@ -59,11 +59,12 @@ the app will render with nothing to show. Nothing later warns you either: an app
 with an empty allowlist compiles, validates and publishes exactly like a working
 one, and only fails once someone opens it.
 
-Leave "capabilities" empty unless the app calls one of these four, each declared
+Leave "capabilities" empty unless the app calls one of these five, each declared
 by its manifest name:
 
   ai              completeAI — ask the AI for a completion
                   (and env.ai.complete in a server function)
+  embed           embed — turn text into embeddings for a vector column
   query_external  queryExternal — read an external or managed database
                   (and env.db(...).query in a server function)
   write_external  executeExternal — write rows to a managed database

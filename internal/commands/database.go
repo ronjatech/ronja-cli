@@ -1,10 +1,9 @@
 package commands
 
 import (
-	"fmt"
-	"os"
+	"errors"
+	"strings"
 
-	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/spf13/cobra"
 )
 
@@ -28,12 +27,6 @@ import (
 //     wrapped endpoint: they move the credential the CLI already holds into
 //     the place psql and pg_dump read it from, without it ever being displayed.
 //     See database_proxy.go for why both exist and why there is no `db dump`.
-//   - `db promote` is the other end of that same loop. It moves a ledger TAIL
-//     between two ledgers: the shared prefix is compared position by position,
-//     the divergence case has to be reported as an instruction rather than a
-//     hash mismatch, and the tail applies all-or-nothing. Stateful, drift-guarded
-//     and multi-step — the same test `migrate` passes, and it is not a list, a
-//     browse or a delete.
 //
 // Everything else stays plain HTTP. There is deliberately no `db list`, no
 // `db create` and no `db delete`: those are single calls that `ronja api` runs
@@ -53,7 +46,6 @@ state, rather than the analytical tables ` + "`ronja query`" + ` reads.
   ronja db sql <database-id> "SELECT * FROM leads"
   ronja db migrate status        what is applied, pending or drifted
   ronja db migrate push          apply the migrations/ folder
-  ronja db promote <database-id> move the dev copy's migrations onto production
   ronja db env <database-id>     PG* variables for psql and pg_dump (eval it)
   ronja db connect <database-id> open psql, read-only
 
@@ -64,10 +56,8 @@ your own Postgres tools, over a read-only session:
 
   eval "$(ronja db env mdb-abc)" && pg_dump -Fc > dump.pgc
 
-A database can have a DEV COPY — same schema, its own data, its own ledger.
-` + "`db sql`" + ` and ` + "`db migrate`" + ` reach it with --env dev, always naming the
-production database (the copy has no id you ever see), and ` + "`db promote`" + ` moves
-what worked there onto production.
+Every command runs on exactly the database you name. To try a change without
+touching live data, use a dev Space: its own database, named by its own id.
 
 Creating, listing and deleting databases stay on plain HTTP:
 
@@ -78,62 +68,59 @@ Creating, listing and deleting databases stay on plain HTTP:
 That last one is not optional: a new database has no connection roles, and
 ` + "`db sql`" + ` runs as the write role, so mint one before your first statement.`,
 	}
-	db.AddCommand(newDatabaseSQLCmd(), newDatabaseMigrateCmd(), newDatabasePromoteCmd(),
-		newDatabaseEnvCmd(), newDatabaseConnectCmd())
+	db.AddCommand(newDatabaseSQLCmd(), newDatabaseMigrateCmd(),
+		newDatabaseEnvCmd(), newDatabaseConnectCmd(), newRetiredDatabasePromoteCmd())
 	return db
 }
 
-// parseEnvFlag validates a --env value before anything is sent.
-//
-// Locally, so a typo fails naming the FLAG the person typed. The server does
-// validate it — it answers 400 for anything but "prod" or "dev" — but that
-// message is about a query parameter, and the caller wrote a flag. It also fails
-// after the migration set or the statement has already gone out.
-//
-// The accepted values come from api.ParseEnvironment so there is one definition
-// of what they are; only the wording is restated here, to put --env in it.
-func parseEnvFlag(raw string) (api.Environment, error) {
-	env, err := api.ParseEnvironment(raw)
-	if err != nil {
-		return "", fmt.Errorf("--env %v", err)
-	}
-	return env, nil
+// errDevCopiesRemoved is the server's refusal for a caller with no role, word for
+// word: the CLI cannot see the caller's role. Keep it on one line, because
+// backend/lib/devcopyremoved's test matches it in this file.
+var errDevCopiesRemoved = errors.New(devCopiesRemovedSentence) //nolint:staticcheck // ST1005: the sentence is shared verbatim with the server's refusal
+
+const devCopiesRemovedSentence = "Dev copies of databases were removed. To test without touching live data, use a dev Space: ask an admin to create one, then build and test there against that Space's own database, and build the finished work in your real Space."
+
+// bindRetiredEnvFlag adds the hidden --env that exists only to refuse stale
+// callers by name rather than "unknown flag". See BL-291d.
+func bindRetiredEnvFlag(cmd *cobra.Command, env *string) {
+	cmd.Flags().StringVar(env, "env", "", "")
+	_ = cmd.Flags().MarkHidden("env")
 }
 
-// reportEnvironment says which copy of a managed database actually answered.
-//
-// stderr, in EVERY mode, and before anything else the command prints. `db sql`'s
-// stdout is CSV somebody is parsing, and `--json` output is an envelope somebody
-// is piping — but a dev result read as production's is a WRONG answer rather
-// than an incomplete one, so the reader is told before they can decide what the
-// rows mean.
-//
-// It is shared by `db sql`, `db migrate` and `db promote` because all three ask
-// the same question of the same field, and three phrasings of "which database
-// did this touch" would be three things to keep in step.
-//
-// Production answering a production request prints nothing: a banner on every
-// invocation is a banner nobody reads. The two cases that speak are the ones
-// where the reader could be wrong about where they are.
-func reportEnvironment(requested api.Environment, environment, databaseID, parentDatabaseID string) {
-	if environment == string(api.EnvironmentDev) {
-		// The PRODUCTION id is what the reader typed and what they think in, so
-		// name it rather than the copy's own id, which they have never seen.
-		target := parentDatabaseID
-		if target == "" {
-			target = databaseID
+// refusingRetiredEnv is a command's Args validator with the refusal ahead of
+// its arity check. Cobra validates arguments before PreRunE, so this is the
+// only hook where `--env dev` with a missing argument is still refused by name,
+// and it runs before anything is read or sent.
+func refusingRetiredEnv(env *string, arity cobra.PositionalArgs) cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		if err := refuseRetiredEnv(*env); err != nil {
+			return err
 		}
-		fmt.Fprintf(os.Stderr,
-			"  Note: this ran against the DEV COPY of %s — production was not touched.\n", target)
-		return
+		return arity(cmd, args)
 	}
-	if requested == api.EnvironmentDev {
-		// Against a current instance this cannot happen: `?environment=dev` on a
-		// database with no dev copy is refused server-side. An OLDER instance does
-		// not know the query parameter at all and answers from production without
-		// complaint — the one case where silence would be worst, because the
-		// command looks like it did what was asked.
-		fmt.Fprintln(os.Stderr,
-			"  Warning: --env dev was asked for, but PRODUCTION answered. This instance may predate dev copies — check before trusting this result.")
+}
+
+// refuseRetiredEnv lets "prod" through because it always meant the database
+// named; any other non-blank value once meant a copy.
+func refuseRetiredEnv(env string) error {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "", "prod":
+		return nil
+	}
+	return errDevCopiesRemoved
+}
+
+// newRetiredDatabasePromoteCmd exists only to refuse stale callers by name
+// rather than "unknown command". See BL-291d.
+func newRetiredDatabasePromoteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "promote",
+		Hidden: true,
+		Long:   devCopiesRemovedSentence,
+		// The old --dry-run and --yes must reach the refusal, not "unknown flag".
+		DisableFlagParsing: true,
+		RunE: func(*cobra.Command, []string) error {
+			return errDevCopiesRemoved
+		},
 	}
 }

@@ -183,7 +183,9 @@ type Automation struct {
 	// error. So a folder declaring enabled:true against a paused row is
 	// ACCEPTED — silently reversing an incident response — while the same
 	// folder against a row in a workspace pending deletion fails every push
-	// with a message about something else entirely.
+	// with a message about something else entirely. Enabling an old-model
+	// inline-agent automation whose access group is gone is refused too,
+	// whatever its reason.
 	DisabledReason string `json:"disabledReason"`
 
 	EmailAllowedFromDomains []string `json:"emailAllowedFromDomains"`

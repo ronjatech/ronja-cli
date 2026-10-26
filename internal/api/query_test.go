@@ -144,3 +144,40 @@ func TestQueryResultIsTheServersCSVVerbatim(t *testing.T) {
 		}
 	}
 }
+
+// tableHealth is on both server formats; the CLI asks for csv_meta, but the
+// decode must not depend on the meta fields being present.
+func TestQueryDecodesTableHealthOnEitherFormat(t *testing.T) {
+	const health = `"tableHealth":[{"id":"table-c","name":"Sessions Weekly",` +
+		`"buildFailing":{"since":"2026-10-08T19:03:00Z","reason":"timeout"},` +
+		`"upstream":[{"id":"table-a","name":"User Events","problem":"build_failing","reason":"its build is failing","since":"2026-10-07T00:00:00Z"}],"upstreamMore":1}]`
+	for name, body := range map[string]string{
+		"csv_meta": `{"result":"id\n1\n","rowCount":1,"truncated":false,"error":"","zoneUsed":"UTC",` + health + `}`,
+		"default":  `{"result":"\"id\\n1\\n\"","error":"","sql":"SELECT 1",` + health + `}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			client := &Client{BaseURL: srv.URL, HTTP: &http.Client{Timeout: 5 * time.Second}}
+			got, err := client.Query(context.Background(), QueryInput{SQL: "SELECT 1"}, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.TableHealth) != 1 {
+				t.Fatalf("tableHealth = %+v", got.TableHealth)
+			}
+			h := got.TableHealth[0]
+			want := time.Date(2026, 10, 8, 19, 3, 0, 0, time.UTC)
+			if h.ID != "table-c" || h.Name != "Sessions Weekly" || h.BuildFailing == nil ||
+				!h.BuildFailing.Since.Equal(want) || h.BuildFailing.Reason != "timeout" || h.UpstreamMore != 1 {
+				t.Errorf("entry = %+v", h)
+			}
+			if len(h.Upstream) != 1 || h.Upstream[0].ID != "table-a" || h.Upstream[0].Since == nil || h.Upstream[0].Readable != nil {
+				t.Errorf("upstream = %+v", h.Upstream)
+			}
+		})
+	}
+}

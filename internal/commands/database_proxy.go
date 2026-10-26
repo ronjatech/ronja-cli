@@ -114,22 +114,6 @@ func proxyForDatabase(cmd *cobra.Command, databaseID string) (*api.DatabaseProxy
 	return conn.Proxy, client, nil
 }
 
-// refuseEnvFlag is the answer to `--env dev` on either of these commands.
-//
-// It exists because `db sql` and `db migrate` both take that flag, so somebody
-// who used it five minutes ago will type it here — and the honest answer is not
-// "unknown flag". A dev copy is a database in its own right at the proxy: it has
-// its own id, its own physical name and its own read role, and it is addressed
-// by that id. The server-side environment overlay that redirects prod→dev exists
-// only for requests that name a production database, which a proxy login never
-// does: the username IS the id.
-func refuseEnvFlag(env string) error {
-	if strings.TrimSpace(env) == "" {
-		return nil
-	}
-	return fmt.Errorf("--env is not supported here: a dev copy is reached by its OWN database id, not by naming production. `ronja api /api/v2/database/<prod-id>` reports the copy's id")
-}
-
 func newDatabaseEnvCmd() *cobra.Command {
 	var envFlag string
 
@@ -166,11 +150,8 @@ front of the proxy drops an idle connection after a few minutes.
 
 With --json, emits the same values as an object for callers that are not a
 POSIX shell.`,
-		Args: cobra.ExactArgs(1),
+		Args: refusingRetiredEnv(&envFlag, cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := refuseEnvFlag(envFlag); err != nil {
-				return err
-			}
 			databaseID := strings.TrimSpace(args[0])
 			if databaseID == "" {
 				return fmt.Errorf("no database id given")
@@ -226,8 +207,7 @@ POSIX shell.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&envFlag, "env", "",
-		"not supported here — a dev copy is reached by its own database id")
+	bindRetiredEnvFlag(cmd, &envFlag)
 	return cmd
 }
 
@@ -259,11 +239,8 @@ The session is READ-ONLY: it resolves the database's read role server-side, so
 SELECT works and nothing else does, whatever your own role is.
 
 Everything after -- is passed to psql unchanged.`,
-		Args: cobra.MinimumNArgs(1),
+		Args: refusingRetiredEnv(&envFlag, cobra.MinimumNArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := refuseEnvFlag(envFlag); err != nil {
-				return err
-			}
 			// Everything before -- is ours; everything after is psql's. Cobra
 			// reports the boundary rather than the two halves, so a database id
 			// that happens to look like a psql flag is never mistaken for one.
@@ -297,8 +274,7 @@ Everything after -- is passed to psql unchanged.`,
 			return child.Run()
 		},
 	}
-	cmd.Flags().StringVar(&envFlag, "env", "",
-		"not supported here — a dev copy is reached by its own database id")
+	bindRetiredEnvFlag(cmd, &envFlag)
 	return cmd
 }
 

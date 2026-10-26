@@ -42,12 +42,18 @@ around them:
   ronja db sql mdb-abc "INSERT INTO leads (email, score) VALUES (\$1, \$2)" \
     --params '["a@b.c", 42]'
 
+A call usually runs one statement: a SELECT- or WITH-led body, one with
+RETURNING, or one sent with --params is refused if it holds a second ("cannot
+insert multiple commands into a prepared statement"). A plain write without
+--params runs every statement in it. Each call is its own session: a
+temporary table or a SET does not carry over, and a transaction left open
+(BEGIN with no COMMIT) is rolled back after the call, though it exits zero.
+
 Output is CSV on stdout, and nothing else is written there:
 
   --out <file>    write the CSV to a file instead of stdout
   --json          print the whole response envelope as one JSON object
   --max-rows N    ask for at most N rows (the server caps at 100000)
-  --env dev       run against the database's dev copy instead
   --timeout       how long to wait (0 waits as long as it takes)
 
 With --out alone, stdout stays empty and the row count is reported on stderr.
@@ -62,15 +68,6 @@ the server cannot honestly say: a statement that returned rows, more than one
 statement sent in one call, or a command whose result carries no count (DO,
 CALL, SET, TRUNCATE, COMMENT).
 
---env dev runs the statement against the database's DEV COPY — a separate
-Postgres database with the same schema and its own data. You still name the
-production database: the copy has no id you ever see. The redirect is reported
-on stderr, never on stdout, because stdout is CSV somebody is parsing.
-
-Minting a connection role against the copy is NOT possible — the copy already
-has one for every tier the parent hands out, named "<parent> (<tier>) (dev)".
-Use those logins if you need to connect to the copy directly.
-
 This runs as the database's WRITE role, so it does DML and SELECT but cannot
 do DDL: CREATE, ALTER and DROP are refused by Postgres itself. Schema changes
 go through ` + "`ronja db migrate`" + `, which records them in the database's ledger.
@@ -81,7 +78,7 @@ Mint one with:
   ronja api -X POST /api/v2/database/<id>/user -d '{"access":"write","featureID":"<feature-id>"}'`,
 		// A third positional is unquoted SQL; refusing it beats a merged string
 		// that half-runs.
-		Args: cobra.RangeArgs(1, 2),
+		Args: refusingRetiredEnv(&env, cobra.RangeArgs(1, 2)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			databaseID := strings.TrimSpace(args[0])
 			if databaseID == "" {
@@ -92,10 +89,6 @@ Mint one with:
 				return err
 			}
 			bound, err := parseSQLParams(params)
-			if err != nil {
-				return err
-			}
-			environment, err := parseEnvFlag(env)
 			if err != nil {
 				return err
 			}
@@ -116,14 +109,10 @@ Mint one with:
 				SQL:     sql,
 				Params:  bound,
 				MaxRows: maxRows,
-			}, environment, timeout)
+			}, timeout)
 			if err != nil {
 				return err
 			}
-
-			// Which database answered, said first: a copy's result read as
-			// production's is a wrong answer, not an incomplete one.
-			reportEnvironment(environment, result.Environment, result.DatabaseID, result.ParentDatabaseID)
 
 			// Always stderr: stdout is the CSV a pipeline is parsing.
 			if result.Truncated {
@@ -168,8 +157,7 @@ Mint one with:
 		"write the CSV to this file instead of stdout")
 	cmd.Flags().StringVar(&params, "params", "",
 		`bound parameters for $1, $2 … as a JSON array (e.g. '["a@b.c", 42]'). An element may itself be a list, bound as one Postgres array — match it with 'col = ANY($1)', not 'col IN ($1)'`)
-	cmd.Flags().StringVar(&env, "env", string(api.EnvironmentProd),
-		`which copy to run against: "prod" or "dev" (the database's dev copy)`)
+	bindRetiredEnvFlag(cmd, &env)
 	cmd.Flags().IntVar(&maxRows, "max-rows", 0,
 		"maximum rows to return (default: the server's cap)")
 	cmd.Flags().DurationVar(&timeout, "timeout", api.DefaultDatabaseSQLTimeout,

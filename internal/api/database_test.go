@@ -10,58 +10,6 @@ import (
 	"time"
 )
 
-// The set is closed: a value accepted here and refused by the server would pass
-// local validation and then 400.
-func TestParseEnvironment(t *testing.T) {
-	ok := map[string]Environment{
-		"":       EnvironmentProd,
-		"prod":   EnvironmentProd,
-		"PROD":   EnvironmentProd,
-		"  dev ": EnvironmentDev,
-		"dev":    EnvironmentDev,
-		"Dev":    EnvironmentDev,
-	}
-	for in, want := range ok {
-		got, err := ParseEnvironment(in)
-		if err != nil {
-			t.Errorf("ParseEnvironment(%q): %v", in, err)
-			continue
-		}
-		if got != want {
-			t.Errorf("ParseEnvironment(%q) = %q, want %q", in, got, want)
-		}
-	}
-
-	// "development" and "production" read as correct and are not.
-	for _, in := range []string{"prd", "development", "production", "staging", "true"} {
-		if _, err := ParseEnvironment(in); err == nil {
-			t.Errorf("ParseEnvironment(%q) should be refused", in)
-		}
-	}
-}
-
-// An instance that predates dev copies knows no `environment` parameter, so a
-// production request must stay byte-identical.
-func TestWithEnvironmentOnlyForDev(t *testing.T) {
-	const path = "database/mdb-abc/sql"
-	if got := withEnvironment(path, EnvironmentProd); got != path {
-		t.Errorf("prod added a query string: %q", got)
-	}
-	if got := withEnvironment(path, ""); got != path {
-		t.Errorf("the zero value added a query string: %q", got)
-	}
-	if got, want := withEnvironment(path, EnvironmentDev), path+"?environment=dev"; got != want {
-		t.Errorf("dev = %q, want %q", got, want)
-	}
-
-	// A second "?" would hide `environment` inside the previous value, and a
-	// request with no environment runs against PRODUCTION.
-	const withQuery = "database/mdb-abc/data?table=leads"
-	if got, want := withEnvironment(withQuery, EnvironmentDev), withQuery+"&environment=dev"; got != want {
-		t.Errorf("dev on a path with a query = %q, want %q", got, want)
-	}
-}
-
 func databaseServer(t *testing.T, status int, body string) (*Client, *http.Request, *[]byte) {
 	t.Helper()
 	var seen http.Request
@@ -77,147 +25,56 @@ func databaseServer(t *testing.T, status int, body string) (*Client, *http.Reque
 	return New(srv.URL, "token"), &seen, &payload
 }
 
-func TestDatabaseSQLSendsEnvironment(t *testing.T) {
-	t.Run("dev asks for the copy", func(t *testing.T) {
-		client, seen, _ := databaseServer(t, 200, `{
-			"databaseID": "mdb-dev-1",
-			"result": "id\n1\n",
-			"rowCount": 1,
-			"truncated": false,
-			"durationMs": 3,
-			"environment": "dev",
-			"parentDatabaseID": "mdb-abc"
-		}`)
-		out, err := client.DatabaseSQL(context.Background(), "mdb-abc",
-			DatabaseSQLInput{SQL: "SELECT 1"}, EnvironmentDev, time.Minute)
-		if err != nil {
-			t.Fatalf("DatabaseSQL: %v", err)
-		}
-		if seen.URL.Path != "/api/v2/database/mdb-abc/sql" {
-			t.Errorf("path = %s", seen.URL.Path)
-		}
-		if got := seen.URL.Query().Get("environment"); got != "dev" {
-			t.Errorf("environment = %q, want dev", got)
-		}
-		if out.Environment != string(EnvironmentDev) {
-			t.Errorf("environment = %q, want the server's own dev label", out.Environment)
-		}
-		if out.ParentDatabaseID != "mdb-abc" {
-			t.Errorf("parentDatabaseID = %q, want the production id", out.ParentDatabaseID)
-		}
-	})
-
-	t.Run("prod sends no query string at all", func(t *testing.T) {
-		client, seen, _ := databaseServer(t, 200, `{"databaseID":"mdb-abc","environment":"prod"}`)
-		out, err := client.DatabaseSQL(context.Background(), "mdb-abc",
-			DatabaseSQLInput{SQL: "SELECT 1"}, EnvironmentProd, time.Minute)
-		if err != nil {
-			t.Fatalf("DatabaseSQL: %v", err)
-		}
-		if seen.URL.RawQuery != "" {
-			t.Errorf("prod put %q on the wire; it must be byte-identical to a request with no environment", seen.URL.RawQuery)
-		}
-		if out.Environment != string(EnvironmentProd) {
-			t.Errorf("environment = %q, want prod", out.Environment)
-		}
-	})
+// A request names exactly the database it runs on: no ?environment= rides
+// along, so nothing about it depends on a server-side redirect.
+func TestDatabaseSQLSendsNoEnvironment(t *testing.T) {
+	client, seen, _ := databaseServer(t, 200, `{"databaseID":"mdb-abc","result":"id\n1\n","rowCount":1}`)
+	out, err := client.DatabaseSQL(context.Background(), "mdb-abc",
+		DatabaseSQLInput{SQL: "SELECT 1"}, time.Minute)
+	if err != nil {
+		t.Fatalf("DatabaseSQL: %v", err)
+	}
+	if seen.URL.Path != "/api/v2/database/mdb-abc/sql" {
+		t.Errorf("path = %s", seen.URL.Path)
+	}
+	if seen.URL.RawQuery != "" {
+		t.Errorf("query string = %q, want none", seen.URL.RawQuery)
+	}
+	if out.DatabaseID != "mdb-abc" || out.RowCount != 1 {
+		t.Errorf("decoded %+v", out)
+	}
 }
 
-func TestApplyMigrationsSendsEnvironment(t *testing.T) {
+func TestApplyMigrationsSendsTheSetVerbatim(t *testing.T) {
 	client, seen, payload := databaseServer(t, 200, `{
-		"databaseID": "mdb-dev-1",
+		"databaseID": "mdb-abc",
 		"dryRun": false,
-		"results": [{"name": "0001_leads", "outcome": "applied", "seq": 1}],
-		"environment": "dev",
-		"parentDatabaseID": "mdb-abc"
+		"results": [{"name": "0001_leads", "outcome": "applied", "seq": 1}]
 	}`)
 	out, err := client.ApplyMigrations(context.Background(), "mdb-abc", MigrationSetInput{
 		Migrations: []Migration{{Name: "0001_leads", SQL: "CREATE TABLE leads (id int);\n"}},
-	}, EnvironmentDev, time.Minute)
+	}, time.Minute)
 	if err != nil {
 		t.Fatalf("ApplyMigrations: %v", err)
 	}
 	if seen.URL.Path != "/api/v2/database/mdb-abc/migrations" {
 		t.Errorf("path = %s", seen.URL.Path)
 	}
-	if got := seen.URL.Query().Get("environment"); got != "dev" {
-		t.Errorf("environment = %q, want dev", got)
+	if seen.URL.RawQuery != "" {
+		t.Errorf("query string = %q, want none", seen.URL.RawQuery)
 	}
-	if out.Environment != string(EnvironmentDev) || out.ParentDatabaseID != "mdb-abc" {
-		t.Errorf("dev redirect not reported: %+v", out)
+	if len(out.Results) != 1 || out.Results[0].Outcome != MigrationApplied {
+		t.Errorf("decoded %+v", out)
 	}
 
-	// The environment is a query parameter, never a body key, so an echoed
-	// payload cannot set it.
 	var body map[string]any
 	if err := json.Unmarshal(*payload, &body); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := body["environment"]; ok {
-		t.Errorf("environment must not be a body field: %s", *payload)
-	}
 
-	// And the SQL must arrive verbatim — the ledger hash covers these bytes.
+	// The SQL must arrive verbatim — the ledger hash covers these bytes.
 	sent := body["migrations"].([]any)[0].(map[string]any)["sql"]
 	if sent != "CREATE TABLE leads (id int);\n" {
 		t.Errorf("sql = %q, want the bytes unchanged", sent)
 	}
-}
-
-func TestPromoteDecodesNotes(t *testing.T) {
-	client, seen, payload := databaseServer(t, 200, `{
-		"databaseID": "mdb-abc",
-		"dryRun": true,
-		"results": [{"name": "0003_seed", "outcome": "pending", "seq": 3}],
-		"environment": "prod",
-		"parentDatabaseID": "",
-		"notes": ["migration 1 (0003_seed) contains DML; rows seeded from dev-copy data replay differently on production"]
-	}`)
-	out, err := client.Promote(context.Background(), "mdb-abc", PromoteInput{DryRun: true}, time.Minute)
-	if err != nil {
-		t.Fatalf("Promote: %v", err)
-	}
-	if seen.URL.Path != "/api/v2/database/mdb-abc/promote" {
-		t.Errorf("path = %s", seen.URL.Path)
-	}
-	// Promote names production explicitly, so it carries no environment: a
-	// redirect would promote the copy into itself and report success.
-	if seen.URL.RawQuery != "" {
-		t.Errorf("promote must send no environment, got %q", seen.URL.RawQuery)
-	}
-	if string(*payload) != `{"dryRun":true}` {
-		t.Errorf("body = %s, want just dryRun — promote sends no migration list", *payload)
-	}
-	if len(out.Notes) != 1 {
-		t.Fatalf("notes = %v, want the one DML warning", out.Notes)
-	}
-	if out.Environment != string(EnvironmentProd) {
-		t.Errorf("a promote lands on production, got environment %q", out.Environment)
-	}
-	if len(out.Pending()) != 1 {
-		t.Errorf("promote must decode through the same outcome helpers: %+v", out.Results)
-	}
-}
-
-// Divergence is an HTTP 400 with a written instruction, so `db promote` needs
-// no second failure mechanism.
-func TestPromoteDivergenceIsAnOrdinaryError(t *testing.T) {
-	const message = "the dev copy's history diverged from production at migration 2 (0002_score): refresh the dev copy to rebase, then re-apply your migrations"
-	client, _, _ := databaseServer(t, 400, `{"error":`+quote(message)+`}`)
-
-	_, err := client.Promote(context.Background(), "mdb-abc", PromoteInput{}, time.Minute)
-	if err == nil {
-		t.Fatal("a diverged promote must be an error")
-	}
-	if StatusOf(err) != 400 {
-		t.Errorf("status = %d, want 400", StatusOf(err))
-	}
-	if CodeOf(err) != message {
-		t.Errorf("the server's instruction must survive to the caller, got %q", CodeOf(err))
-	}
-}
-
-func quote(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
 }

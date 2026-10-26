@@ -2,11 +2,14 @@ package commands
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
-	"github.com/spf13/cobra"
 )
 
 func TestParseSQLParams(t *testing.T) {
@@ -74,6 +77,66 @@ func TestReportMigrationsFailsOnDrift(t *testing.T) {
 	}
 }
 
+// A CI step that adds --json to read the report must not lose the gate: drift
+// is non-zero either way, and stdout still holds nothing but the full result.
+func TestMigrateStatusFailsOnDriftInBothModes(t *testing.T) {
+	drifted := map[string]any{"databaseID": "mdb-abc", "dryRun": true, "results": []map[string]any{
+		{"name": "0001_leads", "outcome": "skipped", "seq": 1},
+		{"name": "0002_score", "outcome": "drifted", "seq": 2},
+	}}
+	for _, mode := range []struct {
+		name string
+		args []string
+	}{
+		{"human", []string{"db", "migrate", "status", "--database", "mdb-abc"}},
+		{"json", []string{"db", "migrate", "status", "--database", "mdb-abc", "--json"}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			srv := newDatabaseServer(t)
+			srv.migrations = drifted
+			signInTo(t, srv.server.URL)
+
+			out, err := runCLI(t, migrationsDir(t), mode.args...)
+			if err == nil {
+				t.Fatal("drift must exit non-zero")
+			}
+			if !strings.Contains(err.Error(), "0002_score") {
+				t.Fatalf("error must name the drifted migration, got: %v", err)
+			}
+			if mode.name == "human" {
+				if out != "" {
+					t.Errorf("the human report belongs on stderr, stdout got %q", out)
+				}
+				return
+			}
+			var got api.MigrationSetResult
+			if jerr := json.Unmarshal([]byte(out), &got); jerr != nil {
+				t.Fatalf("stdout must be only the JSON result: %v\n%s", jerr, out)
+			}
+			if len(got.Results) != 2 || got.Results[1].Name != "0002_score" || got.Results[1].Outcome != api.MigrationDrifted {
+				t.Errorf("the JSON must carry the full result, drifted row included: %+v", got.Results)
+			}
+		})
+	}
+
+	t.Run("clean json", func(t *testing.T) {
+		srv := newDatabaseServer(t)
+		signInTo(t, srv.server.URL)
+
+		out, err := runCLI(t, migrationsDir(t), "db", "migrate", "status", "--database", "mdb-abc", "--json")
+		if err != nil {
+			t.Fatalf("a clean ledger is not a failure: %v", err)
+		}
+		var got api.MigrationSetResult
+		if jerr := json.Unmarshal([]byte(out), &got); jerr != nil {
+			t.Fatalf("stdout must be the JSON result: %v\n%s", jerr, out)
+		}
+		if len(got.Results) != 1 || got.Results[0].Name != "0001_leads" {
+			t.Errorf("results = %+v, want the one skipped migration", got.Results)
+		}
+	})
+}
+
 func TestReportMigrationsCleanRuns(t *testing.T) {
 	t.Run("dry run with pending work", func(t *testing.T) {
 		err := reportMigrations(&api.MigrationSetResult{
@@ -105,96 +168,10 @@ func TestReportMigrationsCleanRuns(t *testing.T) {
 	})
 }
 
-func TestParseEnvFlag(t *testing.T) {
-	t.Run("accepted values", func(t *testing.T) {
-		cases := map[string]api.Environment{
-			"":     api.EnvironmentProd, // the flag's own default
-			"prod": api.EnvironmentProd,
-			"dev":  api.EnvironmentDev,
-			"DEV":  api.EnvironmentDev,
-			" dev": api.EnvironmentDev,
-		}
-		for in, want := range cases {
-			got, err := parseEnvFlag(in)
-			if err != nil {
-				t.Errorf("parseEnvFlag(%q): %v", in, err)
-				continue
-			}
-			if got != want {
-				t.Errorf("parseEnvFlag(%q) = %q, want %q", in, got, want)
-			}
-		}
-	})
-
-	t.Run("a typo names the flag", func(t *testing.T) {
-		// "development" must not run against production for not being "dev".
-		for _, in := range []string{"prd", "development", "staging"} {
-			err := func() error { _, err := parseEnvFlag(in); return err }()
-			if err == nil {
-				t.Fatalf("parseEnvFlag(%q) must be refused", in)
-			}
-			if !strings.Contains(err.Error(), "--env") {
-				t.Errorf("error should name the flag, got: %v", err)
-			}
-			if !strings.Contains(err.Error(), in) {
-				t.Errorf("error should quote what was typed, got: %v", err)
-			}
-		}
-	})
-}
-
-func TestReportEnvironmentNamesTheDevCopy(t *testing.T) {
-	stderr := captureStderr(t, func() {
-		reportEnvironment(api.EnvironmentDev, "dev", "mdb-dev-1", "mdb-abc")
-	})
-	if !strings.Contains(stderr, "DEV COPY") || !strings.Contains(stderr, "mdb-abc") {
-		t.Fatalf("a dev run must say so, naming the PRODUCTION database: %q", stderr)
-	}
-	if strings.Contains(stderr, "mdb-dev-1") {
-		t.Errorf("the copy's own id is one the caller has never seen: %q", stderr)
-	}
-
-	quiet := captureStderr(t, func() {
-		reportEnvironment(api.EnvironmentProd, "prod", "mdb-abc", "")
-	})
-	if quiet != "" {
-		t.Errorf("a production run must print nothing: %q", quiet)
-	}
-}
-
-// An instance that predates ?environment=dev answers from production without
-// complaint; the server-side gate cannot catch that.
-func TestReportEnvironmentWarnsWhenProductionAnswered(t *testing.T) {
-	for _, answered := range []string{"prod", ""} {
-		stderr := captureStderr(t, func() {
-			reportEnvironment(api.EnvironmentDev, answered, "mdb-abc", "")
-		})
-		if !strings.Contains(stderr, "PRODUCTION answered") {
-			t.Errorf("environment=%q: asking for dev and getting production must be called out: %q", answered, stderr)
-		}
-	}
-}
-
-// The environment line has exactly one writer (reportEnvironment), so it is
-// never printed twice or dropped in --json mode.
-func TestReportMigrationsSaysNothingAboutTheEnvironment(t *testing.T) {
-	stderr := captureStderr(t, func() {
-		_ = reportMigrations(&api.MigrationSetResult{
-			DatabaseID:       "mdb-dev-1",
-			Environment:      "dev",
-			ParentDatabaseID: "mdb-abc",
-			Results:          []api.MigrationResult{{Name: "0001_leads", Outcome: api.MigrationApplied, Seq: 1}},
-		})
-	})
-	if strings.Contains(stderr, "DEV COPY") {
-		t.Errorf("reportMigrations must leave the environment line to reportEnvironment: %q", stderr)
-	}
-}
-
 // A note is advisory, never a failure: only the operator can tell a deliberate
 // backfill from a surprise.
 func TestReportMigrationsPrintsNotes(t *testing.T) {
-	const note = "migration 2 (0003_seed) contains DML; rows seeded from dev-copy data replay differently on production"
+	const note = "migration 2 (0003_seed) contains DML; check the rows it writes before pushing it elsewhere"
 	var err error
 	stderr := captureStderr(t, func() {
 		err = reportMigrations(&api.MigrationSetResult{
@@ -211,24 +188,6 @@ func TestReportMigrationsPrintsNotes(t *testing.T) {
 	}
 }
 
-// Only promote reaches an empty result: an empty migrations folder is refused
-// before any request.
-func TestReportMigrationsEmptyTail(t *testing.T) {
-	var err error
-	stderr := captureStderr(t, func() {
-		err = reportMigrations(&api.MigrationSetResult{
-			DatabaseID: "mdb-abc",
-			Results:    []api.MigrationResult{},
-		})
-	})
-	if err != nil {
-		t.Fatalf("nothing to promote is not a failure: %v", err)
-	}
-	if !strings.Contains(stderr, "Nothing to do") {
-		t.Fatalf("an empty tail must say so rather than print an empty list: %q", stderr)
-	}
-}
-
 func TestMigrationSetResultFilters(t *testing.T) {
 	r := &api.MigrationSetResult{Results: []api.MigrationResult{
 		{Name: "a", Outcome: api.MigrationSkipped},
@@ -241,75 +200,6 @@ func TestMigrationSetResultFilters(t *testing.T) {
 	}
 	if got := r.Drifted(); len(got) != 1 || got[0].Name != "c" {
 		t.Fatalf("Drifted() = %+v, want just c", got)
-	}
-}
-
-func TestDatabaseCommandWiring(t *testing.T) {
-	db := newDatabaseCmd()
-
-	find := func(path ...string) *cobra.Command {
-		t.Helper()
-		cur := db
-		for _, name := range path {
-			var next *cobra.Command
-			for _, c := range cur.Commands() {
-				if c.Name() == name {
-					next = c
-					break
-				}
-			}
-			if next == nil {
-				t.Fatalf("no `db %s` command", strings.Join(path, " "))
-			}
-			cur = next
-		}
-		return cur
-	}
-
-	for _, path := range [][]string{{"sql"}, {"migrate", "status"}, {"migrate", "push"}} {
-		cmd := find(path...)
-		flag := cmd.Flags().Lookup("env")
-		if flag == nil {
-			t.Errorf("`db %s` has no --env flag", strings.Join(path, " "))
-			continue
-		}
-		if flag.DefValue != string(api.EnvironmentProd) {
-			t.Errorf("`db %s` --env defaults to %q, want %q",
-				strings.Join(path, " "), flag.DefValue, api.EnvironmentProd)
-		}
-	}
-
-	// A dev-redirected promote would apply the copy into itself and report
-	// success.
-	promote := find("promote")
-	if promote.Flags().Lookup("env") != nil {
-		t.Error("`db promote` must not take --env")
-	}
-	if promote.Flags().Lookup("dry-run") == nil {
-		t.Error("`db promote` needs --dry-run")
-	}
-	if promote.Flags().Lookup("yes") == nil {
-		t.Error("`db promote` needs --yes: it is the one `db` verb that changes production's schema")
-	}
-	if err := promote.Args(promote, nil); err == nil {
-		t.Error("`db promote` must require the production database id")
-	}
-}
-
-func TestConfirmPromoteGate(t *testing.T) {
-	if ok, err := confirmPromote("mdb-abc", true, false); !ok || err != nil {
-		t.Errorf("--dry-run must not ask: ok=%v err=%v", ok, err)
-	}
-	// `go test` gives no terminal.
-	_, err := confirmPromote("mdb-abc", false, false)
-	if err == nil {
-		t.Fatal("a real promote with no --yes and no terminal must be refused")
-	}
-	if !strings.Contains(err.Error(), "--yes") {
-		t.Errorf("the refusal must name the flag that answers it, got %q", err)
-	}
-	if ok, err := confirmPromote("mdb-abc", false, true); !ok || err != nil {
-		t.Errorf("--yes must confirm: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -399,5 +289,160 @@ func TestDatabaseSQLResultKeepsRowsAffectedNull(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `"rowsAffected":0`) {
 		t.Errorf("a real 0 must reach the envelope as 0, distinct from null: %s", body)
+	}
+}
+
+// databaseServer records every request and answers the managed-database
+// routes `db sql` and `db migrate` call, plus the organization lookup a
+// --database push makes.
+type databaseServer struct {
+	server   *httptest.Server
+	requests []*http.Request
+	// migrations is the body the migrations route answers with; set it before
+	// the first request to serve a different ledger.
+	migrations map[string]any
+}
+
+func newDatabaseServer(t *testing.T) *databaseServer {
+	t.Helper()
+	d := &databaseServer{migrations: map[string]any{"databaseID": "mdb-abc", "results": []map[string]any{
+		{"name": "0001_leads", "outcome": "skipped", "seq": 1},
+	}}}
+	d.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d.requests = append(d.requests, r.Clone(r.Context()))
+		switch r.URL.Path {
+		case "/api/v2/authentication/me":
+			writeJSON(w, map[string]any{"tenant": map[string]any{"id": "ten-1", "name": "Acme"}})
+		case "/api/v2/database/mdb-abc/sql":
+			writeJSON(w, map[string]any{"databaseID": "mdb-abc", "result": "id\n1\n", "rowCount": 1})
+		case "/api/v2/database/mdb-abc/migrations":
+			writeJSON(w, d.migrations)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(d.server.Close)
+	return d
+}
+
+// migrationsDir is a folder a push would really send, so a refusal that came
+// after the request could not pass for one that came before it.
+func migrationsDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "migrations", "0001_leads.sql"), []byte("CREATE TABLE leads (id int);\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+const devCopiesRemovedText = "Dev copies of databases were removed. To test without touching live data, use a dev Space: ask an admin to create one, then build and test there against that Space's own database, and build the finished work in your real Space."
+
+// An older script's --env dev or `db promote` meant "not the live database";
+// running it anyway would write production, and "unknown flag" would not say
+// what to do instead.
+func TestRetiredDevCopyCallsAreRefusedBeforeAnyRequest(t *testing.T) {
+	for _, args := range [][]string{
+		{"db", "sql", "--env", "dev", "mdb-abc", "SELECT 1"},
+		{"db", "sql", "--env", "DEV", "mdb-abc", "SELECT 1"},
+		{"db", "sql", "--env", "staging", "mdb-abc", "SELECT 1"},
+		// No positionals: the refusal must win over the arity error.
+		{"db", "sql", "--env", "dev"},
+		{"db", "env", "--env", "dev"},
+		{"db", "connect", "--env", "dev"},
+		{"db", "migrate", "push", "--env", "dev", "extra"},
+		{"db", "migrate", "push", "--env", "dev", "--database", "mdb-abc"},
+		{"db", "migrate", "status", "--env", "dev", "--database", "mdb-abc"},
+		{"db", "env", "--env", "dev", "mdb-abc"},
+		{"db", "connect", "--env", "dev", "mdb-abc"},
+		{"db", "promote", "mdb-abc"},
+		{"db", "promote", "mdb-abc", "--dry-run"},
+		{"db", "promote", "mdb-abc", "--yes"},
+		{"--json", "db", "promote", "mdb-abc"},
+		{"db", "promote", "mdb-abc", "--json"},
+		{"db", "promote", "--help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			srv := newDatabaseServer(t)
+			signInTo(t, srv.server.URL)
+
+			_, err := runCLI(t, migrationsDir(t), args...)
+			if err == nil {
+				t.Fatal("accepted; it must be refused")
+			}
+			if err.Error() != devCopiesRemovedText {
+				t.Errorf("refusal = %q, want the dev-Space sentence", err.Error())
+			}
+			if len(srv.requests) != 0 {
+				t.Errorf("sent %d request(s) before refusing, first %s", len(srv.requests), srv.requests[0].URL)
+			}
+		})
+	}
+}
+
+// The flag and the command exist only to refuse; --help must not offer them.
+func TestRetiredDevCopySurfaceIsHidden(t *testing.T) {
+	db := newDatabaseCmd()
+	for _, path := range [][]string{{"sql"}, {"migrate", "status"}, {"migrate", "push"}, {"env"}, {"connect"}} {
+		cmd, _, err := db.Find(path)
+		if err != nil {
+			t.Fatalf("db %s: %v", strings.Join(path, " "), err)
+		}
+		flag := cmd.Flags().Lookup("env")
+		if flag == nil || !flag.Hidden {
+			t.Errorf("db %s: --env must exist and be hidden", strings.Join(path, " "))
+		}
+	}
+	promote, _, err := db.Find([]string{"promote"})
+	if err != nil || promote.Name() != "promote" {
+		t.Fatalf("db promote is gone; it must stay to refuse old scripts: %v", err)
+	}
+	if !promote.Hidden {
+		t.Error("db promote must be hidden")
+	}
+	// `ronja help db promote` prints Long, so it says why rather than nothing.
+	if promote.Long != devCopiesRemovedText {
+		t.Errorf("db promote Long = %q, want the refusal sentence", promote.Long)
+	}
+}
+
+// "prod" always meant the database named, so it and no flag at all both run,
+// and neither puts ?environment= on the wire.
+func TestDatabaseCommandsRunWithProdOrNoEnv(t *testing.T) {
+	for _, args := range [][]string{
+		{"db", "sql", "mdb-abc", "SELECT 1"},
+		{"db", "sql", "--env", "prod", "mdb-abc", "SELECT 1"},
+		{"db", "sql", "--env", " prod ", "mdb-abc", "SELECT 1"},
+		// Blank after trimming is the same as no flag.
+		{"db", "sql", "--env", " ", "mdb-abc", "SELECT 1"},
+		{"db", "migrate", "status", "--database", "mdb-abc"},
+		{"db", "migrate", "push", "--database", "mdb-abc"},
+		{"db", "migrate", "push", "--env", "prod", "--database", "mdb-abc"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			srv := newDatabaseServer(t)
+			signInTo(t, srv.server.URL)
+
+			if _, err := runCLI(t, migrationsDir(t), args...); err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			sent := 0
+			for _, r := range srv.requests {
+				if !strings.HasPrefix(r.URL.Path, "/api/v2/database/") {
+					continue
+				}
+				sent++
+				if r.URL.RawQuery != "" {
+					t.Errorf("%s carried %q, want no query string", r.URL.Path, r.URL.RawQuery)
+				}
+			}
+			if sent != 1 {
+				t.Errorf("sent %d database request(s), want 1", sent)
+			}
+		})
 	}
 }

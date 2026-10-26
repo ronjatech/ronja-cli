@@ -1545,7 +1545,7 @@ func TestAppPushAcceptsTheDeclarableCapabilities(t *testing.T) {
 		name         string
 		capabilities []string
 	}{
-		{"all four", declarableCapabilities},
+		{"all five", declarableCapabilities},
 		{"none declared", []string{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

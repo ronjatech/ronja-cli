@@ -245,13 +245,6 @@ whether a credential exists, and revoking it, stay on `ronja api` and in Ronja.
 the CLI already holds into the place another program reads it, and only as
 something to `eval` or exec.)
 
-`ronja db promote` is the one verb in that set whose two ends are both remote,
-and it passes the same test rather than getting an exception: it moves a ledger
-**tail** from a database's dev copy onto the database, comparing the shared
-prefix position by position, applying all-or-nothing, and reporting divergence
-as an instruction. Stateful, multi-step, drift-guarded — and not a list, a
-browse or a delete. What makes it a verb is the loop, not the endpoint.
-
 One verb sits beside those loops rather than inside one: `ronja bind` reconciles
 a folder's **declared dependencies** against one organization's rows (see
 [Dependencies](#dependencies-ronja-bind)). It passes the same test — the
@@ -944,13 +937,6 @@ rotating a leaked credential at 3am is exactly when a human-only gate makes
 security worse), and **irreversible at organisation scale** (deleting the org,
 cascade execute, billing).
 
-One refusal carries the same code without being one of those routes: making or
-refreshing a managed database's dev copy **with the production data** in it,
-which terminates every connection to the production database while the copy is
-taken. That is a property of the argument rather than the route — the same two
-routes answer `202` for a **structure-only** copy — so the route is not flagged
-and the handler refuses the narrower thing. See below.
-
 ⚠️ **This makes the CLI strictly less capable than the app, on purpose, and
 someone will file it as a bug.** The defence is the same one the whole PAT model
 rests on: you approved this credential in a browser ninety days ago, for the
@@ -1601,6 +1587,18 @@ correct, and nothing else in the output says why. Check `zoneUsed` first when
 CLI numbers disagree with the app. (With `--json` the field is in the envelope
 too; `--jq .zoneUsed` reads it.)
 
+**A table that is not updating gets a `Warning:` line on stderr, after the
+truncation note.** The envelope's `tableHealth` names each referenced table
+whose own build is failing (since when, and that the rows are its last good
+data) or that is built on a broken input (naming the oldest upstream problem
+and counting the rest as "and N more upstream problems"), one line per table; a
+table with both gets the own-build line only. Names and reasons are collapsed
+to one bounded line. The query ran and exits zero, and an older server that
+sends no `tableHealth` prints nothing; `--json` / `--jq .tableHealth` carry the
+entries (`[]` when there are none, and each entry's `upstream` is `[]` too); an
+optional field the server left out (`buildFailing`, or an `upstream` item's
+`id`, `name`, `readable`, `since`, `lastBuiltAt`) is absent, never `null`.
+
 ## Managed databases (`ronja db`)
 
 `ronja database`, aliased `db`, is the managed-Postgres loops plain HTTP does
@@ -1614,31 +1612,23 @@ ronja db sql <database-id> "INSERT INTO leads (email) VALUES (\$1)" --params '["
 ronja db migrate status --database <database-id>
 ronja db migrate push   --database <database-id>
 
-# try it on the dev copy first, then move what worked onto production
-ronja db migrate push   --database <database-id> --env dev
-ronja db sql <database-id> "SELECT count(*) FROM leads" --env dev
-ronja db promote <database-id> --dry-run
-ronja db promote <database-id>            # asks first
-ronja db promote <database-id> --yes      # for CI, agents, anything headless
-
 # reach it from outside Ronja, with your own Postgres tools
 eval "$(ronja db env <database-id>)" && pg_dump -Fc > dump.pgc
 ronja db connect <database-id>
 ```
 
-**Why these three and no others.** `db sql` clears the same bar `ronja query`
+**Why these two and no others.** `db sql` clears the same bar `ronja query`
 does — quoting, result shape, and an error that must not be silent. `db migrate`
-is a stateful loop with a drift guard. `db promote` moves a ledger **tail**
-between two ledgers: the shared prefix is compared position by position, the
-tail applies all-or-nothing, and divergence has to be reported as an instruction
-rather than a hash mismatch — stateful, multi-step and drift-guarded, which is
-the same test `migrate` passes, and it is not a list, a browse or a delete.
-Creating, listing and deleting a database are single calls that `ronja api` runs
+is a stateful loop with a drift guard. Creating, listing and deleting a database are single calls that `ronja api` runs
 perfectly well, so there is deliberately no `db list` / `db create` /
 `db delete`.
 
 `db env` and `db connect` are a different kind of thing again — see
 "psql and pg_dump" below.
+
+**Every command runs on the database you name.** To try a migration or a write
+without touching live data, run it against a dev Space's own database first —
+see [Testing without touching live data: a dev Space](#testing-without-touching-live-data-a-dev-space).
 
 **`db sql` is DML only.** It runs as the database's *write* role, which has no
 CREATE privilege, so DDL is refused by Postgres itself rather than filtered
@@ -1680,7 +1670,8 @@ whitespace forever — the first time it did not, every applied migration would
 report as drifted. Drift is the one signal that must never cry wolf, so only the
 thing that stored the hash is entitled to raise it.
 
-`status` exits non-zero on drift, so it works as a CI gate without parsing.
+`status` exits non-zero on drift, with or without `--json` (the JSON is printed
+in full first), so it works as a CI gate without parsing.
 
 **Two limits, each counting what it is about.** The whole folder is always
 sent, and one request may carry up to 1000 migrations (past that the server
@@ -1693,121 +1684,9 @@ note (when nothing has drifted) and still exits 0: it warns about the next
 push, the folder is not broken. Drift is refused first, naming every drifted
 file.
 
-### The dev copy (`--env dev`) and `db promote`
-
-A managed database can have a **dev copy**: a separate Postgres database with
-the same schema, its own data, and its own migration ledger. `db sql` and
-`db migrate` reach it with `--env dev`, and `db promote` moves the migrations
-the copy has and production does not onto production.
-
-**Making one is not a CLI verb** (resource verbs never are — see the doctrine
-above), but it is machine-callable, so a pipeline can stand up its own sandbox
-through `ronja api` rather than depending on one made by hand:
-
-```bash
-ronja api -X POST /api/v2/database/<database-id>/twin -d '{"mode":"schema"}'
-```
-
-That answers `202` with the copy at `provisioning`; poll
-`GET /api/v2/database/<database-id>` until its `twin` says `ready`. Do not
-re-POST to poll — a repeat while it is provisioning returns the same row and
-starts nothing, so it tells you no more than the GET does. Refreshing a
-structure-only copy is the same shape at `:id/twin/refresh`, with no body — so
-`-X POST` is required there, since `ronja api` defaults to `GET` when there is
-nothing to send:
-
-```bash
-ronja api -X POST /api/v2/database/<database-id>/twin/refresh
-```
-
-A refresh while the copy is still `provisioning` is refused: the discard that
-starts it would delete the record of a database that is still being built. Wait
-for `ready`.
-
-⚠️ **`{"mode":"data"}` is refused to a machine** with `403 human_required`,
-create and refresh alike: a copy carrying production's rows is taken by
-`CREATE DATABASE ... TEMPLATE`, which terminates every connection to production
-while it runs. A person does that on the database's page in Data Studio, or by
-asking Ronja in a chat. And a refresh may not CHANGE the kind — a stated `mode`
-that differs from the copy's is a `400` for everyone, since downgrading would
-empty a data sandbox and upgrading would disconnect production for a request
-that never said so. Send no `mode` to rebuild the copy as it is.
-
-**You never name the copy.** Every command takes the **production** id and the
-server resolves the copy from it — the copy has no id the CLI ever learns, sends
-or records. That asymmetry is the safety property, so the flag is a query
-parameter on an admin-gated route rather than a second id passed around: it can
-only ever narrow what a request touches, never widen it. `prod` is the default,
-and asking for it explicitly puts nothing on the wire — a non-dev request is
-byte-identical to the one this CLI sent before dev copies existed, which is also
-what keeps it working against an older instance.
-
-**Asking for the copy fails when there is none.** `--env dev` against a database
-with no dev copy — or one that is provisioning, in error, or in the trash — is
-refused by the server before a statement runs, naming what is wrong. It is
-deliberately NOT the same rule a draft workflow gets: a draft with no copy falls
-through to production so it stays runnable, while somebody who TYPED `--env dev`
-asked for the copy, and production would be an answer to a different question.
-On `db sql` that distinction is the difference between a refusal and a `DELETE`
-that already ran.
-
-Which copy answered is reported on **stderr** — never stdout, which is CSV
-somebody is parsing or a `--json` envelope somebody is piping, and a dev result
-read as production's is a wrong answer rather than an incomplete one. It is
-printed whenever the answer could surprise: the dev copy answering (in every
-mode, before the rows or the verdicts), and production answering a `--env dev`
-request, which a current instance refuses but an instance predating dev copies
-does silently. A plain production command says nothing extra.
-
-**Minting a connection role against the copy is refused.** `POST :id/user` is a
-production act, and there is nothing to mint anyway: every tier the parent hands
-out is mirrored on the copy automatically, named `<parent> (<tier>) (dev)`. Use
-those logins to connect to the copy directly.
-
-**`db promote` sends no migrations.** What promotes is exactly the tail the
-copy's ledger has past production's, computed server-side from the two ledgers —
-there is no list to send and nothing to choose, for the same reason `db migrate`
-computes no hashes. The tail applies through the *same* path `db migrate push`
-uses, so promoting twice is safe and the second run reports everything as
-skipped. `--dry-run` shows the plan.
-
-**A real promote asks first.** It is the only `db` verb that changes
-production's schema, so on a terminal it prompts `[y/N]` naming the database,
-and `--yes` answers up front. Without a terminal — CI, an agent, anything
-piping — `--yes` is *required*: the command refuses rather than prompting into a
-pipe that will never answer, because a job that did not pass it did not mean to
-change production. `--json` counts as "no terminal" for the same reason. Only
-`--dry-run` is exempt, since it changes nothing.
-
-Two things it is not:
-
-- **It replays SQL, not data.** A migration that seeded rows from whatever was
-  in the dev copy runs against production's rows instead. Any migration in the
-  tail that writes rows comes back as an advisory `note`, printed and never
-  fatal — only the person promoting can tell a deliberate backfill from a
-  surprise.
-- **It is not a sync.** Nothing comes back down; the copy is refreshed by
-  refreshing it.
-
-**Divergence** is the failure worth knowing about: the shared prefix of the two
-ledgers disagrees, because production moved on or the copy was edited at a
-position production already has. The server refuses, applies nothing, and says
-so in words — a plain HTTP 400, so an ordinary non-zero exit covers it and the
-command needs no second mechanism. The fix is to refresh the dev copy (which
-rebases it on production), re-apply your migrations on top, and promote again.
-`db promote` also exits non-zero on drift, so it works as a deployment gate
-without parsing its output.
-
-**A reused migration name is refused too**, naming it and telling you to rename
-it on the copy. The ledger's names are not unique and the server resolves a name
-to its recorded hash newest-first, so promoting a second migration under a name
-production already has would make every later `db migrate status` report that
-file as drifted — and drift is the one signal that must never cry wolf.
-
 **The binding is local-only** — `.ronja/database.json`, keyed by
 `(url, tenantID)` through `wfdir.InstanceKey`, written only after a successful
-`push`. A `--env dev` push records it exactly as a production push does, because
-the id it records is the production one either way. It is deliberately *not* a
+`push`. It is deliberately *not* a
 committed `ronja.json`: `wfdir.FindRoot` walks parents and `LoadManifest`
 refuses a non-`workflow` kind, so a committed
 `kind: "database"` manifest at a repo root would break every `wf` command
@@ -1897,12 +1776,6 @@ ronja api /api/v2/feature/query --jq '.result[] | [.id, .scope, .name] | @tsv' -
 And if the database already has a read credential, minting **replaces** it:
 anything still holding the old one stops working.
 
-**`--env dev` is not supported here** and says so rather than failing as an
-unknown flag. A dev copy is a database in its own right at the proxy — its own
-id, its own physical name, its own read role — and it is addressed by that id.
-The prod→dev overlay exists for requests that *name* a production database, and
-a proxy login never does: the username **is** the id.
-
 **There is deliberately no `db dump`.** `pg_dump` after `db env` is the whole
 feature, and a wrapper would have to re-expose every `pg_dump` flag — format,
 compression, parallelism, table selection, `--no-owner` — forever, to be worth
@@ -1910,6 +1783,10 @@ using at all. What the CLI can add is the credential and the connection
 parameters, which is exactly what these two do.
 
 ## Workflow folders (`ronja wf`)
+
+**A draft's test run uses the databases its logins name.** In your real Space,
+those are the live databases. To test without touching live data, use a
+[dev Space](#testing-without-touching-live-data-a-dev-space).
 
 `ronja workflow`, aliased `wf`, develops one workflow from a local folder:
 clone → edit → validate → push → test → publish → run. The code lives in the
@@ -2542,10 +2419,10 @@ Four behaviours are deliberate and easy to undo by accident:
 
 **A folder on a retired runtime does not deploy to a new stack.** The first
 push to a stack creates the workflow, and a workflow is created only on runtime
-3 — so a committed folder declaring `"runtime": 1` or `2` keeps pushing to the
-stacks that already hold its workflow, but its first push to a new one (another
-organization, or a fresh environment) is refused at the create. Convert the
-code and declare `"runtime": 3` first.
+3 or 4 — so a committed folder declaring `"runtime": 1` or `2` keeps pushing to
+the stacks that already hold its workflow, but its first push to a new one
+(another organization, or a fresh environment) is refused at the create. Convert
+the code and declare `"runtime": 3` or `4` first.
 
 ### Dependencies (`ronja bind`)
 
@@ -2761,7 +2638,7 @@ Seven rules, and each one is a wrong deploy that does not fail:
 - **A write target is never proposed.** A dependency declared `"write": true`
   is a row the folder's code CHANGES, and the organization-wide exact-name
   match for it in a new stack is the very table another stack writes —
-  production, when the new stack is a Dev copy in the same organization. It is
+  production, when the new stack is a Dev stack in the same organization. It is
   reported unresolved with reason `write_target` ("write target — bound by
   hand, per stack") and left for a person to bind, stack by stack.
 - **A run target is never proposed.** A dependency declared `"run": true` is a
@@ -3113,6 +2990,10 @@ rather than an 8: version 7 never shipped without it, so no CLI reads 7 and not
 
 ### `wf run` — the step after publish
 
+**A run uses the databases its logins name, as a draft's test run does.** In
+your real Space, those are the live databases. To test without touching live
+data, use a [dev Space](#testing-without-touching-live-data-a-dev-space).
+
 `run` is the only verb that touches the **live** workflow, and it is a sync verb
 rather than a wrapper because it takes **no workflow id**: it runs the row this
 folder's binding names, resolved exactly as `status` and `publish` resolve it. A
@@ -3203,15 +3084,15 @@ types every time guards nothing.
   is read. `--no-validate` skips the pass that reports them, and so skips the
   verdict.
 
-### Durable workflows (runtime 3)
+### Durable workflows (runtime 3 and 4)
 
 A durable workflow journals the result of every `@tools.step` under a key
 DERIVED from the function and its arguments, so a failed run can be **resumed**
 instead of re-run: the journaled steps are replayed and only the work that never
 finished executes again.
 
-**Runtime 3 is what a new workflow is, and the only runtime it can be.** It is
-durable **and** withholds every Ronja table credential from the container: its
+**A new workflow is created on runtime 3 or 4, and nothing else.** Both are
+durable **and** withhold every Ronja table credential from the container: their
 code reads a table only through
 `tools.query("SELECT ... FROM {{ ref('tbl::...') }}")`, never by reading a
 parquet file itself. `wf init` pins the runtime the instance creates on and
@@ -3240,7 +3121,8 @@ ronja wf test --resume                        # continue from where it stopped
 Three things are worth knowing, and each is a place the obvious behaviour would
 be wrong:
 
-- **The runtime only ever goes up, and only to 3: 1 → 3, 2 → 3.** The manifest's
+- **The runtime only ever goes up, and never to a retired one: 1 → 3, 2 → 3,
+  and to 4 from any of them.** The manifest's
   `runtime` rides the `POST /workflow` body of the push that creates the
   workflow, and afterwards a push from a folder declaring `3` **upgrades** a
   workflow on runtime 1 or 2 — as its own request, sent after the files land,
@@ -3765,24 +3647,25 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   [Dependencies](#dependencies-ronja-bind) for the resolution rules and for why
   `allowedMetricIDs` takes a `table` alias.
 
-  Only four names ever belong in `capabilities` — `ai`, `query_external`,
-  `write_external`, `upload_file` — one per SDK call that is not derived from
-  an allowlist (completeAI, queryExternal, executeExternal, uploadFile).
+  Only five names ever belong in `capabilities` — `ai`, `embed`,
+  `query_external`, `write_external`, `upload_file` — one per SDK call that is
+  not derived from an allowlist (completeAI, embed, queryExternal,
+  executeExternal, uploadFile).
   Everything else — reading tables, running an allowed agent or workflow,
   evaluating an allowed metric, codex search, HTTP fetch through an allowed
   secret — is granted by the `allowed*IDs` lists themselves, and the org
   roster (`users()`) needs neither. `ronja app init --help` names the same
-  four, so the vocabulary lives in the command.
+  five, so the vocabulary lives in the command.
 
   **`push` refuses any other name, locally, before its first request.** The
   server does not validate this field: an unknown capability is dropped when the
   app's token is minted, so `"upload_fil"` used to push green, publish green and
   show no drift, then fail in a viewer's browser with nothing pointing back at
-  the manifest. The refusal names the offending entry and the four valid names —
+  the manifest. The refusal names the offending entry and the five valid names —
   and says so if you are simply older than the server, since the vocabulary is
   closed but not frozen (`declarableCapabilities` in
   `internal/commands/dataapp.go`; the backend pins the correspondence in
-  `TestDataAppCaps_DeclareOnlySetIsExactlyFour`).
+  `TestDataAppCaps_DeclareOnlySetIsExactlyFive`).
 
   It has the same **three states** `parameters` does — absent means "not
   managed, push never touches them", present means "push makes the row match" —
@@ -3976,6 +3859,10 @@ skipped rather than silently dropped. A data app holds at most 100 files and
 before the first request rather than half-way through a sync.
 
 ### `app test` — render it and look at it
+
+**A draft's test render uses the databases its logins name.** In your real
+Space, those are the live databases. To test without touching live data, use a
+[dev Space](#testing-without-touching-live-data-a-dev-space).
 
 ```bash
 ronja app test
@@ -8132,6 +8019,104 @@ left in place, and every reference is a stem, an address, an own-output name or 
 data source bound in `main`. `TestImportLeavesNoUnreportedLiteral` scans every
 written file for an id the report does not name. One test per row of the
 table above is in `import_portability_test.go`.
+
+## Testing without touching live data: a dev Space
+
+Everything the CLI runs uses exactly the rows and credentials it names. A
+draft's `wf test` and an `app test` render use the databases their logins name,
+and `ronja db` runs on the database you pass it. In your real Space, those are
+the live databases, and Ronja has no per-database copies to redirect to. To try
+a change without touching live data, build and test it in a **dev Space**: a
+separate Space of the same organization, with its own feature, its own managed
+database and its own secrets. Then deploy the finished work to your real Space.
+
+**Once, in the browser.**
+
+1. An Admin creates the Space on the **Spaces** page (`/admin/spaces`), for
+   example "Dev". Anyone else asks an admin to.
+2. Switch to that Space and create the feature the `dev` stack will deploy
+   into.
+3. If the work uses a managed database, an Admin creates it while in that
+   Space: on the **Databases** page, or by asking Ronja in a chat started
+   there. The database then belongs to the dev Space.
+4. Still in that Space, create the dev Space's own copy of every row the work
+   depends on: its secrets, its tables, and a login to the dev database. `bind`
+   below can only offer the dev Space's rows once they exist.
+
+A token cannot choose a Space today (what it creates lands in the
+organization's default Space), which is why these are made in the browser. For
+the same reason, a token's database create reuses only a database of that name
+in the default Space: if the name is only in another Space, the create is
+refused and names that Space.
+
+**Migrations: the dev database first, then the real one.**
+
+```bash
+ronja db migrate push --database <the dev Space's database id>
+# test against it
+ronja db migrate push --database <the real Space's database id>
+```
+
+Today a `migrations/` folder remembers one database per organization, and both
+databases are in the same one, so pass `--database` on each push rather than
+relying on the remembered binding.
+
+**Folders: one per Space.** A stack is one deployment per organization today,
+and both Spaces are in the same organization, so one folder cannot declare a
+`dev` and a `prod` stack for them: `ronja bind --stack prod --feature …` in a
+folder whose `dev` stack names this organization is refused, because the
+folder's local sync baseline is keyed by the organization. Deploy to the dev
+Space from a second folder instead:
+
+1. Make the dev folder a copy of the real one: copy the source files, and copy
+   `ronja.json` with both its `stacks` and its `instances` blocks removed. Do
+   not copy `.ronja/` or `ronja.lock.json`; they record the real Space's rows.
+2. In each folder of the dev tree, declare the `dev` stack on the dev Space's
+   feature. Run it without `--yes`:
+
+   ```bash
+   ronja bind --stack dev --feature col-<the dev Space's feature>
+   ```
+
+3. Check every id `bind` proposes before you accept it. A token's search covers
+   the whole organization, so `bind` can propose a row from your real Space:
+   as the only candidate when the dev Space has no row of that name yet, or as
+   one of several candidates when both Spaces have one. Never run `bind --yes`
+   in the dev folder. To see which feature each candidate belongs to:
+
+   ```bash
+   ronja api '/api/v2/search?q=hubspot' --jq '.result[] | [.kind, .id, .title, .featureID] | @tsv' -r
+   ```
+
+   A row is the dev Space's when its feature is the dev feature, or another
+   feature in the dev Space. In the web app, a table's or a secret's page
+   (`/tables/<id>`, `/secrets/<id>`) links the feature it belongs to; open that
+   feature with the dev Space selected, and a feature in any other Space says
+   "This feature is in <Space>." at the top of its page. If a proposed id is
+   not the dev Space's, decline (one prompt covers the whole write, so nothing
+   is written), create the dev Space's row of that name, and run `bind` again.
+4. For a name `bind` reports as ambiguous, set the dev Space's row id by hand
+   under `stacks.dev.bind` in the dev folder's `ronja.json`:
+   `"<alias>": "<the dev Space's row id>"`. `bind` never fills in a table the
+   code writes (`write_target`) or a workflow or Saved Agent it runs
+   (`run_target`): set each of those by hand under `stacks.dev.bind` too, to
+   the dev Space's row (see [Dependencies](#dependencies-ronja-bind)).
+5. Run `ronja sync apply --stack dev --allow-create` in the dev tree, and test
+   there (`ronja wf test`, `ronja app test`). The first deploy creates every
+   row in the dev Space, and `sync apply` creates nothing without
+   `--allow-create`; later deploys to the dev stack don't need it.
+6. Copy the finished work back, folder by folder: copy the source files into
+   the real folder, and replace its `ronja.json` with the dev folder's (which
+   holds the tested `parameters`, `dependencies`, `entrypoint`, `runtime` and
+   `access`) with the real folder's own `stacks` and `instances` put back into
+   it. Keep the real folder's `.ronja/` and `ronja.lock.json`. Then run
+   `ronja sync apply --stack prod` in the real tree, with `--allow-create` the
+   first time if the dev work added a unit (a workflow, an app, a `.sql` file)
+   the real tree never had.
+
+The dev folder's `bind` map answers `hubspot` with the dev Space's secret, while
+the real folder's answers it with the live one (see
+[Dependencies](#dependencies-ronja-bind)).
 
 ## Design rules
 

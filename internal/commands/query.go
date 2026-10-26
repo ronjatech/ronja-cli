@@ -83,6 +83,10 @@ Authoring advice about the SQL — a backslash escape that reads differently
 under raw and legacy escape handling, say — is printed on stderr too, and
 carried as .advice. It is never a failure: a query with advice on it ran.
 
+A referenced table that is not updating — its own build is failing, or a table
+it is built from is broken — gets a Warning line on stderr, carried as
+.tableHealth. The query ran; the rows may be older than you expect.
+
 A heavy query can take several minutes; raise --timeout for those (the default
 is generous for an interactive query and too short for a heavy one). One that
 runs out of memory or time fails with an error that says so; narrow the query.
@@ -179,6 +183,7 @@ is non-zero.`,
 					"  Note: truncated at %d %s — this is a prefix, not the whole answer. Raise --max-rows (with --out for a large result), or aggregate in SQL.\n",
 					result.RowCount, plural(result.RowCount, "row"))
 			}
+			printQueryTableHealth(os.Stderr, result.TableHealth)
 
 			if out != "" {
 				if err := writeResultFile(out, result.Result); err != nil {

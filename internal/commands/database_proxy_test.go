@@ -78,6 +78,26 @@ func TestDatabaseEnvEmitsPGVariables(t *testing.T) {
 	}
 }
 
+// "prod" always meant the database named, so it reaches the proxy lookup.
+func TestDatabaseEnvAndConnectAcceptEnvProd(t *testing.T) {
+	srv, gotPath := proxyServer(t, proxyRolesBody)
+	signInTo(t, srv.URL)
+
+	if _, err := runCLI(t, t.TempDir(), "db", "env", "--env", "prod", "mdb-abc"); err != nil {
+		t.Fatalf("db env --env prod: %v", err)
+	}
+	if *gotPath != "/api/v2/database/mdb-abc/roles" {
+		t.Errorf("db env --env prod asked %q", *gotPath)
+	}
+
+	// With no psql on PATH, the psql refusal proves the --env check passed.
+	t.Setenv("PATH", t.TempDir())
+	_, err := runCLI(t, t.TempDir(), "db", "connect", "--env", "prod", "mdb-abc")
+	if err == nil || !strings.Contains(err.Error(), "psql is not on your PATH") {
+		t.Errorf("db connect --env prod = %v, want it past the --env check to the psql lookup", err)
+	}
+}
+
 func TestDatabaseEnvJSON(t *testing.T) {
 	srv, _ := proxyServer(t, proxyRolesBody)
 	signInTo(t, srv.URL)
@@ -177,24 +197,6 @@ func mintPayload(t *testing.T, msg string) string {
 		t.Fatalf("refusal's -d payload is unterminated:\n%s", msg)
 	}
 	return rest[:j]
-}
-
-// `db sql` and `db migrate` take --env, so it will be typed here; the refusal
-// says a dev copy is addressed at the proxy by its own id, since the username
-// is the id and there is no prod→dev overlay to redirect.
-func TestDatabaseConnectRefusesEnvFlag(t *testing.T) {
-	srv, _ := proxyServer(t, proxyRolesBody)
-	signInTo(t, srv.URL)
-
-	for _, cmd := range []string{"env", "connect"} {
-		_, err := runCLI(t, t.TempDir(), "db", cmd, "--env", "dev", "mdb-abc")
-		if err == nil {
-			t.Fatalf("db %s --env dev was accepted", cmd)
-		}
-		if !strings.Contains(err.Error(), "OWN database id") {
-			t.Errorf("db %s: refusal must say how a dev copy IS reached, got: %v", cmd, err)
-		}
-	}
 }
 
 // libpq has no environment variable for keepalives_idle, so only a built
