@@ -275,6 +275,18 @@ func installedBinary(t *testing.T, dir string) string {
 	return resolved
 }
 
+// Tests take the Unix branches unless they call pretendWindows: the swap they
+// drive is the Unix path, and Windows refuses before it.
+func init() { hostOS = "linux" }
+
+// pretendWindows takes the Windows branches on whatever OS runs the test.
+func pretendWindows(t *testing.T) {
+	t.Helper()
+	previous := hostOS
+	hostOS = "windows"
+	t.Cleanup(func() { hostOS = previous })
+}
+
 func useMirror(t *testing.T, m *fakeMirror, version string) {
 	t.Helper()
 	previousURL, previousVersion := releaseBaseURL, Version

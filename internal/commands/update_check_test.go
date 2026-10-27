@@ -76,7 +76,7 @@ func expectedNoticeFor(t *testing.T, latest string) string {
 
 func assertNoNotice(t *testing.T, stderr string) {
 	t.Helper()
-	if strings.Contains(stderr, "— run:") {
+	if len(noticeLines(stderr)) > 0 {
 		t.Errorf("a notice was printed and should not have been:\n%s", stderr)
 	}
 }
@@ -253,7 +253,7 @@ func TestUpdateNoticeKeepsCheckedAtAfterAFailedLookup(t *testing.T) {
 	mirror.failRelease = true
 	noticeEnv(t, mirror, testCurrentVersion)
 
-	if _, _, stderr := runNotice(t, noticeCommand...); strings.Contains(stderr, "— run:") {
+	if _, _, stderr := runNotice(t, noticeCommand...); len(noticeLines(stderr)) > 0 {
 		t.Errorf("a failed lookup printed something:\n%s", stderr)
 	}
 	assertNear(t, "CheckedAt", loadState(t).CheckedAt, time.Now())
@@ -713,6 +713,48 @@ func TestUpdateNoticeNamesTheInstallMethod(t *testing.T) {
 	}
 }
 
+// On Windows the remedy is the way the binary was installed: only a release
+// build carries the version stamp, and a `go install` build reads "dev".
+func TestUpdateInstallMethodOnWindows(t *testing.T) {
+	const zipExe = `C:\Users\a\AppData\Local\Programs\ronja\ronja.exe`
+	cases := []struct {
+		name  string
+		stamp string
+		exe   string
+		want  update.Method
+	}{
+		{"a release zip downloads the next one", testCurrentVersion, zipExe, update.MethodDownload},
+		{"a go install build installs again", "dev", zipExe, update.MethodGoInstall},
+		{"Homebrew is asked first", testCurrentVersion, "/opt/homebrew/Caskroom/ronja/0.28.4/ronja", update.MethodHomebrew},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pretendWindows(t)
+			previous, previousExe := Version, currentExecutable
+			Version = tc.stamp
+			currentExecutable = func() (string, error) { return tc.exe, nil }
+			t.Cleanup(func() { Version, currentExecutable = previous, previousExe })
+
+			if got := updateInstallMethod(); got != tc.want {
+				t.Errorf("updateInstallMethod() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The notice a Windows user on a release zip actually sees.
+func TestUpdateNoticeOnWindowsPointsAtTheDownload(t *testing.T) {
+	pretendWindows(t)
+	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
+	noticeEnv(t, mirror, testCurrentVersion)
+
+	_, _, stderr := runNotice(t, noticeCommand...)
+	want := update.Notice(testCurrentVersion, testLatestVersion, update.MethodDownload)
+	if got := noticeLines(stderr); !equalLines(got, []string{want}) {
+		t.Errorf("stderr notice lines = %q, want %q", got, want)
+	}
+}
+
 // cobra runs only the NEAREST PersistentPreRun, so one on any subcommand would
 // silently switch the check off for that branch.
 func TestNoSubcommandShadowsTheRootPersistentPreRun(t *testing.T) {
@@ -733,7 +775,9 @@ func TestNoSubcommandShadowsTheRootPersistentPreRun(t *testing.T) {
 func noticeLines(stderr string) []string {
 	var out []string
 	for _, line := range strings.Split(stderr, "\n") {
-		if strings.Contains(line, "— run:") {
+		// Every remedy, "download it from" included, but not update --check's
+		// "(you have …). Would".
+		if strings.Contains(line, " is available (you have ") && strings.Contains(line, ") — ") {
 			out = append(out, line)
 		}
 	}

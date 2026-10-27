@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
 	"strings"
 	"time"
 
@@ -212,9 +211,13 @@ func updateInstallMethod() update.Method {
 	if exe, err := currentExecutable(); err == nil && update.InstalledByHomebrew(exe) {
 		return update.MethodHomebrew
 	}
-	if runtime.GOOS == "windows" {
-		// `ronja update` refuses on Windows: no release asset, and no rename
-		// over a running exe.
+	if hostOS == "windows" {
+		// `ronja update` refuses on Windows, so the remedy is the way it was
+		// installed. Only a release build carries the stamp; a `go install`
+		// build takes its version from Go's build info.
+		if Version != "dev" {
+			return update.MethodDownload
+		}
 		return update.MethodGoInstall
 	}
 	return update.MethodSwap

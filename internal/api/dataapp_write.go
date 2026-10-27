@@ -326,7 +326,7 @@ type DataAppAudience struct {
 	FeatureName string `json:"featureName"`
 	// Reads / Calls / Writes are the app's bindings, labelled. Writes is
 	// non-empty only when the app can write to a managed database — every
-	// viewer gets it, since an app cannot tell viewers apart.
+	// viewer gets it: the app's capabilities are the same for every viewer.
 	Reads  []string `json:"reads"`
 	Calls  []string `json:"calls"`
 	Writes []string `json:"writes"`

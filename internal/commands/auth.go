@@ -47,7 +47,8 @@ A token belongs to ONE organization: the one you are signed in to in the browser
 when you approve. To add a second organization, switch to it in the web app and
 run this again — the new token is stored as its own profile beside the first,
 never on top of it. The profile is named after the organization unless
---profile says otherwise.
+--profile says otherwise. An organization already signed in here keeps its
+profile's name; 'ronja profile rename' changes it.
 
 With --with-token, a token is read from stdin instead. That is the path for CI
 and for machines with no browser:
@@ -135,7 +136,7 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 	// ⚠️ Persist before verifying: the server hands the plaintext over exactly
 	// once, so a /me failure first would orphan a live credential. The poll
 	// response carries the organization; only the profile's name waits on /me.
-	name, provisional, declined, err := claimLogin(baseURL, token.TenantID, func(p *config.Profile) {
+	claim, err := claimLogin(baseURL, token.TenantID, func(p *config.Profile) {
 		p.Token = token.Token
 		p.TokenID = token.TokenID
 		p.TokenName = token.TokenName
@@ -145,12 +146,13 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 	if err != nil {
 		return fmt.Errorf("store the token that was just issued: %w", err)
 	}
+	name := claim.name
 
 	me, err := api.New(baseURL, token.Token).Me(ctx)
 	if err != nil {
 		// Stored but unverified, which is not a failed login.
 		if flagJSON {
-			return emitJSON(map[string]any{
+			payload := map[string]any{
 				"url":            baseURL,
 				"profile":        name,
 				"authenticated":  true,
@@ -158,7 +160,9 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 				"tokenFromEnv":   false,
 				"tokenExpiresAt": token.ExpiresAt,
 				"warning":        fmt.Sprintf("token stored but not verified: %v", err),
-			})
+			}
+			claim.addTo(payload)
+			return emitJSON(payload)
 		}
 		fmt.Fprintf(os.Stderr,
 			"\n  Warning: the token was issued and stored as profile %q, but %s did\n"+
@@ -170,7 +174,7 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 	// A failure here only warns: the token is stored and working, and a
 	// non-zero exit would prompt a second login that orphans it. The first
 	// write, which persists the token, must keep failing loudly.
-	final, err := finishLogin(name, provisional, baseURL, me)
+	final, err := finishLogin(name, claim.auto, baseURL, me)
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
 			"\n  Warning: signed in, but the identity details could not be written\n"+
@@ -178,7 +182,8 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 				"  profile %q and works.\n", err, name)
 		final = name
 	}
-	reportLogin(baseURL, final, me, token.ExpiresAt, declined)
+	claim.name = final
+	reportLogin(baseURL, me, token.ExpiresAt, claim)
 	return nil
 }
 
@@ -200,22 +205,48 @@ func checkRequestedProfile(name, instanceURL string) error {
 	return nil
 }
 
+// loginClaim is where a login's credential landed and why it has that name.
+type loginClaim struct {
+	name string
+	// auto: nobody chose this name, so finishLogin names the profile after the
+	// organization. A --profile name another organization holds leaves the
+	// choice open too.
+	auto bool
+	// declined: the requested --profile name was not used. kept says why: this
+	// organization already has a profile, and a re-login renews it in place
+	// rather than renaming it, since scripts and RONJA_PROFILE refer to it.
+	declined, kept bool
+	// nameHeld: another sign-in holds the requested name, so no rename can free it.
+	nameHeld bool
+}
+
+// addTo records a declined --profile name in a login's --json output.
+func (c loginClaim) addTo(payload map[string]any) {
+	if c.declined {
+		payload["requestedProfile"] = flagProfile
+		payload["profileNameDeclined"] = true
+		payload["organizationAlreadyStored"] = c.kept
+	}
+}
+
 // claimLogin stores a freshly minted credential in one locked step: allocating
 // the name and writing the token cannot be separated, or two concurrent logins
-// take the same free name and the second evicts the first. created means the
-// name is still provisional; declined means a different organization holds the
-// requested --profile name.
-func claimLogin(instanceURL, tenantID string, fill func(*config.Profile)) (name string, created, declined bool, err error) {
+// take the same free name and the second evicts the first.
+func claimLogin(instanceURL, tenantID string, fill func(*config.Profile)) (loginClaim, error) {
 	preferred := flagProfile
-	err = config.Update(func(f *config.File) error {
-		var p *config.Profile
-		name, p, created = f.ClaimProfile(instanceURL, tenantID, preferred)
-		declined = preferred != "" && name != preferred
+	var c loginClaim
+	err := config.Update(func(f *config.File) error {
+		name, p, created := f.ClaimProfile(instanceURL, tenantID, preferred)
+		c = loginClaim{name: name, declined: preferred != "" && name != preferred}
+		c.kept = c.declined && !created
+		_, c.nameHeld = f.Profiles[preferred]
+		c.nameHeld = c.nameHeld && c.declined
+		c.auto = created && (preferred == "" || c.declined)
 		fill(p)
 		f.Current = name
 		return nil
 	})
-	return name, created, declined, err
+	return c, err
 }
 
 // finishLogin backfills the identity snapshot and, for a provisional name,
@@ -271,7 +302,7 @@ func loginWithToken(ctx context.Context, baseURL string) error {
 	if me.Tenant != nil {
 		tenantID = me.Tenant.ID
 	}
-	name, created, declined, err := claimLogin(baseURL, tenantID, func(p *config.Profile) {
+	claim, err := claimLogin(baseURL, tenantID, func(p *config.Profile) {
 		p.Token = token
 		p.UserID = me.User.ID
 		p.UserEmail = me.User.Email
@@ -283,25 +314,23 @@ func loginWithToken(ctx context.Context, baseURL string) error {
 	if err != nil {
 		return err
 	}
-	if created && flagProfile == "" {
-		if final, err := finishLogin(name, true, baseURL, me); err == nil {
-			name = final
+	if claim.auto {
+		if final, err := finishLogin(claim.name, true, baseURL, me); err == nil {
+			claim.name = final
 		}
 	}
-	reportLogin(baseURL, name, me, "", declined)
+	reportLogin(baseURL, me, "", claim)
 	return nil
 }
 
-func reportLogin(baseURL, profile string, me *api.Me, expiresAt string, declined bool) {
+func reportLogin(baseURL string, me *api.Me, expiresAt string, claim loginClaim) {
+	profile := claim.name
 	if flagJSON {
 		payload := statusPayload(baseURL, profile, me, false)
 		if expiresAt != "" {
 			payload["tokenExpiresAt"] = expiresAt
 		}
-		if declined {
-			payload["requestedProfile"] = flagProfile
-			payload["profileNameDeclined"] = true
-		}
+		claim.addTo(payload)
 		_ = emitJSON(payload)
 		return
 	}
@@ -323,7 +352,22 @@ func reportLogin(baseURL, profile string, me *api.Me, expiresAt string, declined
 
 	// Said out loud: a credential silently landing under another name is how
 	// someone later runs a command against the wrong organization.
-	if declined {
+	switch {
+	case claim.kept && claim.nameHeld:
+		fmt.Fprintf(os.Stderr,
+			"\n  Note: this organization was already signed in here as profile %q, so its\n"+
+				"  token was renewed there. Profile %q already holds another sign-in. To reach\n"+
+				"  that one, switch organization in the web app and run\n"+
+				"  `ronja login --profile %s` again.\n",
+			profile, flagProfile, flagProfile)
+	case claim.kept:
+		fmt.Fprintf(os.Stderr,
+			"\n  Note: this organization was already signed in here as profile %q, so its\n"+
+				"  token was renewed there and not stored as %q. To use the new name, run\n"+
+				"  `ronja profile rename %s %s`. To reach another organization, switch to it\n"+
+				"  in the web app and run `ronja login` again.\n",
+			profile, flagProfile, profile, flagProfile)
+	case claim.declined:
 		fmt.Fprintf(os.Stderr,
 			"\n  Note: profile %q already holds a different organization on this instance,\n"+
 				"  so nothing was overwritten — this login is stored as %q instead.\n"+

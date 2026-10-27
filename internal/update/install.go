@@ -18,9 +18,11 @@ const (
 	// MethodHomebrew is a cask install; swapping the file would leave brew's
 	// manifest describing bytes that are no longer there.
 	MethodHomebrew Method = "homebrew"
-	// MethodGoInstall is the remedy on a platform with no release asset
-	// (Windows, where `ronja update` refuses).
+	// MethodGoInstall is a `go install` build on Windows, where `ronja update`
+	// refuses.
 	MethodGoInstall Method = "go-install"
+	// MethodDownload is a release zip on Windows, where `ronja update` refuses.
+	MethodDownload Method = "download"
 )
 
 // AssetName is the release archive for one platform. The `v` is dropped
@@ -112,12 +114,14 @@ func InstalledByHomebrew(exe string) bool {
 // Notice is the one line printed when a newer release exists, with the remedy
 // chosen by how this binary was installed.
 func Notice(current, latest string, method Method) string {
-	remedy := "ronja update"
+	remedy := "run: ronja update"
 	switch method {
 	case MethodHomebrew:
-		remedy = "brew upgrade ronja"
+		remedy = "run: brew upgrade ronja"
 	case MethodGoInstall:
-		remedy = "go install github.com/" + Repo + "/cmd/ronja@latest"
+		remedy = "run: go install github.com/" + Repo + "/cmd/ronja@latest"
+	case MethodDownload:
+		remedy = "download it from " + LatestReleasePage()
 	}
-	return fmt.Sprintf("ronja %s is available (you have %s) — run: %s", latest, current, remedy)
+	return fmt.Sprintf("ronja %s is available (you have %s) — %s", latest, current, remedy)
 }

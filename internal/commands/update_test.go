@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -389,6 +390,57 @@ func TestUpdateRefusesADevelopmentBuild(t *testing.T) {
 	}
 	if n := mirror.requestCount(); n != 0 {
 		t.Errorf("a development build made %d requests to the mirror, want 0", n)
+	}
+}
+
+// Windows refuses a rename over a running executable, so the refusal names the
+// download instead, and asks the mirror nothing.
+func TestUpdateRefusesOnWindows(t *testing.T) {
+	pretendWindows(t)
+	installedBinary(t, t.TempDir())
+	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
+	useMirror(t, mirror, testCurrentVersion)
+
+	_, _, err := runUpdateCmd(t, "update")
+	if err == nil {
+		t.Fatal("update ran on Windows")
+	}
+	for _, want := range []string{update.LatestReleasePage(), "_windows_" + runtime.GOARCH + ".zip"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q", err, want)
+		}
+	}
+	if n := mirror.requestCount(); n != 0 {
+		t.Errorf("a refused update made %d requests to the mirror, want 0", n)
+	}
+}
+
+// A `go install` build carries no stamp and reads its version from build info,
+// so it passes the release check and must be told to `go install` again: the
+// zip would leave a second ronja.exe beside the one on its Path.
+func TestUpdateRefusesAGoInstallBuildOnWindows(t *testing.T) {
+	pretendWindows(t)
+	installedBinary(t, t.TempDir())
+	mirror := newFakeMirror(t, testLatestVersion, releaseTarball(t))
+	useMirror(t, mirror, "dev")
+	previous := readBuildInfo
+	readBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{Main: debug.Module{Version: testCurrentVersion}}, true
+	}
+	t.Cleanup(func() { readBuildInfo = previous })
+
+	_, _, err := runUpdateCmd(t, "update")
+	if err == nil {
+		t.Fatal("update ran on Windows")
+	}
+	if want := "go install github.com/" + update.Repo + "/cmd/ronja@latest"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to name %q", err, want)
+	}
+	if strings.Contains(err.Error(), ".zip") {
+		t.Errorf("error = %q, want no zip for a go install build", err)
+	}
+	if n := mirror.requestCount(); n != 0 {
+		t.Errorf("a refused update made %d requests to the mirror, want 0", n)
 	}
 }
 

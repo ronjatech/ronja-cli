@@ -156,6 +156,7 @@ func TestNotice(t *testing.T) {
 		MethodSwap:      "ronja v0.29.0 is available (you have v0.28.4) — run: ronja update",
 		MethodHomebrew:  "ronja v0.29.0 is available (you have v0.28.4) — run: brew upgrade ronja",
 		MethodGoInstall: "ronja v0.29.0 is available (you have v0.28.4) — run: go install github.com/ronjatech/ronja-cli/cmd/ronja@latest",
+		MethodDownload:  "ronja v0.29.0 is available (you have v0.28.4) — download it from https://github.com/ronjatech/ronja-cli/releases/latest",
 	}
 	for method, want := range cases {
 		if got := Notice("v0.28.4", "v0.29.0", method); got != want {

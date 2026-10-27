@@ -65,6 +65,11 @@ func ReleasesPage() string {
 	return "https://github.com/" + Repo + "/releases"
 }
 
+// LatestReleasePage redirects to the newest non-prerelease release.
+func LatestReleasePage() string {
+	return ReleasesPage() + "/latest"
+}
+
 // ReleasePage is the page for one specific release.
 func ReleasePage(version string) string {
 	return ReleasesPage() + "/tag/" + version

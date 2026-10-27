@@ -39,6 +39,7 @@ builds:
     goos:
       - darwin
       - linux
+      - windows
     goarch:
       - amd64
       - arm64
@@ -61,6 +62,14 @@ archives:
   - id: ronja
     formats:
       - tar.gz
+    # Windows gets a zip: Explorer and PowerShell's Expand-Archive open it on
+    # every Windows version, while a tar.gz needs tar.exe from a terminal.
+    # `ronja update` refuses on Windows, so internal/update.AssetName never
+    # asks for a zip.
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
     name_template: "ronja_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
@@ -76,8 +85,10 @@ checksum:
 # Homebrew expects pre-compiled binaries to arrive.
 #
 # Consequence worth knowing: casks are macOS-ONLY. Homebrew on Linux does not
-# support them, so `brew` is the macOS install path and Linux/CI users take
-# `go install` or the release tarball. Both are documented in README.md.
+# support them, so `brew` is the macOS install path, Linux/CI users take
+# `go install` or the release tarball, and Windows users the release zip.
+# The cask picks up only darwin and linux archives, so the Windows ones need
+# no exclusion here.
 homebrew_casks:
   - name: ronja
     binaries:

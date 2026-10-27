@@ -341,7 +341,10 @@ Customer-facing documentation lives at
 [`docs-site/src/content/docs/guides/use-the-cli.md`](https://ronja.tech/docs/guides/use-the-cli/)
 (getting started) and
 [`docs-site/src/content/docs/guides/work-from-your-editor.md`](https://ronja.tech/docs/guides/work-from-your-editor/)
-(the folder loops), deliberately short: every flag, refusal and edge case lives
+(the folder loops), plus
+[`docs-site/src/content/docs/guides/build-in-ronja-with-claude-code.md`](https://ronja.tech/docs/guides/build-in-ronja-with-claude-code/)
+(a prompt that has Claude Code install and sign in the CLI; it depends on the release
+archives, `checksums.txt` and which platforms are released), deliberately short: every flag, refusal and edge case lives
 here and in each command's `--help`, not there.
 This file is for people working *on* the CLI.
 
@@ -361,7 +364,11 @@ go install github.com/ronjatech/ronja-cli/cmd/ronja@latest
 
 Or take a binary from the
 [releases](https://github.com/ronjatech/ronja-cli/releases) — `darwin` and
-`linux`, `amd64` and `arm64`.
+`linux` as `.tar.gz`, `windows` as `.zip` holding `ronja.exe`; `amd64` and
+`arm64` each. On Windows that is the route that needs neither Go nor admin
+rights: unzip `ronja.exe` into a folder of your own (for example
+`%LOCALAPPDATA%\Programs\ronja`) and add it to your user `Path`. A process
+already running, Claude Code included, reads `Path` only when it starts.
 
 Homebrew puts it somewhere already on your `PATH`. After `go install` it lands
 in the Go bin directory, which often is not:
@@ -398,9 +405,14 @@ ronja v0.29.0 is available (you have v0.28.4) — run: ronja update
 
 The remedy is chosen by how the binary got onto the machine, because offering
 the wrong one is worse than offering none: a Homebrew install is told
-`brew upgrade ronja` (the file belongs to brew), and on Windows — where there is
-no release asset and `ronja update` refuses — it is told
-`go install github.com/ronjatech/ronja-cli/cmd/ronja@latest`.
+`brew upgrade ronja` (the file belongs to brew). On Windows, where `ronja update`
+refuses (a running `.exe` cannot be renamed over), a release zip is told
+`download it from https://github.com/ronjatech/ronja-cli/releases/latest`, and a
+`go install` build is told
+`go install github.com/ronjatech/ronja-cli/cmd/ronja@latest`. The version stamp
+tells the two apart: only the release build carries one, and a `go install`
+build reads its version from Go's build info. Pointing a Go user at the zip
+would leave two `ronja.exe` on the machine, the old one perhaps first on `Path`.
 
 **Never stdout, and never for a machine.** The line is suppressed outright when
 any of these hold:
@@ -446,11 +458,11 @@ that is simply not there, fails immediately: no stall at all, and the ordinary
 
 Both cadences live in the update-check file, beside the credential file in the
 config directory (`$RONJA_CONFIG_DIR`, else `~/Library/Application
-Support/ronja` or `~/.config/ronja`): when the mirror was last asked, when the
-user was last told, and the newest release known. It holds no secret, and losing
-it costs one extra request. It is claimed *before* the fetch, which is what
-makes an unreadable or root-owned file cost nothing rather than a stalled second
-and a github.com request on every single command.
+Support/ronja`, `~/.config/ronja` or `%AppData%\ronja`): when the mirror was
+last asked, when the user was last told, and the newest release known. It holds
+no secret, and losing it costs one extra request. It is claimed *before* the
+fetch, which is what makes an unreadable or root-owned file cost nothing rather
+than a stalled second and a github.com request on every single command.
 
 **`ronja update`** brings the binary forward, and nothing else ever runs it:
 
@@ -479,6 +491,16 @@ one thing — a `Caskroom` element in the fully resolved path. Deliberately not
 `$HOMEBREW_PREFIX`, which on an Intel Mac is `/usr/local`, exactly where
 somebody who unpacked the tarball puts the binary; they would be told to
 `brew upgrade` a cask they do not have.
+
+On Windows it swaps nothing, asks the mirror nothing and exits non-zero, with
+the remedy chosen as the notice's is. A release zip is told `ronja update cannot
+replace a running ronja.exe on Windows — download ronja_…_windows_amd64.zip
+from https://github.com/ronjatech/ronja-cli/releases/latest and replace
+ronja.exe with the one inside`; a `go install` build is told `… — run: go
+install github.com/ronjatech/ronja-cli/cmd/ronja@latest`.
+Windows refuses a rename over a running executable, and that rename is the whole
+swap below. A self-update there would rename the running file aside, move the
+new one in and delete the old one on a later run; it is not built.
 
 **Two ordinary refusals**, and neither is a malfunction. A build that is not a
 release exits non-zero with `ronja is a development build (dev) — there is no
@@ -842,7 +864,8 @@ organization on a different URL — where the host label says more. On loopback
 that label carries the PORT (`local-8082`), because several local backends at
 once is the normal way to work on Ronja — one per worktree — and they are
 identical in every other respect a name could draw on. `--profile <name>` overrides, and `profile rename` fixes anything you
-dislike. A name is a **local handle only**; the profile's identity is (URL,
+dislike. An organization already signed in keeps its profile's name when
+you sign in again, even with `--profile`; `profile rename` changes it. A name is a **local handle only**; the profile's identity is (URL,
 organization), which is what every lookup matches on and what a re-login updates.
 
 ### Selecting one
@@ -1308,6 +1331,9 @@ id=$(ronja api -X POST /api/v2/workflow -d @wf.json --jq '.id' -r)
 ronja api /api/v2/organization/settings
 ronja api -X PUT /api/v2/organization/settings/reporting -d '{"reportingCurrency":"SEK","reportingLocale":"sv-SE"}'
 ronja api /api/v2/organization/settings/options --jq '.locales[].tag' -r
+
+# tell the Ronja team about friction you hit (no customer values; check .recorded)
+ronja api -X POST /api/v2/vent -d '{"category":"confusing_error","summary":"…","tool":"POST /api/v2/workflow","error":"…"}'
 
 # wait for asynchronous work (the /head sibling follows a run that parks and
 # resumes; wait for the statuses that mean FINISHED, not for "not running")
@@ -2116,7 +2142,35 @@ and `pipeline` share one manifest format:
   `removed`"); **6 is the folder `"id"`**; **7 is a dependency by address, as a
   write target, as an output or as a run edge**.
 
-- **`stacks` and `ronja.lock.json`.** See the next section.
+- **`stacks` and `ronja.lock.json`.** See **Stacks** below.
+
+### JavaScript workflow folders
+
+A workflow can be JavaScript instead of Python. Start the folder with
+`--language js`; the language is fixed when the first push creates the workflow:
+
+```bash
+ronja wf init --feature collection-abc --language js            # main.js + package.json
+ronja wf init --feature collection-abc --language js --from scripts/sync.js
+```
+
+- **What `init` writes:** `main.js` (`export async function main(params, env)`)
+  and `package.json` (no dependencies), both from
+  `GET /api/v2/workflow/defaults?language=js`. `--from` must be a `.js` or `.mjs` file,
+  and a JavaScript `--from` without `--language js` is refused rather than pushed as Python.
+- **The manifest:** `ronja.json` carries `"language": "js"` and is stamped
+  `formatVersion` 4 or higher, so a CLI too old to know JavaScript refuses the folder
+  instead of pushing it as Python. `--runtime` other than 4 is refused.
+- **The loop is the same:** `validate`, `push`, `test`, `publish`, `run`, `clone`
+  and `ronja sync` treat it like any workflow folder. `node_modules/`, `dist/` and
+  `build/` are never pushed; npm packages are installed by Ronja before each run
+  from `package.json` (exact versions only) and an optional `package-lock.json`.
+- **The language cannot change.** A push of a JavaScript folder to a Python
+  workflow, or the other way round, is refused before anything is written, and
+  `ronja wf status` reports the mismatch.
+
+What the code may do — the `env` calls, markers as whole strings, npm rules, the
+15-minute limit — is the skill `/docs/api/skills/workflows-javascript.md`.
 
 ### Stacks (`--stack`)
 
@@ -3805,8 +3859,8 @@ outcome line:
   committed to "NCR register"
   Everyone in your organization can open "NCR register" (its feature "Quality").
   Anyone who opens it can read tables "ncr", "ncr_events" and WRITE via secret
-  "ncr_db write role". Every viewer gets the same powers — the app cannot tell
-  viewers apart.
+  "ncr_db write role". Every viewer gets the same powers; only the app's server
+  functions can tell viewers apart.
 ```
 
 A private feature gets the other half of the answer: `Only you (and admins) can
@@ -8356,6 +8410,10 @@ chosen at login, so it has to be read rather than assumed.
 
 If you are tempted to add `ronja auth token` back for convenience, that is the
 convenience being traded away on purpose.
+
+On Windows the credential file's 0600 mode sets nothing: what protects it is
+the permissions of `%AppData%\ronja`, which is your own profile folder, and on a
+roaming profile that folder may be synced to a network share.
 
 `RONJA_CONFIG_DIR` relocates the credential file; the tests use it to stay off
 the developer's real profile. It is also how a non-interactive caller — an agent

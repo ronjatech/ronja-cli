@@ -1,3 +1,8 @@
+// `ronja update` refuses on Windows before it downloads, extracts or swaps
+// anything, and these tests remove files a Windows handle still holds.
+
+//go:build !windows
+
 package update
 
 import (
@@ -12,7 +17,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -355,9 +359,6 @@ func sha256Of(b []byte) string {
 // machine); a symlink planted there before the write would otherwise truncate
 // its target with the running user's privileges.
 func TestWriteBinaryRefusesASymlink(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("no O_NOFOLLOW here — the flag is zero and the guard is not available")
-	}
 	dir := t.TempDir()
 	victim := filepath.Join(dir, "somebody-elses-file")
 	if err := os.WriteFile(victim, []byte("do not touch\n"), 0o600); err != nil {

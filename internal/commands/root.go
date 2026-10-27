@@ -86,8 +86,7 @@ func init() {
 // resolveVersion reports the version to display.
 //
 // The ldflags stamp above only reaches binaries the release pipeline builds —
-// the Homebrew cask and the release tarballs. A user who installs the
-// documented way for every non-macOS platform,
+// the Homebrew cask and the release archives. A user who installs with
 //
 //	go install github.com/ronjatech/ronja-cli/cmd/ronja@latest
 //
@@ -98,8 +97,11 @@ func init() {
 //
 // Only consulted when the stamp is absent, so a pipeline build always wins.
 func resolveVersion() string {
-	return resolveVersionFrom(Version, debug.ReadBuildInfo)
+	return resolveVersionFrom(Version, readBuildInfo)
 }
+
+// readBuildInfo is a var so a test can be a `go install` build.
+var readBuildInfo = debug.ReadBuildInfo
 
 // resolveVersionFrom is the testable half of resolveVersion.
 //

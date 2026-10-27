@@ -31,6 +31,9 @@ var releaseBaseURL = update.DefaultBaseURL
 // instead of the test binary.
 var currentExecutable = os.Executable
 
+// hostOS is a var so a test on any OS can take the Windows branches.
+var hostOS = runtime.GOOS
+
 // updateTimeout bounds the release lookup only. A wall-clock cap on the
 // download would be a bandwidth requirement; transfers rely on the client's
 // ResponseHeaderTimeout and update.Download's idle-read watchdog instead.
@@ -105,9 +108,15 @@ func runUpdate(ctx context.Context, checkOnly bool) error {
 	if !update.IsRelease(current) {
 		return fmt.Errorf("ronja is a development build (%s) — there is no release to update to; build from source or install a release", current)
 	}
-	if runtime.GOOS == "windows" {
-		// No Windows release asset, and no rename over a running executable.
-		return fmt.Errorf("ronja update does not support Windows yet — download the release from %s", update.ReleasesPage())
+	if hostOS == "windows" {
+		// Windows refuses a rename over a running executable, which is the
+		// whole swap below.
+		const refusal = "ronja update cannot replace a running ronja.exe on Windows"
+		if updateInstallMethod() == update.MethodGoInstall {
+			return fmt.Errorf("%s — run: go install github.com/%s/cmd/ronja@latest", refusal, update.Repo)
+		}
+		return fmt.Errorf("%s — download ronja_…_windows_%s.zip from %s and replace ronja.exe with the one inside",
+			refusal, runtime.GOARCH, update.LatestReleasePage())
 	}
 
 	exe, err := currentExecutable()
