@@ -8,6 +8,7 @@ import (
 // Version comparison is hand-rolled for the one shape the release pipeline
 // stamps, `vMAJOR.MINOR.PATCH[-pre]`. Anything else (a `dev` build, `(devel)`, a
 // pseudo-version) reports ok=false so the caller stays silent.
+// Copy in backend/lib/clirelease/version.go; a test there keeps them equal.
 
 type parsedVersion struct {
 	nums [3]int

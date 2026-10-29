@@ -18,7 +18,8 @@ const Product = "ronja-cli"
 //
 // The format is a contract with the server, which parses `ronja-cli/<version>`
 // to count CLI adoption before it changes a default an older CLI cannot follow,
-// and reads a bare Product as older than every versioned build. A version
+// and to tell an outdated CLI to update (backend/lib/clirelease), and reads a
+// bare Product as older than every versioned build. A version
 // carrying anything a header product token cannot hold (it only ever comes from
 // the build, but it is still text) degrades to the bare Product rather than to
 // a malformed header.

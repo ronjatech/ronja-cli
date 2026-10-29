@@ -391,7 +391,7 @@ func TestTokenCreateNoWaitAndNoBrowser(t *testing.T) {
 	}
 }
 
-// A sign-in token is full access, so it never matches on scopes.
+// A `ronja login` token is full access, so it never matches on scopes.
 func TestTokenCreateIgnoresAnUnrelatedTokenThatAppearsFirst(t *testing.T) {
 	fastToken(t, 5*time.Second)
 	login := tok("api_token-login", "ronja-cli on desktop", nil, nil)

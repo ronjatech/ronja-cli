@@ -438,6 +438,17 @@ any of these hold:
 - anything at all failed. Every path here returns quietly; the check cannot
   change an exit code, and it has nothing to say worth a second line.
 
+**An agent is told by the server instead.** An agent's shell is not a terminal,
+so it never sees that line; it runs `ronja context`, which prints the instance's
+`/llms.txt`. For a CLI older than the newest release on the mirror (or one
+sending a bare `ronja-cli`), the instance puts one line at the top of it: run
+`ronja update` once (`brew update && brew upgrade ronja` when its output
+mentions Homebrew, or the command or download it names); if the CLI's file
+cannot be replaced, tell the user rather than use `sudo`; then continue, even if
+the line still shows. A `dev` build, a pseudo-version and `ronja api`'s requests
+are never told (a hand-stamped `git describe` build reads as a prerelease of its
+tag, and is told).
+
 **The one honest cost.** The lookup starts after cobra has parsed the flags,
 runs concurrently with the command under a one-second deadline, and is joined
 only once the command has finished writing. For anything that talks to the Ronja
@@ -1263,9 +1274,10 @@ So the command does not mint. It hands the mint to the browser:
    id that was **not** in the snapshot AND whose name is `--name` or whose
    grant is exactly the requested scopes — so the person may rename the token
    on the form, or change its scopes, but not both. A new token that matches
-   neither (another terminal's `ronja login`, an MCP client signing in: full
-   access, so never a scope match) is named on stderr as it appears and does
-   not end the wait. On stdout:
+   neither (another terminal's `ronja login`, which is full access; an MCP
+   client signing in, whose read-only grant matches only a request for exactly
+   that set) is named on stderr as it appears and does not end the wait. On
+   stdout:
 
    ```
    created: api_token-d3f…  Sales dashboard  data:read, structure:write  expires never

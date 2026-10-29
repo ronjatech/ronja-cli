@@ -584,34 +584,38 @@ func TestAPIWaitUntilAnEmptyArrayIsTruthy(t *testing.T) {
 // the wait by vacuous truth.
 func TestAPIWaitUntilNoOutputDoesNotSatisfy(t *testing.T) {
 	e := newEchoServer(t)
-	e.body = `{"runs":[{"state":"running"}]}`
+	e.script = []echoedReply{
+		{Status: http.StatusOK, Body: `{"runs":[{"state":"running"}]}`},
+		{Status: http.StatusOK, Body: `{"runs":[{"state":"done"}]}`},
+	}
 	signInTo(t, e.URL())
 
-	_, err := runCLI(t, t.TempDir(), "api",
-		"--wait-until", `.runs[] | select(.state == "done")`, "--wait-interval", "1ms", "--wait-timeout", "30ms",
-		"/api/v2/thing")
-	if err == nil {
-		t.Fatal("a condition that matched nothing satisfied the wait")
+	if _, err := runCLI(t, t.TempDir(), "api",
+		"--wait-until", `.runs[] | select(.state == "done")`, "--wait-interval", "1ms",
+		"/api/v2/thing"); err != nil {
+		t.Fatalf("api: %v", err)
 	}
-	if len(e.requests) < 2 {
-		t.Errorf("made %d requests, want it to keep polling", len(e.requests))
+	if len(e.requests) != 2 {
+		t.Errorf("made %d requests, want 2 — a condition that matched nothing must keep polling", len(e.requests))
 	}
 }
 
 // A comparison over an ABSENT field yields one output, `false`, not zero.
 func TestAPIWaitUntilAFalseConditionDoesNotSatisfy(t *testing.T) {
 	e := newEchoServer(t)
-	e.body = `{"other":1}`
+	e.script = []echoedReply{
+		{Status: http.StatusOK, Body: `{"other":1}`},
+		{Status: http.StatusOK, Body: `{"status":"done"}`},
+	}
 	signInTo(t, e.URL())
 
-	_, err := runCLI(t, t.TempDir(), "api",
-		"--wait-until", `.status == "done"`, "--wait-interval", "1ms", "--wait-timeout", "30ms",
-		"/api/v2/thing")
-	if err == nil {
-		t.Fatal("a false condition satisfied the wait")
+	if _, err := runCLI(t, t.TempDir(), "api",
+		"--wait-until", `.status == "done"`, "--wait-interval", "1ms",
+		"/api/v2/thing"); err != nil {
+		t.Fatalf("api: %v", err)
 	}
-	if len(e.requests) < 2 {
-		t.Errorf("made %d requests, want it to keep polling", len(e.requests))
+	if len(e.requests) != 2 {
+		t.Errorf("made %d requests, want 2 — a false condition must keep polling", len(e.requests))
 	}
 }
 

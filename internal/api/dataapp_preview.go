@@ -182,10 +182,9 @@ type PreviewResult struct {
 type PreviewScreenshot struct {
 	FileID string `json:"fileID"`
 	// FileKey is what the bytes are actually fetched by, and it is the field to
-	// prefer: /api/v2/file/download/:key is `data`-scoped like the preview
-	// itself, whereas resolving an id through /api/v2/feature/file/:id needs a
-	// route whose group carries no scope at all — which a SCOPED token is
-	// refused on. Empty only against an instance older than this field.
+	// prefer: it fetches the frame in one call, where an id needs
+	// /api/v2/feature/file/:id first to resolve the key. Empty only against an
+	// instance older than this field.
 	FileKey string `json:"fileKey"`
 	// Phase is the NEWEST phase these pixels were observed at: "first_paint" /
 	// "settled" / "deadline", or "step-<n>" for a `screenshot` step's frame.
@@ -481,8 +480,8 @@ func (c *Client) GetFile(ctx context.Context, id string) (*File, error) {
 //
 // It prefers the KEY the preview already handed over — one call, on the same
 // scope the preview itself needs — and falls back to resolving the id only when
-// the instance predates the key (which costs an extra call AND a route a scoped
-// token cannot reach; see PreviewScreenshot.FileKey).
+// the instance predates the key. That fallback costs an extra call: it reads
+// GET /feature/file/:id, which serves anyone the file is shared with.
 func (c *Client) DownloadFrame(ctx context.Context, shot PreviewScreenshot) (io.ReadCloser, error) {
 	if shot.FileKey != "" {
 		return c.downloadFileByKey(ctx, shot.FileKey)
