@@ -1044,6 +1044,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			Entrypoint:        entrypoint,
 			FeatureID:         in.FeatureID,
 			Parameters:        in.Parameters,
+			PipPackages:       wfdir.CleanPipPackages(in.PipPackages),
 			ReportingTimezone: zone,
 			Hidden:            true,
 		}, api.WorkflowFile{
@@ -1077,6 +1078,19 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		result := f.validate
 		if result == nil {
 			result = &api.ValidateResult{Findings: []api.ValidateFinding{}}
+		}
+		// The one pipPackages rule the tests stage: rworkflow refuses a
+		// specifier starting with '-' (a pip flag).
+		for _, spec := range in.PipPackages {
+			if strings.HasPrefix(strings.TrimSpace(spec), "-") {
+				computed := *result
+				computed.Findings = append(slices.Clone(computed.Findings), api.ValidateFinding{
+					Severity: api.SeverityError, Code: "invalid_pip_packages", Path: "pipPackages",
+					Message: fmt.Sprintf("pip package %q may not start with '-'", strings.TrimSpace(spec)),
+				})
+				result = &computed
+				break
+			}
 		}
 		// writeTargets, computed from the POSTED files as the server does
 		// (write_targets_fake_test.go) — unless the test staged
@@ -1229,6 +1243,9 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			wf.Parameters = *patch.Parameters
 			f.parameterPatches[id] = patch.Parameters
 		}
+		if patch.PipPackages != nil {
+			wf.PipPackages = wfdir.CleanPipPackages(*patch.PipPackages)
+		}
 		// Mirrors rworkflow.resolveDeclaredZonePatch: absent leaves the
 		// declaration alone, and an explicit "" is stored as the LITERAL "UTC"
 		// rather than as NULL — which is what keeps an empty column meaning
@@ -1340,6 +1357,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// legible: the draft starts at the parent's generation, the push
 			// raises it there, and commit publishes the flip.
 			draft.RuntimeVersion = parent.RuntimeVersion
+			draft.PipPackages = append([]string{}, parent.PipPackages...)
 		}
 		f.writeRow(w, draft)
 		return true

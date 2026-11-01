@@ -2,7 +2,6 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -125,13 +124,11 @@ func initRuntime(ctx context.Context, resolved *config.Resolved, named int, isNa
 // starter is a page of code, and the instance's answer is written to disk as is.
 const maxStarterBytes = 256 << 10
 
-// errEmptyStarter is writeStarter's refusal to write an empty entrypoint; the
-// caller words it.
-var errEmptyStarter = errors.New("empty starter")
-
 // writeStarter writes the starter into the folder, reporting whether it wrote
-// anything. An empty starter is refused (errEmptyStarter) — but only when it
-// would be written: a folder adopting an existing entrypoint never needed one.
+// anything. An empty starter is refused — but only when it would be written: a
+// folder adopting an existing entrypoint never needed one. `wf init` words that
+// refusal for the entrypoint before it creates anything; this one is the
+// backstop.
 //
 // An existing entrypoint is left ALONE rather than refused: `wf init` in a
 // directory that already holds main.py is the documented way to adopt a script
@@ -146,7 +143,7 @@ func writeStarter(root, entrypoint, starter string) (bool, error) {
 		return false, fmt.Errorf("read %s: %w", dest, err)
 	}
 	if strings.TrimSpace(starter) == "" {
-		return false, errEmptyStarter
+		return false, fmt.Errorf("the instance sent an empty starter for %s", entrypoint)
 	}
 	if err := wfdir.WriteFile(root, entrypoint, starter); err != nil {
 		return false, err

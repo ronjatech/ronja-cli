@@ -288,6 +288,25 @@ func TestCreateAndUpdateWorkflow(t *testing.T) {
 	}
 }
 
+// The update answers the GET view with `warnings` as plain-text save notices,
+// so an installed CLI keeps reading the notices and ignores the row.
+func TestUpdateWorkflowReadsNoticesFromTheViewShapedReply(t *testing.T) {
+	client := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":"wf-1","lifecycle":"draft","title":"Monthly report",
+		  "parentWorkflowID":"wf-0","entrypoint":"main.py","pipPackages":["google-auth"],
+		  "url":"https://app.example/workflows/wf-1","canDecide":true,
+		  "parameterDefaults":{"days":7},
+		  "warnings":["approver \"x@example.com\" is not a member of this organization"]}`))
+	})
+	warnings, err := client.UpdateWorkflow(context.Background(), "wf-1", WorkflowPatch{Title: "Monthly report"})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "not a member") {
+		t.Errorf("warnings = %q, want the one save notice", warnings)
+	}
+}
+
 // --- optimistic concurrency --------------------------------------------------
 
 // The raw body is asserted, not a decode: a *string collapsing to a string would

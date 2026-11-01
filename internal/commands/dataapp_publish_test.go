@@ -47,6 +47,29 @@ func TestPrintAppPublishReport_PublishedPrintsTheAudience(t *testing.T) {
 	}
 }
 
+// The server's warnings (a per-person rule's sentence) follow the audience
+// sentence, verbatim, on either ending.
+func TestPrintAppPublishReport_PrintsEachWarningAfterTheAudience(t *testing.T) {
+	for _, outcome := range []string{outcomePublished, outcomeSubmittedForReview} {
+		out := publishReportOutput(t, &appPublishResult{
+			Outcome:   outcome,
+			DataAppID: "data_app-1",
+			DraftID:   "data_app-1",
+			Audience:  writeRoleAudience(),
+			Warnings: []api.DataAppWarning{
+				{Code: "per_person_rule", Message: "Server-side data only is off, so this app's page can query \"public.deals\" itself."},
+				{Code: "per_person_rule", Message: "\"public.deals\" has a per-person rule without FORCE ROW LEVEL SECURITY."},
+			},
+		})
+		audience := strings.Index(out, "can open")
+		first := strings.Index(out, "Server-side data only is off")
+		second := strings.Index(out, "without FORCE ROW LEVEL SECURITY")
+		if audience < 0 || first < audience || second < first {
+			t.Fatalf("%s: want the audience, then each warning in order:\n%s", outcome, out)
+		}
+	}
+}
+
 // The review path (a non-admin editing an org-shared app) is the one that most
 // needs the line.
 func TestPrintAppPublishReport_SubmittedForReviewPrintsTheAudience(t *testing.T) {

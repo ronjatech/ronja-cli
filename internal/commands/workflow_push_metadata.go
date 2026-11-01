@@ -3,22 +3,23 @@ package commands
 import (
 	"fmt"
 	"reflect"
+	"slices"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
 // The METADATA a push patches onto the row — the title, the entrypoint, the
-// parameters and the declared calendar — split out of workflow_push.go alongside
-// workflow_push_zone.go so the state machine there reads as the sequence of
-// phases it is rather than as a phase list with three field-level rules folded
-// into the middle of it.
+// parameters, the Python packages and the declared calendar — split out of
+// workflow_push.go alongside workflow_push_zone.go so the state machine there
+// reads as the sequence of phases it is rather than as a phase list with
+// field-level rules folded into the middle of it.
 //
 // Four things live here and nothing else does: building the patch
-// (metadataPatch), the one comparison it needs that `==` cannot do
-// (sameParameters), mirroring an ACCEPTED patch back onto the in-memory row
-// (applyPatch), and the question the up-to-date path asks of the baseline
-// (baselineDescribes). The declared zone's own rules stay in
+// (metadataPatch), the comparisons it needs that `==` cannot do
+// (sameParameters, samePipPackages), mirroring an ACCEPTED patch back onto the
+// in-memory row (applyPatch), and the question the up-to-date path asks of the
+// baseline (baselineDescribes). The declared zone's own rules stay in
 // workflow_push_zone.go — it is the one field a 2xx does not confirm, so it has
 // a lifecycle none of these share.
 
@@ -49,6 +50,12 @@ func metadataPatch(manifest *wfdir.Manifest, codec aliasCodec, target *api.Workf
 			// no-op exactly when the author is removing their last parameter.
 			out := append([]api.WorkflowParameter{}, declared...)
 			patch.Parameters = &out
+		}
+	}
+	if manifest.ManagesPipPackages() {
+		declared := manifest.DeclaredPipPackages()
+		if !samePipPackages(declared, target.PipPackages) {
+			patch.PipPackages = &declared
 		}
 	}
 	// The declared execution calendar, on the same terms: an unmanaged folder
@@ -220,10 +227,18 @@ func sameParameters(a, b []api.WorkflowParameter) bool {
 	return reflect.DeepEqual(a, b)
 }
 
+// samePipPackages compares two package lists after the server's cleaning, so a
+// hand-written " google-auth" neither patches on every push nor reads as drift.
+func samePipPackages(a, b []string) bool {
+	return slices.Equal(wfdir.CleanPipPackages(a), wfdir.CleanPipPackages(b))
+}
+
 // applyPatch mirrors an ACCEPTED metadata patch onto the in-memory row.
 //
-// PUT :id answers with nothing, so this is the only way `target` keeps
-// describing the server without the re-read the success path does anyway.
+// The CLI does not read PUT :id's row: an older instance answers only
+// `{warnings}`, as this one does when its read-back fails, and a push can write
+// files without any PUT. This is the only way `target` keeps describing the
+// server without the re-read the success path does anyway.
 //
 // The declared zone is deliberately NOT mirrored here — confirmDeclaredZone
 // owns it, because it is the one field whose acceptance a 2xx does not prove.
@@ -236,6 +251,9 @@ func applyPatch(row *api.Workflow, patch api.WorkflowPatch) {
 	}
 	if patch.Parameters != nil {
 		row.Parameters = *patch.Parameters
+	}
+	if patch.PipPackages != nil {
+		row.PipPackages = *patch.PipPackages
 	}
 }
 
@@ -251,6 +269,7 @@ func baselineDescribes(baseline *wfdir.InstanceState, row *api.Workflow) bool {
 		// make the baseline stale on its own — same treatment the metadata
 		// fields get, and the next push records it.
 		(baseline.Parameters == nil || sameParameters(*baseline.Parameters, row.Parameters)) &&
+		(baseline.PipPackages == nil || samePipPackages(*baseline.PipPackages, row.PipPackages)) &&
 		// Same treatment for an unrecorded declared zone: nil is a baseline
 		// written before it was part of one, not a row that lost its declaration.
 		(baseline.ReportingTimezone == nil || *baseline.ReportingTimezone == row.ReportingTimezone)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -979,10 +980,11 @@ func declareFormatVersion(t *testing.T, root string, version int) {
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
-	patched := strings.Replace(string(body), `"formatVersion": 3`, fmt.Sprintf(`"formatVersion": %d`, version), 1)
-	if patched == string(body) {
-		t.Fatalf("the manifest was not stamped at 3 to begin with:\n%s", body)
+	stamped := regexp.MustCompile(`"formatVersion": \d+`)
+	if !stamped.Match(body) {
+		t.Fatalf("the manifest was not stamped to begin with:\n%s", body)
 	}
+	patched := stamped.ReplaceAllString(string(body), fmt.Sprintf(`"formatVersion": %d`, version))
 	if err := os.WriteFile(path, []byte(patched), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}

@@ -82,8 +82,11 @@ type InstanceState struct {
 	Entrypoint        string                   `json:"entrypoint,omitempty"`
 	Parameters        *[]api.WorkflowParameter `json:"parameters,omitempty"`
 	ReportingTimezone *string                  `json:"reportingTimezone,omitempty"`
-	Access            *api.DataAppAccess       `json:"access,omitempty"`
-	Files             map[string]FileState     `json:"files"`
+	// PipPackages is the row's list at the last sync, nil when unrecorded, for
+	// the drift guard Parameters has.
+	PipPackages *[]string            `json:"pipPackages,omitempty"`
+	Access      *api.DataAppAccess   `json:"access,omitempty"`
+	Files       map[string]FileState `json:"files"`
 	// Tables is a PIPELINE folder's per-file remote state: relative path →
 	// which row the baseline describes, and whether this checkout holds an open
 	// draft of it.

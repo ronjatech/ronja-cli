@@ -101,12 +101,14 @@ func workflowStatusReportAt(ctx context.Context, root string, resolved *config.R
 		// The zone the folder would put on the row, so what is reported is
 		// what a push would do: a declared "" is the reset, and the server
 		// stores it as the literal UTC.
-		ReportingTimezone: declaredZoneForCreate(f.Manifest),
-		Stack:             f.declaredStack(),
-		Bound:             f.Bound,
-		Ambiguous:         f.BindingErr != nil,
-		WorkflowID:        f.Binding.WorkflowID,
-		FeatureID:         f.Binding.FeatureID,
+		ReportingTimezone:  declaredZoneForCreate(f.Manifest),
+		ManagesPipPackages: f.Manifest.ManagesPipPackages(),
+		PipPackages:        reportedPipPackages(f.Manifest),
+		Stack:              f.declaredStack(),
+		Bound:              f.Bound,
+		Ambiguous:          f.BindingErr != nil,
+		WorkflowID:         f.Binding.WorkflowID,
+		FeatureID:          f.Binding.FeatureID,
 	}
 
 	enumeration, err := wfdir.Enumerate(f.Root, f.Kind)
@@ -145,8 +147,12 @@ type statusReport struct {
 	// ManagesTimezone carries the same distinction for the declared execution
 	// calendar: a folder that leaves the zone to the organization default is not
 	// a folder declaring UTC, and ReportingTimezone alone cannot say which it is.
-	ManagesTimezone   bool   `json:"managesTimezone"`
-	ReportingTimezone string `json:"reportingTimezone,omitempty"`
+	ManagesTimezone    bool   `json:"managesTimezone"`
+	ReportingTimezone  string `json:"reportingTimezone,omitempty"`
+	ManagesPipPackages bool   `json:"managesPipPackages"`
+	// PipPackages is the cleaned list, [] for a folder that declares none and
+	// absent for one that does not manage them.
+	PipPackages *[]string `json:"pipPackages,omitempty"`
 	// Stack is the NAME of the environment this report is about, empty for a
 	// folder still using the unnamed legacy "instances" shape. Reported because
 	// a folder can name several and the answer to "which one am I looking at"
@@ -246,6 +252,8 @@ type remoteReport struct {
 	// ReportingTimezone follows Parameters exactly: set only when the folder
 	// manages the zone and a push would change the row's.
 	ReportingTimezone *timezoneReport `json:"reportingTimezone,omitempty"`
+	// PipPackages is set on the same terms as Parameters.
+	PipPackages *pipPackagesReport `json:"pipPackages,omitempty"`
 	// TargetUnknown reports that the row a push would WRITE TO could not be
 	// established — the draft lookup failed, so everything below was measured
 	// against the live row while the caller may well have a draft.
@@ -284,6 +292,23 @@ type parameterReport struct {
 type timezoneReport struct {
 	Local  string `json:"local"`
 	Remote string `json:"remote"`
+}
+
+// pipPackagesReport is the cleaned package list on each side, as lists like
+// the manifest's rather than the strings parameterReport carries.
+type pipPackagesReport struct {
+	Local  []string `json:"local"`
+	Remote []string `json:"remote"`
+}
+
+// reportedPipPackages is the folder's cleaned list, nil when it does not
+// manage them.
+func reportedPipPackages(m *wfdir.Manifest) *[]string {
+	if !m.ManagesPipPackages() {
+		return nil
+	}
+	cleaned := wfdir.CleanPipPackages(m.DeclaredPipPackages())
+	return &cleaned
 }
 
 // runtimeReport is the runtime generation on each side. Distinct is what makes
@@ -423,6 +448,12 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 			Remote: describeParameters(f.Codec.parametersToDisk(target.Parameters)),
 		}
 	}
+	if f.Manifest.ManagesPipPackages() && !samePipPackages(f.Manifest.DeclaredPipPackages(), target.PipPackages) {
+		out.PipPackages = &pipPackagesReport{
+			Local:  wfdir.CleanPipPackages(f.Manifest.DeclaredPipPackages()),
+			Remote: wfdir.CleanPipPackages(target.PipPackages),
+		}
+	}
 	// Same rule for the declared calendar, compared on the EFFECTIVE value: a
 	// folder declaring the reset value and a row already holding the literal UTC
 	// agree, and reporting them as a difference would advise a push that changes
@@ -516,6 +547,9 @@ func printStatus(r *statusReport) {
 	if r.ManagesTimezone {
 		fmt.Fprintf(out, "  Timezone:   %s\n", r.ReportingTimezone)
 	}
+	if r.PipPackages != nil {
+		fmt.Fprintf(out, "  Python packages: %s\n", describePipPackages(*r.PipPackages))
+	}
 	printResourceURL(out, statusKeyWidth, r.WorkflowURL)
 
 	fmt.Fprintf(out, "\n  Local changes\n")
@@ -549,7 +583,8 @@ func printStatus(r *statusReport) {
 			fmt.Fprintf(out, " (vs %s)", r.Remote.ComparedAgainst.ID)
 		}
 		fmt.Fprintln(out)
-		if !r.Remote.Drift.Dirty() && r.Remote.Parameters == nil && r.Remote.ReportingTimezone == nil && r.Remote.Runtime == nil {
+		if !r.Remote.Drift.Dirty() && r.Remote.Parameters == nil && r.Remote.ReportingTimezone == nil &&
+			r.Remote.PipPackages == nil && r.Remote.Runtime == nil {
 			fmt.Fprintf(out, "    none\n")
 		} else {
 			printPathList(out, "new", r.Remote.Drift.Added)
@@ -563,6 +598,9 @@ func printStatus(r *statusReport) {
 			}
 			if z := r.Remote.ReportingTimezone; z != nil {
 				fmt.Fprintf(out, "    %-9s timezone: %s here, %s there\n", "changed", z.Local, z.Remote)
+			}
+			if p := r.Remote.PipPackages; p != nil {
+				fmt.Fprintf(out, "    %-9s Python packages: %s here, %s there\n", "changed", describePipPackages(p.Local), describePipPackages(p.Remote))
 			}
 			if rt := r.Remote.Runtime; rt != nil {
 				label := "changed"

@@ -398,6 +398,10 @@ func pullWorkflow(ctx context.Context, client *api.Client, f *folder) (*pullPlan
 				m.SetParameters(f.Codec.parametersToDisk(live.Parameters))
 				changed = true
 			}
+			if m.ManagesPipPackages() && !samePipPackages(m.DeclaredPipPackages(), live.PipPackages) {
+				m.SetPipPackages(live.PipPackages)
+				changed = true
+			}
 			if m.ManagesReportingTimezone() && effectiveDeclaredZone(m.DeclaredReportingTimezone()) != live.ReportingTimezone {
 				if live.ReportingTimezone == "" {
 					return false, nil, pullInexpressible(f, "the live workflow declares no reporting timezone, and this folder's \"reportingTimezone\" can only declare one — remove the key to stop managing it, then pull")

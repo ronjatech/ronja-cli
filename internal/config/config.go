@@ -335,6 +335,16 @@ func Resolve(flagURL, flagProfile string) (*Resolved, error) {
 	case name != "":
 		p, ok := f.Profiles[name]
 		if !ok {
+			// A name exported by the shell is not one the caller typed, so the
+			// refusal says where it came from rather than sending them to log in.
+			if !nameFromFlag {
+				if names := f.Names(); len(names) > 0 {
+					return nil, fmt.Errorf("%w %q (from %s in your environment, not a flag) — stored profiles are: %s. Unset %s or pass --profile <name>.",
+						ErrNoProfile, name, EnvProfile, strings.Join(names, ", "), EnvProfile)
+				}
+				return nil, fmt.Errorf("%w %q (from %s in your environment, not a flag) — no profiles are stored yet. Unset %s, then run ronja login.",
+					ErrNoProfile, name, EnvProfile, EnvProfile)
+			}
 			if names := f.Names(); len(names) > 0 {
 				return nil, fmt.Errorf("%w %q — stored profiles are: %s",
 					ErrNoProfile, name, strings.Join(names, ", "))

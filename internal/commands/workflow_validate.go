@@ -225,6 +225,7 @@ func validateWorkflowFolder(ctx context.Context, client *api.Client, f *folder) 
 		FeatureID:      featureID,
 		Entrypoint:     f.Manifest.Entrypoint,
 		Parameters:     params,
+		PipPackages:    f.Manifest.DeclaredPipPackages(),
 		Files:          validateFilesOf(f.Codec, files),
 		RuntimeVersion: runtime,
 		Language:       languageOnTheWire(f.Manifest),

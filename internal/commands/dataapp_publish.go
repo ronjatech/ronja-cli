@@ -104,6 +104,9 @@ type appPublishResult struct {
 	// Omitted when the server did not supply it (an older instance, or a
 	// hydration failure). The publish still happened.
 	Audience *api.DataAppAudience `json:"audience,omitempty"`
+	// Warnings is the server's guidance on the app, printed verbatim after the
+	// audience sentence.
+	Warnings []api.DataAppWarning `json:"warnings,omitempty"`
 	// ManagedInGit is the app's `managedBy`, when a repository folder other
 	// than this one deploys it (managed_notice.go).
 	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
@@ -188,14 +191,14 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 			}
 			result.Outcome = outcomeSubmittedForReview
 			result.Detail = fmt.Sprintf("%q is in a shared feature, so an admin or a maintainer of it commits changes to it", parent.Name)
-			result.Audience = audienceOf(review)
+			result.Audience, result.Warnings = audienceAndWarnings(review)
 			return result, nil
 		}
 	}
 
 	outcome, commitErr := client.CommitDataAppDraft(ctx, draft.ID)
 	if commitErr == nil {
-		result.Audience = audienceOf(outcome)
+		result.Audience, result.Warnings = audienceAndWarnings(outcome)
 		// Nothing went live: a first publish into a shared feature by a
 		// non-admin was handed to an admin as a proposal. Saying "published"
 		// here is exactly the lie this command's two-outcome shape exists to
@@ -232,18 +235,19 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 	}
 	result.Outcome = outcomeSubmittedForReview
 	result.Detail = fmt.Sprintf("the commit was refused (%v), so the draft was submitted for review", commitErr)
-	result.Audience = audienceOf(review)
+	result.Audience, result.Warnings = audienceAndWarnings(review)
 	return result, nil
 }
 
-// audienceOf is the nil-safe read of the outcome's audience. Both routes return
-// the same shape, and both may omit it (an older instance, or a server-side
-// hydration failure) — the publish still happened either way.
-func audienceOf(outcome *api.DataAppCommitOutcome) *api.DataAppAudience {
+// audienceAndWarnings is the nil-safe read of the outcome's audience and
+// warnings. Both routes return the same shape, and both may omit the audience
+// (an older instance, or a server-side hydration failure) — the publish still
+// happened either way.
+func audienceAndWarnings(outcome *api.DataAppCommitOutcome) (*api.DataAppAudience, []api.DataAppWarning) {
 	if outcome == nil {
-		return nil
+		return nil, nil
 	}
-	return outcome.Audience
+	return outcome.Audience, outcome.Warnings
 }
 
 // formatCompileDetail appends the compiler's own message when there is one.
@@ -353,6 +357,9 @@ func printAppPublishReport(r *appPublishResult) {
 	// what Ronja says in chat are one sentence, not three.
 	if r.Audience != nil && r.Audience.Sentence != "" {
 		fmt.Fprintf(out, "  %s\n", r.Audience.Sentence)
+	}
+	for _, w := range r.Warnings {
+		fmt.Fprintf(out, "  %s\n", w.Message)
 	}
 	fmt.Fprintf(out, "\n  Data app: %s\n", r.DataAppID)
 	fmt.Fprintf(out, "  Draft:    %s\n", r.DraftID)

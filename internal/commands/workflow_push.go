@@ -708,9 +708,10 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		return result, refuseDroppedBindings(result)
 	}
 
-	// A re-read: PUT :id answers with warnings but not the row, and the file
-	// writes above have re-derived the row's bindings anyway, so the current row
-	// has to come from a fresh GET.
+	// A re-read. The CLI does not read PUT :id's row: an older instance answers
+	// only `{warnings}`, as this one does when its read-back fails, and a push
+	// can write files without any PUT. The file writes above have re-derived the
+	// row's bindings anyway, so the current row has to come from a fresh GET.
 	updated, err := client.GetWorkflow(ctx, target.ID)
 	if err != nil {
 		return stop(fmt.Errorf("re-read %s after pushing: %w", target.ID, err))
@@ -750,10 +751,11 @@ func validateWorkflowCandidate(ctx context.Context, client *api.Client, f *folde
 	}
 	posted := validateFilesOf(f.Codec, local)
 	validated, err := client.ValidateWorkflowFiles(ctx, api.ValidateInput{
-		FeatureID:  featureID,
-		Entrypoint: f.Manifest.Entrypoint,
-		Parameters: validateParams,
-		Files:      posted,
+		FeatureID:   featureID,
+		Entrypoint:  f.Manifest.Entrypoint,
+		Parameters:  validateParams,
+		PipPackages: f.Manifest.DeclaredPipPackages(),
+		Files:       posted,
 		// The runtime the folder DECLARES, including on a push to a workflow
 		// that already exists — where it is both what the metadata patch may
 		// RAISE the row to (never lowered) and, either way, the runtime this
@@ -1082,6 +1084,9 @@ func describePatch(patch api.WorkflowPatch) string {
 	if patch.ReportingTimezone != nil {
 		parts = append(parts, fmt.Sprintf("the reporting timezone to %q", effectiveDeclaredZone(*patch.ReportingTimezone)))
 	}
+	if patch.PipPackages != nil {
+		parts = append(parts, fmt.Sprintf("the Python packages to %s", describePipPackages(*patch.PipPackages)))
+	}
 	if patch.RuntimeVersion != 0 {
 		if label, _ := runtimeInfo(patch.RuntimeVersion); label != "" {
 			parts = append(parts, fmt.Sprintf("the runtime to %d (%s)", patch.RuntimeVersion, label))
@@ -1280,7 +1285,8 @@ func createWorkflowRow(ctx context.Context, client *api.Client, f *folder, featu
 		// and for `sync apply`'s first pass, whose create carries nothing an
 		// address could still be pending in (the push that follows patches
 		// them).
-		Parameters: params,
+		Parameters:  params,
+		PipPackages: f.Manifest.DeclaredPipPackages(),
 		// The runtime, stamped at create. This is the only request that can
 		// pick it FREELY: afterwards it moves one way only, so a push to a
 		// workflow that already exists sends the declared runtime as a
@@ -1748,6 +1754,13 @@ func metadataDriftOf(baseline *wfdir.InstanceState, target *api.Workflow, patch 
 			Remote:   describeParameters(target.Parameters),
 		})
 	}
+	if patch.PipPackages != nil && baseline.PipPackages != nil && !samePipPackages(target.PipPackages, *baseline.PipPackages) {
+		out = append(out, metadataDrift{
+			Field:    "Python packages",
+			Baseline: describePipPackages(*baseline.PipPackages),
+			Remote:   describePipPackages(target.PipPackages),
+		})
+	}
 	if patch.ReportingTimezone != nil && baseline.ReportingTimezone != nil &&
 		target.ReportingTimezone != *baseline.ReportingTimezone {
 		out = append(out, metadataDrift{
@@ -1757,6 +1770,13 @@ func metadataDriftOf(baseline *wfdir.InstanceState, target *api.Workflow, patch 
 		})
 	}
 	return out
+}
+
+func describePipPackages(packages []string) string {
+	if cleaned := wfdir.CleanPipPackages(packages); len(cleaned) > 0 {
+		return strings.Join(cleaned, ", ")
+	}
+	return "none"
 }
 
 // describeParameters renders a declaration for a drift line — the names, which

@@ -571,6 +571,9 @@ func workflowMetaChanges(r *remoteReport) []string {
 	if r.ReportingTimezone != nil {
 		out = append(out, "the reporting timezone")
 	}
+	if r.PipPackages != nil {
+		out = append(out, "the Python packages")
+	}
 	if r.Runtime != nil {
 		if r.Runtime.Refused {
 			out = append(out, fmt.Sprintf("the runtime generation (this folder declares %d and the row is on %d, which a push REFUSES rather than lowers)",

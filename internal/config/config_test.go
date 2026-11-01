@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -683,5 +684,44 @@ func TestEvictionKey(t *testing.T) {
 				t.Errorf("evictionKey(%q) = %q, want %q", tt.body, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestUnknownProfileFromTheEnvironmentNamesRONJA_PROFILE(t *testing.T) {
+	isolate(t)
+	t.Setenv(EnvProfile, "__unset__")
+	_, err := Resolve("", "")
+	if !errors.Is(err, ErrNoProfile) {
+		t.Fatalf("Resolve = %v, want ErrNoProfile", err)
+	}
+	want := `no such profile "__unset__" (from RONJA_PROFILE in your environment, not a flag) — no profiles are stored yet. Unset RONJA_PROFILE, then run ronja login.`
+	if err.Error() != want {
+		t.Errorf("with none stored:\n got %s\nwant %s", err, want)
+	}
+
+	acme := login(t, "https://app.ronja.tech", "ten-acme", "Acme", "acme-token", "2026-01-01T00:00:00Z")
+	_, err = Resolve("", "")
+	if !errors.Is(err, ErrNoProfile) {
+		t.Fatalf("Resolve = %v, want ErrNoProfile", err)
+	}
+	want = `no such profile "__unset__" (from RONJA_PROFILE in your environment, not a flag) — stored profiles are: ` + acme + `. Unset RONJA_PROFILE or pass --profile <name>.`
+	if err.Error() != want {
+		t.Errorf("with profiles stored:\n got %s\nwant %s", err, want)
+	}
+}
+
+func TestUnknownProfileFromTheFlagDoesNotNameRONJA_PROFILE(t *testing.T) {
+	isolate(t)
+	for _, stored := range []bool{false, true} {
+		if stored {
+			login(t, "https://app.ronja.tech", "ten-acme", "Acme", "acme-token", "2026-01-01T00:00:00Z")
+		}
+		_, err := Resolve("", "nope")
+		if !errors.Is(err, ErrNoProfile) {
+			t.Fatalf("Resolve = %v, want ErrNoProfile", err)
+		}
+		if strings.Contains(err.Error(), EnvProfile) {
+			t.Errorf("a --profile typo blames the environment: %v", err)
+		}
 	}
 }

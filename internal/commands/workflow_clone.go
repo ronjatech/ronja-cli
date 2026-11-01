@@ -323,6 +323,9 @@ func writeWorkflowClone(ctx context.Context, client *api.Client, resolved *confi
 	// faithful copy, and a folder that came down without the key would
 	// silently not manage the parameters it can plainly see.
 	manifest.SetParameters(hooks.codec.parametersToDisk(source.Parameters))
+	if !manifest.IsJS() {
+		manifest.SetPipPackages(source.PipPackages)
+	}
 	// The declared calendar, but ONLY when the row declares one. An empty
 	// value means the row declares nothing at all — permanently, not
 	// pending a migration — and falls back to the caller's zone at run

@@ -26,9 +26,9 @@ func newDataAppInitCmd() *cobra.Command {
 	var title string
 
 	cmd := &cobra.Command{
-		Use:   "init",
-		Short: "Set up a data-app folder in the current directory",
-		Long: `Set up a data-app folder in the current directory.
+		Use:   "init [directory]",
+		Short: "Set up a data-app folder",
+		Long: `Set up a data-app folder in the named directory, or the current one.
 
 Writes ronja.json (the manifest) and .ronja/ (the local sync baseline, already
 git-ignored). Nothing is created on the server — the app itself comes into
@@ -42,6 +42,11 @@ entrypoint:
 Without --from you get an empty folder to write App.tsx into yourself:
 
   ronja app init --feature collection-abc123 --title "Revenue explorer"
+
+A directory argument creates the folder there (it may not exist yet); --from is
+still read relative to where you run the command:
+
+  ronja app init ./revenue --from src/Revenue.tsx --feature collection-abc123
 
 --feature names the feature the app will be created in; find it with
 ` + "`ronja api /api/v2/feature/query`" + `. An organization with no features yet answers
@@ -79,7 +84,7 @@ listing the table (or agent, workflow, metric, codex, secret) is all it takes �
 and the org roster (users()) needs neither. Any other name is refused by
 ` + "`ronja app push`" + ` before it sends anything, since the server would drop it
 silently and the app would fail in the browser.`,
-		Args: cobra.NoArgs,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// MarkFlagRequired only asserts the flag was PASSED, so `--feature ""`
 			// sails through it and writes a binding with no feature — which nothing
@@ -100,9 +105,9 @@ silently and the app would fail in the browser.`,
 				return err
 			}
 
-			root, err := os.Getwd()
+			root, err := initRoot(args)
 			if err != nil {
-				return fmt.Errorf("locate working directory: %w", err)
+				return err
 			}
 			if _, err := os.Stat(wfdir.ManifestPath(root)); err == nil {
 				return fmt.Errorf("%s already exists — this directory is already a Ronja folder",
@@ -118,15 +123,50 @@ silently and the app would fail in the browser.`,
 				return err
 			}
 
+			// Everything that can refuse runs before the directory exists, so a
+			// refused init into a named directory leaves nothing behind.
+			var fromBody []byte
+			if fromPath != "" {
+				if fromBody, err = os.ReadFile(fromPath); err != nil {
+					return fmt.Errorf("read %s: %w", fromPath, err)
+				}
+			}
 			// Fixed, not chosen: rdataapp stamps App.tsx at create and carries no
 			// field to change it, so offering an --entrypoint flag would be offering
 			// something the server will not honour.
 			entrypoint := wfdir.DataAppKind.DefaultEntrypoint
+			if strings.TrimSpace(title) == "" {
+				title = deriveTitle(fromPath, root)
+			}
+			manifest := &wfdir.Manifest{
+				Kind:       wfdir.KindDataApp,
+				Title:      title,
+				Entrypoint: entrypoint,
+			}
+			// A folder INITIALIZED onto a stack is born adopted: its id is minted
+			// here, locally, so its first push claims its address on the server and
+			// CI never needs the lock. See mintFolderIDAtInit.
+			if err := mintFolderIDAtInit(manifest); err != nil {
+				return err
+			}
+			// No dataAppID: nothing exists server-side yet. The first push creates
+			// the app and fills it in.
+			lock, err := recordFirstBinding(manifest,
+				wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID},
+				wfdir.Binding{FeatureID: featureID})
+			if err != nil {
+				return err
+			}
+
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				return fmt.Errorf("create %s: %w", root, err)
+			}
+
 			copied := false
 			scaffolded := false
 			var warnings []string
 			if fromPath != "" {
-				copied, err = copyEntrypoint(fromPath, root, entrypoint)
+				copied, err = copyEntrypoint(fromPath, fromBody, root, entrypoint)
 				if err != nil {
 					return err
 				}
@@ -161,29 +201,6 @@ silently and the app would fail in the browser.`,
 				}
 			}
 
-			if strings.TrimSpace(title) == "" {
-				title = deriveTitle(fromPath, root)
-			}
-
-			manifest := &wfdir.Manifest{
-				Kind:       wfdir.KindDataApp,
-				Title:      title,
-				Entrypoint: entrypoint,
-			}
-			// A folder INITIALIZED onto a stack is born adopted: its id is minted
-			// here, locally, so its first push claims its address on the server and
-			// CI never needs the lock. See mintFolderIDAtInit.
-			if err := mintFolderIDAtInit(manifest); err != nil {
-				return err
-			}
-			// No dataAppID: nothing exists server-side yet. The first push creates
-			// the app and fills it in.
-			lock, err := recordFirstBinding(manifest,
-				wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID},
-				wfdir.Binding{FeatureID: featureID})
-			if err != nil {
-				return err
-			}
 			// An EMPTY declaration rather than an absent one, so the folder owns its
 			// allowlists from the start and granting the app a table is editing
 			// ronja.json rather than discovering that the key exists. Harmless on an

@@ -1840,6 +1840,12 @@ ronja wf publish                       # commit, or submit for review, and say w
 ronja wf run --param month=2026-07     # run what is now live, and wait for it
 ```
 
+`wf init` writes into the working directory, or into the directory you name
+(`ronja wf init ./ga4 --feature collection-abc`), creating it if needed. A
+refused init (an existing `ronja.json` there, a `--feature` the credential
+cannot reach) creates nothing. `--from` is read relative to where you run the
+command, not the new folder. `app init [directory]` works the same way.
+
 A **durable** workflow — which is what a first push creates unless the folder
 declares otherwise — adds one verb to that loop: `ronja wf test --resume`
 continues a failed run instead of starting over. See "Durable workflows" below.
@@ -1858,7 +1864,7 @@ Two or three files describe the folder — see **Stacks** below for which, and
 why the third one exists:
 
 - **`ronja.json`** — the manifest, committed to the customer's git. Title,
-  entrypoint, declared `parameters`, and either named **`stacks`** (the current
+  entrypoint, declared `parameters` and `pipPackages`, and either named **`stacks`** (the current
   shape) or a legacy `instances` list — one entry per (instance, organization)
   the folder has been pushed to, so one folder can target a local backend and
   production, or two organizations on one instance, without any binding
@@ -2105,6 +2111,25 @@ why the third one exists:
   hand-added declaration that vanishes from a committed file means somebody on
   one of them rewrote it; `ronja --version` reports what you are running.
 
+  `pipPackages` are the extra Python packages the workflow installs before
+  each run (`["google-auth", "facebook-business==19.0.0"]`). Same three states
+  as `parameters`: absent leaves the workflow's list alone, `[]` clears it, a
+  list makes the workflow match. `wf init` writes `[]` for a Python folder (a
+  JavaScript folder declares npm packages in `package.json` and gets no key);
+  `wf clone` writes the workflow's list, `[]` when it has none; `wf pull`
+  updates the key in a folder that has it. `push` sends the list on the create,
+  patches it when it differs, and sends it with the check before anything is
+  written, so a bad specifier is refused first. Both sides are compared after
+  the server's cleaning (trimmed, blanks and repeats dropped, order kept), so
+  `" google-auth"` is not a change. A list changed in the web app since your
+  last sync stops the push like any other metadata drift. A non-empty list
+  stamps `formatVersion` 8: an older CLI would push the folder without the
+  packages, report success, and every run would fail with
+  `ModuleNotFoundError`. A list added by hand must declare
+  `"formatVersion": 8` too, set in the same edit: push, validate and `sync`
+  refuse a non-empty list below 8, naming the line to add, and `wf status`
+  says so.
+
 - **`.ronja/state.json`** — the sync baseline, never committed (`clone` and
   `init` write `.ronja/.gitignore` containing `*`). One entry per (instance,
   organization) binding, exactly like the manifest — the row the baseline came
@@ -2152,7 +2177,8 @@ and `pipeline` share one manifest format:
   `dependencies`**; **4 is a JavaScript workflow** (`"language": "js"`); **5 is
   `moved`**, and `removed` in an automation folder (see "Addresses: `moved` and
   `removed`"); **6 is the folder `"id"`**; **7 is a dependency by address, as a
-  write target, as an output or as a run edge**.
+  write target, as an output or as a run edge**; **8 is a non-empty
+  `pipPackages` list**.
 
 - **`stacks` and `ronja.lock.json`.** See **Stacks** below.
 
@@ -2624,9 +2650,9 @@ All three scan source as TEXT — so a commented-out marker trips them. Accepted
 rather than mirroring `stripLineComments` and `stripTripleQuotedBlocks`, whose
 drift would be silent in both directions; deleting a dead line is a real fix, and
 the messages say so. (The instance's runtime-3 starter, which `wf init` writes,
-names its example ref as `{{ ref('table-…') }}` for exactly this reason: an
-id-shaped placeholder, so `wf init` never writes a file `push` would then
-refuse.)
+names its example ref as `{{ ref(...) }}` for exactly this reason: no quoted
+argument, so no scan binds it and `wf init` never writes a file `push` would
+then refuse.)
 
 **`wf validate` and `app validate` fail on an alias refusal** — non-zero, `ok:
 false`, and the refusals in the `--json` payload under `aliasRefusals`. They are
@@ -4859,7 +4885,7 @@ carry `"tags"` refuses the whole metric file as an unknown key — run
 `ronja update` (see [Keeping it current](#keeping-it-current)).
 
 **Stated limits.** A tag assignment carries no author, so removing a name from
-the file removes it for everyone who also chose it. A token's tags land in the
+the file removes it for everyone who also chose it. A push's tags land in the
 organization's default Space. Tables, workflows, apps and modules have no
 `tags` key yet.
 
@@ -6616,7 +6642,7 @@ so publishing on that alone minted a version every second run.
 the workflow, data-app and module pushes with `LiveFirst`: before anything is checked
 out, the folder is compared with the **live** row — files, and every piece of
 metadata the push writes (title, entrypoint, declared parameters, declared
-calendar, a runtime upgrade; a data app's title and `access`; a module's
+Python packages (`pipPackages`), declared calendar, a runtime upgrade; a data app's title and `access`; a module's
 package name and title). When live already
 holds it, the push ends there: no checkout, no file write, no patch, no validate
 (a candidate save that is not going to happen — `sync check` is the verb that
@@ -7465,8 +7491,8 @@ ronja pipeline pull --dry-run # print the diff, write nothing anywhere
    folder's disk form, and check it before writing a byte:
    - **workflow / app / module:** the file set (added, rewritten, deleted) via
      the codec's `toDisk`, and the manifest metadata the folder ALREADY manages —
-     title, entrypoint, parameters (`parametersToDisk`), reporting timezone,
-     runtime; an app's title and `access` (each id its codec names written as
+     title, entrypoint, parameters (`parametersToDisk`), Python packages
+     (`pipPackages`), reporting timezone, runtime; an app's title and `access` (each id its codec names written as
      the alias); a module's title and package name. A key the manifest leaves
      out stays out. The plan must pass the push's own parity function
      (`workflowRowHoldsFolder` / `appRowHoldsFolder` / `moduleRowHoldsFolder`),
@@ -8014,10 +8040,10 @@ belong before the walk-through:
   therefore refused; deploy each stack from its own clone. A CI checkout (no
   `.ronja/`) is unaffected. Stacks in different organizations have separate
   baselines and are unaffected too.
-- ⚠️ **One live module per organization.** A module's package name is unique
-  among an organization's live modules, so every stack deploys the module folder
-  to the feature it already lives in, and applying any stack publishes that one
-  copy (the `shared_module` warning below).
+- ⚠️ **One module folder, one module.** Every stack deploys the module folder
+  to the feature the module already lives in (a module's package name is unique
+  among the live modules of its feature), so applying any stack publishes that
+  one copy (the `shared_module` warning below).
 
 The stack is declared by hand (one command for it is BL-6179)
 in EVERY folder's `ronja.json` — the same `url` and `tenantID` as `main`, the new
@@ -8040,9 +8066,9 @@ to the new copy as it is made. Two things in the tree still name the ORIGINAL
 feature's rows, and the import report lists both: an id literal in app source
 (edit it by hand), and an output literal — which the write gate refuses in the
 new stack, naming the line, until it is written as `{{ write('<alias>') }}` so
-the stack's bind is what it writes. A module's package name is unique in the
-organization, so its folder's new stack names the feature the module already
-lives in: every stack of one organization imports the same module.
+the stack's bind is what it writes. A module folder's new stack names the
+feature the module already lives in, so every stack of one organization imports
+the same module.
 
 ⚠️ **So applying the new stack publishes the organization's ONE module** — the
 copy every feature's workflows import, production's included. `sync apply`
@@ -8109,11 +8135,11 @@ database and its own secrets. Then deploy the finished work to your real Space.
    depends on: its secrets, its tables, and a login to the dev database. `bind`
    below can only offer the dev Space's rows once they exist.
 
-A token cannot choose a Space today (what it creates lands in the
-organization's default Space), which is why these are made in the browser. For
-the same reason, a token's database create reuses only a database of that name
-in the default Space: if the name is only in another Space, the create is
-refused and names that Space.
+An organization API token cannot choose a Space. A personal access token can,
+per request, with `ronja api -H 'X-Ronja-Space: <id>'`. A request that names no
+Space creates in the default Space, and a database create there reuses only a
+database in the default Space: if the name is only in another Space, the create
+is refused and names that Space.
 
 **Migrations: the dev database first, then the real one.**
 

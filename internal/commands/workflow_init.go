@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,9 +34,9 @@ func newWorkflowInitCmd() *cobra.Command {
 	var language string
 
 	cmd := &cobra.Command{
-		Use:   "init",
-		Short: "Set up a workflow folder in the current directory",
-		Long: `Set up a workflow folder in the current directory.
+		Use:   "init [directory]",
+		Short: "Set up a workflow folder",
+		Long: `Set up a workflow folder in the named directory, or the current one.
 
 Writes ronja.json (the manifest) and .ronja/ (the local sync baseline, already
 git-ignored). Nothing is created on the server — the workflow itself comes into
@@ -51,6 +50,11 @@ Point --from at a script you already have and it is copied in as the entrypoint:
 Without --from you get a main.py to start from, written for that runtime:
 
   ronja wf init --feature collection-abc --title "Monthly report"
+
+A directory argument creates the folder there (it may not exist yet); --from is
+still read relative to where you run the command:
+
+  ronja wf init ./ga4 --from scripts/ga4.py --feature collection-abc
 
 --feature names the feature the workflow will be created in; find it with
 GET /api/v2/feature/query. The binding is recorded per instance, so run this
@@ -69,7 +73,7 @@ repeating what already went out — and runs in a container that holds no
 credential for Ronja's table storage: its code reads a table only through
 ` + "`tools.query(\"SELECT ... FROM {{ ref('tbl::...') }}\")`" + `, never by reading a
 parquet file itself.`,
-		Args: cobra.NoArgs,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Only a runtime a new workflow can be created on. Runtime 1 and 2
 			// are retired, so naming one is refused here, in the words the
@@ -113,9 +117,9 @@ parquet file itself.`,
 				return err
 			}
 
-			root, err := os.Getwd()
+			root, err := initRoot(args)
 			if err != nil {
-				return fmt.Errorf("locate working directory: %w", err)
+				return err
 			}
 			if _, err := os.Stat(wfdir.ManifestPath(root)); err == nil {
 				return fmt.Errorf("%s already exists — this directory is already a workflow folder",
@@ -141,12 +145,80 @@ parquet file itself.`,
 			}
 			runtime = scaffold.runtime
 			starter := scaffold.starter
-
 			entrypoint := scaffold.entrypoint
+
+			// Everything that can refuse runs before the directory exists, so a
+			// refused init into a named directory leaves nothing behind.
+			var fromBody []byte
+			if fromPath != "" {
+				if fromBody, err = os.ReadFile(fromPath); err != nil {
+					return fmt.Errorf("read %s: %w", fromPath, err)
+				}
+			} else if strings.TrimSpace(starter) == "" {
+				// An empty starter matters only when it would be written: an
+				// entrypoint already in the folder is adopted instead.
+				if _, err := os.Stat(filepath.Join(root, entrypoint)); os.IsNotExist(err) {
+					return fmt.Errorf("%s named runtime %d for a new workflow but sent no starter %s — write %s yourself, or pass --from with the code to start from",
+						describeTarget(resolved), runtime, entrypoint, entrypoint)
+				}
+			}
+
+			if strings.TrimSpace(title) == "" {
+				title = deriveTitle(fromPath, root)
+			}
+			manifest := &wfdir.Manifest{
+				Kind:       wfdir.KindWorkflow,
+				Title:      title,
+				Language:   language,
+				Entrypoint: entrypoint,
+			}
+			// A folder INITIALIZED onto a stack is born adopted: its id is minted
+			// here, locally, so its first push claims its address on the server and
+			// CI never needs the lock. See mintFolderIDAtInit.
+			if err := mintFolderIDAtInit(manifest); err != nil {
+				return err
+			}
+			// ALWAYS pinned, named or not: the first push sends it, so the
+			// workflow is created on the runtime init settled — not on whatever
+			// the instance's default has become by then. Code from --from or an
+			// adopted entrypoint was not written from that runtime's starter,
+			// and the note below says so.
+			manifest.Runtime = runtime
+			// No workflowID: nothing exists server-side yet. The first push
+			// creates the workflow and fills it in.
+			lock, err := recordFirstBinding(manifest,
+				wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID},
+				wfdir.Binding{FeatureID: featureID})
+			if err != nil {
+				return err
+			}
+			// An empty declaration rather than an absent one, so the folder owns
+			// its parameters from the start and adding one is editing ronja.json
+			// rather than discovering that the key exists. Harmless on a workflow
+			// that does not exist yet, which is every folder init produces.
+			manifest.SetParameters(nil)
+			// A js folder declares its packages in package.json instead.
+			if !manifest.IsJS() {
+				manifest.SetPipPackages(nil)
+			}
+			// No reportingTimezone, deliberately, and the asymmetry with the line
+			// above is the point: a workflow declaring no parameters is the normal
+			// starting state and the server has no default to inherit, whereas the
+			// declared calendar DOES have an organization-wide default the create
+			// stamps. Writing the key here would have to write something, and the
+			// only value available without a round trip is "" — which means "declare
+			// UTC", so every fresh folder would silently override its organization's
+			// default. Absent means "inherit it", and `wf clone` records whatever
+			// the row ends up with.
+
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				return fmt.Errorf("create %s: %w", root, err)
+			}
+
 			copied := false
 			var warnings []string
 			if fromPath != "" {
-				copied, err = copyEntrypoint(fromPath, root, entrypoint)
+				copied, err = copyEntrypoint(fromPath, fromBody, root, entrypoint)
 				if err != nil {
 					return err
 				}
@@ -177,12 +249,7 @@ parquet file itself.`,
 			// work.
 			scaffolded := false
 			if fromPath == "" {
-				scaffolded, err = writeStarter(root, entrypoint, starter)
-				if errors.Is(err, errEmptyStarter) {
-					return fmt.Errorf("%s named runtime %d for a new workflow but sent no starter %s — write %s yourself, or pass --from with the code to start from",
-						describeTarget(resolved), runtime, entrypoint, entrypoint)
-				}
-				if err != nil {
+				if scaffolded, err = writeStarter(root, entrypoint, starter); err != nil {
 					return err
 				}
 			}
@@ -195,56 +262,11 @@ parquet file itself.`,
 					return err
 				}
 			}
-
-			if strings.TrimSpace(title) == "" {
-				title = deriveTitle(fromPath, root)
-			}
-
-			manifest := &wfdir.Manifest{
-				Kind:       wfdir.KindWorkflow,
-				Title:      title,
-				Language:   language,
-				Entrypoint: entrypoint,
-			}
-			// A folder INITIALIZED onto a stack is born adopted: its id is minted
-			// here, locally, so its first push claims its address on the server and
-			// CI never needs the lock. See mintFolderIDAtInit.
-			if err := mintFolderIDAtInit(manifest); err != nil {
-				return err
-			}
-			// ALWAYS pinned, named or not: the first push sends it, so the
-			// workflow is created on the runtime init settled — not on whatever
-			// the instance's default has become by then. Code from --from or an
-			// adopted entrypoint was not written from that runtime's starter,
-			// and the note below says so.
-			manifest.Runtime = runtime
 			if !scaffolded && !runtimeNamed {
 				warnings = append(warnings, fmt.Sprintf(
 					"this folder is pinned to runtime %d, the one %s creates new workflows on, and %s was not written from its starter — make sure the code is written for runtime %d before the first push, or pick another with `wf init --runtime`",
 					runtime, describeTarget(resolved), entrypoint, runtime))
 			}
-			// No workflowID: nothing exists server-side yet. The first push
-			// creates the workflow and fills it in.
-			lock, err := recordFirstBinding(manifest,
-				wfdir.InstanceKey{URL: resolved.URL, TenantID: resolved.TenantID},
-				wfdir.Binding{FeatureID: featureID})
-			if err != nil {
-				return err
-			}
-			// An empty declaration rather than an absent one, so the folder owns
-			// its parameters from the start and adding one is editing ronja.json
-			// rather than discovering that the key exists. Harmless on a workflow
-			// that does not exist yet, which is every folder init produces.
-			manifest.SetParameters(nil)
-			// No reportingTimezone, deliberately, and the asymmetry with the line
-			// above is the point: a workflow declaring no parameters is the normal
-			// starting state and the server has no default to inherit, whereas the
-			// declared calendar DOES have an organization-wide default the create
-			// stamps. Writing the key here would have to write something, and the
-			// only value available without a round trip is "" — which means "declare
-			// UTC", so every fresh folder would silently override its organization's
-			// default. Absent means "inherit it", and `wf clone` records whatever
-			// the row ends up with.
 			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}
@@ -320,8 +342,8 @@ parquet file itself.`,
 	return cmd
 }
 
-// copyEntrypoint copies --from into the folder as the entrypoint, reporting
-// whether a copy actually happened.
+// copyEntrypoint writes body, the --from source the caller has already read,
+// into the folder as the entrypoint, reporting whether a copy actually happened.
 //
 // Three cases where it does not: --from IS the entrypoint already (running init
 // in a directory that has main.py in it is the obvious way to do this), a
@@ -334,7 +356,7 @@ parquet file itself.`,
 // The destination is always the entrypoint name, never the source's basename:
 // a source called "monthly report (v2).py" is a path the server rejects, and
 // silently renaming to something legal is less surprising than a mid-push 400.
-func copyEntrypoint(fromPath, root, entrypoint string) (bool, error) {
+func copyEntrypoint(fromPath string, body []byte, root, entrypoint string) (bool, error) {
 	dest := filepath.Join(root, entrypoint)
 	srcAbs, err := filepath.Abs(fromPath)
 	if err != nil {
@@ -345,17 +367,7 @@ func copyEntrypoint(fromPath, root, entrypoint string) (bool, error) {
 		return false, fmt.Errorf("resolve %s: %w", dest, err)
 	}
 	if srcAbs == destAbs {
-		// Already in place: `wf init --from main.py` run inside the directory
-		// that holds it. Still verify it is readable, so init does not claim to
-		// have set up a folder around a file it cannot open.
-		if _, err := os.Stat(srcAbs); err != nil {
-			return false, fmt.Errorf("read %s: %w", fromPath, err)
-		}
 		return false, nil
-	}
-	body, err := os.ReadFile(srcAbs)
-	if err != nil {
-		return false, fmt.Errorf("read %s: %w", fromPath, err)
 	}
 	if existing, err := os.ReadFile(dest); err == nil {
 		if string(existing) == string(body) {
@@ -375,6 +387,23 @@ func copyEntrypoint(fromPath, root, entrypoint string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// initRoot is the folder an init writes into: the named directory, resolved
+// against the working directory, or the working directory itself.
+func initRoot(args []string) (string, error) {
+	if len(args) == 0 {
+		root, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("locate working directory: %w", err)
+		}
+		return root, nil
+	}
+	root, err := filepath.Abs(args[0])
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", args[0], err)
+	}
+	return root, nil
 }
 
 // mustAbs is filepath.Abs for the cases where a failure only costs a warning

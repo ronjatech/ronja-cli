@@ -286,12 +286,13 @@ func (m *Manifest) checkDependencies(path string) error {
 // `status` to explain it. See checkStacks for the invariant, and
 // checkDependencies for the half that stays at load.
 //
-// The first two describe a file THIS BUILD NEVER WRITES. The third is the one
-// that widened the boundary: this build DOES write it, and an older build wrote
-// it legitimately — the file is stranded by us adding a kind, not by somebody
-// else's CLI. Same conclusion either way, which is why it belongs here.
+// The first, second and fourth describe a file THIS BUILD NEVER WRITES. The
+// third is the one that widened the boundary: this build DOES write it, and an
+// older build wrote it legitimately — the file is stranded by us adding a kind,
+// not by somebody else's CLI. Same conclusion either way, which is why it
+// belongs here.
 //
-// The three refusals:
+// The four refusals:
 //
 //   - DEPENDENCIES DECLARED BELOW THE VERSION THAT MEANS THEM. `dependencies` is
 //     a v3 key and MarshalJSON stamps 3 on any manifest that carries one, so
@@ -327,7 +328,15 @@ func (m *Manifest) checkDependencies(path string) error {
 //     actually deploy something unresolvable. ⚠️ Scoped to the alias's OWN
 //     declared kind, unlike the marker half — see the loop below for why
 //     widening it would break folders nobody touched while closing nothing.
+//   - A NON-EMPTY `pipPackages` DECLARED BELOW 8. The list is usually added by
+//     hand to the `[]` init wrote, so no save stamps 8, and an older CLI opening
+//     the file deploys the workflow without its packages. Checked first: 8
+//     satisfies every lower demand, so one message fixes them all.
 func (m *Manifest) CheckDeclarations() error {
+	if len(m.DeclaredPipPackages()) > 0 && m.FormatVersion < manifestVersionPipPackages {
+		return fmt.Errorf("%s declares pipPackages but its formatVersion is %d: set \"formatVersion\": %d, so an older ronja refuses this folder instead of deploying it without its packages",
+			ManifestName, declaredFormatVersion(m.FormatVersion), manifestVersionPipPackages)
+	}
 	if len(m.Dependencies) > 0 && m.FormatVersion < manifestVersionDependencies {
 		// FormatVersion is the DECLARED one — 0 is an absent key, and absent
 		// means 1, so every version this build understands compares correctly

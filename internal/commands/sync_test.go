@@ -518,6 +518,13 @@ func TestSyncStatusLocalChangesAreNotClean(t *testing.T) {
 			},
 			want: "reporting timezone",
 		},
+		{
+			name: "a Python packages list the folder declares and the row does not have",
+			change: func(t *testing.T, _ *fakeInstance, root string) {
+				setManifestPipPackages(t, root, []string{"requests"})
+			},
+			want: "the Python packages",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

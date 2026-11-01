@@ -60,12 +60,9 @@ type ValidateFile struct {
 // endpoint persists nothing and needs nothing to exist, which is what makes
 // "iterate an existing script to green before the first push" possible.
 //
-// Parameters and PipPackages are omitempty because the CLI does not persist
-// either in the manifest today: a workflow's declared parameters live
-// server-side on the draft, and sending an empty list would read as "this
-// candidate declares no parameters" rather than "I am not telling you about
-// them". The server treats an absent list as none, which is the honest answer
-// for a folder that has no record of them.
+// Parameters and PipPackages are omitempty: the server reads an absent list
+// as none, which is also what an empty one says, so a folder declaring none and
+// a folder that does not manage the key send the same bytes.
 //
 // RuntimeVersion is omitempty for a third reason: the server reads an absent
 // value as 1, so a v1 candidate's request bytes stay exactly what they were
@@ -232,6 +229,9 @@ type CreateWorkflowInput struct {
 	// omitempty because a folder that does not manage parameters must create a
 	// workflow with none rather than assert an empty declaration.
 	Parameters []WorkflowParameter `json:"parameters,omitempty"`
+	// PipPackages is omitempty because a create with none and a create with []
+	// make the same row.
+	PipPackages []string `json:"pipPackages,omitempty"`
 	// RuntimeVersion is stamped at CREATE here, and the server creates a new
 	// workflow on runtime 3 only (1 and 2 are retired and refused). An existing
 	// runtime-1/2 workflow is raisable to 3 through WorkflowPatch — never
@@ -284,7 +284,9 @@ type CreateWorkflowInput struct {
 // (rworkflow.resolveDeclaredZonePatch). Both are things a folder legitimately
 // means — "I don't manage the zone" and "I declare UTC" — and a plain string
 // with omitempty collapses them into the first, making the reset unexpressible.
-// RuntimeVersion is a plain int with omitempty, and the third state the two
+// PipPackages is a pointer for the reason Parameters is: an explicit [] clears
+// the row's list, an absent key leaves it alone.
+// RuntimeVersion is a plain int with omitempty, and the third state the
 // pointers carry has nothing to describe here: the field moves ONE WAY (to 3, as
 // runtime 1 and 2 are retired), so "the folder does not manage it" and "the
 // folder declares the runtime the row already has" both mean "send nothing". The
@@ -295,6 +297,7 @@ type WorkflowPatch struct {
 	Entrypoint        string               `json:"entrypoint,omitempty"`
 	Parameters        *[]WorkflowParameter `json:"parameters,omitempty"`
 	ReportingTimezone *string              `json:"reportingTimezone,omitempty"`
+	PipPackages       *[]string            `json:"pipPackages,omitempty"`
 	RuntimeVersion    int                  `json:"runtimeVersion,omitempty"`
 }
 
@@ -302,7 +305,7 @@ type WorkflowPatch struct {
 // round trip rather than send `{}`.
 func (p WorkflowPatch) Empty() bool {
 	return p.Title == "" && p.Entrypoint == "" && p.Parameters == nil &&
-		p.ReportingTimezone == nil && p.RuntimeVersion == 0
+		p.ReportingTimezone == nil && p.PipPackages == nil && p.RuntimeVersion == 0
 }
 
 // ValidateWorkflowFiles dry-runs a candidate workflow. Findings are data: a
@@ -333,13 +336,14 @@ func (c *Client) CreateWorkflow(ctx context.Context, in CreateWorkflowInput) (*W
 	return &out, nil
 }
 
-// UpdateWorkflow patches a workflow's metadata and returns the endpoint's
-// `{warnings}` — soft save-time notices such as a draft's non-member approvers,
+// UpdateWorkflow patches a workflow's metadata and returns the response's
+// `warnings` — soft save-time notices such as a draft's non-member approvers,
 // or an entrypoint moved onto a file that carries a main guard, which no file
 // save reports because that file was saved while it was still a helper.
 //
-// The response carries no row, so a caller that needs the row's current state
-// re-reads it afterwards.
+// The response is the GET view of the updated row, but its `warnings` are
+// these plain-text save notices, not the structured `warnings` of
+// `GET /workflow/:id`, so it must not be decoded as a Workflow read.
 func (c *Client) UpdateWorkflow(ctx context.Context, id string, patch WorkflowPatch) ([]string, error) {
 	var out struct {
 		Warnings []string `json:"warnings"`

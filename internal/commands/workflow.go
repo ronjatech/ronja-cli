@@ -1607,6 +1607,11 @@ func baselineReportingTimezone(source *api.Workflow) *string {
 	return &zone
 }
 
+func baselinePipPackages(source *api.Workflow) *[]string {
+	packages := append([]string{}, source.PipPackages...)
+	return &packages
+}
+
 // codec de-aliases the fetched content before it is hashed, for the reason
 // hashFiles records: this baseline is compared against hashes of the bytes on
 // disk, which are in alias form.
@@ -1619,6 +1624,7 @@ func baselineFrom(codec aliasCodec, source *api.Workflow, files []api.WorkflowFi
 		Entrypoint:        source.Entrypoint,
 		Parameters:        baselineParameters(source),
 		ReportingTimezone: baselineReportingTimezone(source),
+		PipPackages:       baselinePipPackages(source),
 		Files:             map[string]wfdir.FileState{},
 		Aliases:           codec.baselineAliases(),
 		AliasesRecorded:   true,
@@ -1654,6 +1660,7 @@ func baselineFromLocal(codec aliasCodec, source *api.Workflow, files map[string]
 		Entrypoint:        source.Entrypoint,
 		Parameters:        baselineParameters(source),
 		ReportingTimezone: baselineReportingTimezone(source),
+		PipPackages:       baselinePipPackages(source),
 		Files:             map[string]wfdir.FileState{},
 		Aliases:           codec.baselineAliases(),
 		AliasesRecorded:   true,

@@ -1011,11 +1011,12 @@ func checkAliases(m *wfdir.Manifest, sel wfdir.Selection, codec aliasCodec, file
 	}
 	where, fix := describeBindSite(sel)
 
-	// The DECLARATION rules this build can never have written: `dependencies`
-	// declared below the format version that means them, and a kind this build
-	// does not resolve. First, because both say the manifest cannot be read as
-	// the folder intends, which makes every message after them a guess. See
-	// Manifest.CheckDeclarations for why neither is at load.
+	// The DECLARATION rules this build can never have written: a key declared
+	// below the format version that means it, a malformed or id-shaped
+	// dependency, and a kind this build does not resolve. First, because each
+	// says the manifest cannot be read as the folder intends, which makes every
+	// message after them a guess. See Manifest.CheckDeclarations for why none is
+	// at load.
 	if err := m.CheckDeclarations(); err != nil {
 		out.Refusals = append(out.Refusals, err.Error())
 	}
@@ -1437,7 +1438,8 @@ func (f *folder) noteAliases() {
 // aliasReport runs the alias pre-flight over the folder's own files, for a
 // command that needs the findings rather than just the printing.
 //
-// An empty report for a folder that declares no dependencies — see noteAliases.
+// For a folder that declares no dependencies, only CheckDeclarations — see
+// noteAliases.
 //
 // THE ERROR IS THE VERDICT for a folder whose files cannot be read, and it is
 // returned rather than swallowed because a caller that gates on this report has
@@ -1451,6 +1453,11 @@ func (f *folder) noteAliases() {
 // the unreadable folder properly.
 func (f *folder) aliasReport() (aliasReport, error) {
 	if len(f.Manifest.Dependencies) == 0 {
+		// Without dependencies only a declaration rule can refuse, such as an
+		// under-stamped pipPackages list, and a status must still say so.
+		if err := f.Manifest.CheckDeclarations(); err != nil {
+			return aliasReport{Refusals: []string{err.Error()}}, nil
+		}
 		return aliasReport{}, nil
 	}
 	files, _, err := readLocalFiles(f.Root, f.Kind)

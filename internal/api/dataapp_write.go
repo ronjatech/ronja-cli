@@ -308,6 +308,16 @@ type DataAppCommitOutcome struct {
 	// system of record to an audience of one, or handed a whole organization a
 	// managed database's write role without being told.
 	Audience *DataAppAudience `json:"audience,omitempty"`
+	// Warnings is guidance on the app the commit produced, printed after the
+	// audience sentence: a "per_person_rule" entry is a setting that lets a
+	// viewer around a per-person rule in one of its managed databases.
+	Warnings []DataAppWarning `json:"warnings,omitempty"`
+}
+
+// DataAppWarning mirrors governance.Warning.
+type DataAppWarning struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 // DataAppAudience mirrors rdataapp.AudienceSummary.

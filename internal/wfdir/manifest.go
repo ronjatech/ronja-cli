@@ -110,7 +110,7 @@ var ErrNoManifest = errors.New("no ronja.json found")
 // push rewrites a stack folder's ronja.json to stamp them. So the stamp is
 // demanded rather than only written: CheckAddressFormat refuses either key in a
 // file that declares less than it needs, naming the line to add — the same rule
-// CheckDeclarations applies to `dependencies`.
+// CheckDeclarations applies to `dependencies`, and to `pipPackages` at 8.
 //
 // **6 is the folder `"id"`** (an adopted folder, whose state lives on the
 // server), and it clears the bar because adopting changes what the LOCK means.
@@ -146,7 +146,15 @@ var ErrNoManifest = errors.New("no ronja.json found")
 // without it, so no CLI exists that reads 7 and not `run`, and a CLI below 7
 // has no write gate at all — the stamp is what tells it the file was written
 // for a gate it does not have.
-const ManifestFormatVersion = manifestVersionAddressDeps
+//
+// **8 is a declared `pipPackages` list.** An older CLI keeps the key, pushes
+// the folder without it, and reports success; the workflow then has none of
+// the packages its code imports, and every run fails with ModuleNotFoundError.
+// Stamped only for a NON-EMPTY list: `[]` and an absent key ask an older CLI
+// for nothing it gets wrong. As with 5, the list is usually added by hand to
+// the `[]` init wrote, so 8 is demanded at acceptance (CheckDeclarations), not
+// only stamped.
+const ManifestFormatVersion = manifestVersionPipPackages
 
 // The versions the CONTENT of a manifest can require, named rather than spelled
 // as bare integers at the two places that compare them. See
@@ -160,6 +168,7 @@ const (
 	manifestVersionMoves        = 5
 	manifestVersionFolderID     = 6
 	manifestVersionAddressDeps  = 7
+	manifestVersionPipPackages  = 8
 )
 
 // Manifest is ronja.json — the committed half of a workflow folder.
@@ -329,6 +338,10 @@ type Manifest struct {
 	// `wf clone` writes the key when the row DECLARES a zone; `wf init` leaves it
 	// absent so a fresh folder inherits the organization's default.
 	ReportingTimezone *string `json:"reportingTimezone,omitempty"`
+	// PipPackages are the extra Python packages the workflow installs, with the
+	// three states Parameters has: absent leaves the row's list alone, [] clears
+	// it, and a list makes the row match.
+	PipPackages *[]string `json:"pipPackages,omitempty"`
 	// Access is the DATA-APP analogue of Parameters: the capability allowlists
 	// (tables, secrets, agents, workflows, codexes, metrics) and the capability
 	// set the app's minted script-token is scoped from.
@@ -522,6 +535,9 @@ func (m Manifest) StampedFormatVersion() int {
 // folder can perfectly well have both stacks and dependencies, and the answer is
 // the higher of the two.
 func (m Manifest) requiredFormatVersion() int {
+	if len(m.DeclaredPipPackages()) > 0 {
+		return manifestVersionPipPackages
+	}
 	for _, dep := range m.Dependencies {
 		if dep.NeedsAddressDepsVersion() {
 			return manifestVersionAddressDeps
@@ -711,6 +727,48 @@ func (m *Manifest) DeclaredReportingTimezone() string {
 func (m *Manifest) SetReportingTimezone(zone string) {
 	zone = strings.TrimSpace(zone)
 	m.ReportingTimezone = &zone
+}
+
+// ManagesPipPackages reports whether push should sync the workflow's packages.
+func (m *Manifest) ManagesPipPackages() bool { return m.PipPackages != nil }
+
+// DeclaredPipPackages is the declared list, cleaned as the server cleans it, so
+// a hand-written " google-auth" compares equal to the row's "google-auth".
+func (m *Manifest) DeclaredPipPackages() []string {
+	if m.PipPackages == nil {
+		return nil
+	}
+	return CleanPipPackages(*m.PipPackages)
+}
+
+// SetPipPackages marks the folder as managing its packages and records them; nil
+// records an empty declaration.
+//
+// A non-empty list raises FormatVersion to the 8 a save stamps, so a pull that
+// records a list and pushes in the same run passes CheckDeclarations, which
+// reads the declared version.
+func (m *Manifest) SetPipPackages(packages []string) {
+	out := append([]string{}, packages...)
+	m.PipPackages = &out
+	if len(CleanPipPackages(out)) > 0 && m.FormatVersion < manifestVersionPipPackages {
+		m.FormatVersion = manifestVersionPipPackages
+	}
+}
+
+// CleanPipPackages mirrors the server's rworkflow.CleanPipPackages: trim each
+// entry, drop blanks and repeats, keep the order. Always non-nil.
+func CleanPipPackages(packages []string) []string {
+	out := make([]string, 0, len(packages))
+	seen := make(map[string]bool, len(packages))
+	for _, p := range packages {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
 }
 
 // ManagesAccess reports whether the manifest is the source of truth for a data
