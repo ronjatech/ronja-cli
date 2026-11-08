@@ -223,7 +223,7 @@ func TestPublishDoesNotRecordABaselineTheWalkCanNeverMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	baseline := state.For(f.Key())
+	baseline := stateForKey(state, f.Key())
 	if baseline == nil {
 		t.Fatal("the refusal wiped the baseline instead of leaving the previous one")
 	}
@@ -626,7 +626,7 @@ func TestDiscardResetsTheBaselineToLiveAndKeepsLocalFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	baseline := state.For(f.Key())
+	baseline := stateForKey(state, f.Key())
 	if baseline == nil || baseline.SourceID != "wf-1" {
 		t.Fatalf("baseline = %+v, want it pointing at the live row", baseline)
 	}
@@ -761,7 +761,7 @@ func TestDiscardDeleteWorkflowKeepsOtherInstancesBaselines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	state.Set(other, &wfdir.InstanceState{
+	stateSetKey(state, other, &wfdir.InstanceState{
 		SourceID: "wf-prod-9", SourceLifecycle: api.LifecycleLive,
 		Title: "Monthly report", Entrypoint: "main.py",
 		Files: map[string]wfdir.FileState{"main.py": {SHA256: wfdir.HashString("shipped\n"), UpdatedAt: "2026-08-01T09:00:00Z"}},
@@ -769,7 +769,7 @@ func TestDiscardDeleteWorkflowKeepsOtherInstancesBaselines(t *testing.T) {
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatalf("write state: %v", err)
 	}
-	before := marshalJSON(t, state.For(other))
+	before := marshalJSON(t, stateForKey(state, other))
 
 	if _, err := runCLI(t, root, "wf", "discard", "--delete-workflow", "--yes", "--json"); err != nil {
 		t.Fatalf("discard --delete-workflow: %v", err)
@@ -779,12 +779,12 @@ func TestDiscardDeleteWorkflowKeepsOtherInstancesBaselines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if got := marshalJSON(t, after.For(other)); got != before {
+	if got := marshalJSON(t, stateForKey(after, other)); got != before {
 		t.Errorf("production's baseline was rewritten by a discard against another instance:\n  before %s\n  after  %s", before, got)
 	}
 	// And this instance's is gone, so the folder reads as freshly initialised
 	// here — every local file added, nothing to drift against.
-	if base := after.For(f.Key()); base != nil {
+	if base := stateForKey(after, f.Key()); base != nil {
 		t.Errorf("the discarded instance's baseline should be gone, got %+v", base)
 	}
 }

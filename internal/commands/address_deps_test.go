@@ -237,7 +237,7 @@ func TestCrossFolderTableReadsAreRecorded(t *testing.T) {
 	fx := newAddressFixture(t, testTenantID)
 	fx.claimOrders()
 	m := loadAnyManifest(t, fx.workflow)
-	bind, errs, edges, _ := resolveAddressDeps(t.Context(), newClient(fx.f.URL(), "tok"), fx.workflow, m, "dev")
+	bind, errs, edges, _ := resolveAddressDeps(t.Context(), newClient(fx.f.URL(), "tok"), nil, fx.workflow, m, "dev")
 	if len(errs) != 0 || bind["orders"] != "table-orders" {
 		t.Fatalf("bind = %v, errs = %v", bind, errs)
 	}
@@ -274,7 +274,7 @@ func TestAddressDependencyMayNotLeaveTheRepository(t *testing.T) {
 	m.Dependencies["orders"] = wfdir.Dependency{Kind: markers.KindTable, From: filepath.ToSlash(rel), Address: "orders.sql"}
 	for _, from := range []string{filepath.ToSlash(rel), "../../../outside"} {
 		m.Dependencies["orders"] = wfdir.Dependency{Kind: markers.KindTable, From: from, Address: "orders.sql"}
-		bind, errs, _, _ := resolveAddressDeps(t.Context(), newClient(fx.f.URL(), "tok"), fx.workflow, m, "dev")
+		bind, errs, _, _ := resolveAddressDeps(t.Context(), newClient(fx.f.URL(), "tok"), nil, fx.workflow, m, "dev")
 		if bind["orders"] != "" || errs["orders"].Reason != syncReasonAddressOutsideRepository {
 			t.Fatalf("from %q: bind = %v, errs = %v", from, bind, errs)
 		}
@@ -286,10 +286,10 @@ func TestAddressDependencyMayNotLeaveTheRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.Dependencies["orders"] = wfdir.Dependency{Kind: markers.KindTable, From: "../../pipelines/sales", Address: "orders.sql"}
-	if bind, errs, _, _ := resolveAddressDeps(withAddressWalkRoot(t.Context(), fx.tree), newClient(fx.f.URL(), "tok"), fx.workflow, m, "dev"); bind["orders"] != "table-orders" {
+	if bind, errs, _, _ := resolveAddressDeps(withAddressWalkRoot(t.Context(), fx.tree), newClient(fx.f.URL(), "tok"), nil, fx.workflow, m, "dev"); bind["orders"] != "table-orders" {
 		t.Fatalf("inside the walked tree: bind = %v, errs = %v", bind, errs)
 	}
-	if _, errs, _, _ := resolveAddressDeps(t.Context(), newClient(fx.f.URL(), "tok"), fx.workflow, m, "dev"); errs["orders"].Reason != syncReasonAddressOutsideRepository {
+	if _, errs, _, _ := resolveAddressDeps(t.Context(), newClient(fx.f.URL(), "tok"), nil, fx.workflow, m, "dev"); errs["orders"].Reason != syncReasonAddressOutsideRepository {
 		t.Fatalf("no git and no walk: errs = %v", errs)
 	}
 }

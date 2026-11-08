@@ -140,9 +140,8 @@ const baselineBeforeFirstVersion = 2 * time.Second
 //
 // What the stack applied is the content the row held before its first version,
 // which the server no longer has. This checkout's local baseline holds its
-// fingerprint when the baseline was read off THIS live row (not another
-// stack's row — the baseline is shared between stacks, BL-4e71 — and not a
-// draft) before that first version was committed: an import, a clone, the
+// fingerprint when the baseline was read off THIS live row (not a stale record
+// of another row, and not a draft) before that first version was committed: an import, a clone, the
 // publish that created the row, or a pull. A baseline read after it (a discard
 // re-reads live) describes the publish, not what was applied.
 //
@@ -157,7 +156,7 @@ func unversionedApplied(ctx context.Context, f *folder, liveID string, local map
 	}
 	var base *wfdir.InstanceState
 	if f.State != nil {
-		base = f.State.For(f.Key)
+		base = f.State.For(f.Baseline())
 	}
 	switch {
 	case base == nil:
@@ -361,7 +360,7 @@ func pullDraftKind[R, F any](ctx context.Context, f *folder, k draftKindPull[R, 
 			// is the author's: left exactly as it is.
 			return nil
 		}
-		f.State.Set(f.Key, k.baseline(live, files))
+		f.State.Set(f.Baseline(), k.baseline(live, files))
 		return wfdir.SaveState(f.Root, f.State)
 	}
 	return plan, nil

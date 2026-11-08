@@ -140,7 +140,7 @@ func codecOfBaseline(aliases map[string]wfdir.BaselineAlias) aliasCodec {
 // records nothing and compares through the folder's current codec, as before
 // the record existed.
 func (f *folder) baselineCodec() aliasCodec {
-	if b := f.State.For(f.Key); b != nil && !b.AliasesUnrecorded() {
+	if b := f.State.For(f.Baseline()); b != nil && !b.AliasesUnrecorded() {
 		return codecOfBaseline(b.Aliases)
 	}
 	return f.Codec
@@ -183,7 +183,7 @@ func (r reboundAlias) describe() string {
 // The folder's files are read only when a binding did change; one that cannot
 // be read keeps every changed binding, since nothing then shows it unused.
 func (f *folder) reboundSinceBaseline() []reboundAlias {
-	b := f.State.For(f.Key)
+	b := f.State.For(f.Baseline())
 	if b == nil || b.AliasesUnrecorded() {
 		return nil
 	}
@@ -221,7 +221,7 @@ func (f *folder) reboundSinceBaseline() []reboundAlias {
 // bindings are returned, each carrying the way past the push's refusal.
 // remote is in the folder's current aliases.
 func (f *folder) unrecordedRebind(drift *wfdir.Diff, remote map[string]string) []reboundAlias {
-	if !f.State.For(f.Key).AliasesUnrecorded() || drift == nil || !drift.Dirty() {
+	if !f.State.For(f.Baseline()).AliasesUnrecorded() || drift == nil || !drift.Dirty() {
 		return nil
 	}
 	local, _, err := readLocalFiles(f.Root, f.Kind)
@@ -266,7 +266,7 @@ func reboundWayPast(f *folder) string {
 //
 // remote is in the folder's current aliases, local in disk form.
 func (f *folder) reboundUnrecorded(drift wfdir.Diff, remote, local map[string]string) []reboundAlias {
-	b := f.State.For(f.Key)
+	b := f.State.For(f.Baseline())
 	if !b.AliasesUnrecorded() || len(drift.Added)+len(drift.Deleted) > 0 || len(drift.Modified) == 0 {
 		return nil
 	}

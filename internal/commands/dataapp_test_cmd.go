@@ -263,7 +263,7 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	if err != nil {
 		return err
 	}
-	client := api.New(resolved.URL, resolved.Token)
+	client := f.client()
 
 	// The row to render is resolved HERE, not by the server: POST :id/preview
 	// renders exactly the row it is named (a draft is its own address; nothing

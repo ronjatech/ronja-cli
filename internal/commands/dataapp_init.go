@@ -122,6 +122,10 @@ silently and the app would fail in the browser.`,
 			if err := confirmFeatureIn(cmd.Context(), featureID, resolved); err != nil {
 				return err
 			}
+			space, err := settleStackSpace(cmd.Context(), resolved, featureID)
+			if err != nil {
+				return err
+			}
 
 			// Everything that can refuse runs before the directory exists, so a
 			// refused init into a named directory leaves nothing behind.
@@ -157,6 +161,7 @@ silently and the app would fail in the browser.`,
 			if err != nil {
 				return err
 			}
+			stampSpace(manifest, flagStack, space)
 
 			if err := os.MkdirAll(root, 0o755); err != nil {
 				return fmt.Errorf("create %s: %w", root, err)

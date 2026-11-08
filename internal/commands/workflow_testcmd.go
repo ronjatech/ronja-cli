@@ -181,7 +181,7 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 			// killing the wait does not kill the run.
 			ctx := cmd.Context()
 
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -326,7 +326,7 @@ type testOutcome struct {
 // does so before the run starts — the point at which the workflow's side
 // effects stop being hypothetical.
 func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, error) {
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 
 	// 1. Which row. `wf test` runs the DRAFT, always: the live workflow is what
 	// everyone else's automations use, and a command whose job is "try my
@@ -579,7 +579,7 @@ func noteDraftDrift(ctx context.Context, client *api.Client, f *folder, draft *a
 // workflow wf-1"); `because` is the clause that follows the dash, punctuation
 // included.
 func noteRemoteDrift(ctx context.Context, client *api.Client, f *folder, row *api.Workflow, subject, because string) {
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	if baseline == nil || baseline.SourceID != row.ID {
 		return
 	}
@@ -608,7 +608,7 @@ func checkStale(f *folder, staleOK bool) error {
 	if err != nil {
 		return err
 	}
-	diff := wfdir.DiffHashes(enumeration.Files, f.State.For(f.Key).Hashes())
+	diff := wfdir.DiffHashes(enumeration.Files, f.State.For(f.Baseline()).Hashes())
 	if !diff.Dirty() {
 		return nil
 	}

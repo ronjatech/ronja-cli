@@ -33,6 +33,11 @@ type fakeManaged struct {
 	t  *testing.T
 	mu sync.Mutex
 
+	// inventory answers GET /feature/:id/references — what `sync apply
+	// --allow-create` reads to refuse a same-named twin. Nil answers an empty
+	// feature, which is what every fake staging no twin needs.
+	inventory func(featureID string) []api.ReferenceResource
+
 	claims map[string]*fakeClaim
 	nextID int
 	// probe answers one row's facts from the host fake (probe.go loadFacts).
@@ -561,6 +566,15 @@ func (m *fakeManaged) writesSeen() []string {
 // serve answers the seven routes (handler.go Register, handler.go). It reports whether the
 // path was a managed one.
 func (m *fakeManaged) serve(w http.ResponseWriter, r *http.Request) bool {
+	if feature, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/"); ok && strings.HasSuffix(feature, "/references") && !strings.HasPrefix(feature, "model/") {
+		feature = strings.TrimSuffix(feature, "/references")
+		resources := []api.ReferenceResource{}
+		if m.inventory != nil {
+			resources = append(resources, m.inventory(feature)...)
+		}
+		writeJSON(w, api.FeatureReferences{FeatureID: feature, FeatureName: "Feature", Resources: resources, OmittedKinds: []api.OmittedRefKind{}})
+		return true
+	}
 	rest, ok := strings.CutPrefix(r.URL.Path, "/api/v2/managed")
 	if !ok || (rest != "" && !strings.HasPrefix(rest, "/")) {
 		return false

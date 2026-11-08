@@ -43,7 +43,7 @@ With --json, one object carrying all of the above.`,
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what changed locally, which is most of the value and costs
 			// nothing. The remote half degrades to "not checked" with a reason.
-			resolved, err := config.Resolve(flagURL, flagProfile)
+			resolved, err := resolveStackCredential("", false, false)
 			if err != nil {
 				return err
 			}
@@ -55,7 +55,7 @@ With --json, one object carrying all of the above.`,
 			if err != nil {
 				return err
 			}
-			addAppUpdates(cmd.Context(), resolved, report)
+			addAppUpdates(cmd.Context(), report)
 
 			// The one line a row still on the old SQL escape handling earns,
 			// on STDERR in both modes: the report on stdout is a document a
@@ -107,7 +107,7 @@ func dataAppStatusReportAt(ctx context.Context, root string, resolved *config.Re
 	if err != nil {
 		return nil, err
 	}
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
 	report.Rebound = f.reboundSinceBaseline()
 	report.Skipped = enumeration.Skipped
@@ -223,6 +223,8 @@ type appRemoteReport struct {
 	Updates *appUpdatesReport `json:"updates,omitempty"`
 	// liveID is the published app the binding names, "" when there is none.
 	liveID string
+	// client is the folder's stack client the remote half read with.
+	client *api.Client
 }
 
 // appUpdatesReport is the app's recommended updates, with the same
@@ -278,7 +280,8 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 		return out, ""
 	}
 
-	client := api.New(resolved.URL, resolved.Token)
+	client := f.client()
+	out.client = client
 	target, err := inspectAppTarget(ctx, client, f)
 	if err != nil {
 		// inspectAppTarget folds two different failures together, and status wants
@@ -333,7 +336,7 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 	}
 	out.ComparedAgainst = &comparedReport{ID: row.ID, Lifecycle: row.Lifecycle}
 	out.SQLSemanticsNotice = sqlSemanticsNotice(sqlSemanticsSubject(row.Name, row.ID), row.SQLSemantics)
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	drift := wfdir.DiffHashes(hashAppFiles(f.baselineCodec(), files), baseline.Hashes())
 	out.Drift = &drift
 	out.rebound = f.unrecordedRebind(out.Drift, appContentByPath(f.Codec, files))
@@ -357,11 +360,11 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 // commands share the report and never read it. It never fails the status:
 // updates are recommendations, so the worst a failed read earns is one line
 // saying it was not checked.
-func addAppUpdates(ctx context.Context, resolved *config.Resolved, report *appStatusReport) {
+func addAppUpdates(ctx context.Context, report *appStatusReport) {
 	if report.Remote == nil || report.Remote.liveID == "" {
 		return
 	}
-	report.Remote.Updates = appUpdatesStatus(ctx, api.New(resolved.URL, resolved.Token), report.Remote.liveID)
+	report.Remote.Updates = appUpdatesStatus(ctx, report.Remote.client, report.Remote.liveID)
 }
 
 func appUpdatesStatus(ctx context.Context, client *api.Client, liveID string) *appUpdatesReport {

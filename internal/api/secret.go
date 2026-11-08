@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"time"
 )
 
 // CreateSecretInput is the POST /secret body (rsecret.CreateInput server-side).
@@ -71,16 +72,32 @@ func (c *Client) InitiateOAuth(ctx context.Context, service string, in OAuthInit
 	return &out, nil
 }
 
-// SecretStatus is the slice of GET /secret/:id a connect waits on.
+// SecretStatus is the slice of GET /secret/:id the CLI's waits read.
 // GrantedScopes is written ONLY by the OAuth callback, so a change in it is a
-// completed consent; updatedAt is deliberately absent because a background token
-// refresh bumps it, and a wait keyed on it would report a sign-in that never happened.
+// completed consent; ValueChangedAt moves only when a stored value is replaced.
+// updatedAt is deliberately absent because a background token refresh or a
+// login bumps it, and a wait keyed on it would report something that never happened.
 type SecretStatus struct {
 	ID            string    `json:"id"`
 	Name          string    `json:"name"`
 	Status        string    `json:"status"`
 	FeatureID     *string   `json:"featureID"`
 	GrantedScopes *[]string `json:"grantedScopes"`
+	// NewValue is nil from a server older than the new-value form.
+	NewValue        *SecretNewValue `json:"newValue"`
+	ValueChangedAt  *time.Time      `json:"valueChangedAt"`
+	LastCheckedAt   *time.Time      `json:"lastCheckedAt"`
+	LastCheckStatus string          `json:"lastCheckStatus"`
+	LastCheckError  string          `json:"lastCheckError"`
+	LastCheckSource string          `json:"lastCheckSource"`
+}
+
+// SecretNewValue holds either the link to the form for a new value, built and
+// org-stamped by the server, or the sentence saying why the caller may not
+// enter one.
+type SecretNewValue struct {
+	URL     string `json:"url"`
+	Refusal string `json:"refusal"`
 }
 
 // GetSecretStatus reads one secret's metadata.

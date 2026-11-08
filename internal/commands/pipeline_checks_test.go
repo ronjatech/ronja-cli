@@ -1061,7 +1061,7 @@ func TestPipelineChecksStemRenameHandsTheChecksOver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inst := state.For(f.Key())
+	inst := stateForKey(state, f.Key())
 	inst.Files["gl.sql"], inst.Tables["gl.sql"] = inst.Files["gl_lines.sql"], inst.Tables["gl_lines.sql"]
 	delete(inst.Files, "gl_lines.sql")
 	delete(inst.Tables, "gl_lines.sql")

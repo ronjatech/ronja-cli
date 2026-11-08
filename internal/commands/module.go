@@ -331,7 +331,7 @@ func refreshModuleBaselineFromLive(ctx context.Context, client *api.Client, f *f
 	if err := wfdir.CheckLocalPaths(modulePathsOf(files), f.Kind); err != nil {
 		return fmt.Errorf("the files of %s cannot all be tracked locally: %w", liveID, err)
 	}
-	f.State.Set(f.Key, moduleBaselineFrom(live, files))
+	f.State.Set(f.Baseline(), moduleBaselineFrom(live, files))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return fmt.Errorf("write the local baseline: %w", err)
 	}

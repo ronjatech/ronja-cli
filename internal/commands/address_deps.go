@@ -246,7 +246,10 @@ func (f *folder) resolveAddressDependencies(ctx context.Context) {
 	}
 	client := f.addressClient()
 	if hasAddressDependencies(f.Manifest) {
-		f.addressBind, f.addressErrors, f.addressEdges, f.addressPending = resolveAddressDeps(ctx, client, f.Root, f.Manifest, f.Stack)
+		if f.spaces == nil && client != nil {
+			f.spaces = newSpaceLookupOn(ctx, client)
+		}
+		f.addressBind, f.addressErrors, f.addressEdges, f.addressPending = resolveAddressDeps(ctx, client, f.spaces, f.Root, f.Manifest, f.Stack)
 	}
 	if f.addressBind != nil {
 		f.Codec = newAliasCodec(f.Manifest.Dependencies, f.codecBind())
@@ -258,7 +261,7 @@ func (f *folder) resolveAddressDependencies(ctx context.Context) {
 // caller with no token (every lookup is then skipped).
 func (f *folder) addressClient() *api.Client {
 	if f.Resolved != nil && f.Resolved.Token != "" {
-		return newClient(f.Resolved.URL, f.Resolved.Token)
+		return f.client()
 	}
 	return nil
 }
@@ -446,8 +449,11 @@ func (f *folder) codecBind() map[string]string {
 
 // resolveAddressDeps is the resolution itself, root-parameterised so `sync`
 // can ask it of any folder in a tree. One GET /managed per (other folder) —
-// several aliases into one folder share it.
-func resolveAddressDeps(ctx context.Context, client *api.Client, root string, m *wfdir.Manifest, stack string) (map[string]string, map[string]wfdir.AddressError, []addressEdge, map[string]addressPending) {
+// several aliases into one folder share it. On a stack that declares a Space,
+// spaces places every resolved row by its own read, and a row outside the
+// Space is refused, read or write: an address resolves within one Space, and
+// a deliberate read of another is a bind by id.
+func resolveAddressDeps(ctx context.Context, client *api.Client, spaces *spaceLookup, root string, m *wfdir.Manifest, stack string) (map[string]string, map[string]wfdir.AddressError, []addressEdge, map[string]addressPending) {
 	bind := map[string]string{}
 	errs := map[string]wfdir.AddressError{}
 	pending := map[string]addressPending{}
@@ -455,6 +461,41 @@ func resolveAddressDeps(ctx context.Context, client *api.Client, root string, m 
 	overlay := addressOverlayFrom(ctx)
 	refuse := func(alias, reason, format string, args ...any) {
 		errs[alias] = wfdir.AddressError{Reason: reason, Detail: fmt.Sprintf("dependency %q: ", alias) + fmt.Sprintf(format, args...)}
+	}
+	spaceID := m.Stacks[stack].SpaceID
+	// resolved binds an alias to the row it resolved to, once that row is
+	// placed in the stack's Space.
+	resolved := func(alias string, dep wfdir.Dependency, edge addressEdge) {
+		if spaceID != "" {
+			if spaces == nil {
+				refuse(alias, syncReasonNoCredential, "%s resolved to %s, and there is no credential to read which Space it is in — sign in with `ronja login`", dep.From, edge.ID)
+				return
+			}
+			in, featureID, _, ok, err := spaces.rowSpace(dep.Kind, edge.ID)
+			outside := func(why string) {
+				refuse(alias, syncReasonAddressSpaceMismatch, "%s at %s resolves in stack %q to %s, %s, and this stack is declared for %s — an address resolves only within one Space; to read a row of another Space, declare it as a dependency and bind it by id",
+					dep.From, describeAddressKey(dep.Address), stack, edge.ID, why, spaces.describeSpace(spaceID))
+			}
+			switch {
+			case !ok:
+				outside(fmt.Sprintf("a %s this ronja cannot place in a Space", dep.Kind))
+				return
+			case err != nil && unreachable(err):
+				outside("which this credential cannot read, so nothing can say which Space it is in")
+				return
+			case err != nil:
+				refuse(alias, syncReasonLookupFailed, "reading which Space %s (%s at %s) is in: %v", edge.ID, dep.From, describeAddressKey(dep.Address), err)
+				return
+			case featureID == "":
+				outside("which is in no feature and so in no Space")
+				return
+			case in != spaceID:
+				outside("which is in " + spaces.describeSpace(in))
+				return
+			}
+		}
+		bind[alias] = edge.ID
+		edges = append(edges, edge)
 	}
 	type claimsOf struct {
 		claims []api.ManagedClaim
@@ -535,8 +576,8 @@ func resolveAddressDeps(ctx context.Context, client *api.Client, root string, m 
 				dep.From, stack, describeKeyForApply(there.Key()), describeKeyForApply(here.Key()))
 			continue
 		}
-		if problem := addressSameSpace(here, there); problem != nil {
-			errs[alias] = *problem
+		if problem := addressSpaceMismatch(here, there, dep.From, stack); problem != nil {
+			refuse(alias, problem.Reason, "%s", problem.Detail)
 			continue
 		}
 		if !other.Adopted() || there.Unmanaged {
@@ -556,8 +597,7 @@ func resolveAddressDeps(ctx context.Context, client *api.Client, root string, m 
 				errs[alias] = wfdir.AddressError{Reason: failure.Reason, Detail: fmt.Sprintf("dependency %q: ", alias) + failure.Detail}
 				continue
 			}
-			bind[alias] = id
-			edges = append(edges, addressEdge{Alias: alias, Kind: dep.Kind, FromRoot: otherRoot, Address: dep.Address, ID: id, FeatureID: feature, Written: true})
+			resolved(alias, dep, addressEdge{Alias: alias, Kind: dep.Kind, FromRoot: otherRoot, Address: dep.Address, ID: id, FeatureID: feature, Written: true})
 			continue
 		}
 		if row, ok := overlay.lookup(there.FeatureID, other.ID, dep.Address); ok {
@@ -566,8 +606,7 @@ func resolveAddressDeps(ctx context.Context, client *api.Client, root string, m 
 					"%s's row at %s is a %s, and this folder declares it a %s", dep.From, describeAddressKey(dep.Address), row.Kind, dep.Kind)
 				continue
 			}
-			bind[alias] = row.ID
-			edges = append(edges, addressEdge{Alias: alias, Kind: dep.Kind, FromRoot: otherRoot, Address: dep.Address, ID: row.ID, FeatureID: there.FeatureID})
+			resolved(alias, dep, addressEdge{Alias: alias, Kind: dep.Kind, FromRoot: otherRoot, Address: dep.Address, ID: row.ID, FeatureID: there.FeatureID})
 			continue
 		}
 		if client == nil {
@@ -606,8 +645,7 @@ func resolveAddressDeps(ctx context.Context, client *api.Client, root string, m 
 				"%s's row at %s is a %s, and this folder declares it a %s", dep.From, describeAddressKey(dep.Address), claim.ResourceKind, dep.Kind)
 			continue
 		}
-		bind[alias] = claim.ResourceID
-		edges = append(edges, addressEdge{Alias: alias, Kind: dep.Kind, FromRoot: otherRoot, Address: dep.Address, ID: claim.ResourceID, FeatureID: there.FeatureID})
+		resolved(alias, dep, addressEdge{Alias: alias, Kind: dep.Kind, FromRoot: otherRoot, Address: dep.Address, ID: claim.ResourceID, FeatureID: there.FeatureID})
 	}
 	if len(bind) == 0 {
 		bind = nil
@@ -719,16 +757,6 @@ func resolveWorkflowTable(signedIn bool, overlay *addressOverlay,
 	}
 	return fail(syncReasonAddressUnresolved,
 		"%s's workflow has not made its output %q in stack %q's feature %s yet — %s", dep.From, dep.Address, stack, there.FeatureID, runFirst)
-}
-
-// addressSameSpace is where the same-SPACE half of the rule hooks
-// in: two stacks with the same url and tenantID must ALSO name features in the
-// same Space, or a Dev deployment could resolve an address to a Main row. Spaces
-// are invisible to this build (a stack does not name one yet), so it
-// answers nil; the url/tenantID half is enforced above.
-func addressSameSpace(here, there wfdir.Stack) *wfdir.AddressError {
-	_, _ = here, there
-	return nil
 }
 
 // addressKindHeldBy reports whether a folder of `kind` manages a dependency of

@@ -54,7 +54,7 @@ With --json, the server's response verbatim plus an "ok" boolean and any local
 			if err != nil {
 				return err
 			}
-			client := api.New(resolved.URL, resolved.Token)
+			client := f.client()
 
 			validation, err := validateWorkflowFolder(cmd.Context(), client, f)
 			// The alias findings are printed BEFORE the error is returned, and

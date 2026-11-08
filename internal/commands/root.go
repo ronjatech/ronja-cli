@@ -43,8 +43,10 @@ var errAlreadyReported = errors.New("already reported")
 // into one non-zero makes the difference unreadable to the caller that most
 // needs it (see syncExitDrifted / syncExitUnknown).
 //
-// Deliberately additive: nothing else returns one, so every existing command
-// keeps exiting exactly 0 or 1 as it always has.
+// The rule: a command exits 0 or 1 unless its failure names another code here,
+// or is a refusal of a stack's Space (asSpaceEntry), which exits 2 from every
+// command; see exitCodeFor. A Space refusal held by any latch when the command
+// ends exits 2 whatever the command returned (run).
 type exitCodeError struct {
 	code int
 	err  error
@@ -63,6 +65,21 @@ func withExitCode(code int, err error) error {
 		return nil
 	}
 	return &exitCodeError{code: code, err: err}
+}
+
+// exitCodeFor is the process exit code of a command's error.
+func exitCodeFor(err error) int {
+	if err == nil {
+		return 0
+	}
+	var coded *exitCodeError
+	if errors.As(err, &coded) {
+		return coded.code
+	}
+	if _, refused := asSpaceEntry(err); refused {
+		return syncExitUnknown
+	}
+	return 1
 }
 
 // Version is stamped at build time by the release pipeline:
@@ -197,7 +214,8 @@ func run(args []string) int {
 	ctx, stop := signalContext()
 	defer stop()
 	code := 0
-	if err := root.ExecuteContext(ctx); err != nil {
+	err := root.ExecuteContext(ctx)
+	if err != nil {
 		err = runtimeRefusalHint(err)
 		// Cobra has already printed the error for usage problems; this covers
 		// the RunE path. Keep it on stderr so --json output stays parseable.
@@ -207,11 +225,18 @@ func run(args []string) int {
 		// A command that named its own exit code gets it. Checked AFTER the
 		// reporting above rather than instead of it, so a coded failure is still
 		// explained on stderr like every other one.
-		code = 1
-		var coded *exitCodeError
-		if errors.As(err, &coded) {
-			code = coded.code
+		code = exitCodeFor(err)
+	}
+	// A Space refusal a step swallowed (a tag half, a lookup) left only prose
+	// behind, or nothing; the latch still holds it, and it outranks every
+	// other exit code.
+	if held := heldSpaceRefusals(); len(held) > 0 {
+		for _, e := range held {
+			if !errors.Is(err, e) {
+				fmt.Fprintln(os.Stderr, "error:", e)
+			}
 		}
+		code = syncExitUnknown
 	}
 	// The daily update notice goes out LAST: after the command's own output and
 	// after any error line, so it is never interleaved with a report. It cannot
@@ -224,6 +249,7 @@ func newRootCmd() *cobra.Command {
 	// One command tree is one invocation, and what an instance said about its
 	// workflow defaults is cached for exactly that long. See defaultsCache.
 	forgetWorkflowDefaults()
+	forgetSpaceLatches()
 	root := &cobra.Command{
 		Use:   "ronja",
 		Short: "Build and explore in Ronja from the command line",
@@ -255,12 +281,15 @@ through another interpreter to read it. api also has -F for file uploads and
   ronja api -X POST /api/v2/file/upload/uploads -F file=@report.pdf
   ronja api /api/v2/workflow/run/$id --wait-until '.status != "running"'
 
-And three credential handshakes, which own only the interactive half of a
+And four credential handshakes, which own only the interactive half of a
 credential and never print one:
 
   ronja secret create  store an API key or database login — typed at an
                        echo-off prompt, piped, or read from a file, or
                        with --in-browser entered by you in Ronja
+  ronja secret new-value
+                       open Ronja's form to enter a new value for a secret,
+                       then print what Ronja found when she tried it
   ronja secret connect connect a service like Gmail by signing in to it
   ronja token create   open Ronja's create-token form, pre-filled, for a
                        person to create the token there
@@ -353,7 +382,7 @@ credentials entirely and never touch disk.`,
 	// verb would be filing a repository-wide question under one of its answers.
 	root.AddCommand(newLoginCmd(), newLogoutCmd(), newWhoamiCmd(), newProfileCmd(),
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
-		newPipelineCmd(), newModuleCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(), newImportCmd(),
+		newPipelineCmd(), newModuleCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(), newImportCmd(), newCopyCmd(),
 		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newSecretCmd(), newTokenCmd(), newUpdateCmd())
 	return root
 }

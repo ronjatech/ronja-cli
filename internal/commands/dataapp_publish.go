@@ -51,7 +51,7 @@ Push first: publish sends what is already on the server, and warns when the
 folder has local changes that are not in the draft.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -113,7 +113,7 @@ type appPublishResult struct {
 }
 
 func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPublishResult, error) {
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	parent, draft, err := resolveAppDraft(ctx, client, f, "nothing to publish")
 	if err != nil {
 		return nil, err
@@ -325,7 +325,7 @@ func refreshAppBaselineFromLive(ctx context.Context, client *api.Client, f *fold
 	if err := wfdir.CheckLocalPaths(appPathsOf(files), wfdir.DataAppKind); err != nil {
 		return fmt.Errorf("the files of %s cannot all be tracked locally: %w", liveID, err)
 	}
-	f.State.Set(f.Key, baselineFromApp(f.Codec, live, files))
+	f.State.Set(f.Baseline(), baselineFromApp(f.Codec, live, files))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return fmt.Errorf("write the local baseline: %w", err)
 	}

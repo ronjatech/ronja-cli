@@ -35,7 +35,7 @@ type Module struct {
 	FeatureID string `json:"featureID"`
 
 	// Name is the Python package a consumer workflow imports — the module's one
-	// piece of load-bearing metadata. Unique per tenant among live modules, and
+	// piece of load-bearing metadata. Unique per feature among live modules, and
 	// refused when it shadows a stdlib or runtime-baseline module.
 	Name        string `json:"name"`
 	Title       string `json:"title"`

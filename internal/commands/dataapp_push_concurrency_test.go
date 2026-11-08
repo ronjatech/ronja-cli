@@ -132,7 +132,7 @@ func TestAppPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
 	if loadErr != nil {
 		t.Fatalf("load state: %v", loadErr)
 	}
-	if got := state.For(f.Key()).Files["lib/chart.tsx"].SHA256; got == wfdir.HashString("theirs\n") {
+	if got := stateForKey(state, f.Key()).Files["lib/chart.tsx"].SHA256; got == wfdir.HashString("theirs\n") {
 		t.Error("the baseline acknowledged content this push never wrote")
 	}
 }

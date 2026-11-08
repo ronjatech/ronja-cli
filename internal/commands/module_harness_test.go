@@ -67,8 +67,9 @@ type moduleFake struct {
 	// and each exactly once.
 	draftPatches []recordedModulePatch
 
-	// nameTaken models the live-uniqueness index on the package name: a
-	// PARENTLESS commit of a name in here is refused with the server's 409.
+	// nameTaken models the live-uniqueness index on the package name, which is
+	// per feature: keyed "<featureID>/<name>", a PARENTLESS commit or a private
+	// create of that name in that feature is refused with the server's 409.
 	nameTaken map[string]bool
 	// commitHeadVersionID models the base CAS for a PARENT-ATTACHED commit —
 	// rmodule.checkCommitBaseCAS. "" switches it off.
@@ -172,7 +173,7 @@ func (f *fakeInstance) serveModule(w http.ResponseWriter, r *http.Request) bool 
 		// The live-name uniqueness index fires at INSERT for a private create,
 		// since the row is born live. Modelled here as well as at commit: a
 		// private folder learns its name is taken at the FIRST PUSH.
-		if m.nameTaken[in.Name] && !m.sharedFeature {
+		if m.nameTaken[in.FeatureID+"/"+in.Name] && !m.sharedFeature {
 			http.Error(w, `{"error":"a live module named \"`+in.Name+`\" already exists"}`, http.StatusConflict)
 			return true
 		}
@@ -480,7 +481,7 @@ func (f *fakeInstance) serveModuleCommit(w http.ResponseWriter, r *http.Request,
 		// The only thing that can refuse it is the live-name uniqueness index,
 		// and it refuses with a 409 — a conflict with NO parent behind it and
 		// nothing an override could overwrite.
-		if m.nameTaken[draft.Name] {
+		if m.nameTaken[draft.FeatureID+"/"+draft.Name] {
 			http.Error(w, `{"error":"a live module named \"`+draft.Name+`\" already exists"}`,
 				http.StatusConflict)
 			return

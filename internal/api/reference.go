@@ -57,8 +57,9 @@ func (c *Client) GetAgent(ctx context.Context, id string) (*Agent, error) {
 // row's metadata, and the values live behind a separate surface this CLI has no
 // business touching.
 type Secret struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	FeatureID string `json:"featureID,omitempty"`
 }
 
 // GetSecret reads one secret's metadata. Scope: secrets:read.

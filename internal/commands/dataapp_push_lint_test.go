@@ -109,7 +109,7 @@ func TestAppPushKeepsWarningsWhenTheIconIsWrittenLast(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
 		{Path: "App.tsx", Content: "entry"},
 	}))
 	if err := wfdir.SaveState(root, state); err != nil {
@@ -208,7 +208,7 @@ func TestAppPushOmitsWarningsWhenTheLintIsClean(t *testing.T) {
 			t.Fatal(err)
 		}
 		state := &wfdir.State{}
-		state.Set(f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
+		stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
 			{Path: "App.tsx", Content: "entry"},
 			{Path: "lib/old.tsx", Content: "old"},
 		}))
@@ -248,7 +248,7 @@ func lintWarningsDraftFolder(t *testing.T, f *fakeAppInstance) string {
 		t.Fatal(err)
 	}
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
 		{Path: "App.tsx", Content: "entry"},
 		{Path: "lib/old.tsx", Content: "old"},
 	}))

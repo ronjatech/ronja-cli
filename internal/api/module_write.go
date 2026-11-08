@@ -33,7 +33,7 @@ import (
 type CreateModuleInput struct {
 	FeatureID string `json:"featureID"`
 	// Name is the Python package consumers import. Required, and validated
-	// server-side: a valid identifier, unique among live modules, and not a
+	// server-side: a valid identifier, unique among its feature's live modules, and not a
 	// shadow of a stdlib/runtime module.
 	Name        string `json:"name"`
 	Title       string `json:"title"`

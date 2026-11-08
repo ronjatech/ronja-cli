@@ -50,7 +50,7 @@ func moduleFolderFor(t *testing.T, root string, key wfdir.InstanceKey, baseline 
 	}
 	state := &wfdir.State{}
 	if baseline != nil {
-		state.Set(key, baseline)
+		stateSetKey(state, key, baseline)
 	}
 	b, _, err := manifest.Binding(key)
 	if err != nil {
@@ -717,7 +717,7 @@ func TestModulePushRenameSequence(t *testing.T) {
 func TestModulePushRefusesATakenNameAtCreate(t *testing.T) {
 	f := newFakeInstance(t)
 	signInAsModuleUser(t, f)
-	f.mod.nameTaken["emab_tracker"] = true
+	f.mod.nameTaken["collection-1/emab_tracker"] = true
 
 	root := t.TempDir()
 	if _, err := runCLI(t, root, "module", "init", "emab_tracker",
@@ -753,7 +753,7 @@ func TestModulePublishFirstPublishNameCollision(t *testing.T) {
 	f := newFakeInstance(t)
 	signInAsModuleAdmin(t, f)
 	// Somebody else's live module already holds the package name.
-	f.mod.nameTaken["emab_tracker"] = true
+	f.mod.nameTaken["collection-1/emab_tracker"] = true
 	f.AddModule(&api.Module{
 		ID: "module-new-1", Lifecycle: api.LifecycleDraft, Name: "emab_tracker",
 		Title: "EMAB tracker", DrafterUserID: fakeCallerUserID,
@@ -1207,7 +1207,7 @@ func TestModulePushChecksFileNamesOnlyOnFilesItWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	state.For(f.Key()).Files["calc.v2.py"] = wfdir.FileState{SHA256: wfdir.HashString(dotted)}
+	stateForKey(state, f.Key()).Files["calc.v2.py"] = wfdir.FileState{SHA256: wfdir.HashString(dotted)}
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatalf("save state: %v", err)
 	}

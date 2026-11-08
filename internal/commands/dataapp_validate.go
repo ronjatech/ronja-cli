@@ -43,9 +43,7 @@ the verdict and "compiles" is the draft alone.`,
 			if err != nil {
 				return err
 			}
-			// newClient, not api.New: the test seam for staging a timeout and an
-			// unanswered check, which a fake HTTP handler cannot.
-			client := newClient(resolved.URL, resolved.Token)
+			client := f.client()
 
 			_, draft, err := resolveAppDraft(cmd.Context(), client, f, "nothing to validate")
 			if err != nil {
@@ -135,7 +133,7 @@ func warnIfAppDirty(f *folder) error {
 	if err != nil {
 		return err
 	}
-	diff := wfdir.DiffHashes(enumeration.Files, f.State.For(f.Key).Hashes())
+	diff := wfdir.DiffHashes(enumeration.Files, f.State.For(f.Baseline()).Hashes())
 	if diff.Dirty() {
 		fmt.Fprintf(os.Stderr,
 			"  Warning: %d local file(s) differ from your last sync and are NOT part of what is being checked — run `ronja app push` first if you meant to include them.\n",

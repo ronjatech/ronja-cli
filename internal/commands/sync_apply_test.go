@@ -326,7 +326,7 @@ func TestSyncApplyDoesNotCallAProposedDataAppDeployed(t *testing.T) {
 	// is the state a clone leaves behind. Without one the push refuses for a
 	// different (correct) reason and never reaches the publish.
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-new-1"],
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-new-1"],
 		[]api.DataAppFile{{Path: "App.tsx", Content: "const x = 1;\n"}}))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)
@@ -1193,7 +1193,7 @@ func TestSyncApplyPublishesAnUnpublishedDataAppWithNothingLeftToPush(t *testing.
 		t.Fatal(err)
 	}
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-new-1"],
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-new-1"],
 		[]api.DataAppFile{{Path: "App.tsx", Content: "const x = 1;\n"}}))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)
@@ -1237,7 +1237,7 @@ func lintNotesTree(t *testing.T, f *fakeAppInstance) string {
 		t.Fatal(err)
 	}
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-new-1"],
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-new-1"],
 		[]api.DataAppFile{{Path: "App.tsx", Content: "const x = 1;\n"}}))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)

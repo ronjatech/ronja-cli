@@ -26,6 +26,7 @@ func orderTree(t *testing.T) (*fakeImportInstance, string) {
 	f := importFixture(t)
 	f.pipe.privilegeLevel = adminPrivilegeLevel
 	f.pipe.AddFeature(devFeature, "Sales dev", "organization")
+	f.inv.features[devFeature] = "Sales dev"
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -243,7 +244,7 @@ func TestAddressResolvesInMemoryToARowThisRunMade(t *testing.T) {
 	overlay := newAddressOverlay()
 	overlay.record(devFeature, testFolderID("pipelines/b-base"), "base.sql", wfdir.ManagedTable, "table-made-this-run")
 	ctx := withAddressOverlay(withAddressWalkRoot(t.Context(), dir), overlay)
-	bind, errs, edges, pending := resolveAddressDeps(ctx, nil, report, m, "dev")
+	bind, errs, edges, pending := resolveAddressDeps(ctx, nil, nil, report, m, "dev")
 	if bind["base"] != "table-made-this-run" || len(errs) != 0 || len(pending) != 0 {
 		t.Fatalf("bind %v errs %v pending %v", bind, errs, pending)
 	}
@@ -252,7 +253,7 @@ func TestAddressResolvesInMemoryToARowThisRunMade(t *testing.T) {
 	}
 	// A kind the declaration does not hold is refused, as a claim's is.
 	overlay.record(devFeature, testFolderID("pipelines/b-base"), "base.sql", wfdir.ManagedWorkflow, "workflow-x")
-	if _, errs, _, _ := resolveAddressDeps(ctx, nil, report, m, "dev"); errs["base"].Reason != syncReasonAddressUnresolved {
+	if _, errs, _, _ := resolveAddressDeps(ctx, nil, nil, report, m, "dev"); errs["base"].Reason != syncReasonAddressUnresolved {
 		t.Fatalf("a row of the wrong kind resolved: %v", errs)
 	}
 }

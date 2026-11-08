@@ -285,6 +285,7 @@ func TestBindNeverInfersARunTarget(t *testing.T) {
 	f := importFixture(t)
 	dir, _ := runImport(t, f)
 	f.pipe.AddFeature(devFeature, "Sales dev", "organization")
+	f.inv.features[devFeature] = "Sales dev"
 	root := filepath.Join(dir, "apps/sales-dashboard")
 	m := loadAnyManifest(t, root)
 	main := m.Stacks["main"]

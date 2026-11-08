@@ -69,6 +69,10 @@ back into.`,
 			if err := refuseUnclonableModule(mod); err != nil {
 				return err
 			}
+			space, err := settleStackSpace(cmd.Context(), resolved, mod.FeatureID)
+			if err != nil {
+				return err
+			}
 
 			// Prefer the open draft: it is the newest state, and the row a push
 			// would write to. Best-effort — a failure here degrades to the live
@@ -107,7 +111,7 @@ back into.`,
 				}
 			}
 
-			files, err := writeModuleClone(cmd.Context(), client, resolved, mod, source, root, cloneHooks{})
+			files, err := writeModuleClone(cmd.Context(), client, resolved, mod, source, root, cloneHooks{space: space})
 			if err != nil {
 				return err
 			}
@@ -211,6 +215,7 @@ func writeModuleClone(ctx context.Context, client *api.Client, resolved *config.
 	if err != nil {
 		return nil, err
 	}
+	stampSpace(manifest, flagStack, hooks.space)
 	// The committed anchor: which live version this folder's content
 	// descends from. A clone is the cleanest moment there is to record
 	// one, and recording it here is what lets a CI checkout of the result
@@ -245,7 +250,7 @@ func writeModuleClone(ctx context.Context, client *api.Client, resolved *config.
 	state := &wfdir.State{}
 	// The baseline records the row the files actually came from, which may
 	// be the draft even though the binding names the live module.
-	state.Set(key, moduleBaselineFrom(source, files))
+	state.Set(wfdir.BaselineKey{Key: key, Stack: flagStack}, moduleBaselineFrom(source, files))
 	if err := wfdir.SaveState(root, state); err != nil {
 		return nil, err
 	}

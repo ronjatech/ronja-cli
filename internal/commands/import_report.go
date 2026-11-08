@@ -1,12 +1,14 @@
 package commands
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/markers"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
@@ -67,16 +69,26 @@ type importReport struct {
 	ClaimedElsewhere []importClaimedElsewhere `json:"claimedElsewhere"`
 	NotImported      []importSkip             `json:"notImported"`
 	NotCarried       []importNotCarried       `json:"notCarried"`
-	Problems         []string                 `json:"problems,omitempty"`
+	// AlsoFires are the automations an --only import carries: the original
+	// keeps running once another stack deploys its copy.
+	AlsoFires []importAlsoFires `json:"alsoFires"`
+	// WritersCarried are the workflows an --only import carried because they
+	// write a row it needs.
+	WritersCarried []importWriterCarried `json:"writersCarried"`
+	Problems       []string              `json:"problems,omitempty"`
 }
 
 func (imp *featureImport) report() *importReport {
+	imp.markCopies()
 	r := &importReport{
 		Root: imp.base, URL: imp.resolved.URL, Stack: imp.stack,
 		FeatureID: imp.feature.ID, FeatureName: imp.feature.Name, Verdict: verdictApplied,
 		Folders: []importFolderView{}, Claims: imp.claims, Literals: imp.literals,
 		DataSources: imp.sources, Addresses: imp.addresses, Outputs: imp.outputs, ClaimedElsewhere: imp.claimedElsewhere,
-		NotImported: imp.notImported, NotCarried: imp.notCarried, Problems: imp.problems,
+		NotImported: imp.notImported, NotCarried: imp.notCarried, AlsoFires: imp.alsoFires(), WritersCarried: imp.writersCarried, Problems: imp.problems,
+	}
+	if r.WritersCarried == nil {
+		r.WritersCarried = []importWriterCarried{}
 	}
 	for _, f := range imp.folders {
 		view := importFolderView{Path: f.Rel, Kind: f.Kind.Name, FolderID: f.FolderID, Withdrawn: f.withdrawn}
@@ -125,6 +137,23 @@ func (imp *featureImport) report() *importReport {
 	return r
 }
 
+// markCopies marks each readable table data source that is a snapshot copy
+// with its source. A read that fails leaves the source unmarked, or unnamed.
+func (imp *featureImport) markCopies() {
+	if imp.lookup == nil {
+		return
+	}
+	for i := range imp.sources {
+		d := &imp.sources[i]
+		if d.Kind != markers.KindTable || !d.Readable {
+			continue
+		}
+		if d.CopiedFrom = imp.lookup.copiedFrom(d.BoundTo); d.CopiedFrom != "" {
+			_, d.copiedFromName, _, _ = imp.lookup.rowFeature(markers.KindTable, d.CopiedFrom)
+		}
+	}
+}
+
 func printImportReport(r *importReport) {
 	out := os.Stdout
 	fmt.Fprintf(out, "  Imported %q into %s, for stack %q\n\n", r.FeatureName, r.Root, r.Stack)
@@ -160,7 +189,11 @@ func printImportReport(r *importReport) {
 	if len(r.DataSources) > 0 {
 		fmt.Fprintf(out, "\n  Data sources (%d) — bound in stack %q only; any other stack must bind each one:\n", len(r.DataSources), r.Stack)
 		for _, d := range r.DataSources {
-			fmt.Fprintf(out, "    %-30s %-10s %-11s %s → %s\n", d.Folder, d.Kind, d.Access, d.Alias, d.BoundTo)
+			fmt.Fprintf(out, "    %-30s %-10s %-11s %s → %s", d.Folder, d.Kind, d.Access, d.Alias, d.BoundTo)
+			if d.CopiedFrom != "" {
+				fmt.Fprintf(out, ", a copy of %s", cmp.Or(d.copiedFromName, d.CopiedFrom))
+			}
+			fmt.Fprintln(out)
 		}
 	}
 	if len(r.Addresses) > 0 {
@@ -195,6 +228,18 @@ func printImportReport(r *importReport) {
 				what = c.TargetPath
 			}
 			fmt.Fprintf(out, "    %s %s.%s %s %s — %s\n", c.Folder, c.ResourceID, c.Field, c.TargetKind, what, c.Effect)
+		}
+	}
+	if len(r.WritersCarried) > 0 {
+		fmt.Fprintf(out, "\n  Workflows carried because they write a row the import needs (%d):\n", len(r.WritersCarried))
+		for _, w := range r.WritersCarried {
+			fmt.Fprintf(out, "    %s (%s) writes %s\n", w.Name, w.ID, strings.Join(w.Writes, ", "))
+		}
+	}
+	if len(r.AlsoFires) > 0 {
+		fmt.Fprintf(out, "\n  Automations that will fire in both places (%d) — this one keeps running in %s once another stack deploys its copy; switch it off in the web app if it should stop:\n", len(r.AlsoFires), r.FeatureName)
+		for _, a := range r.AlsoFires {
+			fmt.Fprintf(out, "    %s/%s  %s (%s)\n", a.Folder, a.Path, a.Name, a.ID)
 		}
 	}
 	if len(r.Problems) > 0 {

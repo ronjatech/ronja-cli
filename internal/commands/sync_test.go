@@ -18,16 +18,7 @@ import (
 // does. Used by the tests that assert the three-valued contract without
 // spawning a subprocess; TestSyncStatusExitCodeReachesTheProcess pins that
 // `run` itself really is wired to it.
-func exitCodeOf(err error) int {
-	if err == nil {
-		return 0
-	}
-	var coded *exitCodeError
-	if errors.As(err, &coded) {
-		return coded.code
-	}
-	return 1
-}
+func exitCodeOf(err error) int { return exitCodeFor(err) }
 
 // clonedTree is clonedFolder plus the directory ABOVE it, which is what a tree
 // command is pointed at.

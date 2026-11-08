@@ -208,7 +208,7 @@ func TestPushRecordsThePushedPipPackagesInTheBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inst := state.For(wfdir.InstanceKey{URL: f.URL(), TenantID: testTenantID})
+	inst := state.For(wfdir.BaselineKey{Key: wfdir.InstanceKey{URL: f.URL(), TenantID: testTenantID}})
 	if inst == nil || inst.PipPackages == nil || !reflect.DeepEqual(*inst.PipPackages, []string{"google-auth"}) {
 		t.Fatalf("baseline pipPackages = %+v, want the pushed list", inst)
 	}

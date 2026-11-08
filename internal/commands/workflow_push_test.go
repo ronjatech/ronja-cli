@@ -439,7 +439,7 @@ func TestPushPassesThroughADeletionRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	baseline := state.For(f.Key())
+	baseline := stateForKey(state, f.Key())
 	if baseline == nil || baseline.Files["main.py"].SHA256 != wfdir.HashString("M2\n") {
 		t.Errorf("baseline = %+v, want the pushed content", baseline)
 	}
@@ -545,7 +545,7 @@ func TestPushAcceptsARemoteTitleChangeItAgreesWith(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if got := state.For(f.Key()).Title; got != "Same idea" {
+	if got := stateForKey(state, f.Key()).Title; got != "Same idea" {
 		t.Errorf("baseline title = %q, want the row's current one", got)
 	}
 }
@@ -569,9 +569,9 @@ func TestPushWithALegacyBaselineRefusesAnUnrecordedTitleMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	legacy := state.For(f.Key())
+	legacy := stateForKey(state, f.Key())
 	legacy.Title, legacy.Entrypoint = "", ""
-	state.Set(f.Key(), legacy)
+	stateSetKey(state, f.Key(), legacy)
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestPushForcedThatFailsDoesNotBaselineTheDriftedContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if got := state.For(f.Key()).Files["lib/helpers.py"].SHA256; got == wfdir.HashString("theirs\n") {
+	if got := stateForKey(state, f.Key()).Files["lib/helpers.py"].SHA256; got == wfdir.HashString("theirs\n") {
 		t.Error("the failed --force recorded the colleague's content as the baseline")
 	}
 
@@ -662,7 +662,7 @@ func TestPushUpToDateAfterACheckoutRecordsTheNewDraft(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if got := state.For(f.Key()).SourceID; got != draftID {
+	if got := stateForKey(state, f.Key()).SourceID; got != draftID {
 		t.Errorf("baseline sourceID = %s, want the draft %s it just checked out", got, draftID)
 	}
 	assertBaselineMatchesDisk(t, root, f.Key())
@@ -778,7 +778,7 @@ func TestPushNeverAcknowledgesContentItDidNotWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if got := state.For(f.Key()).Files["lib/helpers.py"].SHA256; got == wfdir.HashString("COLLEAGUE\n") {
+	if got := stateForKey(state, f.Key()).Files["lib/helpers.py"].SHA256; got == wfdir.HashString("COLLEAGUE\n") {
 		t.Error("the baseline acknowledged the colleague's content for a file this push never wrote — the next push would overwrite it in silence")
 	}
 
@@ -952,7 +952,7 @@ func TestPushBaselineTimestampComesFromTheRereadRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	stamped := state.For(f.Key()).BaselineUpdatedAt
+	stamped := stateForKey(state, f.Key()).BaselineUpdatedAt
 	if stamped == before.UTC().Format(time.RFC3339) {
 		t.Errorf("baselineUpdatedAt = %s — the pre-push row, not the re-read one", stamped)
 	}
@@ -1413,7 +1413,7 @@ func TestPushRetriesAfterAFailedFirstPushWithoutForce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	baseline := state.For(f.Key())
+	baseline := stateForKey(state, f.Key())
 	if baseline == nil || baseline.Files["main.py"].SHA256 != wfdir.HashString(fakeEntrypointStarter) {
 		t.Fatalf("baseline = %+v, want it to describe the seeded entrypoint", baseline)
 	}
@@ -1789,7 +1789,7 @@ func TestPushStopsWhenAFileMovesUnderItMidPush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if got := state.For(f.Key()).Files["main.py"].SHA256; got == wfdir.HashString("theirs\n") {
+	if got := stateForKey(state, f.Key()).Files["main.py"].SHA256; got == wfdir.HashString("theirs\n") {
 		t.Error("the baseline acknowledged content this push never wrote — the next push would overwrite it in silence")
 	}
 }
@@ -1852,7 +1852,7 @@ func TestPushBaselineAfterAMidPushConflictRecordsOnlyWhatLanded(t *testing.T) {
 	if err2 != nil {
 		t.Fatalf("load state: %v", err2)
 	}
-	baseline := state.For(f.Key())
+	baseline := stateForKey(state, f.Key())
 	if baseline == nil {
 		t.Fatal("the stopped push recorded no baseline at all")
 	}

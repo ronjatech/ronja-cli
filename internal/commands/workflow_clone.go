@@ -69,6 +69,10 @@ at the right flow.`,
 			if err := refuseUnclonable(wf); err != nil {
 				return err
 			}
+			space, err := settleStackSpace(cmd.Context(), resolved, wf.FeatureID)
+			if err != nil {
+				return err
+			}
 
 			// Prefer the caller's own draft: it is their newest state, and
 			// cloning live over it would look like their web-builder edits had
@@ -97,7 +101,7 @@ at the right flow.`,
 				}
 			}
 
-			files, entrypoint, err := writeWorkflowClone(cmd.Context(), client, resolved, wf, source, root, cloneHooks{})
+			files, entrypoint, err := writeWorkflowClone(cmd.Context(), client, resolved, wf, source, root, cloneHooks{space: space})
 			if err != nil {
 				return err
 			}
@@ -203,6 +207,9 @@ type cloneHooks struct {
 	// import clones the live row, so the title it writes is the live one, and
 	// an apply that had to record it itself would write an anchor.
 	recordTitle bool
+	// space is the Space the folder's stack records (settleStackSpace), nil
+	// for none.
+	space *api.Space
 }
 
 // appliedTitle records title as the stack's applied title when the hooks ask.
@@ -298,6 +305,7 @@ func writeWorkflowClone(ctx context.Context, client *api.Client, resolved *confi
 	if err != nil {
 		return nil, "", err
 	}
+	stampSpace(manifest, flagStack, hooks.space)
 	// The committed anchor: which live version this folder's content
 	// descends from. A clone is the cleanest moment there is to record
 	// one, and recording it here is what lets a CI checkout of the
@@ -364,7 +372,7 @@ func writeWorkflowClone(ctx context.Context, client *api.Client, resolved *confi
 	// may be the draft even though the binding names the live workflow —
 	// de-aliased by the same codec the files were written through (empty,
 	// and so the identity, for a clone).
-	state.Set(key, baselineFrom(hooks.codec, source, files))
+	state.Set(wfdir.BaselineKey{Key: key, Stack: flagStack}, baselineFrom(hooks.codec, source, files))
 	if err := wfdir.SaveState(root, state); err != nil {
 		return nil, "", err
 	}

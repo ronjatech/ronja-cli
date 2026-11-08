@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/markers"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
 )
@@ -55,7 +56,7 @@ Publishing is a separate step:
   ronja module publish             commit the draft, or submit it for review`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -75,6 +76,7 @@ Publishing is a separate step:
 						return emitErr
 					}
 				} else {
+					printStackLine(f)
 					printModulePushReport(result)
 				}
 			}
@@ -177,7 +179,7 @@ func runModulePush(ctx context.Context, f *folder, opts modulePushOptions) (*mod
 }
 
 func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (*modulePushResult, error) {
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	result := &modulePushResult{
 		ModuleID: f.Binding.ModuleID,
 		Target:   describeTarget(f.Resolved),
@@ -362,7 +364,7 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 	// a --force push that stops must not hand the retry a baseline containing
 	// the very content it was forcing past. Shared with the workflow loop
 	// verbatim (acknowledgedRemote), because the rule is the same rule.
-	landed := acknowledgedRemote(f.State.For(f.Key), remoteFiles, local, result.Created)
+	landed := acknowledgedRemote(f.State.For(f.Baseline()), remoteFiles, local, result.Created)
 	// metadataLanded: a metadata patch was accepted, so the draft no longer
 	// holds only a copy of live even when no file was written.
 	metadataLanded := false
@@ -495,8 +497,8 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 		// here, and the baseline then names the row the files came from rather
 		// than the one the next push will compare against. Written only when it
 		// would actually change.
-		if !moduleBaselineDescribes(f.State.For(f.Key), target, identity) {
-			f.State.Set(f.Key, moduleBaselineFromLocal(target, identity, landed))
+		if !moduleBaselineDescribes(f.State.For(f.Baseline()), target, identity) {
+			f.State.Set(f.Baseline(), moduleBaselineFromLocal(target, identity, landed))
 			if err := wfdir.SaveState(f.Root, f.State); err != nil {
 				return result, err
 			}
@@ -507,7 +509,7 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 	// 9. The new baseline is what we just pushed: the server now holds exactly
 	// these bytes on `target`, and `identity` carries the metadata as patched
 	// above.
-	f.State.Set(f.Key, moduleBaselineFromLocal(target, identity, local))
+	f.State.Set(f.Baseline(), moduleBaselineFromLocal(target, identity, local))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return result, err
 	}
@@ -666,6 +668,12 @@ func inspectModuleTarget(ctx context.Context, client *api.Client, f *folder) (ex
 			return existingModuleTarget{}, fmt.Errorf("cannot read module %s on %s.\n  Either it no longer exists (or you lost access to it), or it is an unpublished draft or proposal belonging to somebody else, which this route will not resolve for you.\n  `ronja module status` says which; to start over, remove the binding from %s",
 				f.Binding.ModuleID, f.Resolved.URL, wfdir.ManifestPath(f.Root))
 		}
+		if refusal := f.placeOwnRow(ctx, markers.KindModule, f.Binding.ModuleID, "", err); refusal != nil {
+			return existingModuleTarget{}, refusal
+		}
+		return existingModuleTarget{}, err
+	}
+	if err := f.placeOwnRow(ctx, markers.KindModule, mod.ID, mod.FeatureID, nil); err != nil {
 		return existingModuleTarget{}, err
 	}
 	if err := refuseUnclonableModule(mod); err != nil {
@@ -806,7 +814,7 @@ func resolveModulePushTarget(ctx context.Context, client *api.Client, f *folder,
 // and `identity` is the row whose metadata a push would change (the live one,
 // or the module itself while it is unpublished). See moduleIdentityRow.
 func checkModuleDrift(f *folder, identity *api.Module, remote, local map[string]string, force bool, head headAgreement) (driftVerdict, error) {
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
 		remoteHashes[path] = wfdir.HashString(content)
@@ -1037,7 +1045,7 @@ func moduleBaselineDescribes(baseline *wfdir.InstanceState, source, identity *ap
 // on the partial-push path, where the push has already failed and a second
 // failure must not replace the first in the report.
 func saveModuleBaseline(f *folder, source, identity *api.Module, files map[string]string) {
-	f.State.Set(f.Key, moduleBaselineFromLocal(source, identity, files))
+	f.State.Set(f.Baseline(), moduleBaselineFromLocal(source, identity, files))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
 	}

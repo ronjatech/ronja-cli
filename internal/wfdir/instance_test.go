@@ -108,16 +108,16 @@ func TestStateSeparatesOrganizations(t *testing.T) {
 	north := InstanceKey{URL: url, TenantID: "ten-north"}
 
 	s := &State{}
-	s.Set(acme, &InstanceState{SourceID: "wf-acme"})
-	s.Set(north, &InstanceState{SourceID: "wf-north"})
+	stateSetKey(s, acme, &InstanceState{SourceID: "wf-acme"})
+	stateSetKey(s, north, &InstanceState{SourceID: "wf-north"})
 
-	if got := s.For(acme); got == nil || got.SourceID != "wf-acme" {
+	if got := stateForKey(s, acme); got == nil || got.SourceID != "wf-acme" {
 		t.Errorf("acme baseline = %+v", got)
 	}
-	if got := s.For(north); got == nil || got.SourceID != "wf-north" {
+	if got := stateForKey(s, north); got == nil || got.SourceID != "wf-north" {
 		t.Errorf("northwind baseline = %+v", got)
 	}
-	if got := s.For(InstanceKey{URL: url, TenantID: "ten-third"}); got != nil {
+	if got := stateForKey(s, InstanceKey{URL: url, TenantID: "ten-third"}); got != nil {
 		t.Errorf("unrelated organization got baseline %+v, want none", got)
 	}
 }

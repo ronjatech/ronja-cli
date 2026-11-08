@@ -350,7 +350,7 @@ func TestAppPushOfAPromotedAliasAccessFolderSendsNoPatch(t *testing.T) {
 		t.Fatalf("save lock: %v", err)
 	}
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, live, f.files[live.ID]))
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, live, f.files[live.ID]))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatalf("save state: %v", err)
 	}

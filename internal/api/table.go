@@ -113,6 +113,9 @@ const PartialDataCorruptErrorType = "partial_data_corrupt"
 type Table struct {
 	ID        string `json:"id"`
 	FeatureID string `json:"featureID"`
+	// CopiedFromModelID is the table this one is a snapshot copy of, set only by
+	// the table-copy route.
+	CopiedFromModelID string `json:"copiedFromModelID,omitempty"`
 
 	Name string `json:"name"`
 	// Kind is derived|foundation|integration|manual_integration|dynamic|metric.

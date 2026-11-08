@@ -270,7 +270,7 @@ func pushBaseline(t *testing.T, f *fakeInstance, root string) *wfdir.InstanceSta
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	baseline := state.For(f.Key())
+	baseline := stateForKey(state, f.Key())
 	if baseline == nil {
 		t.Fatal("no baseline recorded")
 	}

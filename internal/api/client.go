@@ -117,6 +117,16 @@ type Client struct {
 	// RateLimitBackoff is added to the interval on a 429.
 	RateLimitBackoff time.Duration
 
+	// Space, when set, goes out as X-Ronja-Space on every request, so the
+	// request acts in that Space: a Dev stack's client. Every response to it
+	// must confirm the Space (spaceAnswer), and SpaceName names it in the
+	// refusal when one does not.
+	Space     string
+	SpaceName string
+	// SpaceLatch, shared by every client for one Space, refuses all later
+	// requests once one response did not confirm it.
+	SpaceLatch *SpaceLatch
+
 	// TableBuild is the schedule WaitForTableBuild polls on. Grouped rather than
 	// flattened alongside the device-flow knobs above, because "MaxInterval"
 	// belonging to one loop or the other is not something a reader should have
@@ -462,6 +472,10 @@ func (c *Client) do(ctx context.Context, timeout time.Duration, method, path str
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
+	spaced, err := c.setSpace(req.Header)
+	if err != nil {
+		return err
+	}
 
 	resp, err := c.httpFor(timeout).Do(req)
 	if err != nil {
@@ -470,7 +484,18 @@ func (c *Client) do(ctx context.Context, timeout time.Duration, method, path str
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return parseError(resp)
+		failure := parseError(resp)
+		if spaced {
+			if err := c.spaceAnswer(method, req.URL.Path, resp.StatusCode, resp.Header, WireCodeOf(failure)); err != nil {
+				return err
+			}
+		}
+		return failure
+	}
+	if spaced {
+		if err := c.spaceAnswer(method, req.URL.Path, resp.StatusCode, resp.Header, ""); err != nil {
+			return err
+		}
 	}
 	if out == nil {
 		// DRAINED, not just closed. net/http only returns a connection to the

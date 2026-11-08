@@ -222,7 +222,7 @@ func TestClonePrefersOpenDraft(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if base := state.For(f.Key()); base == nil || base.SourceID != "wf-1-draft" {
+	if base := stateForKey(state, f.Key()); base == nil || base.SourceID != "wf-1-draft" {
 		t.Errorf("baseline source = %+v, want wf-1-draft", base)
 	}
 }
@@ -1107,7 +1107,7 @@ func assertBaselineMatchesDisk(t *testing.T, root string, key wfdir.InstanceKey)
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	baseline := state.For(key)
+	baseline := stateForKey(state, key)
 	if baseline == nil {
 		t.Fatalf("no baseline recorded for %s", key.URL)
 	}

@@ -349,7 +349,7 @@ func createWorkflowFirst(ctx context.Context, plan *plannedFolder) {
 	if !settlePlanned(ctx, plan) {
 		return
 	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	featureID, err := featureIDFor(ctx, client, f, nil)
 	if err == nil {
 		var result pushResult

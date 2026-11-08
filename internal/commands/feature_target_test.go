@@ -500,22 +500,21 @@ func TestPipelineInitCreatesNoDirectoryWhenItRefusesAForeignFeature(t *testing.T
 	}
 }
 
-func TestBindWithFeatureContinuesWhenTheInstanceDoesNotAnswer(t *testing.T) {
+// A feature read the instance does not answer leaves nothing to say which
+// Space the stack would deploy into, so bind declares nothing and says to
+// retry, rather than declaring a stack no Space check covers.
+func TestBindWithFeatureRefusesWhenTheInstanceDoesNotAnswer(t *testing.T) {
 	f := newFakeSearchInstance(t)
 	f.featureStatus["col-prod"] = http.StatusServiceUnavailable
 	signInTo(t, f.URL())
 	root := bindCmdFolderOn(t, f, "dev", "ten-other", `{}`)
 
-	stderr := captureStderr(t, func() {
-		if _, err := runCLI(t, root, "bind", "--stack", "prod", "--feature", "col-prod", "--yes"); err != nil {
-			t.Fatalf("bind refused a promotion over an instance that did not answer: %v", err)
-		}
-	})
-	if !strings.Contains(stderr, "could not confirm") {
-		t.Errorf("bind said nothing about the check it could not make: %q", stderr)
+	_, err := runCLI(t, root, "bind", "--stack", "prod", "--feature", "col-prod", "--yes")
+	if err == nil || !strings.Contains(err.Error(), "could not read which Space feature col-prod is in") || !strings.Contains(err.Error(), "try again") {
+		t.Fatalf("bind over an instance that did not answer: %v", err)
 	}
-	if got := stackOf(t, root, "prod"); got.FeatureID != "col-prod" {
-		t.Errorf("bind did not declare the stack it was told to: %+v", got)
+	if _, declared := loadStacks(t, root)["prod"]; declared {
+		t.Fatal("bind declared the stack anyway")
 	}
 }
 

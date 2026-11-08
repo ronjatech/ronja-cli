@@ -279,7 +279,7 @@ func runPull(ctx context.Context, kind wfdir.Kind, dir string, opts pullOptions)
 		}
 	}
 
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	plan, err := pullRendererFor(kind)(ctx, client, f)
 	if err != nil {
 		return nil, err

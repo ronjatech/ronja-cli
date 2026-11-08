@@ -149,7 +149,7 @@ func noteWrittenAutomationsManagedBy(ctx context.Context, f *folder, result *aut
 	if result == nil || f.managed != nil {
 		return
 	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	for _, file := range result.Files {
 		if file.Outcome != automationOutcomeUpdated || file.AutomationID == "" {
 			continue

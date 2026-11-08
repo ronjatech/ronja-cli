@@ -154,7 +154,21 @@ var ErrNoManifest = errors.New("no ronja.json found")
 // for nothing it gets wrong. As with 5, the list is usually added by hand to
 // the `[]` init wrote, so 8 is demanded at acceptance (CheckDeclarations), not
 // only stamped.
-const ManifestFormatVersion = manifestVersionPipPackages
+//
+// **9 is a stack's Space** (`spaceID` on a stack), and two stacks on one
+// (instance, organization), the shape a Dev Space beside Main takes. An older
+// CLI keeps `spaceID` and ignores it, so it deploys a Dev stack with no Space
+// rule: a write bound into Main, or a feature id pasted from Main, deploys and
+// reports success. It also keeps one local sync record per organization, so
+// with two stacks there it compares one stack's drafts against the other's
+// rows, and its next save drops the stack each record names. Both are a
+// wrong deploy reported as a good one. A stack in the organization's default
+// Space records no `spaceID`, so a folder with only a Main stack stays at the
+// version its other content needs. A hand-written `spaceID` below 9 is
+// refused at load (checkStacks), on the rule the folder id follows; two
+// stacks on one organization are not, since a merge makes that shape and the
+// folder must stay openable to recover from it.
+const ManifestFormatVersion = manifestVersionSpaces
 
 // The versions the CONTENT of a manifest can require, named rather than spelled
 // as bare integers at the two places that compare them. See
@@ -169,6 +183,7 @@ const (
 	manifestVersionFolderID     = 6
 	manifestVersionAddressDeps  = 7
 	manifestVersionPipPackages  = 8
+	manifestVersionSpaces       = 9
 )
 
 // Manifest is ronja.json — the committed half of a workflow folder.
@@ -214,7 +229,7 @@ type Manifest struct {
 	// Name is a MODULE folder's Python package name — the identifier a consumer
 	// workflow writes in import position (`from {{ module('module-X') }} import
 	// tracker` inlines to it). It is the one piece of module metadata that is
-	// not cosmetic: two live modules cannot share it, and a workflow whose own
+	// not cosmetic: two live modules of one feature cannot share it, and a workflow whose own
 	// file tree has a top-level name colliding with it is refused at save.
 	//
 	// A plain string with omitempty rather than the three-state pointer
@@ -535,6 +550,9 @@ func (m Manifest) StampedFormatVersion() int {
 // folder can perfectly well have both stacks and dependencies, and the answer is
 // the higher of the two.
 func (m Manifest) requiredFormatVersion() int {
+	if m.declaresSpaces() {
+		return manifestVersionSpaces
+	}
 	if len(m.DeclaredPipPackages()) > 0 {
 		return manifestVersionPipPackages
 	}

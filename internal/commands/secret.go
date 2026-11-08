@@ -24,13 +24,15 @@ func newSecretCmd() *cobra.Command {
 		Short: "Store a credential in Ronja without it ever being printed",
 		Long: `Store a credential in Ronja without it ever being printed.
 
-  ronja secret create    store an API key or a database login
-  ronja secret connect   connect a service like Gmail by signing in to it
+  ronja secret create      store an API key or a database login
+  ronja secret new-value   enter a new value for one, in Ronja
+  ronja secret connect     connect a service like Gmail by signing in to it
 
 With create, the value is typed at an echo-off prompt, piped on stdin, or read
 from a file — never passed as a flag, so it never lands in a shell history or an
 agent's transcript. With connect, you sign in on the service's own page and the
-token goes straight to Ronja. Nothing either command prints contains a value.
+token goes straight to Ronja. With new-value, you type the new value in Ronja's
+own form. Nothing these commands print contains a value.
 
 Listing, inspecting and deleting secrets stay on plain HTTP and in Ronja:
 
@@ -38,6 +40,7 @@ Listing, inspecting and deleting secrets stay on plain HTTP and in Ronja:
   ronja api -X DELETE /api/v2/secret/<id>`,
 	}
 	secret.AddCommand(newSecretCreateCmd())
+	secret.AddCommand(newSecretNewValueCmd())
 	secret.AddCommand(newSecretConnectCmd())
 	return secret
 }

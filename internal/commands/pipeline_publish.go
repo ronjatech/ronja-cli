@@ -74,7 +74,7 @@ folder has local changes that are not in the drafts.`,
 		// visible where cobra reads it rather than only in the resolver.
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -207,7 +207,7 @@ func pipelineStagedDrafts(inst *wfdir.InstanceState) []string {
 }
 
 func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequestReview, overwriteRemote bool) (*pipelinePublishResult, error) {
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	result := &pipelinePublishResult{
 		FeatureID: f.Binding.FeatureID,
 		Target:    describeTarget(f.Resolved),

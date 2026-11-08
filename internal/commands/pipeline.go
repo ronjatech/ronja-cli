@@ -199,10 +199,10 @@ func refusePositionalRefs(files map[string]string) error {
 // wholesale replacement: a pipeline push lands file by file, and each file's
 // entry has to survive the next one failing.
 func pipelineBaseline(f *folder) *wfdir.InstanceState {
-	inst := f.State.For(f.Key)
+	inst := f.State.For(f.Baseline())
 	if inst == nil {
 		inst = &wfdir.InstanceState{SourceID: f.Binding.FeatureID}
-		f.State.Set(f.Key, inst)
+		f.State.Set(f.Baseline(), inst)
 	}
 	if inst.Files == nil {
 		inst.Files = map[string]wfdir.FileState{}
@@ -375,7 +375,7 @@ func (h liveHashes) setMeta(path, tableID, meta string) {
 // into a committed file.
 //
 // ⚠️ A NIL inst IS THE ORDINARY CASE, not a defensive nicety, and both halves
-// have to answer it. `.ronja/state.json` is gitignored, so `f.State.For(f.Key)`
+// have to answer it. `.ronja/state.json` is gitignored, so `f.State.For(f.Baseline())`
 // is nil on every fresh clone — and `pipeline status` passes that nil straight
 // in, unlike push and publish which go through pipelineBaseline. Both siblings
 // already guard it (wfdir.InstanceState.TableStateFor answers the zero value,
@@ -432,7 +432,7 @@ func (h liveHashes) setDocsSeen(path, tableID, meta, declared string) {
 //
 // ⚠️ A NIL inst IS THE ORDINARY CASE here too, and it is the trap the sidecar
 // pair's comment warns about: `.ronja/state.json` is gitignored, so
-// `f.State.For(f.Key)` is nil on every fresh clone — and `pipeline status`
+// `f.State.For(f.Baseline())` is nil on every fresh clone — and `pipeline status`
 // passes that nil straight in, unlike push and publish which go through
 // pipelineBaseline. The read also runs inside a status worker goroutine, so a
 // miss is a raw process panic rather than an error anybody could act on.

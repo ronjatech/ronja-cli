@@ -24,11 +24,18 @@ const FileName = "database.json"
 // MigrationsDir is the folder `db migrate` reads .sql files from.
 const MigrationsDir = "migrations"
 
-// Binding is .ronja/database.json, keyed by (instance, organization): a
+// Binding is .ronja/database.json, keyed by (instance, organization, stack): a
 // database id belongs to one organization, and keying by URL alone would send
-// one organization's id under another's token.
+// one organization's id under another's token. Stack tells apart the databases
+// of two Spaces of one organization — `--stack dev` and `--stack main`.
+//
+// The bindings remembered with --stack live under "stacks", a key a CLI from
+// before it ignores: that CLI reads "instances" alone, so it never takes a
+// Dev database for the one remembered without --stack. Its next save drops
+// "stacks", and a later `--stack dev` then says no database is remembered.
 type Binding struct {
-	Instances []Instance `json:"instances"`
+	Instances []Instance            `json:"instances"`
+	Stacks    map[string][]Instance `json:"stacks,omitempty"`
 }
 
 // Instance is one binding.
@@ -62,37 +69,57 @@ func Load(dir string) (*Binding, error) {
 	return &b, nil
 }
 
-// DatabaseFor returns the database id bound for want, or "" if none is. An
-// ambiguous match (two organizations on one instance, no tenant known) is
-// returned as an error, never guessed.
-func (b *Binding) DatabaseFor(want wfdir.InstanceKey) (string, error) {
+// DatabaseForStack returns the database id bound for (want, stack), or "" if
+// none is. An ambiguous match (two organizations on one instance, no tenant
+// known) is returned as an error, never guessed.
+//
+// A stack reads only its own entry: one remembered without --stack is not
+// another stack's, since the two Spaces of one organization have two
+// databases.
+func (b *Binding) DatabaseForStack(want wfdir.InstanceKey, stack string) (string, error) {
 	if b == nil {
 		return "", nil
 	}
-	i, err := wfdir.Find(b.Instances, Instance.Key, want)
+	mine := b.entries(stack)
+	i, err := wfdir.Find(mine, Instance.Key, want)
 	if err != nil {
 		return "", err
 	}
 	if i < 0 {
 		return "", nil
 	}
-	return b.Instances[i].DatabaseID, nil
+	return mine[i].DatabaseID, nil
 }
 
-// Save records databaseID for key, replacing an equivalent entry.
-func (b *Binding) Save(dir string, key wfdir.InstanceKey, databaseID string) error {
+// entries is the bindings remembered for stack, "" for none.
+func (b *Binding) entries(stack string) []Instance {
+	if stack == "" {
+		return b.Instances
+	}
+	return b.Stacks[stack]
+}
+
+// SaveStack records databaseID for (key, stack), replacing an equivalent entry.
+func (b *Binding) SaveStack(dir string, key wfdir.InstanceKey, stack, databaseID string) error {
+	mine := b.entries(stack)
 	replaced := false
-	for i := range b.Instances {
-		if wfdir.Matches(b.Instances[i].Key(), key) {
-			b.Instances[i].DatabaseID = databaseID
+	for i := range mine {
+		if wfdir.Matches(mine[i].Key(), key) {
+			mine[i].DatabaseID = databaseID
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
-		b.Instances = append(b.Instances, Instance{
-			URL: key.URL, TenantID: key.TenantID, DatabaseID: databaseID,
-		})
+		mine = append(mine, Instance{URL: key.URL, TenantID: key.TenantID, DatabaseID: databaseID})
+	}
+	if stack == "" {
+		b.Instances = mine
+	} else {
+		if b.Stacks == nil {
+			b.Stacks = map[string][]Instance{}
+		}
+		b.Stacks[stack] = mine
 	}
 
 	raw, err := json.MarshalIndent(b, "", "  ")

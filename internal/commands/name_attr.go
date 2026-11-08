@@ -284,7 +284,7 @@ func titleLeg(f *folder, kind string, live *titledRow, target titledRow, headVou
 	// THIS folder put it there. A live row still carrying the old title is then
 	// just the rename waiting for its publish, not somebody else's.
 	ownPending := false
-	if b := f.State.For(f.Key); b != nil && b.Title != "" &&
+	if b := f.State.For(f.Baseline()); b != nil && b.Title != "" &&
 		(b.SourceID == target.ID || (live != nil && b.SourceID == live.ID)) {
 		known = append(known, b.Title)
 		ownPending = b.SourceID == target.ID && sameName(b.Title, declared) && sameName(target.Title, declared)

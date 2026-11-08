@@ -60,7 +60,7 @@ func (f *folder) goneAddresses() ([]goneAddress, error) {
 		var metricPaths []string
 		if f.Stack != "" {
 			metricPaths = f.Lock.MetricPaths(f.Stack)
-		} else if inst := f.State.For(f.Key); inst != nil {
+		} else if inst := f.State.For(f.Baseline()); inst != nil {
 			for p, m := range inst.Metrics {
 				if m.MetricID != "" {
 					metricPaths = append(metricPaths, p)
@@ -68,7 +68,7 @@ func (f *folder) goneAddresses() ([]goneAddress, error) {
 			}
 		}
 		for _, p := range metricPaths {
-			id, _, _ := f.live(f.State.For(f.Key)).metricSeen(p)
+			id, _, _ := f.live(f.State.For(f.Baseline())).metricSeen(p)
 			bound[p] = goneAddress{Path: p, Kind: wfdir.AddressMetric, ID: id}
 		}
 	}
@@ -87,7 +87,7 @@ func (f *folder) goneAddresses() ([]goneAddress, error) {
 			}
 		}
 	}
-	for _, m := range resolveMetricIdentities(f, f.live(f.State.For(f.Key)), metricFiles) {
+	for _, m := range resolveMetricIdentities(f, f.live(f.State.For(f.Baseline())), metricFiles) {
 		if m.MetricID == "" {
 			newOf[wfdir.AddressMetric] = append(newOf[wfdir.AddressMetric], m.Path)
 		}

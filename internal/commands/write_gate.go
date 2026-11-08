@@ -35,6 +35,13 @@ import (
 // so a folder that writes outside is refused whether or not it changed. A
 // classic folder (no folder id) is checked exactly as before.
 //
+// THE SPACE RULE (spaceRule) runs on the same paths for every stack that
+// declares a "spaceID", adopted or not, unmanaged included: each target the
+// feature rule lets out of the stack's feature — or, where that rule does not
+// run, each target outside it — must be in the stack's Space, or the folder is
+// refused bind_space_mismatch. A folder write scope passes it only on a stack
+// in the organization's default Space.
+//
 // WHAT IT CHECKS, per kind:
 //
 //   - a WORKFLOW: the server's own scan of the files about to be sent — POST
@@ -113,6 +120,25 @@ const syncReasonNoWriteTargets = "no_write_targets"
 // outside its own feature that no "run": true dependency of that stack binds.
 // Machine contract: add, never rename.
 const syncReasonRunsOutsideTarget = "runs_outside_target"
+
+// gateRefusalReasons are the reasons a gate refuses a folder for what it
+// would deploy, as against a lookup that answered nothing.
+var gateRefusalReasons = map[string]bool{
+	syncReasonWritesOutsideTarget: true,
+	syncReasonRunsOutsideTarget:   true,
+	syncReasonBindSpaceMismatch:   true,
+}
+
+// gateRefusalDetail is a refusal's detail as `sync apply` reports it. A gate
+// that refused inside the push after settle had written the folder's records
+// did not leave "nothing written", so its last sentence says what was.
+func gateRefusalDetail(r *managedRefusal, settled bool) string {
+	if !settled || !gateRefusalReasons[r.Reason] {
+		return r.Detail
+	}
+	return strings.TrimSuffix(r.Detail, " Nothing was written") +
+		" No row was written; only this folder's records in Ronja (its moved, removed or newly claimed addresses) were settled before the check"
+}
 
 // writeAuthority is what one stack has bound on purpose: the ids (and folder
 // paths) its write-capable data sources resolve to, by kind — and the rows it
@@ -271,7 +297,8 @@ type runEdge struct {
 
 // gateRunEdges is the run rule over a folder's run edges.
 func gateRunEdges(ctx context.Context, client *api.Client, f *folder, edges []runEdge) error {
-	if !f.adoptedHere() || len(edges) == 0 {
+	adopted, rule := f.adoptedHere(), f.spaceRuleFor(ctx)
+	if (!adopted && rule == nil) || len(edges) == 0 {
 		return nil
 	}
 	auth := f.writeAuthorityOf()
@@ -299,8 +326,11 @@ func gateRunEdges(ctx context.Context, client *api.Client, f *folder, edges []ru
 			// noted when its claim is in another feature, which is what a stack
 			// block copied from another stack looks like (its folder's stack
 			// still names that stack's feature). Known without a request.
-			if feature := auth.managedFeature[alias]; feature != "" && feature != auth.featureID {
+			if feature := auth.managedFeature[alias]; adopted && feature != "" && feature != auth.featureID {
 				f.noteManagedOutside(auth, e.Where, "runs", fmt.Sprintf("the %s %s", e.Kind, e.ID), alias, feature)
+			}
+			if err := rule.placeRow(gateOutside{Verb: "runs", Where: e.Where, Target: fmt.Sprintf("the %s %s", e.Kind, e.ID)}, e.Kind, e.ID); err != nil {
+				return err
 			}
 			continue
 		}
@@ -319,26 +349,34 @@ func gateRunEdges(ctx context.Context, client *api.Client, f *folder, edges []ru
 		if got.err == nil && got.name != "" {
 			target = fmt.Sprintf("the %s %s (%s)", e.Kind, e.ID, got.name)
 		}
-		switch status := api.StatusOf(got.err); {
+		if adopted && bound && got.err == nil {
+			// Deliberate: a run edge declared and bound for this stack.
+			f.noteBoundOutside(auth, e.Where, "runs", target, auth.run[e.Kind][e.ID], e.ID, got.feature)
+		}
+		switch {
 		case got.err == nil && got.feature != "" && got.feature == auth.featureID:
 			continue
-		case bound:
-			// Deliberate: a run edge declared and bound for this stack.
-			if got.err == nil {
-				f.noteBoundOutside(auth, e.Where, "runs", target, auth.run[e.Kind][e.ID], e.ID, got.feature)
-			}
+		case adopted && bound && rule == nil:
 			continue
-		case got.err == nil:
+		case got.err != nil && !unreachable(got.err):
+			return fmt.Errorf("check which feature the %s %s is in: %w — nothing was written", e.Kind, e.ID, got.err)
+		case adopted && !bound && got.err == nil:
 			outside = append(outside, gateOutside{Verb: "runs", Where: e.Where, Target: target, Feature: got.feature,
 				Why: describeFeatureOf(got.feature) + ", and no run source (\"run\": true) of this stack binds it"})
-		case status == 400 || status == 403 || status == 404:
+			continue
+		case adopted && !bound:
 			outside = append(outside, gateOutside{Verb: "runs", Where: e.Where, Target: target,
 				Why: "which this credential cannot read, so nothing can say which feature it is in; no run source of this stack binds it"})
-		default:
-			return fmt.Errorf("check which feature the %s %s is in: %w — nothing was written", e.Kind, e.ID, got.err)
+			continue
+		}
+		if err := rule.placeRead(gateOutside{Verb: "runs", Where: e.Where, Target: target}, got.feature, got.err); err != nil {
+			return err
 		}
 	}
-	return refuseRunsOutside(f, outside)
+	if err := refuseRunsOutside(f, outside); err != nil {
+		return err
+	}
+	return rule.refusal()
 }
 
 // runTargetOf reads the feature (and name) of a run edge's target.
@@ -432,32 +470,42 @@ var unresolvedRunEdgeKinds = map[string]string{
 // because the code names more than a workflow may bind (its too_many_bindings
 // finding, whose path is the leg's label): none of their edges reached
 // `resolved`, so nothing can say where they point.
-func tooManyRunEdges(f *folder, result *api.ValidateResult) error {
+func tooManyRunEdges(ctx context.Context, f *folder, result *api.ValidateResult) error {
 	if result == nil {
 		return nil
 	}
+	adopted, rule := f.adoptedHere(), f.spaceRuleFor(ctx)
 	var outside []gateOutside
 	for _, finding := range result.Findings {
 		if finding.Code != "too_many_bindings" || (finding.Path != "workflowIDs" && finding.Path != "agentIDs") {
 			continue
 		}
-		outside = append(outside, gateOutside{Verb: "runs", Where: finding.Path, Target: "more workflows or agents than a workflow may bind",
-			Why: "which the server did not resolve, so nothing can say which feature any of them is in"})
+		o := gateOutside{Verb: "runs", Where: finding.Path, Target: "more workflows or agents than a workflow may bind"}
+		if adopted {
+			o.Why = "which the server did not resolve, so nothing can say which feature any of them is in"
+			outside = append(outside, o)
+			continue
+		}
+		rule.refuseUnplaced(o, "which the server did not resolve, so nothing can say which Space any of them is in")
 	}
-	return refuseRunsOutside(f, outside)
+	if err := refuseRunsOutside(f, outside); err != nil {
+		return err
+	}
+	return rule.refusal()
 }
 
 // gateWorkflowCandidate is the whole gate over one workflow candidate — the
 // files posted to validate and what it answered: the writes, then the run
 // edges.
 func gateWorkflowCandidate(ctx context.Context, client *api.Client, f *folder, files []api.ValidateFile, result *api.ValidateResult) error {
-	if err := gateWorkflowTargets(f, result); err != nil {
+	if !f.gateApplies() {
+		return nil
+	}
+	if err := gateWorkflowTargets(ctx, f, result); err != nil {
 		return err
 	}
-	if f.adoptedHere() {
-		if err := tooManyRunEdges(f, result); err != nil {
-			return err
-		}
+	if err := tooManyRunEdges(ctx, f, result); err != nil {
+		return err
 	}
 	return gateRunEdges(ctx, client, f, workflowRunEdges(files, result))
 }
@@ -533,23 +581,35 @@ func describeFeatureOf(featureID string) string {
 }
 
 // gateWorkflowTargets is the workflow rule over validate's writeTargets.
-func gateWorkflowTargets(f *folder, result *api.ValidateResult) error {
+func gateWorkflowTargets(ctx context.Context, f *folder, result *api.ValidateResult) error {
+	adopted, rule := f.adoptedHere(), f.spaceRuleFor(ctx)
 	if result == nil || result.WriteTargets == nil {
 		// An instance too old to report write targets. Reading the absence as
 		// "writes nothing" would wave every write through, so it is refused —
 		// the one answer the gate can give without a scanner of its own.
+		checked := fmt.Sprintf("%s has a folder id, so every write it deploys is checked against %s's feature", wfdir.ManifestName, describeStackFor(f.Stack))
+		classic := fmt.Sprintf(", or run `ronja sync unmanage --stack %s` to deploy this folder the classic way", f.Stack)
+		if rule != nil {
+			checked = fmt.Sprintf("%s declares a Space, so every write it deploys is checked against that Space", describeStackFor(f.Stack))
+			classic = ""
+		}
 		return &managedRefusal{Reason: syncReasonNoWriteTargets, Detail: fmt.Sprintf(
-			"this Ronja instance (%s) does not report write targets — POST /workflow/validate answered no writeTargets — so it is older than this CLI. %s has a folder id, so every write it deploys is checked against %s's feature, and without that answer nothing here can vouch for this code. Nothing was written. Deploy once the instance is upgraded, use a `ronja` that matches it, or run `ronja sync unmanage --stack %s` to deploy this folder the classic way",
-			f.Resolved.URL, wfdir.ManifestName, describeStackFor(f.Stack), f.Stack)}
+			"this Ronja instance (%s) does not report write targets — POST /workflow/validate answered no writeTargets — so it is older than this CLI. %s, and without that answer nothing here can vouch for this code. Nothing was written. Deploy once the instance is upgraded, use a `ronja` that matches it%s",
+			f.Resolved.URL, checked, classic)}
 	}
 	auth := f.writeAuthorityOf()
 	var outside []gateOutside
 	for _, t := range result.WriteTargets {
-		if o, refused := judgeWorkflowTarget(auth, t); refused {
-			outside = append(outside, o)
-			continue
+		if adopted {
+			if o, refused := judgeWorkflowTarget(auth, t); refused {
+				outside = append(outside, o)
+				continue
+			}
 		}
-		if t.TargetKind != api.WriteTargetTable && t.TargetKind != api.WriteTargetCodex {
+		if err := placeWorkflowTarget(rule, t); err != nil {
+			return err
+		}
+		if !adopted || t.TargetKind != api.WriteTargetTable && t.TargetKind != api.WriteTargetCodex {
 			continue
 		}
 		kind := markers.KindTable
@@ -564,7 +624,44 @@ func gateWorkflowTargets(f *folder, result *api.ValidateResult) error {
 			f.noteBoundOutside(auth, workflowTargetWhere(t), "writes", fmt.Sprintf("the %s %s", t.TargetKind, t.TargetID), alias, t.TargetID, feature)
 		}
 	}
-	return refuseWritesOutside(f, outside)
+	if err := refuseWritesOutside(f, outside); err != nil {
+		return err
+	}
+	return rule.refusal()
+}
+
+// placeWorkflowTarget is the Space rule over one validate write target the
+// feature rule did not refuse.
+func placeWorkflowTarget(rule *spaceRule, t api.ValidateWriteTarget) error {
+	if rule == nil {
+		return nil
+	}
+	o := gateOutside{Where: workflowTargetWhere(t), Target: fmt.Sprintf("a %q target %q", t.TargetKind, t.Arg)}
+	switch t.TargetKind {
+	case api.WriteTargetTable, api.WriteTargetCodex:
+		if t.TargetKind == api.WriteTargetTable && t.NameForm {
+			// The runtime creates (or reuses) it in the run's own feature.
+			return nil
+		}
+		if t.TargetID == "" {
+			rule.refuseUnplaced(o, "which names no row this ronja can place in a Space")
+			return nil
+		}
+		o.Target = fmt.Sprintf("the %s %s", t.TargetKind, t.TargetID)
+		if !t.Readable {
+			rule.refuseUnplaced(o, "which this credential cannot read, so nothing can say which Space it is in")
+			return nil
+		}
+		if t.TargetName != "" {
+			o.Target = fmt.Sprintf("the %s %s (%s)", t.TargetKind, t.TargetID, t.TargetName)
+		}
+		return rule.placeFeature(o, t.TargetFeatureID)
+	case api.WriteTargetFolder:
+		o.Target = "into the folder " + orUnknown(t.TargetPath)
+		return rule.placeFolder(o)
+	}
+	rule.refuseUnplaced(o, "a kind of write this ronja does not know how to place in a Space — upgrade the CLI")
+	return nil
 }
 
 // workflowTargetWhere is where a validate write target sits: file, line and
@@ -647,7 +744,7 @@ func workflowGateInput(f *folder, local map[string]string, params []api.Workflow
 // the row holds them. ⚠️ The commit or run is a LATER request: an edit made in
 // between is not seen. See BL-b3c7.
 func gateWorkflowRow(ctx context.Context, client *api.Client, f *folder, row *api.Workflow) error {
-	if !f.adoptedHere() || row == nil {
+	if !f.gateApplies() || row == nil {
 		return nil
 	}
 	files, err := client.ListWorkflowFiles(ctx, row.ID)
@@ -689,7 +786,7 @@ func rowLanguageOnTheWire(row *api.Workflow) string {
 // every workflow and agent it allows is run by it. access is the WIRE form —
 // ids, after the codec.
 func gateAppAccess(ctx context.Context, client *api.Client, f *folder, access api.DataAppAccess) error {
-	if !f.adoptedHere() {
+	if !f.gateApplies() {
 		return nil
 	}
 	if err := gateAppCodexes(ctx, client, f, access); err != nil {
@@ -710,40 +807,54 @@ func gateAppCodexes(ctx context.Context, client *api.Client, f *folder, access a
 	if len(access.AllowedCodexIDs) == 0 {
 		return nil
 	}
+	adopted, rule := f.adoptedHere(), f.spaceRuleFor(ctx)
 	auth := f.writeAuthorityOf()
 	var outside []gateOutside
 	for i, id := range access.AllowedCodexIDs {
 		where := fmt.Sprintf("%s → access.allowedCodexIDs[%d]", wfdir.ManifestName, i)
-		if alias, ok := auth.boundAs(markers.KindCodex, id); ok {
-			if codex, err := client.GetCodex(ctx, id); err == nil {
-				f.noteBoundOutside(auth, where, "writes", "the codex "+id, alias, id, codex.FeatureID)
-			}
-			continue
-		}
+		alias, bound := auth.boundAs(markers.KindCodex, id)
 		codex, err := client.GetCodex(ctx, id)
+		feature := ""
+		if err == nil {
+			feature = codex.FeatureID
+		}
+		if adopted && bound && err == nil {
+			f.noteBoundOutside(auth, where, "writes", "the codex "+id, alias, id, feature)
+		}
 		switch {
-		case err == nil && codex.FeatureID != "" && codex.FeatureID == auth.featureID:
+		case adopted && bound && rule == nil:
 			continue
-		case err == nil:
+		case err != nil && !unreachable(err):
+			return fmt.Errorf("check which feature the codex %s is in: %w — nothing was written", id, err)
+		case err == nil && feature != "" && feature == auth.featureID:
+			continue
+		case adopted && !bound && err == nil:
 			outside = append(outside, gateOutside{Where: where, Target: "the codex " + id,
-				Feature: codex.FeatureID, Why: describeFeatureOf(codex.FeatureID) + ", and no write source of this stack binds it"})
-		case api.StatusOf(err) == 400 || api.StatusOf(err) == 403 || api.StatusOf(err) == 404:
+				Feature: feature, Why: describeFeatureOf(feature) + ", and no write source of this stack binds it"})
+			continue
+		case adopted && !bound:
 			outside = append(outside, gateOutside{Where: where, Target: "the codex " + id,
 				Why: "which this credential cannot read, so nothing can say which feature it is in; no write source of this stack binds it"})
-		default:
-			return fmt.Errorf("check which feature the codex %s is in: %w — nothing was written", id, err)
+			continue
+		}
+		if err := rule.placeRead(gateOutside{Where: where, Target: "the codex " + id}, feature, err); err != nil {
+			return err
 		}
 	}
-	return refuseWritesOutside(f, outside)
+	if err := refuseWritesOutside(f, outside); err != nil {
+		return err
+	}
+	return rule.refusal()
 }
 
 // gateAutomationReferences is the automation rule: every TABLE in an agent
 // action's reference set may be written by the headless run, and so may every
 // table of every FEATURE there. files are resolved (ids), keyed by path.
 func gateAutomationReferences(ctx context.Context, client *api.Client, f *folder, files map[string]*automationFile) error {
-	if !f.adoptedHere() {
+	if !f.gateApplies() {
 		return nil
 	}
+	adopted, rule := f.adoptedHere(), f.spaceRuleFor(ctx)
 	auth := f.writeAuthorityOf()
 	var outside []gateOutside
 	for _, path := range sortedKeys(files) {
@@ -758,17 +869,7 @@ func gateAutomationReferences(ctx context.Context, client *api.Client, f *folder
 			}
 			id := ref.ResourceID
 			where := fmt.Sprintf("%s → references[%d]", path, i)
-			if alias, ok := auth.boundAs(kind, id); ok {
-				switch kind {
-				case markers.KindFeature:
-					f.noteBoundOutside(auth, where, "writes", "every table of the feature "+id, alias, id, id)
-				default:
-					if table, err := client.GetTable(ctx, id); err == nil {
-						f.noteBoundOutside(auth, where, "writes", "the table "+id, alias, id, table.FeatureID)
-					}
-				}
-				continue
-			}
+			alias, bound := auth.boundAs(kind, id)
 			if kind == markers.KindFeature {
 				// "@feature" was resolved to the stack's own feature before
 				// this ran, so it passes here; any other feature is one whose
@@ -776,30 +877,60 @@ func gateAutomationReferences(ctx context.Context, client *api.Client, f *folder
 				if id == auth.featureID {
 					continue
 				}
-				outside = append(outside, gateOutside{Where: where, Target: "every table of the feature " + id, Feature: id,
-					Why: "a feature an agent run given it may write throughout, other than this stack's own, and no write source (\"kind\": \"feature\", \"write\": true) of this stack binds it"})
+				target := "every table of the feature " + id
+				switch {
+				case adopted && bound:
+					f.noteBoundOutside(auth, where, "writes", target, alias, id, id)
+				case adopted:
+					outside = append(outside, gateOutside{Where: where, Target: target, Feature: id,
+						Why: "a feature an agent run given it may write throughout, other than this stack's own, and no write source (\"kind\": \"feature\", \"write\": true) of this stack binds it"})
+					continue
+				}
+				if err := rule.placeFeature(gateOutside{Where: where, Target: target}, id); err != nil {
+					return err
+				}
 				continue
 			}
 			table, err := client.GetTable(ctx, id)
+			feature, target := "", "the table "+id
+			if err == nil {
+				feature = table.FeatureID
+			}
+			if adopted && bound && err == nil {
+				f.noteBoundOutside(auth, where, "writes", target, alias, id, feature)
+			}
 			switch {
+			case adopted && bound && rule == nil:
+				continue
+			case err != nil && !unreachable(err):
+				return fmt.Errorf("check which feature the table %s is in: %w — nothing was written", id, err)
 			case err == nil && table.Kind == "metric":
 				// A metric is a recipe: no tool writes one, so the reference is
 				// a read (the inventory narrows it back to read the same way).
 				continue
-			case err == nil && table.FeatureID != "" && table.FeatureID == auth.featureID:
+			case err == nil && feature != "" && feature == auth.featureID:
 				continue
-			case err == nil:
+			case adopted && !bound && err == nil:
 				outside = append(outside, gateOutside{Where: where, Target: fmt.Sprintf("the table %s (%s)", id, table.Name),
-					Feature: table.FeatureID, Why: describeFeatureOf(table.FeatureID) + ", which an agent run given it may write, and no write source of this stack binds it"})
-			case api.StatusOf(err) == 400 || api.StatusOf(err) == 403 || api.StatusOf(err) == 404:
-				outside = append(outside, gateOutside{Where: where, Target: "the table " + id,
+					Feature: feature, Why: describeFeatureOf(feature) + ", which an agent run given it may write, and no write source of this stack binds it"})
+				continue
+			case adopted && !bound:
+				outside = append(outside, gateOutside{Where: where, Target: target,
 					Why: "which this credential cannot read, so nothing can say which feature it is in; no write source of this stack binds it"})
-			default:
-				return fmt.Errorf("check which feature the table %s is in: %w — nothing was written", id, err)
+				continue
+			}
+			if err == nil {
+				target = fmt.Sprintf("the table %s (%s)", id, table.Name)
+			}
+			if err := rule.placeRead(gateOutside{Where: where, Target: target}, feature, err); err != nil {
+				return err
 			}
 		}
 	}
 	if err := refuseWritesOutside(f, outside); err != nil {
+		return err
+	}
+	if err := rule.refusal(); err != nil {
 		return err
 	}
 	return gateRunEdges(ctx, client, f, automationRunEdges(files))
@@ -848,9 +979,10 @@ func automationRunEdges(files map[string]*automationFile) []runEdge {
 // that cannot be used as it stands (Problem), or declares nothing, writes
 // nothing and is not asked about. Reads only.
 func gateTableDocsSidecars(ctx context.Context, client *api.Client, f *folder, sidecars []tableDocsSidecar) error {
-	if !f.adoptedHere() {
+	if !f.gateApplies() {
 		return nil
 	}
+	adopted, rule := f.adoptedHere(), f.spaceRuleFor(ctx)
 	auth := f.writeAuthorityOf()
 	var outside []gateOutside
 	for _, file := range sidecars {
@@ -859,32 +991,47 @@ func gateTableDocsSidecars(ctx context.Context, client *api.Client, f *folder, s
 		}
 		id := file.TableID
 		if alias, ok := auth.managed[markers.KindTable][id]; ok {
-			if feature := auth.managedFeature[alias]; feature != "" && feature != auth.featureID {
+			if feature := auth.managedFeature[alias]; adopted && feature != "" && feature != auth.featureID {
 				f.noteManagedOutside(auth, file.Path, "documents", "the table "+id, alias, feature)
+			}
+			if err := rule.placeRow(gateOutside{Verb: "documents", Where: file.Path, Target: "the table " + id}, markers.KindTable, id); err != nil {
+				return err
 			}
 			continue
 		}
 		table, err := client.GetTable(ctx, id)
-		if alias, ok := auth.boundAs(markers.KindTable, id); ok {
-			if err == nil {
-				f.noteBoundOutside(auth, file.Path, "documents", "the table "+id, alias, id, table.FeatureID)
-			}
+		alias, bound := auth.boundAs(markers.KindTable, id)
+		feature, target := "", "the table "+id
+		if err == nil {
+			feature, target = table.FeatureID, fmt.Sprintf("the table %s (%s)", id, table.Name)
+		}
+		if adopted && bound && err == nil {
+			f.noteBoundOutside(auth, file.Path, "documents", "the table "+id, alias, id, feature)
+		}
+		switch {
+		case adopted && bound && rule == nil:
+			continue
+		case err != nil && !unreachable(err):
+			return fmt.Errorf("check which feature the table %s is in: %w — nothing was written", id, err)
+		case err == nil && feature != "" && feature == auth.featureID:
+			continue
+		case adopted && !bound && err == nil:
+			outside = append(outside, gateOutside{Verb: "documents", Where: file.Path, Target: target,
+				Feature: feature, Why: describeFeatureOf(feature) + ", and no write source of this stack binds it"})
+			continue
+		case adopted && !bound:
+			outside = append(outside, gateOutside{Verb: "documents", Where: file.Path, Target: target,
+				Why: "which this credential cannot read, so nothing can say which feature it is in; no write source of this stack binds it"})
 			continue
 		}
-		switch status := api.StatusOf(err); {
-		case err == nil && table.FeatureID != "" && table.FeatureID == auth.featureID:
-			continue
-		case err == nil:
-			outside = append(outside, gateOutside{Verb: "documents", Where: file.Path, Target: fmt.Sprintf("the table %s (%s)", id, table.Name),
-				Feature: table.FeatureID, Why: describeFeatureOf(table.FeatureID) + ", and no write source of this stack binds it"})
-		case status == 400 || status == 403 || status == 404:
-			outside = append(outside, gateOutside{Verb: "documents", Where: file.Path, Target: "the table " + id,
-				Why: "which this credential cannot read, so nothing can say which feature it is in; no write source of this stack binds it"})
-		default:
-			return fmt.Errorf("check which feature the table %s is in: %w — nothing was written", id, err)
+		if err := rule.placeRead(gateOutside{Verb: "documents", Where: file.Path, Target: target}, feature, err); err != nil {
+			return err
 		}
 	}
-	return refuseWritesOutside(f, outside)
+	if err := refuseWritesOutside(f, outside); err != nil {
+		return err
+	}
+	return rule.refusal()
 }
 
 // planWriteGate is `sync apply`'s plan-time gate: the folder's writes and run
@@ -905,9 +1052,10 @@ func gateTableDocsSidecars(ctx context.Context, client *api.Client, f *folder, s
 //
 // Every request here is a read (validate is a check, not a save). A module is
 // marker-free and has nothing to gate; an automation's real apply is gated by
-// its push, which creates and writes in one step.
-func planWriteGate(ctx context.Context, f *folder, files map[string]string, decisions []applyDecision) (reason, detail string) {
-	if !f.adoptedHere() {
+// its push, which creates and writes in one step. every gates every folder
+// whatever it creates: a dry run, and `sync check` on a stack with a Space.
+func planWriteGate(ctx context.Context, f *folder, files map[string]string, decisions []applyDecision, every bool) (reason, detail string) {
+	if !f.gateApplies() {
 		return "", ""
 	}
 	creates := false
@@ -916,11 +1064,11 @@ func planWriteGate(ctx context.Context, f *folder, files map[string]string, deci
 			creates = true
 		}
 	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	var err error
 	switch f.Kind.Name {
 	case wfdir.KindWorkflow:
-		if !creates && !flagSyncDryRun {
+		if !creates && !every {
 			return "", ""
 		}
 		var params []api.WorkflowParameter
@@ -934,7 +1082,7 @@ func planWriteGate(ctx context.Context, f *folder, files map[string]string, deci
 			err = gateWorkflowCandidate(ctx, client, f, in.Files, result)
 		}
 	case wfdir.KindDataApp:
-		if (creates || flagSyncDryRun) && f.Manifest.ManagesAccess() {
+		if (creates || every) && f.Manifest.ManagesAccess() {
 			err = gateAppAccess(ctx, client, f, f.declaredAccess())
 		}
 	case wfdir.KindPipeline:
@@ -943,7 +1091,7 @@ func planWriteGate(ctx context.Context, f *folder, files map[string]string, deci
 			err = gateTableDocsSidecars(ctx, client, f, resolveTableDocsSidecars(f, sidecars))
 		}
 	case wfdir.KindAutomation:
-		if flagSyncDryRun {
+		if every {
 			if resolved := automationGateFiles(f, files); resolved != nil {
 				err = gateAutomationReferences(ctx, client, f, resolved)
 			}
@@ -954,6 +1102,9 @@ func planWriteGate(ctx context.Context, f *folder, files map[string]string, deci
 	}
 	if r, ok := asManagedRefusal(err); ok {
 		return r.Reason, r.Detail
+	}
+	if e, ok := f.spaceRefusal(err); ok {
+		return e.Reason, e.Detail
 	}
 	return syncReasonLookupFailed, fmt.Sprintf("could not check where this folder writes before deploying it: %v — nothing was written", err)
 }

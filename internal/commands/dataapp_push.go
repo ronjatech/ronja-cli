@@ -66,7 +66,7 @@ Publishing is a separate step:
   ronja app publish                commit the draft, or submit it for review`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -86,6 +86,7 @@ Publishing is a separate step:
 						return emitErr
 					}
 				} else {
+					printStackLine(f)
 					printAppPushReport(result)
 				}
 			}
@@ -296,12 +297,7 @@ func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushRe
 }
 
 func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPushResult, error) {
-	// newClient rather than api.New, for the reason it is a var at all (see
-	// workflow_push.go): it is the seam a test injects a transport through, and
-	// the two failures the closing validate has to tell apart — a request that
-	// never reached the instance, and one that died on our own deadline —
-	// cannot be staged by a fake HTTP handler at all.
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	result := &appPushResult{
 		DataAppID: f.Binding.DataAppID,
 		Target:    describeTarget(f.Resolved),
@@ -383,7 +379,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		liveFiles = read
 		// The drift guard, BEFORE the checkout, when the checkout would only
 		// copy the live app just read — see the same step in runPush.
-		if live := existing.App; opts.Apply && existing.Row() == nil && live != nil && raw != nil && f.State.For(f.Key) != nil && !opts.Force {
+		if live := existing.App; opts.Apply && existing.Row() == nil && live != nil && raw != nil && f.State.For(f.Baseline()) != nil && !opts.Force {
 			if _, err := checkAppDrift(f, read, hashAppFiles(f.baselineCodec(), raw), local, appMetaAgrees(f, live), false, headAgreement{}, live.ID,
 				driftAsk{apply: true}); err != nil {
 				return nil, err
@@ -484,7 +480,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 	// what is ALREADY acknowledged rather than as the whole remote, so a --force
 	// push that stops does not hand the retry a baseline containing the very
 	// content it was forcing past.
-	landed := acknowledgedRemote(f.State.For(f.Key), remoteFiles, local, result.Created)
+	landed := acknowledgedRemote(f.State.For(f.Baseline()), remoteFiles, local, result.Created)
 	stop := func(err error) (*appPushResult, error) {
 		// A stop before anything landed — the server refused the push's first
 		// write — is still a refusal before the first write, and an apply
@@ -572,8 +568,8 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		result.Rename == nil
 	if nothingChanged && !opts.Validate {
 		result.UpToDate = true
-		if !appBaselineDescribes(f.State.For(f.Key), target) {
-			f.State.Set(f.Key, baselineFromAppLocal(f.Codec, target, landed))
+		if !appBaselineDescribes(f.State.For(f.Baseline()), target) {
+			f.State.Set(f.Baseline(), baselineFromAppLocal(f.Codec, target, landed))
 			if err := wfdir.SaveState(f.Root, f.State); err != nil {
 				return result, err
 			}
@@ -672,7 +668,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 
 	// 10. The new baseline is what we just pushed: the server now holds exactly
 	// these bytes.
-	f.State.Set(f.Key, baselineFromAppLocal(f.Codec, target, local))
+	f.State.Set(f.Baseline(), baselineFromAppLocal(f.Codec, target, local))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return result, err
 	}
@@ -948,7 +944,7 @@ func appTitleLeg(f *folder, live, target *api.DataApp, head headAgreement, force
 // atBaseline and remote are the remote in the baseline's aliases and the
 // folder's current ones — see checkDrift.
 func checkAppDrift(f *folder, remote, atBaseline, local map[string]string, metaAgrees, force bool, head headAgreement, targetID string, ask driftAsk) (driftVerdict, error) {
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
 		remoteHashes[path] = wfdir.HashString(content)
@@ -1298,7 +1294,7 @@ func appBaselineDescribes(baseline *wfdir.InstanceState, row *api.DataApp) bool 
 // has already failed and a second failure must not replace the first in the
 // report.
 func saveAppBaseline(f *folder, source *api.DataApp, files map[string]string) {
-	f.State.Set(f.Key, baselineFromAppLocal(f.Codec, source, files))
+	f.State.Set(f.Baseline(), baselineFromAppLocal(f.Codec, source, files))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
 	}

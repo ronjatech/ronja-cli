@@ -624,6 +624,7 @@ func (f *fakePipelineInstance) serve(w http.ResponseWriter, r *http.Request) {
 	if f.beforeServe != nil {
 		f.beforeServe(r)
 	}
+	echoSpace(w, r)
 
 	if f.managed.serve(w, r) {
 		return
@@ -1492,7 +1493,7 @@ func writePipelineBaseline(t *testing.T, root string, key wfdir.InstanceKey, fea
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	state.Set(key, inst)
+	stateSetKey(state, key, inst)
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
@@ -1544,7 +1545,7 @@ func pipelineStateOf(t *testing.T, root string, key wfdir.InstanceKey) *wfdir.In
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	inst := state.For(key)
+	inst := stateForKey(state, key)
 	if inst == nil {
 		t.Fatalf("no baseline recorded for %s", key.URL)
 	}

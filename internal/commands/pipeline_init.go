@@ -93,6 +93,10 @@ Every .sql file in the folder is one derived table. Anything else is ignored.`,
 			if err := confirmFeatureIn(cmd.Context(), featureID, resolved); err != nil {
 				return err
 			}
+			space, err := settleStackSpace(cmd.Context(), resolved, featureID)
+			if err != nil {
+				return err
+			}
 			if len(args) == 1 {
 				if err := os.MkdirAll(root, 0o755); err != nil {
 					return fmt.Errorf("create %s: %w", root, err)
@@ -125,6 +129,7 @@ Every .sql file in the folder is one derived table. Anything else is ignored.`,
 			if err != nil {
 				return err
 			}
+			stampSpace(manifest, flagStack, space)
 			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}

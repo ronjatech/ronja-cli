@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
@@ -65,7 +66,8 @@ The exit code is the tree's verdict, so this is a CI gate that needs no
 parsing:
 
   0   every reference was checked, and every one resolved
-  1   a definite finding — something is unresolved or unreachable
+  1   a definite finding — something is unresolved or unreachable, or a
+      folder is refused as a whole (the Space rule, a claim, the write gate)
   2   could not tell — a folder was skipped, the credential is dead, a
       reference cannot be verified at all, or the walk found no folders
 
@@ -95,7 +97,7 @@ a stable "verdict" field: exit codes do not survive a wrapper script.`,
 			// leg that needs no network at all — every alias this folder declares
 			// and this stack binds nothing to. Everything else is not_checked,
 			// which is exactly what a dead credential should produce.
-			resolved, err := config.Resolve(flagURL, flagProfile)
+			resolved, err := resolveStackCredential(flagSyncDir, false, false)
 			if err != nil {
 				// ⚠️ UNKNOWN, not the default 1. Every failure here — no profile,
 				// a profile whose URL disagrees with --url, an ambiguous one, a
@@ -130,6 +132,9 @@ type syncCheckReport struct {
 	Dir   string `json:"dir"`
 	URL   string `json:"url"`
 	Stack string `json:"stack,omitempty"`
+	// Space is the Space the stack is declared for, by the label its folders
+	// carry; empty when none declares one.
+	Space string `json:"space,omitempty"`
 	// Verdict is the tree's answer — clean, broken or unknown — and the field
 	// this command's contract lives in. Same word as the exit code, because exit
 	// codes do not survive a wrapper script.
@@ -191,6 +196,11 @@ type syncCheckSummary struct {
 	// saying "(0 unresolved, 0 unreachable)", which reads as a bug in the tool
 	// rather than a problem in the repository.
 	Findings int `json:"findings,omitempty"`
+	// Refused is how many of the broken folders a rule refused as a whole (the
+	// Space rule, a claim, the write gate) rather than for their references.
+	// The edges of such a folder may all be ok, so without this count the
+	// sentence would read "(0 unresolved, 0 unreachable)".
+	Refused int `json:"refused,omitempty"`
 	// DroppedBindings is how many of the unreachable ones are the server's soft
 	// tier — the subset --allow-dropped-bindings accepts. Counted whether or not
 	// the flag was given, so the flag can be NAMED in the refusal: a hatch nobody
@@ -209,16 +219,23 @@ type syncCheckSummary struct {
 // reference does not resolve, and a run through it will fail. A `not_checked` is
 // the other thing entirely — nobody looked, so nothing is known in either
 // direction, and a job must not conclude anything from it.
-func (r *syncCheckReport) exitError() error {
+func (r *syncCheckReport) exitError() (err error) {
+	defer func() { err = withPrintedSpaceRefusals(err, r.details()) }()
 	switch r.Verdict {
 	case verdictBroken:
-		// The NOUN agrees with the total ("2 of 5 folders") and the VERB with the
-		// subject ("1 of 1 folder makes"), which are two different counts — see
-		// agree.
-		return withExitCode(syncExitDrifted, fmt.Errorf("%d of %d %s %s references that do not resolve (%s) — see above%s",
-			r.Summary.Broken, r.Summary.Folders, plural(r.Summary.Folders, "folder"),
-			agree(r.Summary.Broken, "makes", "make"),
-			r.Summary.countedBreakage(), r.droppedHatch()))
+		var parts []string
+		if r.Summary.Refused > 0 {
+			parts = append(parts, r.describeRefused())
+		}
+		if unresolved := r.Summary.Broken - r.Summary.Refused; unresolved > 0 {
+			// The NOUN agrees with the total ("2 of 5 folders") and the VERB with
+			// the subject ("1 of 1 folder makes"), which are two different counts
+			// — see agree.
+			parts = append(parts, fmt.Sprintf("%d of %d %s %s references that do not resolve (%s)",
+				unresolved, r.Summary.Folders, plural(r.Summary.Folders, "folder"),
+				agree(unresolved, "makes", "make"), r.Summary.countedBreakage()))
+		}
+		return withExitCode(syncExitDrifted, fmt.Errorf("%s — see above%s", strings.Join(parts, "; "), r.droppedHatch()))
 	case verdictUnknown:
 		if r.Summary.Folders == 0 {
 			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s — nothing was checked, which is not the same answer as nothing being wrong",
@@ -228,6 +245,28 @@ func (r *syncCheckReport) exitError() error {
 			r.Summary.Unknown, r.Summary.Folders, plural(r.Summary.Folders, "folder")))
 	}
 	return nil
+}
+
+// details are the folders' details, in which a Space refusal is printed.
+func (r *syncCheckReport) details() []string {
+	out := make([]string, len(r.Folders))
+	for i, line := range r.Folders {
+		out[i] = line.Detail
+	}
+	return out
+}
+
+// describeRefused counts the refused folders with each reason they were
+// refused for, once.
+func (r *syncCheckReport) describeRefused() string {
+	var reasons []string
+	for _, folder := range r.Folders {
+		if folder.Verdict == verdictBroken && folder.Reason != "" && !slices.Contains(reasons, folder.Reason) {
+			reasons = append(reasons, folder.Reason)
+		}
+	}
+	slices.Sort(reasons)
+	return fmt.Sprintf("%d %s refused (%s)", r.Summary.Refused, plural(r.Summary.Refused, "folder"), strings.Join(reasons, ", "))
 }
 
 // countedBreakage lists exactly what scored, so the number in the sentence and
@@ -311,10 +350,12 @@ func syncCheckTree(ctx context.Context, dir string, resolved *config.Resolved) (
 		Dir:                    base,
 		URL:                    resolved.URL,
 		Stack:                  flagStack,
+		Space:                  treeStackSpace(found, flagStack),
 		Folders:                []syncCheckFolderReport{},
 		DroppedBindingsAllowed: flagSyncAllowDropped,
 	}
 	verdicts := make([]string, 0, len(found))
+	spaces := newSpaceAttribution()
 	for _, folder := range found {
 		line := syncCheckFolderReport{
 			Path: folder.Rel, Root: folder.Root, Kind: folder.Kind.Name,
@@ -325,7 +366,7 @@ func syncCheckTree(ctx context.Context, dir string, resolved *config.Resolved) (
 			line.Verdict, line.Reason, line.Detail = verdictUnknown, folder.Reason, folder.Detail
 		default:
 			line.Title = folder.Manifest.Title
-			checkOneFolder(ctx, &line, folder, resolved, key, checker)
+			checkOneFolder(ctx, &line, folder, resolved, key, checker, spaces)
 		}
 		report.Folders = append(report.Folders, line)
 		verdicts = append(verdicts, line.Verdict)
@@ -343,7 +384,15 @@ func syncCheckTree(ctx context.Context, dir string, resolved *config.Resolved) (
 // checkOneFolder fills in one folder's line: its stack disposition, its edges,
 // and the verdict they add up to.
 func checkOneFolder(ctx context.Context, line *syncCheckFolderReport, folder discoveredFolder,
-	resolved *config.Resolved, key wfdir.InstanceKey, checker *edgeChecker) {
+	resolved *config.Resolved, key wfdir.InstanceKey, checker *edgeChecker, spaces *spaceAttribution) {
+	step := spaces.begin(line.Path, nil)
+	// A Space refusal the step met and swallowed is the folder's answer.
+	defer func() {
+		if e := step.unreported(); e != nil {
+			r := step.entry(e)
+			line.Verdict, line.Reason, line.Detail = verdictUnknown, r.Reason, r.Detail
+		}
+	}()
 	// The lock is read here rather than in the walk because only the stack
 	// resolution needs it, and a folder ruled out earlier never pays for it.
 	lock, lockErr := wfdir.LoadLock(folder.Root)
@@ -388,8 +437,12 @@ func checkOneFolder(ctx context.Context, line *syncCheckFolderReport, folder dis
 	f, err := openFolderForStatusAt(ctx, folder.Root, resolved, folder.Kind)
 	if err != nil {
 		line.Verdict, line.Reason, line.Detail = verdictUnknown, syncReasonFolderRefused, err.Error()
+		if e, ok := step.refusal(err); ok {
+			line.Reason, line.Detail = e.Reason, e.Detail
+		}
 		return
 	}
+	step.opened(f)
 	// The NO-FLAG half of the one-stack-many-folders rule. resolveStackForFolder
 	// above answers it for a NAMED stack and deliberately passes everything when
 	// no name was given; this is the other direction, and without it a folder
@@ -408,6 +461,40 @@ func checkOneFolder(ctx context.Context, line *syncCheckFolderReport, folder dis
 	// any other id; the ones that did not are already among the refusals.
 	line.Edges = append(line.Edges, checker.apply(ctx, addressDependencyEdges(f))...)
 	line.Findings, line.Warnings = findings, warnings
+	found := f.checkSpaces(ctx, true)
+	if found.refusal != nil {
+		line.Verdict, line.Reason, line.Detail = verdictUnknown, syncReasonLookupFailed, found.refusal.Error()
+		if r, ok := asManagedRefusal(found.refusal); ok {
+			line.Verdict, line.Reason, line.Detail = verdictBroken, r.Reason, r.Detail
+		}
+		if e, ok := f.spaceRefusal(found.refusal); ok {
+			line.Verdict, line.Reason, line.Detail = verdictUnknown, e.Reason, e.Detail
+		}
+		return
+	}
+	line.Warnings = append(line.Warnings, found.warnings...)
+	if err := f.placeOwnRows(ctx); err != nil {
+		line.Verdict, line.Reason, line.Detail = verdictUnknown, syncReasonLookupFailed, err.Error()
+		if r, ok := asManagedRefusal(err); ok {
+			line.Verdict, line.Reason, line.Detail = verdictBroken, r.Reason, r.Detail
+		} else if e, ok := f.spaceRefusal(err); ok {
+			line.Reason, line.Detail = e.Reason, e.Detail
+		}
+		return
+	}
+	// What the code writes and runs, placed by Space as the deploy would.
+	if f.stackSpaceID() != "" {
+		f.gateNotesCollected = true
+		gateReason, gateDetail := planWriteGate(ctx, f, found.files, nil, true)
+		line.Warnings = append(line.Warnings, f.gateNotes...)
+		if gateReason != "" {
+			line.Verdict, line.Reason, line.Detail = verdictUnknown, gateReason, gateDetail
+			if gateRefusalReasons[gateReason] {
+				line.Verdict = verdictBroken
+			}
+			return
+		}
+	}
 	// A folder-level reason WINS over whatever the edges add up to, and the
 	// edges are still reported. Both halves matter: the reason is why this
 	// folder cannot be vouched for as a whole, and the edges are the part that
@@ -670,7 +757,7 @@ func pipelineReferences(ctx context.Context, f *folder, checker *edgeChecker) (
 	// file is, and `recipe.source` names the table it reads — and neither is a
 	// marker either. A metric whose source has stopped resolving is a folder that
 	// no longer deploys, which is exactly the question this command asks.
-	fromMetrics, metricFindings := metricEdges(f, pipe, f.live(f.State.For(f.Key)))
+	fromMetrics, metricFindings := metricEdges(f, pipe, f.live(f.State.For(f.Baseline())))
 	edges = append(edges, fromMetrics...)
 	findings = append(append(docsFindings, metricFindings...), addressFormatFindings(f.Manifest)...)
 	return checker.apply(ctx, edges), findings, aliases.Warnings, "", ""
@@ -797,6 +884,9 @@ func summarizeCheck(folders []syncCheckFolderReport) syncCheckSummary {
 			summary.Clean++
 		case verdictBroken:
 			summary.Broken++
+			if folder.Reason != "" {
+				summary.Refused++
+			}
 		default:
 			summary.Unknown++
 		}
@@ -833,7 +923,9 @@ func printSyncCheck(r *syncCheckReport) {
 	out := os.Stdout
 	fmt.Fprintf(out, "  %s\n", r.Dir)
 	fmt.Fprintf(out, "  Instance:   %s\n", r.URL)
-	if r.Stack != "" {
+	if r.Stack != "" && r.Space != "" {
+		fmt.Fprintf(out, "  Stack:      %s · Space %s\n", r.Stack, r.Space)
+	} else if r.Stack != "" {
 		fmt.Fprintf(out, "  Stack:      %s\n", r.Stack)
 	}
 
@@ -874,6 +966,9 @@ func printSyncCheck(r *syncCheckReport) {
 	fmt.Fprintf(out, "\n  %s — %d %s: %d ok, %d unresolved, %d unreachable, %d not checked\n",
 		r.Verdict, r.Summary.Edges, plural(r.Summary.Edges, "reference"),
 		r.Summary.OK, r.Summary.Unresolved, r.Summary.Unreachable, r.Summary.NotChecked)
+	if r.Summary.Refused > 0 {
+		fmt.Fprintf(out, "  %s — see the folder %s above.\n", r.describeRefused(), plural(r.Summary.Refused, "line"))
+	}
 	if r.Summary.Findings > 0 {
 		fmt.Fprintf(out, "  %d other %s — see the `finding` %s above.\n",
 			r.Summary.Findings, plural(r.Summary.Findings, "finding"),

@@ -54,7 +54,8 @@ func newImportCmd() *cobra.Command {
 }
 
 func newImportFeatureCmd() *cobra.Command {
-	return &cobra.Command{
+	var only []string
+	cmd := &cobra.Command{
 		Use:   "feature <name|id> [dir]",
 		Short: "Write every pipeline, workflow, app, module and automation of a feature into folders",
 		Long: `Write a feature into a repository tree, ready to deploy with ronja sync.
@@ -74,9 +75,10 @@ writes one folder per resource kind:
   automations/<feature>/   one .json file per automation
 
 Each folder is adopted (it carries a folder id) and names one stack, --stack
-(default "main"), pinned to the feature's id. Every row is claimed for that
-stack, so ronja sync status is clean straight away and ronja sync apply --stack
-main writes nothing.
+(default: "main" in the organization's default Space, otherwise the feature's
+Space, lowercased, such as "dev"), pinned to the feature's id. Every row is
+claimed for that stack, so ronja sync status is clean straight away and ronja
+sync apply --stack main writes nothing.
 
 References are rewritten rather than copied as ids: a table the same pipeline
 builds becomes its file's stem, anything imported into another folder becomes an
@@ -88,16 +90,46 @@ and id literals in app source.
 
 Managing a table or metric needs the Admin role. Run by anyone else, the import
 writes no pipeline folder: derived tables and metrics are declared as data
-sources wherever they are read, and the report lists them as not imported.`,
-		Args: cobra.RangeArgs(1, 2),
+sources wherever they are read, and the report lists them as not imported.
+
+--only imports part of a feature: the named rows and everything they need in
+it, transitively — an app's workflows, the derived tables it reads and their
+inputs, the workflows that write those tables, the modules the workflows
+import, and the automations that run them.
+The feature is the rows' own (they must share one), so the one argument is the
+destination:
+
+  ronja import feature --only data_app-… --stack dev ./region-board
+
+Every row outside that set is a declared dependency, named after the row and
+bound in this stack, as a row of another feature always is. An Admin runs it,
+so derived tables are imported as folders. Each automation it carries keeps
+running where it is, and the report says so: the copy another stack deploys
+runs too.`,
+		Args: cobra.RangeArgs(0, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(only) > 0 {
+				if len(args) > 1 {
+					return fmt.Errorf("with --only the feature is the rows' own, so the one argument is the destination directory; %d were given", len(args))
+				}
+				dir := "."
+				if len(args) == 1 {
+					dir = args[0]
+				}
+				return runImportFeature(cmd.Context(), "", dir, only)
+			}
+			if len(args) == 0 {
+				return fmt.Errorf("name the feature to import, by name or id, or the rows to import with --only <id>")
+			}
 			dir := "."
 			if len(args) == 2 {
 				dir = args[1]
 			}
-			return runImportFeature(cmd.Context(), args[0], dir)
+			return runImportFeature(cmd.Context(), args[0], dir, nil)
 		},
 	}
+	cmd.Flags().StringSliceVar(&only, "only", nil, "import only these rows (ids) and what they need inside their feature")
+	return cmd
 }
 
 // featureImport is one run.
@@ -117,6 +149,17 @@ type featureImport struct {
 	// and metric as a data source rather than a pipeline row.
 	admin bool
 
+	// space is the Space every folder's stack records, nil in the
+	// organization's default Space.
+	space  *api.Space
+	lookup *spaceLookup
+
+	// only is the --only rows; empty imports the whole feature.
+	only []string
+	// writersCarried are the workflows --only carried because they write a row
+	// it needs.
+	writersCarried []importWriterCarried
+
 	claimedElsewhere []importClaimedElsewhere
 	literals         []importLiteral
 	sources          []importDataSource
@@ -134,12 +177,12 @@ type featureImport struct {
 	problems    []string
 }
 
-func runImportFeature(ctx context.Context, arg, dir string) error {
-	if flagStack == "" {
-		flagStack = "main"
-	}
-	if err := wfdir.ValidStackName(flagStack); err != nil {
-		return err
+func runImportFeature(ctx context.Context, arg, dir string, only []string) error {
+	named := flagStack != ""
+	if named {
+		if err := wfdir.ValidStackName(flagStack); err != nil {
+			return err
+		}
 	}
 	base, err := filepath.Abs(dir)
 	if err != nil {
@@ -159,10 +202,28 @@ func runImportFeature(ctx context.Context, arg, dir string) error {
 		return err
 	}
 	imp := &featureImport{ctx: ctx, client: newClient(resolved.URL, resolved.Token), resolved: resolved,
-		stack: flagStack, base: base, byID: map[string]*importRow{}}
-	if imp.feature, err = imp.resolveFeature(arg); err != nil {
+		stack: flagStack, base: base, byID: map[string]*importRow{}, only: only}
+	if len(only) > 0 {
+		imp.feature, err = imp.onlyFeature(only)
+	} else {
+		imp.feature, err = imp.resolveFeature(arg)
+	}
+	if err != nil {
 		return err
 	}
+	l := newSpaceLookup(ctx, resolved)
+	imp.lookup = l
+	if !named {
+		if flagStack, err = defaultStackName(l, imp.feature.ID, nil); err != nil {
+			return err
+		}
+		imp.stack = flagStack
+	}
+	space, err := featureSpace(l, imp.feature.ID)
+	if err != nil {
+		return declareSpaceFailed(imp.feature.ID, flagStack, err)
+	}
+	imp.space = recordedSpace(space)
 	if err := imp.plan(); err != nil {
 		return err
 	}
@@ -266,6 +327,31 @@ func (imp *featureImport) plan() error {
 		}
 	}
 
+	if len(imp.only) > 0 {
+		// onlyClosure follows a left-out row's references, so importing the
+		// rest would write what it needs without it.
+		var refused []string
+		for _, res := range inv.Resources {
+			if !slices.Contains(imp.only, res.ID) {
+				continue
+			}
+			if c, ok := claimed[res.ID]; ok {
+				refused = append(refused, onlyClaimedRefusal(res, c))
+			} else if reason := imp.skipReason(res); reason != "" {
+				refused = append(refused, onlySkipRefusal(res, reason))
+			}
+		}
+		if err := onlyRefusal(refused); err != nil {
+			return err
+		}
+		keep, writers, err := onlyClosure(inv.Resources, imp.only, imp.feature.Name)
+		if err != nil {
+			return err
+		}
+		imp.writersCarried = writers
+		inv.Resources = slices.DeleteFunc(inv.Resources, func(res api.ReferenceResource) bool { return !keep[res.ID] })
+	}
+
 	featureSlug := wfdir.Slug(imp.feature.Name, "feature")
 	pipeline := newImportFolder(wfdir.PipelineKind, "pipelines/"+featureSlug, imp.base)
 	automations := newImportFolder(wfdir.AutomationKind, "automations/"+featureSlug, imp.base)
@@ -280,28 +366,14 @@ func (imp *featureImport) plan() error {
 				Kind: res.Kind, ID: res.ID, Name: res.Name, FolderID: c.FolderID, Address: c.Address})
 			continue
 		}
+		if reason := imp.skipReason(res); reason != "" {
+			imp.notImported = append(imp.notImported, importSkip{Kind: res.Kind, ID: res.ID, Name: res.Name, Reason: reason})
+			continue
+		}
 		switch res.Kind {
 		case api.RefKindTable, api.RefKindMetric:
-			kind := res.TableKind
-			if res.Kind == api.RefKindMetric {
-				kind = api.TableKindMetric
-			}
-			if kind != api.TableKindDerived && kind != api.TableKindMetric {
-				// No SQL a file could hold: a connector, foundation, manual or
-				// dynamic table is a data source wherever it is read.
-				imp.notImported = append(imp.notImported, importSkip{Kind: res.Kind, ID: res.ID, Name: res.Name, Reason: notImportedTableReason(res)})
-				continue
-			}
-			if !imp.admin {
-				// A table or metric claim needs the Admin role, so a pipeline
-				// folder this caller writes could never be claimed — and every
-				// address into it would dangle. Planned as a data source
-				// instead, wherever it is referenced.
-				imp.notImported = append(imp.notImported, importSkip{Kind: res.Kind, ID: res.ID, Name: res.Name, Reason: importReasonNeedsAdmin})
-				continue
-			}
 			pipeline.rows = append(pipeline.rows, &importRow{res: res, folder: pipeline})
-			tableItems = append(tableItems, &api.TableListItem{ID: res.ID, Name: res.Name, Kind: kind})
+			tableItems = append(tableItems, &api.TableListItem{ID: res.ID, Name: res.Name, Kind: tableKindOf(res)})
 		case api.RefKindWorkflow, api.RefKindDataApp, api.RefKindModule:
 			kind, parent, slug := wfdir.WorkflowKind, "workflows", wfdir.Slug(res.Name, "workflow")
 			switch res.Kind {
@@ -316,8 +388,6 @@ func (imp *featureImport) plan() error {
 		case api.RefKindAutomation:
 			address := uniqueSegment(automationFiles, wfdir.Slug(res.Name, "automation"), ".json")
 			automations.rows = append(automations.rows, &importRow{res: res, folder: automations, address: address})
-		default:
-			imp.notImported = append(imp.notImported, importSkip{Kind: res.Kind, ID: res.ID, Name: res.Name, Reason: notImportedKindReason(res.Kind)})
 		}
 	}
 
@@ -340,14 +410,22 @@ func (imp *featureImport) plan() error {
 			at[m.MetricID] = m.Path
 		}
 		kept := pipeline.rows[:0]
+		var refused []string
 		for _, row := range pipeline.rows {
 			if p, ok := at[row.res.ID]; ok {
 				row.address = p
 				kept = append(kept, row)
 				continue
 			}
-			imp.notImported = append(imp.notImported, importSkip{Kind: row.res.Kind, ID: row.res.ID, Name: row.res.Name,
-				Reason: "the instance answered no recipe for this metric, so there is nothing a file could hold"})
+			skip := importSkip{Kind: row.res.Kind, ID: row.res.ID, Name: row.res.Name,
+				Reason: "the instance answered no recipe for this metric, so there is nothing a file could hold"}
+			imp.notImported = append(imp.notImported, skip)
+			if slices.Contains(imp.only, row.res.ID) {
+				refused = append(refused, onlySkipRefusal(row.res, skip.Reason))
+			}
+		}
+		if err := onlyRefusal(refused); err != nil {
+			return err
 		}
 		pipeline.rows = kept
 		if len(pipeline.rows) > 0 {
@@ -394,6 +472,59 @@ func (imp *featureImport) plan() error {
 		f.FolderID = id
 	}
 	return nil
+}
+
+// skipReason is why the import leaves res out of the tree, "" for a row a
+// folder holds.
+func (imp *featureImport) skipReason(res api.ReferenceResource) string {
+	switch res.Kind {
+	case api.RefKindTable, api.RefKindMetric:
+		if kind := tableKindOf(res); kind != api.TableKindDerived && kind != api.TableKindMetric {
+			// No SQL a file could hold: a connector, foundation, manual or
+			// dynamic table is a data source wherever it is read.
+			return notImportedTableReason(res)
+		}
+		if !imp.admin {
+			// A table or metric claim needs the Admin role, so a pipeline
+			// folder this caller writes could never be claimed — and every
+			// address into it would dangle. Planned as a data source instead,
+			// wherever it is referenced.
+			return importReasonNeedsAdmin
+		}
+		return ""
+	case api.RefKindWorkflow, api.RefKindDataApp, api.RefKindModule, api.RefKindAutomation:
+		return ""
+	}
+	return notImportedKindReason(res.Kind)
+}
+
+func tableKindOf(res api.ReferenceResource) string {
+	if res.Kind == api.RefKindMetric {
+		return api.TableKindMetric
+	}
+	return res.TableKind
+}
+
+// onlyRefusal refuses an --only import naming rows it would leave out, one
+// line each; nil when there are none.
+func onlyRefusal(lines []string) error {
+	if len(lines) == 0 {
+		return nil
+	}
+	return fmt.Errorf("--only names %d %s the import would leave out, and %s would land without %s, so nothing was written:\n  %s",
+		len(lines), plural(len(lines), "row"), agree(len(lines), "what it needs", "what they need"), agree(len(lines), "it", "them"), strings.Join(lines, "\n  "))
+}
+
+func onlyClaimedRefusal(res api.ReferenceResource, c api.ManagedClaim) string {
+	return fmt.Sprintf("%s %s (%s) is managed at %s. Work in that folder: `ronja sync stack add <stack> --feature <id>` there deploys it to another stack. Or run `ronja sync unmanage --stack %s` in it, which releases every row that folder claims, not only this one, and import again",
+		res.Kind, res.Name, res.ID, describeHolderAddress(&c), c.StackLabel)
+}
+
+func onlySkipRefusal(res api.ReferenceResource, reason string) string {
+	if reason == importReasonNeedsAdmin {
+		reason = "a table or metric needs an Admin to manage, and this credential is not one — have an Admin run the import"
+	}
+	return fmt.Sprintf("%s %s (%s): %s", res.Kind, res.Name, res.ID, reason)
 }
 
 // notImportedTableReason says why a table the feature holds is not a file of
@@ -577,6 +708,7 @@ func importDestinationEmpty(base string) error {
 // writeFolder lays one folder down at root through its kind's shared writer.
 func (imp *featureImport) writeFolder(f *importFolder, root string) error {
 	hooks := f.hooks()
+	hooks.space = imp.space
 	switch f.Kind.Name {
 	case wfdir.KindPipeline:
 		return writePipelineClone(imp.ctx, imp.resolved, imp.feature.ID, imp.feature.Name, root, f.pipeline, hooks)

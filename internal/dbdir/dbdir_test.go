@@ -1,6 +1,7 @@
 package dbdir
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -147,7 +148,7 @@ func TestBindingRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Save(dir, key, "mdb-abc"); err != nil {
+	if err := b.SaveStack(dir, key, "", "mdb-abc"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -155,7 +156,7 @@ func TestBindingRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := reloaded.DatabaseFor(key)
+	got, err := reloaded.DatabaseForStack(key, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +170,7 @@ func TestBindingMissingFileIsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load on a fresh folder: %v", err)
 	}
-	got, err := b.DatabaseFor(wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"})
+	got, err := b.DatabaseForStack(wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,20 +187,20 @@ func TestBindingIsPerOrganization(t *testing.T) {
 	second := wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-2"}
 
 	b, _ := Load(dir)
-	if err := b.Save(dir, first, "mdb-one"); err != nil {
+	if err := b.SaveStack(dir, first, "", "mdb-one"); err != nil {
 		t.Fatal(err)
 	}
 	b, _ = Load(dir)
-	if err := b.Save(dir, second, "mdb-two"); err != nil {
+	if err := b.SaveStack(dir, second, "", "mdb-two"); err != nil {
 		t.Fatal(err)
 	}
 
 	reloaded, _ := Load(dir)
-	gotFirst, err := reloaded.DatabaseFor(first)
+	gotFirst, err := reloaded.DatabaseForStack(first, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotSecond, err := reloaded.DatabaseFor(second)
+	gotSecond, err := reloaded.DatabaseForStack(second, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,11 +217,11 @@ func TestBindingResaveReplaces(t *testing.T) {
 	key := wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"}
 
 	b, _ := Load(dir)
-	if err := b.Save(dir, key, "mdb-old"); err != nil {
+	if err := b.SaveStack(dir, key, "", "mdb-old"); err != nil {
 		t.Fatal(err)
 	}
 	b, _ = Load(dir)
-	if err := b.Save(dir, key, "mdb-new"); err != nil {
+	if err := b.SaveStack(dir, key, "", "mdb-new"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -228,7 +229,7 @@ func TestBindingResaveReplaces(t *testing.T) {
 	if len(reloaded.Instances) != 1 {
 		t.Fatalf("got %d entries, want 1 (a re-save must replace, not append)", len(reloaded.Instances))
 	}
-	got, _ := reloaded.DatabaseFor(key)
+	got, _ := reloaded.DatabaseForStack(key, "")
 	if got != "mdb-new" {
 		t.Fatalf("DatabaseFor = %q, want mdb-new", got)
 	}
@@ -237,12 +238,12 @@ func TestBindingResaveReplaces(t *testing.T) {
 func TestBindingAmbiguousWhenSignedOut(t *testing.T) {
 	dir := t.TempDir()
 	b, _ := Load(dir)
-	_ = b.Save(dir, wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"}, "mdb-one")
+	_ = b.SaveStack(dir, wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"}, "", "mdb-one")
 	b, _ = Load(dir)
-	_ = b.Save(dir, wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-2"}, "mdb-two")
+	_ = b.SaveStack(dir, wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-2"}, "", "mdb-two")
 
 	reloaded, _ := Load(dir)
-	_, err := reloaded.DatabaseFor(wfdir.InstanceKey{URL: "https://acme.ronja.tech"})
+	_, err := reloaded.DatabaseForStack(wfdir.InstanceKey{URL: "https://acme.ronja.tech"}, "")
 	if !errors.Is(err, wfdir.ErrAmbiguousInstance) {
 		t.Fatalf("err = %v, want ErrAmbiguousInstance", err)
 	}
@@ -251,7 +252,7 @@ func TestBindingAmbiguousWhenSignedOut(t *testing.T) {
 func TestBindingFileIsOwnerOnly(t *testing.T) {
 	dir := t.TempDir()
 	b, _ := Load(dir)
-	if err := b.Save(dir, wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "t"}, "mdb-abc"); err != nil {
+	if err := b.SaveStack(dir, wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "t"}, "", "mdb-abc"); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(Path(dir))
@@ -268,7 +269,7 @@ func TestBindingFileIsOwnerOnly(t *testing.T) {
 func TestBindingWritesGitignore(t *testing.T) {
 	dir := t.TempDir()
 	b, _ := Load(dir)
-	if err := b.Save(dir, wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "t"}, "mdb-abc"); err != nil {
+	if err := b.SaveStack(dir, wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "t"}, "", "mdb-abc"); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(dir, DirName, ".gitignore"))
@@ -277,5 +278,59 @@ func TestBindingWritesGitignore(t *testing.T) {
 	}
 	if strings.TrimSpace(string(got)) != "*" {
 		t.Fatalf(".gitignore = %q, want \"*\"", string(got))
+	}
+}
+
+// legacyBinding is .ronja/database.json as a CLI from before per-stack
+// databases decodes and writes it.
+type legacyBinding struct {
+	Instances []struct {
+		URL        string `json:"url"`
+		TenantID   string `json:"tenantID,omitempty"`
+		DatabaseID string `json:"databaseID"`
+	} `json:"instances"`
+}
+
+// An older CLI reads only the database remembered without --stack, never a
+// stack's, and its save of that file loses the stack's entry rather than
+// moving it: the next `--stack dev` reports none remembered instead of
+// migrating Main's database. A file with no stack entry is written as an older
+// CLI writes it.
+func TestAnOlderCLINeverTakesAStacksDatabase(t *testing.T) {
+	dir := t.TempDir()
+	key := wfdir.InstanceKey{URL: "https://acme.ronja.tech", TenantID: "tnt-1"}
+	b, _ := Load(dir)
+	if err := b.SaveStack(dir, key, "", "mdb-main"); err != nil {
+		t.Fatal(err)
+	}
+	unnamedOnly, _ := os.ReadFile(Path(dir))
+	if want := "{\n  \"instances\": [\n    {\n      \"url\": \"https://acme.ronja.tech\",\n      \"tenantID\": \"tnt-1\",\n      \"databaseID\": \"mdb-main\"\n    }\n  ]\n}\n"; string(unnamedOnly) != want {
+		t.Fatalf("a file with no stack entry:\n%s\nwant\n%s", unnamedOnly, want)
+	}
+	b, _ = Load(dir)
+	if err := b.SaveStack(dir, key, "dev", "mdb-dev"); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := os.ReadFile(Path(dir))
+	var old legacyBinding
+	if err := json.Unmarshal(raw, &old); err != nil {
+		t.Fatal(err)
+	}
+	if len(old.Instances) != 1 || old.Instances[0].DatabaseID != "mdb-main" {
+		t.Fatalf("an older CLI reads %+v, want only Main's database", old.Instances)
+	}
+	old.Instances[0].DatabaseID = "mdb-main-2"
+	rewritten, _ := json.MarshalIndent(old, "", "  ")
+	if err := os.WriteFile(Path(dir), append(rewritten, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, _ := Load(dir)
+	if got, _ := reloaded.DatabaseForStack(key, ""); got != "mdb-main-2" {
+		t.Fatalf("unnamed = %q, want the older CLI's save", got)
+	}
+	if got, _ := reloaded.DatabaseForStack(key, "dev"); got != "" {
+		t.Fatalf("dev = %q after an older CLI's save, want none remembered", got)
 	}
 }

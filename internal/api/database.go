@@ -172,3 +172,20 @@ func (c *Client) DatabaseConnectionInfo(ctx context.Context, databaseID string) 
 	}
 	return &out, nil
 }
+
+// Database mirrors the GET /database/:id fields the CLI uses.
+type Database struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// SpaceID is absent from an instance older than Spaces on this view.
+	SpaceID string `json:"spaceID,omitempty"`
+}
+
+// GetDatabase reads one managed database.
+func (c *Client) GetDatabase(ctx context.Context, databaseID string) (*Database, error) {
+	var out Database
+	if err := c.Do(ctx, "GET", "database/"+databaseID, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

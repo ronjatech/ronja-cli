@@ -125,7 +125,7 @@ func TestAppCloneReadsTheDraftNotTheLiveApp(t *testing.T) {
 		t.Errorf("binding should name the live app %s, got %q", live.ID, binding.DataAppID)
 	}
 	// The BASELINE names the row the bytes actually came from.
-	if base := appStateOf(t, dir).For(f.Key()); base == nil || base.SourceID != draft.ID {
+	if base := stateForKey(appStateOf(t, dir), f.Key()); base == nil || base.SourceID != draft.ID {
 		t.Errorf("baseline should record the draft %s as its source, got %+v", draft.ID, base)
 	}
 }
@@ -439,7 +439,7 @@ func TestAppPushReportsFinalCompileFailure(t *testing.T) {
 	if got := f.FileContents(result.DraftID)["App.tsx"]; got != "broken" {
 		t.Errorf("the file should still be saved, got %q", got)
 	}
-	if base := appStateOf(t, root).For(f.Key()); base == nil || len(base.Files) != 1 {
+	if base := stateForKey(appStateOf(t, root), f.Key()); base == nil || len(base.Files) != 1 {
 		t.Errorf("the baseline should record the pushed file, got %+v", base)
 	}
 }
@@ -1007,7 +1007,7 @@ func TestAppPushRecordsFilesThatLandedDespiteAFailedWrite(t *testing.T) {
 
 	// The server holds both files — the entrypoint's write committed before the
 	// failure — so the baseline must say so.
-	base := appStateOf(t, root).For(f.Key())
+	base := stateForKey(appStateOf(t, root), f.Key())
 	if base == nil {
 		t.Fatal("expected a baseline to be recorded after a partial push")
 	}
@@ -1067,7 +1067,7 @@ func TestAppPushNeverAcknowledgesContentItDidNotWrite(t *testing.T) {
 			// A baseline recording what this folder last synced, so the colleague's
 			// edit to lib/chart.tsx is drift — the drift --force runs past.
 			state := &wfdir.State{}
-			state.Set(f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
+			stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
 				{Path: "App.tsx", Content: "entry"},
 				{Path: "lib/chart.tsx", Content: "what I last synced"},
 			}))
@@ -1087,7 +1087,7 @@ func TestAppPushNeverAcknowledgesContentItDidNotWrite(t *testing.T) {
 				t.Errorf("the file never landed, so the report must not list it as pushed: %+v", result)
 			}
 
-			base := appStateOf(t, root).For(f.Key())
+			base := stateForKey(appStateOf(t, root), f.Key())
 			if base == nil {
 				t.Fatal("expected a baseline to be recorded after a partial push")
 			}
@@ -1140,7 +1140,7 @@ func TestAppPushReportsTheFileAnUncertainWriteLeftBehind(t *testing.T) {
 	if !slices.Contains(result.Pushed, "App.tsx") {
 		t.Errorf("App.tsx landed and is in the baseline, so the report must list it: %+v", result)
 	}
-	base := appStateOf(t, root).For(f.Key())
+	base := stateForKey(appStateOf(t, root), f.Key())
 	if base == nil {
 		t.Fatal("expected a baseline to be recorded after a partial push")
 	}
@@ -1188,7 +1188,7 @@ func TestAppPushSaysSoWhenItCannotFindOutWhatLanded(t *testing.T) {
 		t.Errorf("the report must not claim the draft holds what is listed above:\n%s", out)
 	}
 
-	base := appStateOf(t, root).For(f.Key())
+	base := stateForKey(appStateOf(t, root), f.Key())
 	if base == nil {
 		t.Fatal("expected a baseline to be recorded after a partial push")
 	}
@@ -1268,7 +1268,7 @@ func TestAppPushReconcilesAnUncertainDelete(t *testing.T) {
 			// A baseline that already describes the draft exactly, so nothing here
 			// is drift and the deletion is the only thing this push does.
 			state := &wfdir.State{}
-			state.Set(f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
+			stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, draft, []api.DataAppFile{
 				{Path: "App.tsx", Content: "entry"},
 				{Path: "lib/old.tsx", Content: "old"},
 			}))
@@ -1296,7 +1296,7 @@ func TestAppPushReconcilesAnUncertainDelete(t *testing.T) {
 			if got := slices.Contains(result.Deleted, "lib/old.tsx"); got {
 				t.Errorf("report lists it as deleted, but the reconciling read could not establish that (it answers 400, not 404)")
 			}
-			base := appStateOf(t, root).For(f.Key())
+			base := stateForKey(appStateOf(t, root), f.Key())
 			if base == nil {
 				t.Fatal("expected a baseline to be recorded after a partial push")
 			}
@@ -1388,7 +1388,7 @@ func TestAppPushSyncsAccessBeforeFiles(t *testing.T) {
 	}
 	// A baseline that matches the live file, so the push is not refused as drift.
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, live, []api.DataAppFile{{Path: "App.tsx", Content: "old"}}))
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, live, []api.DataAppFile{{Path: "App.tsx", Content: "old"}}))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)
 	}
@@ -1594,7 +1594,7 @@ func TestAppPushRefusesDrift(t *testing.T) {
 	}
 	// A baseline recording a DIFFERENT content, so the remote has moved since.
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-draft-1"],
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, f.apps["data_app-draft-1"],
 		[]api.DataAppFile{{Path: "App.tsx", Content: "what I last synced"}}))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)
@@ -1974,7 +1974,7 @@ func TestAppDiscardDeleteAppRemovesAnUnpublishedApp(t *testing.T) {
 	}
 	// The baseline has to go too: it described a row that no longer exists, and
 	// leaving it would make the next push diff against a ghost.
-	if base := appStateOf(t, root).For(f.Key()); base != nil && base.SourceID != "" {
+	if base := stateForKey(appStateOf(t, root), f.Key()); base != nil && base.SourceID != "" {
 		t.Errorf("baseline should be cleared, still names %q", base.SourceID)
 	}
 }
@@ -2021,7 +2021,7 @@ func TestAppDiscardDropsDraftAndResetsBaseline(t *testing.T) {
 	// The baseline must now describe the LIVE row: the draft it was taken from is
 	// gone, and leaving it would make every local file read as drift against a
 	// row that no longer exists.
-	base := appStateOf(t, root).For(f.Key())
+	base := stateForKey(appStateOf(t, root), f.Key())
 	if base == nil || base.SourceID != live.ID {
 		t.Errorf("baseline should point at the live app %s, got %+v", live.ID, base)
 	}
@@ -2052,11 +2052,11 @@ func TestAppDeleteAppKeepsOtherInstancesBaselines(t *testing.T) {
 	// command has no business touching.
 	other := wfdir.InstanceKey{URL: "https://prod.example.com", TenantID: "ten-prod"}
 	state := appStateOf(t, root)
-	state.Set(f.Key(), &wfdir.InstanceState{
+	stateSetKey(state, f.Key(), &wfdir.InstanceState{
 		SourceID: "data_app-new-1", SourceLifecycle: api.LifecycleDraft,
 		Files: map[string]wfdir.FileState{"App.tsx": {SHA256: wfdir.HashString("x")}},
 	})
-	state.Set(other, &wfdir.InstanceState{
+	stateSetKey(state, other, &wfdir.InstanceState{
 		SourceID: "data_app-prod-9", SourceLifecycle: api.LifecycleLive,
 		Title: "Revenue explorer", Entrypoint: "App.tsx",
 		Files: map[string]wfdir.FileState{"App.tsx": {SHA256: wfdir.HashString("shipped"), UpdatedAt: "2026-08-01T09:00:00Z"}},
@@ -2064,19 +2064,19 @@ func TestAppDeleteAppKeepsOtherInstancesBaselines(t *testing.T) {
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatalf("write state: %v", err)
 	}
-	before := marshalJSON(t, state.For(other))
+	before := marshalJSON(t, stateForKey(state, other))
 
 	if _, err := runCLI(t, root, "app", "discard", "--delete-app", "--yes", "--json"); err != nil {
 		t.Fatalf("discard --delete-app: %v", err)
 	}
 
 	after := appStateOf(t, root)
-	if got := marshalJSON(t, after.For(other)); got != before {
+	if got := marshalJSON(t, stateForKey(after, other)); got != before {
 		t.Errorf("production's baseline was rewritten by a discard against another instance:\n  before %s\n  after  %s", before, got)
 	}
 	// And this instance's is gone, so the folder reads as freshly initialised
 	// here — every local file added, nothing to drift against.
-	if base := after.For(f.Key()); base != nil {
+	if base := stateForKey(after, f.Key()); base != nil {
 		t.Errorf("the discarded instance's baseline should be gone, got %+v", base)
 	}
 }
@@ -2155,7 +2155,7 @@ func appFolderBoundTo(t *testing.T, f *fakeAppInstance, liveID string, files map
 		baseline = append(baseline, api.DataAppFile{Path: path, Content: content})
 	}
 	state := &wfdir.State{}
-	state.Set(f.Key(), baselineFromApp(aliasCodec{}, f.apps[draftID], baseline))
+	stateSetKey(state, f.Key(), baselineFromApp(aliasCodec{}, f.apps[draftID], baseline))
 	if err := wfdir.SaveState(root, state); err != nil {
 		t.Fatal(err)
 	}

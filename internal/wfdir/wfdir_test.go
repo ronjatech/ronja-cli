@@ -363,7 +363,7 @@ func TestStateRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	s := &State{}
 	key := InstanceKey{URL: "https://app.ronja.tech", TenantID: "ten-acme"}
-	s.Set(key, &InstanceState{
+	stateSetKey(s, key, &InstanceState{
 		SourceID:          "wf-draft-1",
 		SourceLifecycle:   "draft",
 		BaselineUpdatedAt: "2026-07-28T10:00:00Z",
@@ -384,11 +384,11 @@ func TestStateRoundTrip(t *testing.T) {
 		t.Fatalf("round trip mismatch:\n in: %+v\nout: %+v", s.Instances, out.Instances)
 	}
 	unknown := InstanceKey{URL: "https://nowhere.example", TenantID: "ten-acme"}
-	if out.For(unknown) != nil {
+	if stateForKey(out, unknown) != nil {
 		t.Fatal("an unknown host must have no baseline")
 	}
 	// A nil baseline must still be diffable — that is the every-file-is-new case.
-	if got := len(out.For(unknown).Hashes()); got != 0 {
+	if got := len(stateForKey(out, unknown).Hashes()); got != 0 {
 		t.Fatalf("nil baseline hashes = %d, want 0", got)
 	}
 
@@ -472,19 +472,19 @@ func TestStateClearLeavesOtherBindingsAlone(t *testing.T) {
 	s := &State{}
 	staging := InstanceKey{URL: "https://staging.ronja.tech", TenantID: "ten-acme"}
 	prod := InstanceKey{URL: "https://app.ronja.tech", TenantID: "ten-acme"}
-	s.Set(staging, &InstanceState{SourceID: "wf-staging-1"})
-	s.Set(prod, &InstanceState{SourceID: "wf-prod-1", Files: map[string]FileState{
+	stateSetKey(s, staging, &InstanceState{SourceID: "wf-staging-1"})
+	stateSetKey(s, prod, &InstanceState{SourceID: "wf-prod-1", Files: map[string]FileState{
 		"main.py": {SHA256: HashString("print(1)")},
 	}})
 
-	s.Clear(staging)
+	s.Clear(BaselineKey{Key: staging})
 
-	if got := s.For(staging); got != nil {
+	if got := stateForKey(s, staging); got != nil {
 		// nil, not an empty entry: that is what "never synced here" looks like,
 		// and it is what this instance now is.
 		t.Errorf("cleared baseline = %+v, want nil", got)
 	}
-	kept := s.For(prod)
+	kept := stateForKey(s, prod)
 	if kept == nil || kept.SourceID != "wf-prod-1" || kept.Files["main.py"].SHA256 != HashString("print(1)") {
 		t.Errorf("production's baseline was disturbed: %+v", kept)
 	}
@@ -494,7 +494,7 @@ func TestStateClearLeavesOtherBindingsAlone(t *testing.T) {
 
 	// Clearing a binding that has no baseline is a no-op, not a panic — a
 	// discard can perfectly well run in a folder that never synced here.
-	s.Clear(InstanceKey{URL: "https://nowhere.example", TenantID: "ten-acme"})
+	s.Clear(BaselineKey{Key: InstanceKey{URL: "https://nowhere.example", TenantID: "ten-acme"}})
 	if len(s.Instances) != 1 {
 		t.Errorf("instances = %d after clearing an absent key, want 1", len(s.Instances))
 	}
@@ -519,7 +519,7 @@ func TestLoadStateWithoutMetadataStillParses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	inst := out.For(InstanceKey{URL: "https://app.ronja.tech", TenantID: "ten-acme"})
+	inst := stateForKey(out, InstanceKey{URL: "https://app.ronja.tech", TenantID: "ten-acme"})
 	if inst == nil || inst.SourceID != "wf-1" || inst.Files["main.py"].SHA256 != "abc" {
 		t.Fatalf("baseline = %+v", inst)
 	}

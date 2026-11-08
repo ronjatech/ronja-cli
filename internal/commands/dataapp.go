@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/markers"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
 )
@@ -319,6 +320,12 @@ func inspectAppRow(ctx context.Context, client *api.Client, f *folder) (appTarge
 			return appTarget{}, fmt.Errorf("data app %s no longer exists on %s (or you lost access to it) — clone the app you meant into a fresh folder, or remove the binding from %s to start a new one",
 				appID, f.Resolved.URL, wfdir.ManifestPath(f.Root))
 		}
+		if refusal := f.placeOwnRow(ctx, markers.KindDataApp, appID, "", err); refusal != nil {
+			return appTarget{}, refusal
+		}
+		return appTarget{}, err
+	}
+	if err := f.placeOwnRow(ctx, markers.KindDataApp, app.ID, app.FeatureID, nil); err != nil {
 		return appTarget{}, err
 	}
 	if err := refuseUnworkableApp(app); err != nil {

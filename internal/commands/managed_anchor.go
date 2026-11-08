@@ -94,7 +94,7 @@ func (f *folder) recordManagedAnchors() {
 // docs-sidecar baselines, and a folder anchor that fails cannot stop a claim's
 // anchor being recorded. The first failure of either is returned.
 func (f *folder) writeManagedAnchors(ctx context.Context) error {
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	folderErr := f.writeFolderAnchor(ctx, client)
 	if err := f.writeClaimAnchors(ctx, client, folderErr == nil); err != nil {
 		return err

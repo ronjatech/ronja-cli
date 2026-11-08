@@ -156,6 +156,11 @@ func (c *Client) DoRaw(ctx context.Context, method, path string, header http.Hea
 	if c.Token != "" && req.Header.Get("Authorization") == "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
+	spaced, err := c.setSpace(req.Header)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	// Host is the one header net/http does not take from the header map: the
 	// request line and the Host line are written from req.Host, and a "Host"
 	// key in Header is silently DROPPED. Honouring it explicitly is what makes
@@ -172,6 +177,18 @@ func (c *Client) DoRaw(ctx context.Context, method, path string, header http.Hea
 		// bearer token among them — are never part of a url.Error, and must
 		// never be added here.
 		return nil, fmt.Errorf("%s %s: %w", method, url, err)
+	}
+	if spaced {
+		code := ""
+		if c.readsSpaceCode(resp.StatusCode, resp.Header) {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+			code = WireCodeOf(errorFrom(resp.StatusCode, raw))
+		}
+		if err := c.spaceAnswer(method, req.URL.Path, resp.StatusCode, resp.Header, code); err != nil {
+			resp.Body.Close()
+			cancel()
+			return nil, err
+		}
 	}
 	return &RawResponse{
 		Status: resp.StatusCode,

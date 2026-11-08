@@ -10,7 +10,6 @@ import (
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 // Discard outcomes, the --json `outcome` vocabulary, kind-neutral because the
@@ -46,7 +45,7 @@ want to abandon. Your local files are kept either way, and the folder is unbound
 so a later push creates a fresh workflow.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(yes)
 			if err != nil {
 				return err
 			}
@@ -79,7 +78,7 @@ type discardResult struct {
 }
 
 func runDiscard(ctx context.Context, f *folder, yes, deleteWorkflow bool) (*discardResult, error) {
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	if !f.Bound || f.Binding.WorkflowID == "" {
 		return nil, fmt.Errorf("nothing to discard — this folder has no workflow on %s yet", f.Resolved.URL)
 	}
@@ -165,7 +164,7 @@ func deleteUnpublishedWorkflow(ctx context.Context, client *api.Client, f *folde
 	}
 	// Only this instance's baseline goes, as after `init`: the folder may still be
 	// bound elsewhere, each with a row its baseline describes.
-	f.State.Clear(f.Key)
+	f.State.Clear(f.Baseline())
 	noteBaselineRefresh(f.Kind, wfdir.SaveState(f.Root, f.State))
 	return &discardResult{Outcome: outcomeResourceDeleted, WorkflowID: wf.ID}, nil
 }
@@ -180,7 +179,7 @@ func confirm(question, effect string, yes bool) (bool, error) {
 	if flagJSON {
 		return false, fmt.Errorf("this %s — pass --yes to confirm (--json is for programs, so there is nobody to prompt)", effect)
 	}
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
+	if !isTerminal(os.Stdin) {
 		return false, fmt.Errorf("this %s — pass --yes to confirm (there is no terminal to ask on)", effect)
 	}
 	fmt.Fprintf(os.Stderr, "  %s [y/N] ", question)

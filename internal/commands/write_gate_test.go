@@ -97,7 +97,7 @@ func TestWriteGateRules(t *testing.T) {
 // writes_outside_target naming every refused write by file and line, its id
 // and — when readable — its feature.
 func TestWriteGateRefusalNamesLineTableAndFeature(t *testing.T) {
-	err := gateWorkflowTargets(gateFolder(), &api.ValidateResult{WriteTargets: []api.ValidateWriteTarget{
+	err := gateWorkflowTargets(t.Context(), gateFolder(), &api.ValidateResult{WriteTargets: []api.ValidateWriteTarget{
 		tableTarget("table-dev-ledger", "collection-finance", true),
 		tableTarget("table-other", "collection-finance", true),
 		{Position: api.WritePositionMarker, TargetKind: api.WriteTargetTable, Path: "lib.py", Line: 2, Arg: "table-hidden", TargetID: "table-hidden"},
@@ -120,7 +120,7 @@ func TestWriteGateRefusalNamesLineTableAndFeature(t *testing.T) {
 // TestWriteGateRefusesAnInstanceThatReportsNoWriteTargets: no writeTargets
 // key is not "writes nothing".
 func TestWriteGateRefusesAnInstanceThatReportsNoWriteTargets(t *testing.T) {
-	r, ok := asManagedRefusal(gateWorkflowTargets(gateFolder(), &api.ValidateResult{}))
+	r, ok := asManagedRefusal(gateWorkflowTargets(t.Context(), gateFolder(), &api.ValidateResult{}))
 	if !ok || r.Reason != syncReasonNoWriteTargets {
 		t.Fatalf("a result without writeTargets passed the gate, or was refused under another reason: %v", r)
 	}
@@ -131,7 +131,7 @@ func TestWriteGateRefusesAnInstanceThatReportsNoWriteTargets(t *testing.T) {
 			t.Fatalf("the refusal does not say %q:\n%s", want, r.Detail)
 		}
 	}
-	if err := gateWorkflowTargets(gateFolder(), &api.ValidateResult{WriteTargets: []api.ValidateWriteTarget{}}); err != nil {
+	if err := gateWorkflowTargets(t.Context(), gateFolder(), &api.ValidateResult{WriteTargets: []api.ValidateWriteTarget{}}); err != nil {
 		t.Fatalf("a candidate writing nothing was refused: %v", err)
 	}
 }
@@ -837,7 +837,7 @@ func TestWriteGateRefusesARunEdgeTheCredentialCannotReach(t *testing.T) {
 
 // A run-edge leg over the binding cap is resolved by nobody: refused.
 func TestWriteGateRefusesARunEdgeLegOverTheCap(t *testing.T) {
-	err := tooManyRunEdges(gateFolder(), &api.ValidateResult{Findings: []api.ValidateFinding{
+	err := tooManyRunEdges(t.Context(), gateFolder(), &api.ValidateResult{Findings: []api.ValidateFinding{
 		{Severity: api.SeverityError, Code: "too_many_bindings", Path: "workflowIDs"},
 		{Severity: api.SeverityError, Code: "too_many_bindings", Path: "secretIDs"},
 	}})
@@ -1014,5 +1014,23 @@ func TestWriteGateSendsAJSRowsLanguage(t *testing.T) {
 		if lang != wfdir.LanguageJS {
 			t.Fatalf("the gate validated a js draft as language %q", lang)
 		}
+	}
+}
+
+// The settled refusal detail (TestAGateRefusalAfterSettleSaysWhatWasWritten)
+// says what was written for the Space rule as for the feature rule; with nothing settled,
+// or for a refusal that is not the gate's, the detail is left as it is.
+func TestTheSettledRefusalDetailCoversTheSpaceRule(t *testing.T) {
+	for _, reason := range []string{syncReasonWritesOutsideTarget, syncReasonRunsOutsideTarget, syncReasonBindSpaceMismatch} {
+		got := gateRefusalDetail(&managedRefusal{Reason: reason, Detail: "it writes Main. Nothing was written"}, true)
+		if strings.Contains(got, "Nothing was written") || !strings.Contains(got, "were settled before the check") {
+			t.Errorf("%s after settle: %q", reason, got)
+		}
+		if got := gateRefusalDetail(&managedRefusal{Reason: reason, Detail: "x. Nothing was written"}, false); got != "x. Nothing was written" {
+			t.Errorf("%s with nothing settled: %q", reason, got)
+		}
+	}
+	if got := gateRefusalDetail(&managedRefusal{Reason: syncReasonNameTaken, Detail: "x. Nothing was written"}, true); got != "x. Nothing was written" {
+		t.Errorf("a refusal that is not the gate's was rewritten: %q", got)
 	}
 }

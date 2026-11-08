@@ -123,6 +123,10 @@ automation's name. Anything else is ignored.`,
 			// A folder INITIALIZED onto a stack is born adopted: its id is minted
 			// here, locally, so its first push claims its address on the server and
 			// CI never needs the lock. See mintFolderIDAtInit.
+			space, err := settleStackSpace(cmd.Context(), resolved, featureID)
+			if err != nil {
+				return err
+			}
 			if err := mintFolderIDAtInit(manifest); err != nil {
 				return err
 			}
@@ -137,6 +141,7 @@ automation's name. Anything else is ignored.`,
 			if err != nil {
 				return err
 			}
+			stampSpace(manifest, flagStack, space)
 			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}

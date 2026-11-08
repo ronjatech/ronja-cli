@@ -32,7 +32,7 @@ Writes ronja.json (the manifest), an ` + "`__init__.py`" + ` if the folder has n
 the server — the module itself comes into existence on your first push.
 
 The NAME is the Python package consumers import, so it has to be a valid Python
-identifier, unique among the live modules in your organization, and not the name
+identifier, unique among the live modules in its feature, and not the name
 of something the runtime already provides (json, requests, tools, …):
 
   ronja module init emab_tracker --feature collection-abc
@@ -132,6 +132,10 @@ is pushed, and everything else is skipped.`,
 			// kind's: its id is minted here, locally, so its first push claims its
 			// address on the server and CI never needs the lock. See
 			// mintFolderIDAtInit.
+			space, err := settleStackSpace(cmd.Context(), resolved, featureID)
+			if err != nil {
+				return err
+			}
 			if err := mintFolderIDAtInit(manifest); err != nil {
 				return err
 			}
@@ -143,6 +147,7 @@ is pushed, and everything else is skipped.`,
 			if err != nil {
 				return err
 			}
+			stampSpace(manifest, flagStack, space)
 			if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 				return err
 			}

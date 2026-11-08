@@ -73,7 +73,7 @@ production without either overwriting the other's binding.`,
 // resolveInstance is the standard preamble: work out which instance we are
 // talking to and refuse early if there is no credential for it.
 func resolveInstance() (*config.Resolved, error) {
-	resolved, err := config.Resolve(flagURL, flagProfile)
+	resolved, err := resolveStackCredential("", false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -290,22 +290,8 @@ type folder struct {
 	// legacy unnamed instances[] entry. It is what --stack selected, or what the
 	// (url, tenantID) match resolved to.
 	Stack string
-	// Key is what the manifest and baseline are looked up by: this instance and
-	// this organization.
-	//
-	// The baseline in .ronja/state.json is still keyed by this pair and NOT by
-	// the stack name, which holds because Manifest.selectNamed refuses to CREATE
-	// a second stack on an (instance, organization) this folder already names —
-	// so the two keys are 1:1 for every folder this CLI wrote, which is what let
-	// the local baseline stay exactly as it was through this change.
-	//
-	// ⚠️ It is no longer 1:1 by CONSTRUCTION. A merge can bring two stacks onto
-	// one pair, and that is deliberately not refused at load — a folder must
-	// stay openable, and `--stack <name>` must stay a recovery (see
-	// wfdir.checkStacks). Such a folder shares one baseline between two stacks:
-	// each command still compares against the last sync made HERE, so the
-	// symptom is spurious drift rather than a wrong row. Closing it means keying
-	// the baseline by stack name; see BL-4e71.
+	// Key is this instance and this organization: what the manifest is matched
+	// by, and with Stack what the local baseline is (see Baseline).
 	Key wfdir.InstanceKey
 	// Binding and Bound describe this folder's link to Key. Unbound is an
 	// ordinary state, not an error: it means the folder has never been pushed
@@ -315,6 +301,9 @@ type folder struct {
 	// Bind is the selected stack's alias → resource id map, straight off
 	// Selection.Bind: CONFIG, read-only, never written back by a push.
 	Bind map[string]string
+	// adoptPending is a stack adoptStack named in memory and nothing has saved
+	// yet (openFolderToPlanAt).
+	adoptPending bool
 	// Codec translates between the folder's committed ALIAS form and the ids one
 	// organization's server speaks. Built here, from Bind, so every command holds
 	// the same one and none of them builds a second — see alias.go for the
@@ -385,11 +374,20 @@ type folder struct {
 	// folder's line instead of printing them as they happen.
 	gateNotes          []string
 	gateNotesCollected bool
+	// spaceStep is the tree command's step this folder is in, which reports
+	// the Space refusals it meets (spaceRefusal); nil outside one.
+	spaceStep *spaceStep
+	// spaces answers the write gate's Space rule, read once per row for the
+	// folder (spaceRuleFor).
+	spaces *spaceLookup
 	// notices are the classic-loop notices this command collected: a row it
 	// read whose single-row GET says another repository folder deploys it
 	// (managed_notice.go). A single-folder command prints them and carries
 	// them in --json; `sync apply` does neither.
 	notices []managedNotice
+	// legacyNoted is set once the unclaimed-record note has been printed, so a
+	// command that re-matches the folder says it once.
+	legacyNoted bool
 	// ctx is the context the folder was opened under, kept for the one thing
 	// that has to make a request from inside a save: recording the anchor that
 	// save changed (recordManagedAnchors). Nil on the local-only openers.
@@ -436,6 +434,17 @@ func openActingFolder(ctx context.Context, resolved *config.Resolved, kind wfdir
 // openActingFolderAt is openActingFolder for a root the caller already knows —
 // `ronja <kind> pull [dir]`.
 func openActingFolderAt(ctx context.Context, root string, resolved *config.Resolved, kind wfdir.Kind, deploy bool) (*folder, error) {
+	return openActing(ctx, root, resolved, kind, deploy, true)
+}
+
+// openFolderToPlanAt is openActingFolderAt for a command that plans every
+// folder before one confirmation writes any (`sync stack add`): a stack the
+// folder would adopt is adopted in memory, and the plan's write saves it.
+func openFolderToPlanAt(ctx context.Context, root string, resolved *config.Resolved, kind wfdir.Kind) (*folder, error) {
+	return openActing(ctx, root, resolved, kind, false, false)
+}
+
+func openActing(ctx context.Context, root string, resolved *config.Resolved, kind wfdir.Kind, deploy, saveAdoption bool) (*folder, error) {
 	f, err := openFolderLocallyAt(root, resolved, kind)
 	if err != nil {
 		return nil, err
@@ -449,11 +458,19 @@ func openActingFolderAt(ctx context.Context, root string, resolved *config.Resol
 	if err := f.requireNamedStack(); err != nil {
 		return nil, err
 	}
-	if err := f.adoptStack(); err != nil {
+	if err := f.adoptStack(saveAdoption); err != nil {
 		return nil, err
 	}
 	if err := f.requireAdoptedStackFeature(); err != nil {
 		return nil, err
+	}
+	// Every acting command checks the stack's feature is in its Space; a
+	// deploy also checks what the folder writes and runs. On a stack that
+	// records a Space these are the command's first requests carrying it, so
+	// an instance that does not confirm the Space stops it here, before any
+	// write.
+	if found := f.checkSpaces(ctx, deploy); found.refusal != nil {
+		return nil, found.refusal
 	}
 	// Address dependencies resolve through OTHER folders' server state, read
 	// here once so every loop's codec already speaks them.
@@ -518,7 +535,10 @@ func (f *folder) requireNamedStack() error {
 // Only for a BOUND entry. An unbound folder has no binding to move, and writing
 // a stack with an empty featureID would put a half-answer in the manifest before
 // the push that fills it in has been allowed to fail.
-func (f *folder) adoptStack() error {
+//
+// Without save the migration is made in memory only and marked adoptPending,
+// for the bindPlan write that saves it.
+func (f *folder) adoptStack(save bool) error {
 	if f.Stack == "" || !f.Bound {
 		return nil
 	}
@@ -535,9 +555,19 @@ func (f *folder) adoptStack() error {
 	}
 	f.recordBinding(f.Binding)
 	f.adoptLiveHashes()
+	if !save {
+		f.adoptPending = true
+		return nil
+	}
 	if err := f.saveFolder(); err != nil {
 		return fmt.Errorf("record stack %q in %s: %w", f.Stack, wfdir.ManifestName, err)
 	}
+	f.sayAdopted()
+	return nil
+}
+
+// sayAdopted reports a saved adoptStack migration.
+func (f *folder) sayAdopted() {
 	// Said out loud, on stderr, because it changes the FORMAT of a file in the
 	// customer's repo, and a colleague on an older CLI will be refused by it
 	// rather than silently misreading it.
@@ -551,7 +581,6 @@ func (f *folder) adoptStack() error {
 	// upgrade nobody has time for and the message loses its credibility over.
 	fmt.Fprintf(os.Stderr, "  %s now names %s as stack %q, and %s records what deploys to it. Both are committed; everyone working on this folder needs a ronja new enough to read format version %d.\n",
 		wfdir.ManifestName, describeTarget(f.Resolved), f.Stack, wfdir.LockName, f.Manifest.StampedFormatVersion())
-	return nil
 }
 
 // openFolderForStatusAt is openFolder without the refusals, for the commands
@@ -594,14 +623,15 @@ func openFolderForStatusAt(ctx context.Context, root string, resolved *config.Re
 	// An ADOPTED folder's state is read from the server here too — in memory,
 	// and nothing is written: a status of an adopted folder compares against
 	// the server's anchor, not a stale lock. A refusal (a claim that is lost,
-	// trashed, unreadable or moved out) is the report; a read that got no
-	// answer degrades like an organization lookup that failed.
+	// trashed, unreadable or moved out, or the stack's Space) is the report; a
+	// read that got no answer degrades like an organization lookup that
+	// failed.
 	f.ctx = ctx
 	if f.OrgErr == nil {
 		f.resolveAddressDependencies(ctx)
 		if err := f.refreshManaged(ctx); err != nil {
 			var unread *managedReadError
-			if !errors.As(err, &unread) {
+			if _, refused := asSpaceEntry(err); refused || !errors.As(err, &unread) {
 				return nil, err
 			}
 			f.OrgErr = err
@@ -775,7 +805,7 @@ func (f *folder) orgNotCheckedReason() string {
 // known, and is re-run whenever that answer changes.
 func (f *folder) matchBinding() {
 	key := wfdir.InstanceKey{URL: f.Resolved.URL, TenantID: f.Resolved.TenantID}
-	sel, err := f.Manifest.Select(f.Lock, key, flagStack)
+	sel, err := f.Manifest.SelectDeclaring(f.Lock, key, flagStack, declaringFeature)
 	// The matched entry's organization is ADOPTED. When ours was already known
 	// this changes nothing (the match was exact on it); when it was not, this is
 	// the answer, and it cost no request. A declared --stack is the same move
@@ -785,6 +815,7 @@ func (f *folder) matchBinding() {
 	if err != nil {
 		f.Stack, f.Key, f.Binding, f.Bound, f.Bind = "", key, wfdir.Binding{}, false, nil
 	}
+	f.claimLegacyBaseline()
 	// What the address dependencies resolved to belongs to the stack it was
 	// resolved for; a match onto another stack drops it, and
 	// resolveAddressDependencies asks again.
@@ -797,6 +828,43 @@ func (f *folder) matchBinding() {
 	// ids, and a codec left over from the previous answer would resolve this
 	// organization's names to the last one's rows.
 	f.Codec = newAliasCodec(f.Manifest.Dependencies, f.codecBind())
+}
+
+// declaringFeature is the feature a DECLARING command names for the stack it
+// adds (`ronja bind --stack dev --feature …`), so matchBinding may add a second
+// stack on an organization this folder already names. Empty for every other
+// command, which is what keeps `--stack prdo` a refused typo.
+var declaringFeature string
+
+// Baseline is the key of the selected stack's local record in
+// .ronja/state.json.
+func (f *folder) Baseline() wfdir.BaselineKey {
+	return wfdir.BaselineKey{Key: f.Key, Stack: f.Stack}
+}
+
+// claimLegacyBaseline gives a record written before records were kept per
+// stack to the stack it belongs to (wfdir.State.ClaimLegacy), and says once when
+// the selected stack cannot have it.
+func (f *folder) claimLegacyBaseline() {
+	unclaimed := f.State.ClaimLegacy(f.Manifest, f.Stack, f.Key)
+	if f.Stack == "" || f.legacyNoted {
+		return
+	}
+	for _, key := range unclaimed {
+		if !wfdir.Matches(key, f.Key) {
+			continue
+		}
+		f.legacyNoted = true
+		var here []string
+		for _, name := range f.Manifest.StackNames() {
+			if wfdir.Matches(f.Manifest.Stacks[name].Key(), key) {
+				here = append(here, name)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "  Note: %s holds a sync record for %s from before records were kept per stack, and stacks %s both deploy there, so neither uses it: stack %q starts with no local record. Delete that entry to drop this note.\n",
+			wfdir.StatePath(f.Root), describeKeyForApply(key), strings.Join(here, ", "), f.Stack)
+		return
+	}
 }
 
 // selection is this folder's resolved stack, in the shape wfdir writes back
@@ -890,7 +958,7 @@ func (f *folder) declaredStack() string {
 // stale relative to it. Harmless for the two kinds that have no table state —
 // their baselines carry no Tables map at all.
 func (f *folder) adoptLiveHashes() {
-	inst := f.State.For(f.Key)
+	inst := f.State.For(f.Baseline())
 	if inst == nil || f.Stack == "" {
 		return
 	}

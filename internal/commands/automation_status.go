@@ -55,7 +55,7 @@ moved".`,
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what its files declare, and the remote half degrades to "not
 			// checked" with a reason. Same trade every other `status` makes.
-			resolved, err := config.Resolve(flagURL, flagProfile)
+			resolved, err := resolveStackCredential("", false, false)
 			if err != nil {
 				return err
 			}
@@ -284,7 +284,7 @@ func automationRemoteStatus(ctx context.Context, resolved *config.Resolved, f *f
 		return out
 	}
 
-	client := newClient(resolved.URL, resolved.Token)
+	client := f.client()
 	rows, err := client.ListAutomations(ctx, f.Binding.FeatureID)
 	var truncated *api.ErrAutomationListTruncated
 	switch {

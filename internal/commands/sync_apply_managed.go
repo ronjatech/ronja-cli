@@ -94,7 +94,7 @@ func relieveAnchorlessAtDesired(ctx context.Context, f *folder, files map[string
 		}
 		if rows == nil {
 			var err error
-			if rows, err = automationRowsOf(ctx, newClient(f.Resolved.URL, f.Resolved.Token), f); err != nil {
+			if rows, err = automationRowsOf(ctx, f.client(), f); err != nil {
 				return
 			}
 		}

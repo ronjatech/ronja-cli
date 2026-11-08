@@ -237,10 +237,11 @@ handshakes**. A credential needs an interactive half — an echo-off prompt, a
 browser approval, a provider's consent screen — and plain HTTP cannot do that
 half without putting the credential in an argument list, a shell history or a
 transcript. The CLI may own exactly that half. `ronja login`, `ronja secret
-create`, `ronja secret connect` and `ronja token create` are handshakes. Each
-one creates or stores one credential. None
-of them prints a credential. None of them grows a list, show, rotate or delete:
-whether a credential exists, and revoking it, stay on `ronja api` and in Ronja.
+create`, `ronja secret new-value`, `ronja secret connect` and `ronja token
+create` are handshakes. Each one creates or stores one credential. None
+of them prints a credential. None of them grows a list, show or delete, and
+`new-value` replaces a value only by opening Ronja's own form: whether a
+credential exists, and revoking it, stay on `ronja api` and in Ronja.
 (`ronja env` and `ronja db env`/`connect` are the loaders: they move a credential
 the CLI already holds into the place another program reads it, and only as
 something to `eval` or exec.)
@@ -1010,7 +1011,7 @@ one is not refused for reaching the other; and the guard implements its own
 10-hop limit, because supplying a `CheckRedirect` **replaces** net/http's default
 policy, which was the only thing stopping a same-origin redirect loop.
 
-## Secrets (`ronja secret create`, `ronja secret connect`)
+## Secrets (`ronja secret create`, `ronja secret new-value`, `ronja secret connect`)
 
 ```
 ronja secret create --feature <feature-id> --name <name>
@@ -1142,6 +1143,59 @@ lengths would be — they never passed through this process; `--json` adds
 A secret's existence, its value's lengths, and deleting it stay on `ronja api`
 (`/api/v2/secret/query`, `/api/v2/secret/:id/field-lengths`,
 `-X DELETE /api/v2/secret/:id`) and in Ronja.
+
+### Entering a new value (`ronja secret new-value`)
+
+```
+ronja secret new-value <secret-id> [--no-browser] [--json]
+```
+
+Replaces the stored value of an API key or a database login without the value
+passing through the CLI. It reads nothing from a prompt, a pipe or a file; a
+script that already holds a value calls `PUT /api/v2/secret/:id`.
+
+1. `GET /api/v2/secret/<id>` answers `newValue`: `{url}`, the form for a new
+   value (built and org-stamped by the server, opened as given), or
+   `{refusal}`, the sentence saying who may change the secret (its owner, the
+   owner of its private feature, an Admin, a maintainer of its feature, or in a
+   project's feature a member with Full access) or why this kind of secret
+   can't be changed this way. A refusal is the error,
+   and nothing opens. A detail read with no `newValue` at all is an older
+   server: `this Ronja server can't take a new value for an existing secret
+   yet (the CLI is newer)`.
+2. The form is opened, or printed on stderr with `--no-browser`, with the
+   same lines as `create --in-browser`: the value goes straight to Ronja and
+   this terminal never sees it; Ctrl-C stops waiting and the secret keeps its
+   current value. The waiting line, and the error when the wait runs out, add
+   that saving the value it already has doesn't count as a new one.
+3. The CLI polls `GET /api/v2/secret/<id>` every 3 s, up to 15 minutes, until
+   `valueChangedAt` moves past what the first read said (absent there means
+   never replaced, so any value counts). Never `updatedAt`: a token refresh or
+   a login moves it too. Re-saving the stored value doesn't move
+   `valueChangedAt`, so that wait runs out. Transient failures get the login
+   poll's window; a 404 is terminal.
+4. A replacement clears the old check result, and the on-save check then
+   stamps a new one. The CLI waits up to 15 s more for a `lastCheckStatus`
+   whose `lastCheckedAt` is at or after `valueChangedAt` and whose
+   `lastCheckSource` is the on-save check's (`probe`, or `refresh` for a login
+   secret's login; never `observed`, which is real traffic that can have used
+   the old value), and prints the line
+   the secret's page shows: `Saved. Ronja tried the new value and it works.`,
+   `Saved, but the service refused the new value: <error>`, `Saved. Ronja
+   couldn't check it: <error>`, or, with no such verdict, `Saved. Ronja hasn't
+   checked the new value yet; the health section shows it when she has.` A
+   verdict stamped before the replacement describes the old value and is never
+   printed. A failure to read the check once the value changed says the new
+   value is saved and that reading the check failed, and prints no JSON.
+5. `--json` prints `{id, name, valueChangedAt, checkStatus, checkError}`:
+   `checkStatus` is `ok`, `auth_failed`, `error` (Ronja couldn't check it) or
+   `null` (not checked yet), and `checkError` is the check's reason or `null`.
+   `auth_failed` exits 1, after the line or the JSON is printed, with an error
+   saying the old value is gone and to enter a working one with `ronja secret
+   new-value <id>`; `ok`, `error` and `null` exit 0, since an unchecked value
+   is an unknown, not a failure. Exit 1 also covers step 1's refusal, an older
+   server and a network failure; a script tells `auth_failed` apart by the JSON on
+   stdout, which only a saved value prints.
 
 ### Connecting a service (`ronja secret connect`)
 
@@ -1724,7 +1778,15 @@ file.
 
 **The binding is local-only** — `.ronja/database.json`, keyed by
 `(url, tenantID)` through `wfdir.InstanceKey`, written only after a successful
-`push`. It is deliberately *not* a
+`push`. `--stack <name>` keys it by stack too, so the databases of two Spaces of
+one organization are told apart (`push --stack dev --database mdb-…` once, then
+`push --stack dev` and `push --stack main`), and a database outside the Space
+that stack declares in the repository is refused (see "Two stacks of one
+organization: a Dev Space and Main"); a push with no `--stack` reads and
+writes only the entry remembered without one. The entries for a stack sit under
+`"stacks"`, which a `ronja` from before them ignores, so it never takes a Dev
+database for the one remembered without `--stack`; its next save drops them,
+and `--stack dev` then says none is remembered. It is deliberately *not* a
 committed `ronja.json`: `wfdir.FindRoot` walks parents and `LoadManifest`
 refuses a non-`workflow` kind, so a committed
 `kind: "database"` manifest at a repo root would break every `wf` command
@@ -2126,7 +2188,8 @@ why the third one exists:
   stamps `formatVersion` 8: an older CLI would push the folder without the
   packages, report success, and every run would fail with
   `ModuleNotFoundError`. A list added by hand must declare
-  `"formatVersion": 8` too, set in the same edit: push, validate and `sync`
+  `"formatVersion"` 8 or higher too, set in the same edit (a folder already
+  above 8 keeps its number): push, validate and `sync`
   refuse a non-empty list below 8, naming the line to add, and `wf status`
   says so.
 
@@ -2178,7 +2241,8 @@ and `pipeline` share one manifest format:
   `moved`**, and `removed` in an automation folder (see "Addresses: `moved` and
   `removed`"); **6 is the folder `"id"`**; **7 is a dependency by address, as a
   write target, as an output or as a run edge**; **8 is a non-empty
-  `pipPackages` list**.
+  `pipPackages` list**; **9 is a stack's Space (`spaceID`), or two stacks on
+  one organization**.
 
 - **`stacks` and `ronja.lock.json`.** See **Stacks** below.
 
@@ -2216,11 +2280,9 @@ A **stack** is one named environment this folder deploys to — `dev`, `staging`
 `prod`. It is what `--stack` selects, and it is the unit the committed files are
 keyed by.
 
-⚠️ The local `.ronja/state.json` is NOT keyed by stack but by instance and
-organization (BL-4e71): two stacks of the same organization share one local
-baseline, so deploy each from its own checkout — switching stacks in one
-checkout is refused as a repointed binding (see "Deploying it to a second
-feature of the same organization" under `ronja import feature`).
+Each stack keeps its own local record in `.ronja/state.json`, so one checkout
+can deploy a Dev Space's stack and Main's in turn (see "Two stacks of one
+organization: a Dev Space and Main" below).
 
 The word is `stack` and not `workspace` (a Ronja primitive) or `env` (which
 collides with `ronja env` and with "environment" meaning the shell's). And it is
@@ -2317,15 +2379,17 @@ otherwise have discovered later:
 - `--stack prd` where this organization is already called `prod` — a typo, and
   the message names the stack that was meant.
 - naming a **second** stack for an (instance, organization) this folder already
-  names — the local baseline is keyed by that pair, so the second stack would
-  compare your drafts against the other environment's rows. One folder, one
-  deployment per organization; use a second directory for a second one.
+  names, from any command that does not declare it with a feature — `--stack
+  mian` beside `main` is a typo, and the refusal lists every stack that is
+  there. Only `ronja bind --stack <name> --feature <id>`, `ronja sync stack
+  add` (and `init`, `clone` and `import feature`, which start a folder) may add
+  one, and never on a feature another stack already deploys into.
 - a new stack name differing from an existing one only by **capitalisation**.
   They are two JSON keys and one word to everybody reading them, so `--stack
   Prod` against a folder naming `prod` would create a second set of resources
   rather than finding the first.
 
-Neither of the last two is a *load*-time refusal, and that is deliberate: **the
+None of the last three is a *load*-time refusal, and that is deliberate: **the
 CLI must never write a manifest it will then refuse to read.** Both pairs can
 arrive with no writer involved — a git merge bringing two branches' stacks
 together is a clean textual merge — and enforced at load one merge accident made
@@ -2348,6 +2412,270 @@ reads the 404 as "create it". (That reading is right for the CREATE twins: they
 "there is nothing here for you". The RUN route answers the same status only for
 a workflow the credential can no longer SEE, and `run` renders it rather than
 passing it through.)
+
+#### Two stacks of one organization: a Dev Space and Main
+
+**Pick the shape by what the second stack is for.**
+
+- **A Space of the same organization** (a "Dev" Space beside "Main"), to build
+  and test against real production data: Dev reads Main's tables its stack
+  names, and never writes or runs a Main row.
+- **A separate organization**, for full isolation: nothing is shared.
+
+References never cross organizations, and neither does anything a stack
+deploys. Each organization needs its own credential: a stored profile per
+organization (`--profile`), or `RONJA_TOKEN`. With no credential chosen (no
+`--profile`, `RONJA_PROFILE`, `--url`, `RONJA_URL` or `RONJA_TOKEN`), a
+command given `--stack` uses the stored profile for that stack's organization
+when there is one. A read (`status`, `sync check`, `sync status`, `pull`,
+`validate`, `app test`) switches and says so on stderr. A command that changes
+the organization (a push, `publish`, `discard`, `run` or `wf test`, `sync
+apply`, `sync stack add`, `copy`, `db migrate push`) switches only after you answer yes on a
+terminal, or with its own `--yes` where it has one: the committed `ronja.json`
+names the organization, so a reviewed edit to its `tenantID` never redirects a
+deploy unannounced. With no terminal it refuses and names the `--profile` to
+pass, so CI chooses its credential. A tree command (`sync apply`, `sync check`,
+`sync status`, `sync adopt`) does the same when the stack names one organization
+across the tree, and refuses, naming them, when it names several.
+
+**One folder, both stacks.** Declare the second with the feature it deploys
+into; with only `--feature`, the stack is named `main` for a feature in the
+organization's default Space, whatever that Space is called, and otherwise
+after the feature's Space, lowercased (`dev`). A name the folder already uses
+for another feature is refused so you pick one:
+
+```bash
+ronja bind --stack dev --feature col-<the Dev Space's feature>
+ronja bind --feature col-<the Dev Space's feature>   # the same, named "dev"
+```
+
+```jsonc
+"stacks": {
+  "dev":  {"url": "https://app.ronja.tech", "tenantID": "ten-…", "featureID": "col-d3v…",
+           "spaceID": "space-d3v…", "space": "Dev", "bind": {…}},
+  "main": {"url": "https://app.ronja.tech", "tenantID": "ten-…", "featureID": "col-…",
+           "bind": {…}} }
+```
+
+**Format version 9.** A stack with a `spaceID`, or two stacks on one
+organization, stamps `"formatVersion": 9`, so a teammate's older `ronja`
+refuses the folder and asks for an upgrade: it would deploy the stack with no
+Space rule, and keep one local sync record for both stacks. A `spaceID` written
+by hand into a file that says less is refused when the folder is opened, naming
+the line to add.
+
+`spaceID` is written when a stack is declared on a feature outside the
+organization's default Space — by `bind --feature`, `sync stack add`, `init`,
+`clone` and `import feature` — and `space` is that Space's name, a label for
+the reader (a note says when it is stale). A stack in the default Space records
+neither, so a folder whose stacks are all there is written exactly as a folder
+from before Spaces, at the format version an older `ronja` reads. Declaring
+refuses when the instance does not answer which Space the feature is in: try
+again. A stack declared on its feature before it recorded a Space gains it the
+next time `bind --feature` or `sync stack add` names that feature. `init` and
+`clone` with no `--stack` declare a stack only for a feature outside the
+default Space, named after that Space (`dev`); a feature in the default Space
+is written with no stack. Every acting command then checks a stack that records
+a Space, adopted or not and `unmanaged` included. A stack that records none
+(Main's) is held to no Space rule by the CLI; the server's own gates still
+apply:
+
+| refusal | where | why |
+|---|---|---|
+| `space_mismatch` | every acting command | the stack's feature is not in its `spaceID` — a feature id pasted from Main into the dev stack, say |
+| `bind_space_mismatch` | `sync check`, `sync apply` (dry run included), every push, `wf test`, `wf run`, `app test` and `pull` | the folder would write or run a row in another Space, or in no feature (which is in no Space): what the write gate reads the code and grants to write or run — an output, a table written by id, a codex, a docs file's table, an automation's `model` or `feature` reference, a workflow or Saved Agent it runs, whether or not its dependency says `"run": true` — and any dependency declared `"write": true` or `"run": true`. In a folder that is not adopted, the row the folder itself deploys (its workflow, app or module, or a pipeline's table, by the id its lock records) is placed too, by the push that reads it and by `sync check`: one in another Space, or one this credential gets a 403 on, is refused before anything is written. A secret is the Space's own: one bound, or named by id, in another Space is refused however it is used. So is every folder write scope (`saveFile`, a write-mode `{{ file() }}`) on a stack outside the organization's default Space, because a run's file writes land in the default Space whatever its feature's Space: a Dev stack writes a table in its own feature instead. Reads of another Space are allowed — a read bind, a module, a `mailbox` — and a raw id the code only reads there is a `sync check` warning: declare it as a dependency, so this stack gets its own |
+| `address_space_mismatch` | wherever an address resolves | the row an address resolves to, read by its own id, is in another Space than the stack's, or the other folder's stack of the same name declares a different Space. A read is refused too: an address resolves within one Space, and reading another Space's row is a bind by id |
+| `space_header_unsupported` | every command on the stack, reads included, at exit 2 | a response to a request naming the stack's Space did not echo it in `X-Ronja-Space`: the instance does not honour the Space header, so that request may have acted in its default Space |
+| `space_unavailable` | the same | the signed-in person cannot enter the stack's Space, or it no longer exists (the server's 409). An Admin includes them on the Space's page, or someone who can signs in |
+| `space_not_selectable` | the same | the credential may not choose a Space: an organization API token, one from the **API Tokens** page not marked **Personal token** (the server's 400). Use a personal sign-in (`ronja login`) or a personal access token |
+
+**A stack's requests carry its Space.** Every request a command makes for a
+stack that records a `spaceID` sends `X-Ronja-Space: <spaceID>`, so what it
+creates outside a feature lands in that Space and its lists and searches cover
+that Space only; a tree command sends each folder its own stack's. The
+instance answers each one it acted on in that Space with the same header, a
+404 or other refusal of the request's own included, and the CLI checks every
+answer: one that does not echo the Space, other than a 401, 403, 429 or 5xx,
+is refused `space_header_unsupported`, and the server's 409 and 400 are the
+other two rows above. The first refusal stops the command at exit 2, and
+nothing further is sent with that Space for the rest of the process; a step
+that only notes its failure, as a metric's tags do, still ends the command at
+exit 2 with the refusal on stderr, unless a tree command's folder line already
+prints it. An acting
+command's first such requests read the stack's Space and feature, so an
+instance that does not honour the header is caught before any write. A stack
+that records no Space (Main's), and a command on no stack, send no header, as
+before. `sync check` and `sync status` read through the stack's Space too, so
+a check predicts the deploy's refusal, and report the folder `unknown` under
+the row's reason (`sync status` in its detail). In `sync check` and `sync
+apply`, apply's plan included, the folder whose step met the refusal is
+`unknown` under the row's reason with the refusal as its detail, whatever else
+the step reported; in `sync apply` a detail it had written before, such as
+what landed, stays as a note. Each later folder on the same Space is `unknown`
+under the same reason, `not attempted: <folder> got no confirmation of the
+Space, and nothing further was sent` (or `was refused the Space`), naming the
+folder that met it, unless a reason of its own answered it before any
+request; a workflow whose row `sync apply`'s first pass had already created
+reads `not attempted after its row was created: <folder> …`. Folders of
+another organization, another Space or no Space go on, and the run exits 2.
+The run's closing error does not repeat a refusal a folder's line printed. A
+status whose Space requests
+get no answer (a dropped connection, a 503) reports its local half and leaves
+the remote half unchecked, as for any unanswered read. A command with no token
+sends no header, so it fails as the instance's own sign-in refusal. `ronja api
+-H "X-Ronja-Space: …"` sends the header as written and checks nothing. `db
+migrate` sends no header: a migration names its database by id, and the
+database's Space is checked instead (below). `app fork` sends none either: the
+kit is the instance's public docs, in no Space. Nor do `bind`'s reads of a
+feature, a Space or a candidate row by id, which answer in any Space, while
+the stack they place may still be being declared; its search does.
+
+On a stack that records a Space, and on any stack `bind --feature` or `sync
+stack add` declares on a feature in a Space (the default Space included),
+`ronja bind` proposes a read dependency only when exactly one row of that name
+is in the Space, and a write or run dependency only
+when exactly one is in the stack's own feature; a row in no feature is never
+proposed. On a stack that already records its Space the search is asked in that
+Space, so the 40-result cap counts only that Space's rows; the Space of every
+hit is still read and checked. A table another stack binds to a snapshot copy is proposed as that
+copy's source, by id, when the source is in this stack's Space. Everything else
+is reported unbound, to bind by hand. A table with no row there that another
+stack of the folder binds is reported with the `ronja copy` line that makes one:
+`ronja copy <name> --to-stack <stack>` for a read, `--no-rows` for a table the
+code writes.
+
+**Every folder at once: `ronja sync stack add`.** From the root of a tree,
+
+```bash
+ronja sync stack add main --feature col-<Main's feature>
+ronja sync stack add --feature col-<the Dev Space's feature>   # named after the Space: "dev"
+ronja sync stack add --feature col-<Main's feature>            # the default Space: "main"
+```
+
+declares the stack in every folder under `--dir`, with the same proposals as
+`bind --feature` in each, under one confirmation (`--yes` without a terminal). It
+writes only `ronja.json` files and creates nothing on the server; `sync apply
+--stack <name> --allow-create` does that. The report lists each folder's
+proposals and every name it could not fill, with its `ronja copy` line where
+there is one, and the command exits 1 while any is left unbound. The stack is
+named by the argument; `--stack` is refused here. A folder whose
+stack already names the feature but records no Space it should is reported as
+`Space recorded` (`spaceRecorded` in `--json`), and gains it. The name
+defaults to `main` in the default Space and otherwise to the feature's Space,
+lowercased; one a folder already uses for
+another feature is refused, and you give the name as the first argument. A
+folder that cannot be opened, or that declares the name for another feature,
+refuses the whole command before anything is written. So does a bound folder
+whose stack names no feature (an unnamed `instances` entry being named, say)
+when the row it already deploys is in another feature than `--feature`, or
+cannot be read; `bind --feature` refuses the same.
+
+In the same confirmation it **lifts every raw id** in the folders' code into a
+declared dependency: `{{ ref('table-…') }}`, `{{ write('table-…') }}`,
+`{{ workflow('workflow-…') }}` and every other marker naming an id become an
+alias, declared and bound to that same id in every other stack and `instances` entry
+of the folder that does not bind it yet; the stack being declared is left to its
+own proposals, so a re-run never hands it the other stack's row. A stack that
+records a Space is bound to an id it would write, run or use as a secret only
+when that row is in its Space: anywhere else its next deploy would be refused
+`bind_space_mismatch`, so the alias is left unbound there, listed per folder and
+stack (`liftUnbound` in `--json`) and counted in the exit code. A read is bound
+wherever the row is. A plain dependency that every stack
+binding it binds to that id is reused, gaining the access the code needs; one
+some stack binds to another id (a Dev copy) is not, and the lift declares its
+own alias beside it. No stack's existing bind is changed. Those stacks' codecs turn the alias back into the id,
+so what they push is byte for byte what they pushed before, and the new stack
+binds its own. An output literal (`tools.replaceTable(df, "table-…")`, placed
+by `POST /workflow/validate`'s own scan in the workflow's one stack on this
+organization) becomes `{{ write('<alias>') }}`, a write dependency bound the
+same way: the existing stack's run writes the same table, and its stored code
+differs in that one argument, so its next push is a new version. Commit the
+lift and push the existing stack after it, so an older checkout does not push
+the literal back. A workflow with no stack, or several, on this
+organization is not scanned: the report notes it per folder (`literalsSkipped`
+in `--json`), and you lift its output literals by hand. A pipeline's own
+tables, an id literal in app TSX, an app's `access` lists and automation files
+are not lifted. Every lift and every declaration is planned before the
+confirmation, so an output literal it cannot place (its line names the id more
+than once) refuses the command naming `file:line`, and nothing is written.
+
+A folder that writes files (a `"kind": "folder"` write dependency) is not
+declared on a stack outside the organization's default Space, since every deploy
+of it there would be refused `bind_space_mismatch`; it is reported as
+`folder_write_outside_default_space`, counted in the exit code, and its raw ids
+are not lifted.
+
+A push of one folder opens its report with the stack it deployed through and
+its Space (`Stack:      dev · Space Dev`), as `sync apply` names them in its
+header.
+
+`ronja db migrate push --stack` (and `status`) remembers a database per stack,
+and refuses one outside the Space the stack of that name, on this instance and
+organization, declares in the repository's folders: every `ronja.json` in the
+git work tree holding the migrations folder is read, nested folders included,
+and a database whose `spaceID` (`GET /api/v2/database/:id`) is not that Space
+is refused before anything is applied, as is a stack that two folders declare
+for two different Spaces (naming the folders): exit 1, with an error that
+leads `refused (bind_space_mismatch):`. A stack no folder declares a Space for
+(Main's) is not checked, and a database the instance reports no Space for gets
+a one-line note and no check. With `--stack`, a migrations folder in no git
+work tree, a `ronja.json` there that cannot be read, or a database whose Space
+could not be read stops the push at exit 2 before anything is applied, naming
+the file or the database: each could hide which Space it is. `--database <id>`
+without `--stack` applies with no Space check, by design, for a build that has
+no repository at hand.
+
+**Copying tables into a stack (`ronja copy`).** Run in a folder, it snapshots
+tables into a stack's feature and binds the folder to the copies there:
+
+```bash
+ronja copy erp_orders erp_items --to-stack dev      # each dependency's row in the other stack
+ronja copy erp_orders --to-stack dev --from-stack main   # when several stacks bind it
+ronja copy table-abc123 --to-stack dev              # a table by id
+ronja copy board_notes --no-rows --to-stack dev     # the columns only, for a table the code writes
+```
+
+Each copy is a dynamic table in the `--to-stack` stack's feature
+(`POST /api/v2/feature/model/:id/copy`), and its id is written into
+`stacks.<to>.bind`. The source is the row another stack of the folder binds,
+and only a stack on the target's organization counts: copies never cross
+organizations, so `--from-stack` naming another one is refused before anything
+is copied. A table given by id is bound under the dependency the target stack
+already binds to that table or to its copy; one it binds under no dependency
+becomes a dependency, named after the table. The server remembers which table a
+copy was made from, so running the same command again refreshes the same table
+(its rows replaced, its id kept) and leaves `ronja.json` unchanged. `--no-rows`
+creates the table with the source's columns and no rows, or empties the copy.
+Reading Main's row to copy it is a read by id, which a Dev stack may make; the
+copy is always made in the target stack's own feature. `--name` names a copy
+of one table that is created; a refresh keeps its name.
+
+A copy is synchronous, is refused above 1 GB, and runs under the CLI's slow
+request deadline (120 s), past the route's own 80 s limit so its answer arrives.
+A failed copy binds nothing, the others in the same run are still bound, and the
+command exits 1:
+
+| reason | why |
+|---|---|
+| `copy_timeout` | the copy did not finish within the route's limit, no answer came within 120 s, or a load balancer answered 504 before the route did (the copy is then probably still writing: wait a minute). Nothing was bound and running the same command again is safe: it refreshes the same table, never a second one. For a large source, copy a smaller derived table |
+| `name_taken` | the target feature already holds a table of that name that is not a copy of this source. Copy it under another name with `--name <name>` |
+
+**One local record per stack.** Each `.ronja/state.json` entry carries its
+`stack`. A record written before that is used by the one stack declared on its
+organization, and renamed to it on the next save; `bind` stamps it before it
+declares a second stack there. When a merge has already put two stacks on the
+organization, neither uses the old record, and a note says so.
+
+**Promotion is `sync apply --stack main`.** The same commands deploy each
+stack, from one checkout:
+
+```bash
+ronja db migrate push --stack dev --database mdb-<Dev's>   # remembered for dev from now on
+ronja sync apply --stack dev --allow-create                # --allow-create only the first time
+(cd workflows/region-report && ronja wf run --stack dev --logs)
+ronja db migrate push --stack main
+ronja sync apply --stack main
+```
 
 **Migration, and how a folder stays on the old shape.** A folder written before
 stacks keeps its `instances` list, ids and all, and **no push rewrites it** — a
@@ -2732,7 +3060,9 @@ Seven rules, and each one is a wrong deploy that does not fail:
   match for it in a new stack is the very table another stack writes —
   production, when the new stack is a Dev stack in the same organization. It is
   reported unresolved with reason `write_target` ("write target — bound by
-  hand, per stack") and left for a person to bind, stack by stack.
+  hand, per stack") and left for a person to bind, stack by stack. On a stack
+  that declares a Space, the one exception is a single same-named row in the
+  stack's own feature (see "Two stacks of one organization").
 - **A run target is never proposed.** A dependency declared `"run": true` is a
   workflow or saved agent outside the stack's feature that the folder RUNS —
   with that row's own authority — and its exact-name match is the row another
@@ -2828,10 +3158,11 @@ is something a person names:
   now names the flag. A stack declared with no feature is a half-answer in a
   committed file that reads as a decision somebody made — the hazard `adoptStack`
   declines for the same reason.
-- **`--feature` needs `--stack`**, and the gate is on the *flag*, not on the
-  resolved stack. A folder matches a stack implicitly perfectly well, so gating
-  on the resolved name would let a bare `--feature` reach into whichever
-  environment this credential happened to match.
+- **`--feature` without `--stack` names a new stack after the feature's Space**
+  (`dev`), or `main` in the organization's default Space whatever it is called,
+  and is refused when the folder already has a stack of that name for another
+  feature, or when the instance names no Space for the feature. It never reaches
+  into whichever environment this credential happened to match.
 - **It will not repoint a stack that already names a different feature.** That
   changes where every future resource is created, and belongs in the file under
   review rather than on a command about aliases.
@@ -2899,9 +3230,10 @@ address dependency is refused: they would be two answers to one question.
    the one being applied.
 2. That stack must point at the same `url` and `tenantID`, or the dependency is
    refused `address_stack_mismatch` — an address never resolves across
-   organizations or instances. The same-Space half of that rule has
-   its hook in `addressSameSpace`, which answers nothing until a stack can name a
-   Space.
+   organizations or instances. When both stacks declare a Space, it must be
+   the same one, or the dependency is refused `address_space_mismatch`; on a
+   stack with a Space, the row it resolves to is read and must be in that
+   Space, or it is refused the same way, read or write.
 3. The other folder must be ADOPTED (have a folder id) for that stack, or it is
    refused `address_not_adopted`: only an adopted folder keeps the server state
    an address is resolved through.
@@ -4886,7 +5218,8 @@ carry `"tags"` refuses the whole metric file as an unknown key — run
 
 **Stated limits.** A tag assignment carries no author, so removing a name from
 the file removes it for everyone who also chose it. A push's tags land in the
-organization's default Space. Tables, workflows, apps and modules have no
+Space its stack records, or the organization's default Space for a stack that
+records none. Tables, workflows, apps and modules have no
 `tags` key yet.
 
 ### Health checks — `checks/<stem>.json`
@@ -5520,7 +5853,7 @@ Two keys are module-specific:
 
 - **`name`** is the Python package consumers import — the identifier that appears
   after `import`. It has to be a valid Python identifier, is unique among the
-  live modules in the organization, and is refused when it shadows something the
+  live modules in its feature, and is refused when it shadows something the
   runtime already provides (`json`, `requests`, `tools`, …), because user modules
   are *appended* to `sys.path` and a shadowing name would be silently
   unimportable. A plain string with the same three-state rule `title` follows:
@@ -6044,7 +6377,7 @@ this" and on "I could not look".
 | exit | `verdict` | meaning |
 |---|---|---|
 | 0 | `clean` | every folder was checked, and every one is clean |
-| 1 | `drifted` (`status`) / `broken` (`check`) | checked, and something is out of step — changed on the server, or never deployed at all / a reference does not resolve |
+| 1 | `drifted` (`status`) / `broken` (`check`) | checked, and something is out of step — changed on the server, or never deployed at all / a reference does not resolve, or a folder is refused as a whole |
 | 2 | `unknown` | could not tell — a skipped folder, an unreadable manifest, a dead credential, or an **empty walk**; under `apply`, also a write the instance never answered (`api.Unanswered` / a timeout) and the folders an interrupt never reached |
 
 **`unknown` wins over the middle answer.** The strongest true statement about a
@@ -6278,6 +6611,17 @@ the instance gave a definite negative, so a run through it will fail.
 `not_checked` is the other thing entirely, and a job must conclude nothing from
 it.
 
+**A folder refused as a whole is counted as refused.** A folder a rule refuses
+before its references decide it (the Space rule's `space_mismatch` and
+`bind_space_mismatch`, a claim refusal such as `claimed_elsewhere`, the write
+gate's `writes_outside_target` and `runs_outside_target`) is `broken` with that
+`reason`, and its references may all be `ok`. The summary counts it under
+`refused` (`summary.refused` in `--json`, a `1 folder refused
+(bind_space_mismatch)` line in the human summary), and the closing error names
+it apart from the folders whose references do not resolve: `1 folder refused
+(bind_space_mismatch); 1 of 3 folders makes references that do not resolve (1
+unresolved, 0 unreachable)`. Exit 1 either way.
+
 **Per-kind legs.**
 
 - **Workflow — the server does it.** `POST /api/v2/workflow/validate` takes
@@ -6450,11 +6794,14 @@ prints, so the preview and the run cannot disagree about what apply will attempt
 | `orphaned_file` | rename detection: a table, metric or automation this stack binds whose file is gone, with no `moved` or `removed` entry covering it. Apply never infers a rename (which would be a create plus an orphan) or a delete from a missing file; the single-folder pipeline push only NOTES it |
 | `address_unresolved`, `address_stack_mismatch`, `address_not_adopted`, `address_folder_unreadable`, `address_not_written` | a dependency declared by address did not resolve for this stack — see "Dependencies by address" under `ronja bind`. Under `--allow-create` an address whose row the same run deploys is deferred instead (below) |
 | `writes_outside_target` | an ADOPTED folder would write outside its stack's feature through something no write source of that stack binds — a docs sidecar's table prose included — see "The write gate". At plan time for a workflow or app the run would create (so a refused folder leaves no row behind), for a pipeline's docs sidecars, and for every folder in a `--dry-run`; inside the push for every write |
-| `no_write_targets` | an ADOPTED workflow folder's validate came back with no `writeTargets` at all: the instance is older than this CLI, so nothing can say where the code writes, and the gate refuses rather than admit it — upgrade the instance, use a matching `ronja`, or `sync unmanage` the stack. Its own reason so a script does not read "writes another feature" for "instance too old" |
+| `no_write_targets` | an ADOPTED workflow folder's, or one on a stack with a Space, validate came back with no `writeTargets` at all: the instance is older than this CLI, so nothing can say where the code writes, and the gate refuses rather than admit it — upgrade the instance, use a matching `ronja`, or `sync unmanage` the stack. Its own reason so a script does not read "writes another feature" for "instance too old" |
 | `runs_outside_target` | an ADOPTED folder would run a workflow or saved agent outside its stack's feature that no `"run": true` dependency of that stack binds — see "The write gate" → run edges. Same timing as `writes_outside_target` |
 | `no_feature` | an ADOPTED folder whose selected stack names no `featureID`: it would deploy unclaimed and ungated. Add the feature, or mark the stack `"unmanaged": true` |
 | `cyclic_dependency` | a pipeline folder's files read each other in a loop (`topoOrder`), or two pipeline FOLDERS read each other's tables by address — neither has an order to build in |
 | `module_marker`, `no_module_name` | a module folder whose file carries a marker, or whose manifest names no package; a module with no `__init__.py` is `missing_entrypoint` |
+| `name_taken` | under `--allow-create`, the target feature already holds a live workflow, app, module or automation of this unit's kind and name, so the create would twin it. The refusal names the row: record its id for the stack in `ronja.lock.json` (`"workflowID"`, `"dataAppID"`, `"moduleID"`, or the automation file's `"automationID"`) and apply again to adopt it, or rename one of the two |
+| `space_mismatch`, `bind_space_mismatch`, `address_space_mismatch` | a stack that declares a Space would deploy outside it — see "Two stacks of one organization: a Dev Space and Main" |
+| `space_header_unsupported`, `space_unavailable`, `space_not_selectable` | `unknown`: the CLI cannot act in the Space a folder's stack records — the instance does not honour the Space header, the person cannot enter the Space, or the credential is an organization API token — see "A stack's requests carry its Space" |
 | `address_conflict` | the folder's `moved` / `removed` cannot be applied to this stack: an old file still on disk, a removed file still on disk, both ends of a move already bound, a table moved without its `checks/<stem>.json`, or `moved` below format 5. A folder that could not be READ while evaluating them is `unreadable` instead |
 
 **Dependency order, and a fresh stack in one apply** (`sync_apply_order.go`).
@@ -7544,8 +7891,7 @@ ronja pipeline pull --dry-run # print the diff, write nothing anywhere
      what the row held before its first version (a commit turns the DRAFT into
      the version). That case compares the folder with this checkout's local
      baseline instead, used only when it was read off this live row (`sourceID`
-     the row, lifecycle live — not another stack's row, BL-4e71, and not a
-     draft) at least 2 s before the oldest version's `committedAt` (a discard
+     the row, lifecycle live — and not a draft) at least 2 s before the oldest version's `committedAt` (a discard
      re-reads live after the publish, and such a baseline describes the
      publish). With no such baseline (a fresh checkout) the pull refuses, saying
      the comparison cannot be made and why, unless the folder already holds
@@ -7736,7 +8082,14 @@ in, before writing a file). A push gates BEFORE its live-first "the live row
 already holds this folder" check, so a folder that writes outside is refused
 whether or not it changed — an adopted workflow folder therefore sends one
 `POST /workflow/validate` on every deploy, unchanged or not (it persists
-nothing). A classic folder (no folder id) is checked exactly as before.
+nothing). A classic folder (no folder id) is checked exactly as before. On a
+stack that declares a Space, the same paths run the gate's Space rule whether
+the folder is adopted or not, `unmanaged` included, and `sync check` runs it
+too: every target the gate lets out of the stack's feature, or in a folder the
+feature rule does not cover every target outside it, must be in the stack's
+Space, or it is refused `bind_space_mismatch` (see "Two stacks of one
+organization"). Validate's `writeTargets` cover the workflow's own files only,
+never a module it imports: a module is read-only to this rule.
 Turning it off is one committed line — `"unmanaged": true` on the stack, or
 deleting `"id"` — so `sync apply` says so: a note on each folder it deploys
 unmanaged where the gate could apply (a stack marked `"unmanaged"`, or no id in
@@ -7889,7 +8242,11 @@ and the first `sync apply` of it sends no write.
 **Defaults.** The name is matched EXACTLY among the organization's features (a
 private feature is imported by its id — a name could otherwise mean somebody's
 private one); a name matching none, several, or only a full page of search hits
-is refused. `--stack` defaults to `main`, pinned to the feature's id. The
+is refused. `--stack` defaults to `main` for a feature in the organization's
+default Space (whatever that Space is called) or on an instance that names no
+Space, and otherwise to the feature's Space, lowercased (`dev` for a Space
+called Dev), pinned to the feature's id. Only a stack outside the default Space
+records its Space, so a Main import is written exactly as before Spaces. The
 destination defaults to the current directory and must be empty but for a
 `.git` (a directory just `git init`ed, or a clone of an empty repository, is
 where a repository starts; the tree is moved in beside it): import never
@@ -7906,6 +8263,58 @@ as data sources") and declared as a read data source — a write-capable one whe
 it is written — wherever it is referenced, bound in the importing stack. A
 credential that cannot call `/me` (a scoped token) is planned as an Admin; a
 claim the server then refuses is withdrawn as step 5 describes.
+
+**Part of a feature: `--only`.**
+
+```bash
+ronja import feature --only data_app-… --stack dev ./region-board
+ronja import feature --only workflow-… --only workflow-… ./reports
+```
+
+imports the named rows and everything they need inside their feature,
+transitively, read off the same reference inventory: every row a member
+references (an app's workflows and tables, a workflow's modules and the derived
+tables it reads, those tables' inputs), the workflow that writes a member
+output table, every other workflow of the feature that writes a member, by
+marker or by id (`tools.replaceTable(df, "table-…")`, the shape a chat-built
+app's table is filled by), and every automation whose action runs a member.
+The report lists each workflow carried only because it writes one under
+`writersCarried` ("Workflows carried because they write a row the import
+needs"), with the rows it writes. The feature is
+the rows' own, so the one argument is the destination; rows of two features are
+refused, naming each. A named row the import would leave out is refused before
+anything is written, since what it needs would land without it: each is named by
+kind, name and id with its reason. A row another folder manages names that
+folder (its id, stack label and source): work there, where `ronja sync stack add
+<stack> --feature <id>` deploys it to another stack, or run `ronja sync unmanage
+--stack <label>` in it, which releases every row that folder claims, and import
+again. A derived table a non-Admin cannot manage, a non-derived table and a metric
+with no recipe are refused with the reasons `notImported` gives them. Everything else is planned exactly as for a whole feature:
+a row of the feature left out of the set is a declared dependency, named after
+the row and bound in the importing stack, as a row of another feature always is.
+Run it as an **Admin**, or the derived tables become data sources instead of a
+pipeline folder. Dependencies are named after the rows they were imported from,
+so name each secret the same in every Space (`hubspot` in Dev and in Main) and
+the next stack's picker finds it; one named differently is reported unbound and
+bound by hand.
+
+An imported automation keeps running in the feature it came from, and the copy
+another stack deploys runs too (automations run in every Space). The report
+lists each one under `alsoFires` ("Automations that will fire in both places"):
+switch the original off in the web app if it should stop.
+
+Taking an app built in a Dev Space to Main is three commands, run by an Admin:
+
+```bash
+ronja import feature --only data_app-<Dev's> --stack dev ./region-board
+cd region-board && ronja sync stack add main --feature col-<Main's feature>
+ronja sync apply --stack main --allow-create
+```
+
+`sync stack add` binds each dependency to its Main row where the picker finds
+one (a snapshot copy to its source) and prints the `ronja copy --no-rows … --to-stack
+main` line for a table the app writes that Main does not have; `sync apply`
+creates the rest in dependency order and stops on `name_taken`.
 
 **The tree.**
 
@@ -8013,7 +8422,9 @@ run.
 `claims` (one outcome per row: `claimed`, `refused` or `unclaimed`), `literals` (each left-in-place literal with its
 folder, file, line, call and target, and the alias an output literal's table was
 declared under), `dataSources` (alias, kind, `read` / `write` / `run` /
-`side_effect`, and the id it is bound to in the importing stack), `addresses`,
+`side_effect`, the id it is bound to in the importing stack, and `copiedFrom`:
+the table a table is a snapshot copy of, which the human report prints as `, a
+copy of <its name>`, by id when the source cannot be read), `addresses`,
 `outputs` (each own output declared by name, and the row the importing stack
 binds it to), `claimedElsewhere`, `notImported` (every resource the inventory
 lists and no folder holds — a non-derived table, a workflow's output, a saved
@@ -8029,36 +8440,38 @@ was imported for: commit it, and `sync apply --stack main` keeps that feature in
 step with the repository.
 
 **Deploying it to a second feature of the same organization** is one `sync apply
---allow-create`, once the new stack is declared. Two limits shape it, and both
+--allow-create`, once the new stack is declared. Two things shape it, and both
 belong before the walk-through:
 
-- ⚠️ **One checkout per stack.** The local `.ronja/state.json` baseline is keyed
-  by instance and organization, not by stack (BL-4e71), so a checkout
-  that has deployed one stack reads another stack of the same organization
-  against that stack's baseline and refuses its rows as a repointed binding —
-  never writing over them. Switching stacks (dev, then main) in ONE checkout is
-  therefore refused; deploy each stack from its own clone. A CI checkout (no
-  `.ronja/`) is unaffected. Stacks in different organizations have separate
-  baselines and are unaffected too.
-- ⚠️ **One module folder, one module.** Every stack deploys the module folder
-  to the feature the module already lives in (a module's package name is unique
-  among the live modules of its feature), so applying any stack publishes that
-  one copy (the `shared_module` warning below).
+- **One checkout deploys both stacks.** Each stack keeps its own local record in
+  `.ronja/state.json`, so applying dev and then main from one checkout compares
+  each with its own last sync.
+- ⚠️ **A module belongs to one feature.** A module's package name is unique among
+  its feature's live modules. A stack whose module folder names the feature the
+  module already lives in shares that copy, and applying it publishes into that
+  feature (the `shared_module` warning below); to give the new stack its own
+  copy, point that folder's stack at the new feature instead.
 
-The stack is declared by hand (one command for it is BL-6179)
-in EVERY folder's `ronja.json` — the same `url` and `tenantID` as `main`, the new
-feature's id — and its data sources are bound there:
+`ronja sync stack add <new> --feature <id>` declares the stack in EVERY folder of
+the tree at once — the same `url` and `tenantID` as `main`, the new feature's id
+(see [Every folder at once](#two-stacks-of-one-organization-a-dev-space-and-main))
+— and binds its data sources by name in the feature's Space, folder by folder:
 
 - every READ or side-effect source (a connector table, another feature's table,
-  a secret, an MCP server) — to the original rows, usually, or to the new
-  stack's own; `ronja bind --stack <new>` proposes name matches for these;
-- every WRITE source (`"write": true`, a folder or a feature included) — by
-  hand, to a row this stack may write. `ronja bind` never proposes one;
-- every RUN source (`"run": true`) — by hand, to the workflow or agent this stack
-  may run: the original only when the new stack should really start it.
-  `ronja bind` never proposes one either;
+  a secret) — re-picked by name: bound when exactly one row of that name is in
+  the Space, usually the one the code reads today; an MCP server, and any name
+  with no single match, is reported for a hand bind;
+- every WRITE source (`"write": true`, a folder or a feature included) — bound
+  only to the one row of its name in the new stack's own feature, and otherwise
+  reported, with the `ronja copy --no-rows` line that creates it empty there;
+- every RUN source (`"run": true`) — on the same terms as a write source, so a
+  workflow or agent of another feature is bound by hand, the original only when
+  the new stack should really start it;
 - nothing for an address or an own output: those resolve in the new stack
   through the run itself.
+
+It exits 1 while any name is left unbound; bind each by hand under
+`stacks.<new>.bind`, or with `ronja bind --stack <new>` once the row exists.
 
 Then `sync apply --stack <new> --allow-create` creates every row in the new
 feature in dependency order, each reference between imported resources resolving
@@ -8066,18 +8479,19 @@ to the new copy as it is made. Two things in the tree still name the ORIGINAL
 feature's rows, and the import report lists both: an id literal in app source
 (edit it by hand), and an output literal — which the write gate refuses in the
 new stack, naming the line, until it is written as `{{ write('<alias>') }}` so
-the stack's bind is what it writes. A module folder's new stack names the
-feature the module already lives in, so every stack of one organization imports
-the same module.
+the stack's bind is what it writes. A module's package name is unique per
+feature, so a module folder's new stack may name the new feature (the stack gets
+its own copy) or the feature the module already lives in (the stacks share it).
 
-⚠️ **So applying the new stack publishes the organization's ONE module** — the
-copy every feature's workflows import, production's included. `sync apply`
-says so loudly whenever it would push a module folder into a feature its other
-folders do not all deploy to (or the run holds no other folder): a run-level
-warning, `shared_module`, at the top of the human report and under `warnings`
-in `--json` (`reason`, `path`, `detail`). It is a warning, not a refusal: one
-shared module is the only shape the tree can have, and an edit to it reaches
-every stack whichever one you deploy. The warning is computed AFTER the run, so
+⚠️ **A shared module is published by every stack that deploys it.** When a
+module folder's stack names the feature production's module lives in, applying
+the new stack publishes that copy — the one production's workflows import.
+`sync apply` says so loudly whenever it would push a module folder into a
+feature its other folders do not all deploy to (or the run holds no other
+folder): a run-level warning, `shared_module`, at the top of the human report
+and under `warnings` in `--json` (`reason`, `path`, `detail`). It is a warning,
+not a refusal: a tree may share one module on purpose, and then an edit to it
+reaches every stack whichever one you deploy. The warning is computed AFTER the run, so
 it tells a planned change from a no-op: "This publishes …" when the module
 changes (or the dry run cannot tell), and "Nothing in module … changes in this
 run" when the dry run found the live module holding the folder or the apply's
@@ -8122,93 +8536,118 @@ a change without touching live data, build and test it in a **dev Space**: a
 separate Space of the same organization, with its own feature, its own managed
 database and its own secrets. Then deploy the finished work to your real Space.
 
-**Once, in the browser.**
+**Once, in the browser or with `ronja api`.**
 
 1. An Admin creates the Space on the **Spaces** page (`/admin/spaces`), for
-   example "Dev". Anyone else asks an admin to.
-2. Switch to that Space and create the feature the `dev` stack will deploy
-   into.
-3. If the work uses a managed database, an Admin creates it while in that
-   Space: on the **Databases** page, or by asking Ronja in a chat started
-   there. The database then belongs to the dev Space.
-4. Still in that Space, create the dev Space's own copy of every row the work
-   depends on: its secrets, its tables, and a login to the dev database. `bind`
-   below can only offer the dev Space's rows once they exist.
+   example "Dev", and includes the people who will test in it there. Anyone
+   else asks an admin to.
+2. Create, in that Space, the feature the `dev` stack will deploy into.
+3. If the work uses a managed database, an Admin creates it in that Space. The
+   database then belongs to the dev Space.
+4. Create the dev Space's own copy of every row the work depends on: its
+   secrets, its tables, and a login to the dev database. `bind` below can only
+   offer the dev Space's rows once they exist.
 
-An organization API token cannot choose a Space. A personal access token can,
-per request, with `ronja api -H 'X-Ronja-Space: <id>'`. A request that names no
-Space creates in the default Space, and a database create there reuses only a
-database in the default Space: if the name is only in another Space, the create
-is refused and names that Space.
-
-**Migrations: the dev database first, then the real one.**
+In the browser, switch to the Space first (steps 2 to 4 then land in it). From
+the command line, the CLI's own sign-in is a personal token, and a request
+naming a Space in `X-Ronja-Space` acts in it:
 
 ```bash
-ronja db migrate push --database <the dev Space's database id>
-# test against it
-ronja db migrate push --database <the real Space's database id>
+space=$(ronja api -X POST /api/v2/space -d '{"name":"Dev"}' --jq '.id' -r)   # an Admin
+ronja api -X POST /api/v2/feature -H "X-Ronja-Space: $space" \
+  -d '{"name":"Sales (Dev)","scope":"private"}' --jq '.id' -r                # the dev stack's feature
+ronja api -X POST /api/v2/database -H "X-Ronja-Space: $space" \
+  -d '{"name":"sales_dev"}'                                                  # an Admin; belongs to Dev
+ronja sync stack add --feature <that feature's id>                           # the dev stack, below
 ```
 
-Today a `migrations/` folder remembers one database per organization, and both
-databases are in the same one, so pass `--database` on each push rather than
-relying on the remembered binding.
+A secret or table made in the dev feature is in the Space through its feature,
+header or not. Including people in the Space takes a signed-in person, on the
+Space's page. An organization API token (one from the **API Tokens** page not
+marked **Personal token**) cannot name a Space: the
+request is refused `400 space_not_selectable`, so use `ronja login` or a
+personal access token. Without the header, a feature or
+database a token creates lands in the organization's default Space, and a
+database create there reuses only a database in the default Space: if the name
+is only in another Space, the create is refused and names that Space.
 
-**Folders: one per Space.** A stack is one deployment per organization today,
-and both Spaces are in the same organization, so one folder cannot declare a
-`dev` and a `prod` stack for them: `ronja bind --stack prod --feature …` in a
-folder whose `dev` stack names this organization is refused, because the
-folder's local sync baseline is keyed by the organization. Deploy to the dev
-Space from a second folder instead:
+**One folder, a stack per Space.** The dev Space is a second stack of the same
+folder, in the same checkout (see "Two stacks of one organization: a Dev Space
+and Main" under Stacks):
 
-1. Make the dev folder a copy of the real one: copy the source files, and copy
-   `ronja.json` with both its `stacks` and its `instances` blocks removed. Do
-   not copy `.ronja/` or `ronja.lock.json`; they record the real Space's rows.
-2. In each folder of the dev tree, declare the `dev` stack on the dev Space's
-   feature. Run it without `--yes`:
-
-   ```bash
-   ronja bind --stack dev --feature col-<the dev Space's feature>
-   ```
-
-3. Check every id `bind` proposes before you accept it. A token's search covers
-   the whole organization, so `bind` can propose a row from your real Space:
-   as the only candidate when the dev Space has no row of that name yet, or as
-   one of several candidates when both Spaces have one. Never run `bind --yes`
-   in the dev folder. To see which feature each candidate belongs to:
+1. Declare the `dev` stack on the dev Space's feature in every folder of the
+   tree, from its root. A folder still on the unnamed `instances` shape names
+   its deployment first (`ronja wf push --stack main`, or its kind's push):
 
    ```bash
-   ronja api '/api/v2/search?q=hubspot' --jq '.result[] | [.kind, .id, .title, .featureID] | @tsv' -r
+   ronja sync stack add --feature col-<the dev Space's feature>   # declares "dev", named after the Space
+   ronja bind --feature col-<the dev Space's feature>             # the same, in one folder
    ```
 
-   A row is the dev Space's when its feature is the dev feature, or another
-   feature in the dev Space. In the web app, a table's or a secret's page
-   (`/tables/<id>`, `/secrets/<id>`) links the feature it belongs to; open that
-   feature with the dev Space selected, and a feature in any other Space says
-   "This feature is in <Space>." at the top of its page. If a proposed id is
-   not the dev Space's, decline (one prompt covers the whole write, so nothing
-   is written), create the dev Space's row of that name, and run `bind` again.
-4. For a name `bind` reports as ambiguous, set the dev Space's row id by hand
-   under `stacks.dev.bind` in the dev folder's `ronja.json`:
-   `"<alias>": "<the dev Space's row id>"`. `bind` never fills in a table the
-   code writes (`write_target`) or a workflow or Saved Agent it runs
-   (`run_target`): set each of those by hand under `stacks.dev.bind` too, to
-   the dev Space's row (see [Dependencies](#dependencies-ronja-bind)).
-5. Run `ronja sync apply --stack dev --allow-create` in the dev tree, and test
-   there (`ronja wf test`, `ronja app test`). The first deploy creates every
-   row in the dev Space, and `sync apply` creates nothing without
-   `--allow-create`; later deploys to the dev stack don't need it.
-6. Copy the finished work back, folder by folder: copy the source files into
-   the real folder, and replace its `ronja.json` with the dev folder's (which
-   holds the tested `parameters`, `dependencies`, `entrypoint`, `runtime` and
-   `access`) with the real folder's own `stacks` and `instances` put back into
-   it. Keep the real folder's `.ronja/` and `ronja.lock.json`. Then run
-   `ronja sync apply --stack prod` in the real tree, with `--allow-create` the
-   first time if the dev work added a unit (a workflow, an app, a `.sql` file)
-   the real tree never had.
+   Under the same confirmation it lifts each raw id in the code into a
+   dependency bound to the same id for main (see "Every folder at once" under
+   Stacks), so main reads and writes the same rows and dev binds its own. A
+   lifted output literal changes main's stored code in that one argument, so
+   its next push is a new version: commit the lift and push main after it, so
+   an older checkout does not push the literal back.
+   The stack records the dev Space, and the picker proposes only what the Space allows:
+   a read dependency when exactly one row of that name is in the dev Space, and
+   a table the code writes or a workflow or Saved Agent it runs when exactly one
+   is in the dev stack's own feature. Everything else is reported unbound. Set
+   each of those by hand under `stacks.dev.bind`: a read may name the real
+   Space's row, to read it live; a write or run must name a dev Space row, and
+   so must a secret — the dev Space has its own — and every deploy refuses one
+   that does not (`bind_space_mismatch`). A dev stack does not write files: a
+   run's file writes land in the default Space, so the code writes a table in
+   its own feature instead.
+2. Copy the production tables the code reads into the dev feature, from the
+   folder that reads them, and the columns only of a table it writes. Each is
+   bound in `stacks.dev.bind`; run the same line again to refresh a copy:
 
-The dev folder's `bind` map answers `hubspot` with the dev Space's secret, while
-the real folder's answers it with the live one (see
-[Dependencies](#dependencies-ronja-bind)).
+   ```bash
+   (cd apps/region-board && ronja copy erp_orders erp_items --to-stack dev)
+   (cd apps/region-board && ronja copy board_notes --no-rows --to-stack dev)
+   ```
+
+3. Migrations, the dev database first:
+
+   ```bash
+   ronja db migrate push --stack dev --database <the dev Space's database id>   # remembered for dev
+   ronja db migrate push --stack dev
+   ```
+
+4. Deploy and test in the dev Space:
+
+   ```bash
+   ronja sync apply --stack dev --allow-create      # --allow-create only the first time
+   (cd workflows/region-report && ronja wf test --stack dev)
+   (cd apps/region-board && ronja app test --stack dev)
+   ```
+
+5. Deploy the same thing to the real Space, from the same checkout:
+
+   ```bash
+   ronja db migrate push --stack main
+   ronja sync apply --stack main
+   ```
+
+   Each stack keeps its own local record, so main is compared with main's last
+   sync, not dev's. A raw id the code writes in the real Space is refused in the
+   dev stack (`bind_space_mismatch`); declare it as a dependency so each stack
+   binds its own (`sync stack add` offers to).
+
+An app built in the dev Space, in a chat or from here, goes to the real Space
+with `import feature --only`, `sync stack add main` and `sync apply --stack main
+--allow-create` (see "Part of a feature: `--only`" under Importing a feature).
+
+The dev stack's `bind` map answers `hubspot` with the dev Space's secret, while
+main's answers it with the live one (see
+[Dependencies](#dependencies-ronja-bind)). Name each secret the same in both
+Spaces and `bind` fills both in.
+
+A folder made the older way — a second copy of the tree for the dev Space,
+whose stack names no Space — keeps working exactly as before, without the Space
+checks.
 
 ## Design rules
 
@@ -8265,7 +8704,7 @@ These are load-bearing for the agent use case — please keep them true:
 ```
 cmd/ronja/           main package — its NAME is what makes the binary `ronja`
 internal/commands/   cobra command tree (root, auth, context, env, api, query,
-                     secret, stdin, bind, sync_*, import*, pull*, managed*,
+                     secret, stdin, bind, copy, sync_*, import*, pull*, managed*,
                      write_gate, address_deps, workflow_*)
 internal/api/        HTTP client + the endpoint shapes it mirrors, plus raw.go
                      (transport only, mirrors nothing), query.go and search.go
@@ -8318,8 +8757,9 @@ the fact that the endpoint has no `codex` or `module` leg at all).
 command, its steps and the staged write, `import_plan.go` the folder plan and
 the portability pass, `import_rewrite.go` the references rewritten into the
 form the plan chose, `import_claim.go` the claims and the settle pass over the
-rows the server refused, `import_report.go` the report, and
-`import_automation.go` the automation files. It writes every folder
+rows the server refused, `import_report.go` the report,
+`import_automation.go` the automation files, and `import_only.go` the `--only`
+closure. It writes every folder
 through the clone commands' own writers (`cloneHooks` carries what it changes),
 and its one mirror is `internal/api/references.go`, against
 `backend/engine/erefs/view.go` and `backend/api/v2/feature/api_references.go`.

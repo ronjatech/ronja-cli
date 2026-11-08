@@ -265,6 +265,9 @@ type fakeInstance struct {
 	// agentFeatures is the feature GET /agent/:id reports for an agent id
 	// agentIDs answers — what the write gate's run-edge rule reads.
 	agentFeatures map[string]string
+	// secretFeatures is the feature GET /secret/:id reports for a secret id
+	// secretIDs answers — what places a secret in a Space.
+	secretFeatures map[string]string
 	// tableDrafts maps a live table id to the caller's open draft of it. Absent
 	// is the ordinary case and answers a JSON `null`, not a 404.
 	tableDrafts map[string]string
@@ -285,6 +288,26 @@ type fakeInstance struct {
 	// and a current one as 404; one in this organization the caller may not read
 	// is the no-enumeration 404), and 503 is the instance not answering at all.
 	featureStatus map[string]int
+	// featureSpace is the Space GET /feature/:id reports per feature, and
+	// spaceNames what GET /space/:id answers; a feature absent here reports no
+	// Space, as an instance before Spaces did.
+	featureSpace map[string]string
+	spaceNames   map[string]string
+	// defaultSpace is the Space GET /space/:id reports as the organization's
+	// default.
+	defaultSpace string
+	// spaceHeader is how the instance treats X-Ronja-Space: "" honours it and
+	// echoes it on the response, "ignored" is an instance that does not
+	// honour it and echoes nothing, "unanswered" answers 503 to every request
+	// carrying it, and "unavailable" or "not_selectable" refuse every such
+	// request without the echo, as the middleware does for a person outside
+	// the Space and for an organization API token. spaceEchoMissing names the
+	// "METHOD path"s answered without the echo however the instance treats
+	// the header (an older pod answering them). spaceSeen records each
+	// request's header.
+	spaceHeader      string
+	spaceEchoMissing map[string]bool
+	spaceSeen        []string
 	// featureNotFoundBody is the `error` string the 404 arm above sends. The
 	// no-enumeration refusal names the feature ("feature not found"); the
 	// retyped lookup miss a current backend answers is the bare "not found",
@@ -642,6 +665,26 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 	if f.beforeServe != nil {
 		f.beforeServe(r)
 	}
+	if space := r.Header.Get(api.HeaderSpace); space != "" {
+		f.mu.Lock()
+		f.spaceSeen = append(f.spaceSeen, r.Method+" "+r.URL.Path+" "+space)
+		f.mu.Unlock()
+		switch f.spaceHeader {
+		case "":
+			if !f.spaceEchoMissing[r.Method+" "+r.URL.Path] {
+				w.Header().Set(api.HeaderSpace, space)
+			}
+		case "unanswered":
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{"error": "space lookup failed"})
+			return
+		case "unavailable":
+			writeJSONStatus(w, http.StatusConflict, map[string]any{"error": "the Space this request names (" + space + ") does not exist, or this token's person cannot enter it", "code": "space_unavailable"})
+			return
+		case "not_selectable":
+			writeJSONStatus(w, http.StatusBadRequest, map[string]any{"error": "this credential can't choose a Space", "code": "space_not_selectable"})
+			return
+		}
+	}
 
 	if f.managed.serve(w, r) {
 		return
@@ -797,7 +840,20 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		writeJSON(w, map[string]any{"id": featureID, "name": "Feature", "scope": "private"})
+		body := map[string]any{"id": featureID, "name": "Feature", "scope": "private"}
+		if space := f.featureSpace[featureID]; space != "" {
+			body["spaceID"] = space
+		}
+		writeJSON(w, body)
+		return
+	}
+	if spaceID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/space/"); ok && r.Method == http.MethodGet {
+		name, known := f.spaceNames[spaceID]
+		if !known {
+			http.Error(w, `{"error":"space not found"}`, http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{"id": spaceID, "name": name, "isDefault": spaceID == f.defaultSpace})
 		return
 	}
 	// The two reference reads `ronja sync check` makes. Neither serves a
@@ -815,7 +871,7 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"not found"}`, f.missStatus)
 			return
 		}
-		writeJSON(w, map[string]any{"id": secretID, "name": secretID})
+		writeJSON(w, map[string]any{"id": secretID, "name": secretID, "featureID": f.secretFeatures[secretID]})
 		return
 	}
 	// GET /workflow/defaults — what `wf init` asks, and every door that creates
@@ -1650,6 +1706,15 @@ func orDefault(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// echoSpace answers X-Ronja-Space as the server's middleware does: the
+// response names the Space the request acted in. Called before anything is
+// written to w.
+func echoSpace(w http.ResponseWriter, r *http.Request) {
+	if space := r.Header.Get(api.HeaderSpace); space != "" {
+		w.Header().Set(api.HeaderSpace, space)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

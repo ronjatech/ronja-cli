@@ -42,7 +42,23 @@ type fakeSearchInstance struct {
 	// existence check `bind --feature` makes before it declares a stack. Absent
 	// (0) is 200, since a feature the caller can reach is the ordinary case.
 	featureStatus map[string]int
-	server        *httptest.Server
+	// featureSpace / spaceNames are the Spaces GET /feature/:id and GET
+	// /space/:id report, and rows what a row read answers for a candidate:
+	// how a Space stack's picker places each one.
+	featureSpace map[string]string
+	spaceNames   map[string]string
+	defaultSpace string
+	rows         map[string]fakeBindRow
+	// featureFailFrom fails GET /feature/:id with a 503 from that read of the
+	// id on (1 is the first); featureReads counts them.
+	featureFailFrom map[string]int
+	featureReads    map[string]int
+	server          *httptest.Server
+}
+
+// fakeBindRow is a row as a single-row read reports it.
+type fakeBindRow struct {
+	featureID, name, copiedFrom string
 }
 
 func newFakeSearchInstance(t *testing.T) *fakeSearchInstance {
@@ -56,6 +72,7 @@ func newFakeSearchInstance(t *testing.T) *fakeSearchInstance {
 func (f *fakeSearchInstance) URL() string { return f.server.URL }
 
 func (f *fakeSearchInstance) serve(w http.ResponseWriter, r *http.Request) {
+	echoSpace(w, r)
 	// GET /feature/:id — the one read `bind --feature` makes, and the only
 	// route here that is not the organization lookup or the search. It is not a
 	// way to browse: the id is one the caller typed, and the answer is whether
@@ -66,9 +83,21 @@ func (f *fakeSearchInstance) serve(w http.ResponseWriter, r *http.Request) {
 	// (`/feature/model/...`, `/feature/query`), and answering those here would
 	// let bind grow a browse call without a single test noticing.
 	if featureID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/feature/"); ok && !strings.Contains(featureID, "/") {
-		switch status := f.featureStatus[featureID]; status {
+		status := f.featureStatus[featureID]
+		if f.featureReads == nil {
+			f.featureReads = map[string]int{}
+		}
+		f.featureReads[featureID]++
+		if from := f.featureFailFrom[featureID]; from != 0 && f.featureReads[featureID] >= from {
+			status = http.StatusServiceUnavailable
+		}
+		switch status {
 		case 0:
-			writeJSON(w, map[string]any{"id": featureID, "name": "Feature", "scope": "private"})
+			body := map[string]any{"id": featureID, "name": "Feature", "scope": "private"}
+			if space := f.featureSpace[featureID]; space != "" {
+				body["spaceID"] = space
+			}
+			writeJSON(w, body)
 		case http.StatusBadRequest:
 			// The OLDER backend's answer for an id the caller cannot reach: the
 			// raw table.ErrNoRows sentinel. A current one retyped that miss to
@@ -79,6 +108,27 @@ func (f *fakeSearchInstance) serve(w http.ResponseWriter, r *http.Request) {
 		default:
 			http.Error(w, `{"error":"Internal server error"}`, status)
 		}
+		return
+	}
+	for _, prefix := range []string{"/api/v2/feature/model/", "/api/v2/workflow/", "/api/v2/agent/", "/api/v2/secret/", "/api/v2/space/"} {
+		id, ok := strings.CutPrefix(r.URL.Path, prefix)
+		if !ok || f.rows == nil && prefix != "/api/v2/space/" {
+			continue
+		}
+		if prefix == "/api/v2/space/" {
+			if name, known := f.spaceNames[id]; known {
+				writeJSON(w, map[string]any{"id": id, "name": name, "isDefault": id == f.defaultSpace})
+				return
+			}
+			http.Error(w, `{"error":"space not found"}`, http.StatusNotFound)
+			return
+		}
+		row, known := f.rows[id]
+		if !known {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{"id": id, "name": row.name, "title": row.name, "featureID": row.featureID, "copiedFromModelID": row.copiedFrom})
 		return
 	}
 	switch r.URL.Path {
@@ -106,6 +156,20 @@ func (f *fakeSearchInstance) serve(w http.ResponseWriter, r *http.Request) {
 					hits = append(hits, row)
 				}
 			}
+		}
+		// The server narrows a search to the Space X-Ronja-Space names before
+		// it caps the page.
+		if space := r.Header.Get(api.HeaderSpace); space != "" {
+			var narrowed []api.SearchHit
+			for _, hit := range hits {
+				if f.featureSpace[f.rows[hit.ID].featureID] == space {
+					narrowed = append(narrowed, hit)
+				}
+			}
+			hits = narrowed
+		}
+		if len(hits) > api.MaxSearchLimit {
+			hits = hits[:api.MaxSearchLimit]
 		}
 		writeJSON(w, map[string]any{"result": hits})
 	default:

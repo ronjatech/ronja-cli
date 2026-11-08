@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/markers"
 	"github.com/ronjatech/ronja-cli/internal/tabledocs"
 	"github.com/ronjatech/ronja-cli/internal/tablerefs"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
@@ -203,7 +204,7 @@ Publishing is a separate step:
 			if forceVerifiedMetric && !force {
 				return fmt.Errorf("--force-verified-metric does nothing on its own: it only widens what --force is allowed to overwrite.\n  Pass both (`--force --force-verified-metric`) to overwrite a VERIFIED metric whose definition changed on the server, or drop it and push with --force alone")
 			}
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -224,6 +225,7 @@ Publishing is a separate step:
 						return emitErr
 					}
 				} else {
+					printStackLine(f)
 					printPipelinePushReport(result)
 				}
 			}
@@ -575,7 +577,7 @@ func withGoneDraftPointers(ctx context.Context, client *api.Client, f *folder, i
 }
 
 func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelinePushOptions) (*pipelinePushResult, error) {
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	opts.pullHint = f.pullHint("    ")
 	result := &pipelinePushResult{
 		FeatureID: f.Binding.FeatureID,
@@ -619,7 +621,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 	}
 	noteAliasWarnings(aliases)
 
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	// A baseline entry for a file that has left BOTH the folder and the binding
 	// describes nothing at all, and left standing it makes `status` report a
 	// deletion for ever. Dropped here rather than only reported, so removing the
@@ -1546,7 +1548,13 @@ func pushOneTable(ctx context.Context, client *api.Client, f *folder, codec pipe
 		recorded := inst.Tables[path]
 		live, err := client.GetTable(ctx, out.TableID)
 		if err != nil {
+			if refusal := f.placeOwnRow(ctx, markers.KindTable, out.TableID, "", err); refusal != nil {
+				return refuse("%v", refusal)
+			}
 			return refuse("read %s: %v", out.TableID, err)
+		}
+		if err := f.placeOwnRow(ctx, markers.KindTable, live.ID, live.FeatureID, nil); err != nil {
+			return refuse("%v", err)
 		}
 		f.noteTableManagedBy(live)
 		heldLive = tableHeldLive(codec, liveHash, path, content, live, draft)

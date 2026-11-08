@@ -266,7 +266,7 @@ func (f *folder) refreshManaged(ctx context.Context) error {
 		source:    sourceLabelOf(f.Root),
 		claims:    map[string]*api.ManagedClaim{},
 	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	state, err := client.ReadManaged(ctx, st.featureID, st.folderID)
 	if err != nil {
 		return &managedReadError{err: describeManagedReadError(err, f)}
@@ -457,7 +457,7 @@ func (f *folder) applyManaged(ctx context.Context) error {
 	if st == nil || st.settled || st.readOnly {
 		return nil
 	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 
 	for _, addr := range st.release {
 		c := st.claims[addr]
@@ -754,7 +754,7 @@ func (f *folder) rereadManagedClaim(ctx context.Context, address string) *api.Ma
 	if f.managed == nil {
 		return nil
 	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	claims, err := client.ListManaged(ctx, f.managed.featureID, f.managed.folderID)
 	if err != nil {
 		return nil

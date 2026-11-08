@@ -99,7 +99,7 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 			// takes its cancellation branch rather than the process dying mid-poll.
 			ctx := cmd.Context()
 
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -159,10 +159,7 @@ type runOptions struct {
 // which can refuse does so before the run starts, which is the point at which
 // the workflow's side effects stop being hypothetical.
 func runLive(ctx context.Context, f *folder, opts runOptions) (*testOutcome, error) {
-	// newClient rather than api.New, for the reason it is a var at all: the
-	// timeout branch at step 7 is only reachable with a transport that reports
-	// a deadline.
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 
 	// 1. Which row. The binding, and nothing else: there is no id argument, so
 	// an unbound folder has nothing to run rather than a missing parameter.
@@ -315,7 +312,7 @@ func runLive(ctx context.Context, f *folder, opts runOptions) (*testOutcome, err
 // code that would run. That gap is announced by noteLiveDrift, which costs a
 // round trip and so notes rather than refuses.
 func checkFolderIsLive(f *folder, live *api.Workflow) error {
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	if baseline == nil {
 		return fmt.Errorf("this folder has no sync baseline for the live workflow %s on %s, so there is no way to tell whether it holds the code that would run — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Run `ronja wf clone %s` into a fresh folder to get one",
 			live.ID, f.Resolved.URL, live.ID)

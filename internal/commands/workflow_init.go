@@ -136,6 +136,10 @@ parquet file itself.`,
 			if err := confirmFeatureIn(cmd.Context(), featureID, resolved); err != nil {
 				return err
 			}
+			space, err := settleStackSpace(cmd.Context(), resolved, featureID)
+			if err != nil {
+				return err
+			}
 
 			// The runtime the folder is pinned to, and the starter written for
 			// it. Settled before anything is written too, for the same reason.
@@ -192,6 +196,7 @@ parquet file itself.`,
 			if err != nil {
 				return err
 			}
+			stampSpace(manifest, flagStack, space)
 			// An empty declaration rather than an absent one, so the folder owns
 			// its parameters from the start and adding one is editing ronja.json
 			// rather than discovering that the key exists. Harmless on a workflow

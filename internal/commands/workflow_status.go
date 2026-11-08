@@ -41,7 +41,7 @@ With --json, one object carrying all of the above.`,
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what changed locally, which is most of the value and costs
 			// nothing. The remote half degrades to "not checked" with a reason.
-			resolved, err := config.Resolve(flagURL, flagProfile)
+			resolved, err := resolveStackCredential("", false, false)
 			if err != nil {
 				return err
 			}
@@ -115,7 +115,7 @@ func workflowStatusReportAt(ctx context.Context, root string, resolved *config.R
 	if err != nil {
 		return nil, err
 	}
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
 	report.Rebound = f.reboundSinceBaseline()
 	report.Skipped = enumeration.Skipped
@@ -380,7 +380,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 		return out, ""
 	}
 
-	client := api.New(resolved.URL, resolved.Token)
+	client := f.client()
 	wf, err := client.GetWorkflow(ctx, f.Binding.WorkflowID)
 	if err != nil {
 		if api.StatusOf(err) == 404 {
@@ -435,7 +435,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 	}
 	out.ComparedAgainst = &comparedReport{ID: target.ID, Lifecycle: target.Lifecycle}
 	out.SQLSemanticsNotice = sqlSemanticsNotice(sqlSemanticsSubject(target.Title, target.ID), target.SQLSemantics)
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	drift := wfdir.DiffHashes(hashFiles(f.baselineCodec(), files), baseline.Hashes())
 	out.Drift = &drift
 	out.rebound = f.unrecordedRebind(out.Drift, contentByPath(f.Codec, files))

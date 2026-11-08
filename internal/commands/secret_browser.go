@@ -100,20 +100,36 @@ func pendingCreateError(err error, featureID string) error {
 	return err
 }
 
-// waitForValue gives transient failures the login poll's window
-// (MaxPollFailureWindow), as every handshake's wait does.
 func waitForValue(ctx context.Context, client *api.Client, id, link string) error {
-	deadline := time.Now().Add(inBrowserWaitLimit)
+	_, err := pollSecret(ctx, client, id, inBrowserWaitLimit, func(s *api.SecretStatus) bool { return s.Status == "ready" })
+	switch {
+	case errors.Is(err, errStoppedWaiting):
+		return fmt.Errorf("stopped waiting; secret %s stays pending — the value can still be entered at %s", id, link)
+	case errors.Is(err, errWaitedTooLong):
+		return fmt.Errorf("still waiting for the value after %s. Secret %s stays pending; finish it at %s or re-run with the same arguments",
+			humanDuration(inBrowserWaitLimit), id, link)
+	}
+	return err
+}
+
+// Sentinels pollSecret returns; each caller words its own message.
+var (
+	errStoppedWaiting = errors.New("stopped waiting")
+	errWaitedTooLong  = errors.New("waited too long")
+)
+
+// pollSecret reads the secret every inBrowserPollInterval until done is true
+// or limit passes. Transient failures get the login poll's window
+// (MaxPollFailureWindow), as every handshake's wait does; a 404 is terminal.
+func pollSecret(ctx context.Context, client *api.Client, id string, limit time.Duration, done func(*api.SecretStatus) bool) (*api.SecretStatus, error) {
+	deadline := time.Now().Add(limit)
 	interval := inBrowserPollInterval
 	var failingSince time.Time
-	stopped := func() error {
-		return fmt.Errorf("stopped waiting; secret %s stays pending — the value can still be entered at %s", id, link)
-	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return stopped()
+			return nil, errStoppedWaiting
 		case <-time.After(interval):
 		}
 
@@ -122,31 +138,30 @@ func waitForValue(ctx context.Context, client *api.Client, id, link string) erro
 		case err == nil:
 			failingSince = time.Time{}
 			interval = inBrowserPollInterval
-			if now.Status == "ready" {
-				return nil
+			if done(now) {
+				return now, nil
 			}
 		case ctx.Err() != nil:
-			return stopped()
+			return nil, errStoppedWaiting
 		case api.StatusOf(err) == http.StatusNotFound:
-			return fmt.Errorf("the secret was deleted while waiting (%s)", id)
+			return nil, fmt.Errorf("the secret was deleted while waiting (%s)", id)
 		case api.IsTransient(err):
 			t := time.Now()
 			if failingSince.IsZero() {
 				failingSince = t
 			}
 			if failing := t.Sub(failingSince); failing > client.MaxPollFailureWindow {
-				return fmt.Errorf("gave up after %s of consecutive failures: %w", failing.Round(time.Second), err)
+				return nil, fmt.Errorf("gave up after %s of consecutive failures: %w", failing.Round(time.Second), err)
 			}
 			if api.StatusOf(err) == http.StatusTooManyRequests {
 				interval += client.RateLimitBackoff
 			}
 		default:
-			return fmt.Errorf("read secret %s: %w", id, err)
+			return nil, fmt.Errorf("read secret %s: %w", id, err)
 		}
 
 		if time.Now().After(deadline) {
-			return fmt.Errorf("still waiting for the value after %s. Secret %s stays pending; finish it at %s or re-run with the same arguments",
-				humanDuration(inBrowserWaitLimit), id, link)
+			return nil, errWaitedTooLong
 		}
 	}
 }

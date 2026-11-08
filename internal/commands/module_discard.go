@@ -38,7 +38,7 @@ local files are kept either way, and the folder is unbound so a later push
 creates a fresh module.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(yes)
 			if err != nil {
 				return err
 			}
@@ -71,7 +71,7 @@ type moduleDiscardResult struct {
 }
 
 func runModuleDiscard(ctx context.Context, f *folder, yes, deleteModule bool) (*moduleDiscardResult, error) {
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	if !f.Bound || f.Binding.ModuleID == "" {
 		return nil, fmt.Errorf("nothing to discard — this folder has no module on %s yet", f.Resolved.URL)
 	}
@@ -182,7 +182,7 @@ func deleteUnpublishedModule(ctx context.Context, client *api.Client, f *folder,
 	}
 	// Only this binding's baseline goes: the folder may be bound to other
 	// stacks whose rows still exist.
-	f.State.Clear(f.Key)
+	f.State.Clear(f.Baseline())
 	noteBaselineRefresh(f.Kind, wfdir.SaveState(f.Root, f.State))
 	return &moduleDiscardResult{Outcome: outcomeResourceDeleted, ModuleID: moduleID}, nil
 }

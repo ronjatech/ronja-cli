@@ -35,7 +35,7 @@ func comparePipelineUnits(ctx context.Context, plan *plannedFolder) {
 	if err != nil {
 		return
 	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	codec := newPipelineCodec(f, local)
 	// In memory only: pipelineBaseline fills in an empty baseline on the
 	// folder, which a dry run never saves.
@@ -227,7 +227,7 @@ func compareAutomationUnits(ctx context.Context, plan *plannedFolder) {
 	if err != nil {
 		return
 	}
-	rows, listErr := automationRowsOf(ctx, newClient(f.Resolved.URL, f.Resolved.Token), f)
+	rows, listErr := automationRowsOf(ctx, f.client(), f)
 	for i := range line.Units {
 		u := &line.Units[i]
 		if u.Action != string(applyActionUpdate) {

@@ -69,6 +69,15 @@ type Stack struct {
 	// from the server's state is a decision a person made, not state a deploy
 	// discovered.
 	Unmanaged bool `json:"unmanaged,omitempty"`
+	// SpaceID is the Space this stack deploys into, written when the stack is
+	// declared on a feature outside the organization's default Space. Every
+	// acting command checks the feature is still there (space_mismatch) and
+	// that what the stack writes or runs is too (bind_space_mismatch). A stack
+	// with none is held to no Space rule.
+	SpaceID string `json:"spaceID,omitempty"`
+	// Space is the Space's name when the stack was declared: a label for a
+	// person reading the file. Nothing decides on it.
+	Space string `json:"space,omitempty"`
 
 	// unknown is this stack's forward-compatibility sidecar, for the reasons on
 	// Manifest.unknown. A stack entry is an object in a committed file, so it has
@@ -253,13 +262,13 @@ func (m *Manifest) KeysOn(url string) []InstanceKey {
 //     everybody reading them, so `--stack Prod` against a folder naming `prod`
 //     would create a second set of resources rather than finding the first.
 //     Refused by selectNamed, which is the only door a new name comes through.
-//   - Two stacks pointing at the SAME (instance, organization). The selection
-//     that runs when no --stack is given matches on exactly that pair, and the
-//     local baseline in .ronja/state.json is keyed by it too — so a second stack
-//     there shares one checkout's draft fingerprints with another environment's
-//     rows. selectNamed refuses to CREATE the second one, and Select reports the
-//     pair as an ambiguity naming both. Closing the limit properly means keying
-//     the baseline by stack name; see BL-4e71.
+//   - A second stack on the SAME (instance, organization) — a Dev Space and
+//     Main. Only a command that declares it with a feature may add it
+//     (SelectDeclaring); any other command given a name this folder does not
+//     declare there is refused as a typo, because `--stack prdo` would
+//     otherwise create a second set of resources. Two stacks naming one
+//     feature are refused, and Select with no --stack reports two stacks on
+//     one organization as an ambiguity naming both.
 func (m *Manifest) checkStacks(path string) error {
 	for _, name := range m.StackNames() {
 		if err := ValidStackName(name); err != nil {
@@ -277,15 +286,27 @@ func (m *Manifest) checkStacks(path string) error {
 			return fmt.Errorf("%s declares stack %q with no \"tenantID\", and a stack is one organization on one instance. Add the organization's id to it — `ronja whoami` prints the one your credential reaches",
 				path, name)
 		}
+		if stack.SpaceID != "" && m.FormatVersion < manifestVersionSpaces {
+			return fmt.Errorf("%s declares a \"spaceID\" on stack %q but says \"formatVersion\": %d. A CLI older than version %d of this format ignores the Space and deploys the stack with no Space rule, so a write into another Space deploys and reports success. Add \"formatVersion\": %d to %s by hand",
+				path, name, declaredFormatVersion(m.FormatVersion), manifestVersionSpaces, manifestVersionSpaces, ManifestName)
+		}
 	}
 	return nil
 }
 
-// sharedBaselineWarning is the sentence every refusal about two entries on ONE
-// (instance, organization) ends with. Written once because it is the same fact
-// each time — the local baseline is keyed by that pair, not by stack name — and
-// two spellings of it would drift.
-const sharedBaselineWarning = "one folder tracks one deployment per organization: its local sync baseline is keyed by that pair, so two entries there compare this checkout's drafts against each other's rows — use a second folder for the second deployment"
+// declaresSpaces reports whether the manifest needs format version 9: a stack
+// declares a Space, or two stacks deploy to one (instance, organization).
+func (m Manifest) declaresSpaces() bool {
+	seen := map[InstanceKey]bool{}
+	for _, name := range m.StackNames() {
+		stack := m.Stacks[name]
+		if stack.SpaceID != "" || seen[stack.Key()] {
+			return true
+		}
+		seen[stack.Key()] = true
+	}
+	return false
+}
 
 // describeKey renders an (instance, organization) for a message.
 func describeKey(key InstanceKey) string {
@@ -322,7 +343,7 @@ func describeKey(key InstanceKey) string {
 //     here", which is a first push.
 func (m *Manifest) Select(lock *Lock, key InstanceKey, want string) (Selection, error) {
 	if want != "" {
-		return m.selectNamed(lock, key, want)
+		return m.selectNamed(lock, key, want, "")
 	}
 	if err := m.refuseStrandedLockStacks(lock); err != nil {
 		return Selection{Key: key}, err
@@ -346,9 +367,8 @@ func (m *Manifest) Select(lock *Lock, key InstanceKey, want string) (Selection, 
 		// brought together, or a hand-edited file where a legacy entry and a
 		// stack both claim one place. REPORTED rather than refused at load, so
 		// naming one with --stack still works — see checkStacks.
-		return Selection{Key: key}, fmt.Errorf("%w for %s — name one with --stack (%s). Note that %s",
-			ErrAmbiguousStack, describeKey(key), strings.Join(namesOf(entries, matches), ", "),
-			sharedBaselineWarning)
+		return Selection{Key: key}, fmt.Errorf("%w: this folder deploys to %s as %s — name one with --stack",
+			ErrAmbiguousStack, describeKey(key), m.describeStacks(namesOf(entries, matches)))
 	}
 }
 
@@ -411,7 +431,46 @@ func namesOf(entries []Selection, matches []int) []string {
 // selectionKey is Selection's InstanceKey, as a method value FindAll can take.
 func (s Selection) selectionKey() InstanceKey { return s.Key }
 
-func (m *Manifest) selectNamed(lock *Lock, key InstanceKey, want string) (Selection, error) {
+// SelectDeclaring is Select for a command that DECLARES the stack it names,
+// with the feature it will deploy into: `ronja bind --stack dev --feature …`.
+// Unlike Select it may add a second stack on an (instance, organization) this
+// folder already names, since the feature makes the name a decision rather than
+// a typo. It refuses a second stack naming a feature another stack already
+// deploys into: the two would deploy the same rows.
+func (m *Manifest) SelectDeclaring(lock *Lock, key InstanceKey, want, featureID string) (Selection, error) {
+	if want == "" {
+		return m.Select(lock, key, want)
+	}
+	return m.selectNamed(lock, key, want, featureID)
+}
+
+// describeStacks renders stack names for a message, each with its Space label
+// when it declares one: `"dev" (Space Dev) and "main" (Space Main)`.
+func (m *Manifest) describeStacks(names []string) string {
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		stack, ok := m.Stacks[name]
+		switch {
+		case !ok:
+			parts = append(parts, name)
+		case stack.Space != "":
+			parts = append(parts, fmt.Sprintf("%q (Space %s)", name, stack.Space))
+		default:
+			parts = append(parts, fmt.Sprintf("%q", name))
+		}
+	}
+	switch len(parts) {
+	case 0:
+		return ""
+	case 1:
+		return parts[0]
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
+}
+
+// selectNamed resolves an explicit --stack. feature is the feature a
+// declaring command names (SelectDeclaring), empty for every other command.
+func (m *Manifest) selectNamed(lock *Lock, key InstanceKey, want, feature string) (Selection, error) {
 	if err := ValidStackName(want); err != nil {
 		return Selection{}, err
 	}
@@ -473,16 +532,34 @@ func (m *Manifest) selectNamed(lock *Lock, key InstanceKey, want string) (Select
 		return Selection{Name: want, Key: key, Binding: binding, Bound: true}, nil
 	}
 	// If this (instance, organization) is already named, the name given is a
-	// typo — creating a second set of resources beside the first is the one
-	// outcome nothing downstream can undo.
+	// typo unless the command is declaring it with a feature — creating a second
+	// set of resources beside the first is the one outcome nothing downstream
+	// can undo.
 	if key.Known() {
+		var here []string
 		for _, name := range m.StackNames() {
-			if Matches(m.Stacks[name].Key(), key) {
-				return Selection{}, fmt.Errorf("this folder already calls %s %q, and there is no stack %q. Use --stack %s, or add a %q entry to \"stacks\" in %s first if you really mean a second deployment — though %s",
-					describeKey(key), name, want, name, want, ManifestName, sharedBaselineWarning)
+			if !Matches(m.Stacks[name].Key(), key) {
+				continue
+			}
+			here = append(here, name)
+			if feature != "" && m.Stacks[name].FeatureID == feature {
+				return Selection{}, fmt.Errorf("stack %q already deploys into feature %s, and a second stack there would deploy the same rows twice. Use --stack %s, or declare %q with a feature of its own",
+					name, feature, name, want)
 			}
 		}
+		if len(here) > 0 && feature == "" {
+			uses := make([]string, 0, len(here))
+			for _, name := range here {
+				uses = append(uses, "--stack "+name)
+			}
+			return Selection{}, fmt.Errorf("this folder already names %s as %s, and there is no stack %q. Use %s, or declare a new stack with the feature it deploys into: `ronja bind --stack %s --feature <id>`",
+				describeKey(key), m.describeStacks(here), want, strings.Join(uses, " or "), want)
+		}
 		for _, inst := range m.Instances {
+			if Matches(inst.Key(), key) && feature != "" && inst.Binding.FeatureID != "" && inst.Binding.FeatureID != feature {
+				return Selection{}, fmt.Errorf("this folder's unnamed \"instances\" entry already deploys to %s, into feature %s, and naming it %q would point that deployment at another feature. Name it first — push once with --stack <its name>, such as --stack main — then declare %q beside it",
+					describeKey(key), inst.Binding.FeatureID, want, want)
+			}
 			if Matches(inst.Key(), key) {
 				// The migration path: a legacy entry, and a human has now supplied
 				// the one thing it never had — a name. Bound is TRUE and the

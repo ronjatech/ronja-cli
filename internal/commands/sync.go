@@ -62,7 +62,7 @@ status and check are read-only: nothing is written, not even a checkout, so they
 are safe to run on a repository you only have read access to. apply writes, and
 refuses by default to create anything that does not already exist.`,
 	}
-	sync.AddCommand(newSyncStatusCmd(), newSyncCheckCmd(), newSyncApplyCmd(), newSyncAdoptCmd(), newSyncUnmanageCmd())
+	sync.AddCommand(newSyncStatusCmd(), newSyncCheckCmd(), newSyncApplyCmd(), newSyncAdoptCmd(), newSyncUnmanageCmd(), newSyncStackCmd())
 	sync.PersistentFlags().StringVar(&flagSyncDir, "dir", ".",
 		"directory to walk for folders (default: the working directory)")
 	addStackFlag(sync)
@@ -129,7 +129,7 @@ name cannot report a whole repository healthy.`,
 			// per-folder status commands are not: a signed-out caller still gets
 			// the walk and a named reason per folder. The verdict is `unknown`
 			// either way, which is exactly what a dead credential should produce.
-			resolved, err := config.Resolve(flagURL, flagProfile)
+			resolved, err := resolveStackCredential(flagSyncDir, false, false)
 			if err != nil {
 				// ⚠️ UNKNOWN, not the default 1. Every failure here — no profile,
 				// a profile whose URL disagrees with --url, an ambiguous one, a
@@ -206,7 +206,8 @@ type syncSummary struct {
 // Clean returns nil. Anything else returns an error carrying its own code —
 // `run` reads it — so the reason is still printed on stderr like every other
 // failure, and a caller that only reads $? gets the three-valued answer.
-func (r *syncStatusReport) exitError() error {
+func (r *syncStatusReport) exitError() (err error) {
+	defer func() { err = withPrintedSpaceRefusals(err, r.details()) }()
 	switch r.Verdict {
 	case verdictDrifted:
 		// "out of step with the organization" rather than "drifted on the
@@ -228,6 +229,15 @@ func (r *syncStatusReport) exitError() error {
 			r.Summary.Unknown, r.Summary.Folders, plural(r.Summary.Folders, "folder")))
 	}
 	return nil
+}
+
+// details are the folders' details, in which a Space refusal is printed.
+func (r *syncStatusReport) details() []string {
+	out := make([]string, len(r.Folders))
+	for i, line := range r.Folders {
+		out[i] = line.Detail
+	}
+	return out
 }
 
 // syncStatusTree walks the tree and computes one report.
@@ -503,8 +513,8 @@ func compareWithLive(ctx context.Context, f *folder, guard bool) (held bool, ref
 	if err != nil {
 		return false, nil, err
 	}
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
-	guarded := guard && f.State.For(f.Key) != nil
+	client := f.client()
+	guarded := guard && f.State.For(f.Baseline()) != nil
 	switch f.Kind.Name {
 	case wfdir.KindWorkflow:
 		if f.Binding.WorkflowID == "" {

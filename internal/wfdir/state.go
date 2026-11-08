@@ -14,19 +14,31 @@ import (
 
 // State is .ronja/state.json — the local sync baseline, never committed.
 //
-// Keyed like the manifest, by (instance, organization), because the same folder
-// can be bound to staging and production — or to two organizations on one
-// instance — and each has its own idea of what "last synced" means.
+// Keyed by (instance, organization, stack), because one folder can deploy to
+// staging and production, to two organizations, or to two stacks — a Dev Space
+// and Main — of one organization, and each has its own idea of what "last
+// synced" means.
 type State struct {
 	Instances []InstanceBaseline `json:"instances"`
 }
 
-// InstanceBaseline is one binding's baseline. It mirrors Manifest.Instance so
-// both files can share the lookup in Find.
+// InstanceBaseline is one binding's baseline.
+//
+// Stack is empty on a LEGACY record: one a CLI wrote before records were kept
+// per stack, and the only shape a folder with no named stack ever has.
+// ClaimLegacy stamps one with the stack it belongs to.
 type InstanceBaseline struct {
 	URL      string         `json:"url"`
 	TenantID string         `json:"tenantID,omitempty"`
+	Stack    string         `json:"stack,omitempty"`
 	State    *InstanceState `json:"state"`
+}
+
+// BaselineKey is what one selection's local record is found by. Stack is empty
+// for a folder's unnamed instances[] entry, whose record is a legacy one.
+type BaselineKey struct {
+	Key   InstanceKey
+	Stack string
 }
 
 // Key is the (instance, organization) this baseline belongs to.
@@ -392,60 +404,121 @@ func WriteStateGitignore(root string) error {
 	return writeAtomic(filepath.Join(dir, GitignoreName), []byte("*\n"), 0o644)
 }
 
-// For returns one binding's baseline, or nil when it has never been synced from
-// this folder.
+// For returns one selection's baseline, or nil when it has never been synced
+// from this folder.
 //
-// The ambiguity error Find can raise is deliberately swallowed here: a baseline
-// is a sync optimisation, and "no baseline" degrades to treating every local
-// file as changed — which is safe. The MANIFEST lookup for the same key reports
-// the ambiguity properly, and that is the one that decides where a push lands.
-func (s *State) For(key InstanceKey) *InstanceState {
-	i, err := Find(s.Instances, InstanceBaseline.Key, key)
-	if err != nil || i < 0 {
+// A named stack reads only a record stamped with its name, so a legacy record is
+// used only once ClaimLegacy has given it to that stack. The ambiguity Find can
+// raise is swallowed: a baseline is a sync optimisation, and "no baseline"
+// degrades to treating every local file as changed — which is safe. The
+// MANIFEST lookup for the same key reports the ambiguity properly, and that is
+// the one that decides where a push lands.
+func (s *State) For(key BaselineKey) *InstanceState {
+	i := s.find(key)
+	if i < 0 {
 		return nil
 	}
 	return s.Instances[i].State
 }
 
-// Set records a baseline for one binding.
-func (s *State) Set(key InstanceKey, inst *InstanceState) {
+func (s *State) find(key BaselineKey) int {
+	var indexes []int
+	var entries []InstanceBaseline
+	for i, e := range s.Instances {
+		if e.Stack == key.Stack {
+			indexes = append(indexes, i)
+			entries = append(entries, e)
+		}
+	}
+	i, err := Find(entries, InstanceBaseline.Key, key.Key)
+	if err != nil || i < 0 {
+		return -1
+	}
+	return indexes[i]
+}
+
+// Set records a baseline for one selection, replacing that selection's record.
+func (s *State) Set(key BaselineKey, inst *InstanceState) {
 	if inst.Files == nil {
 		inst.Files = map[string]FileState{}
 	}
-	url := key.URL
+	url := key.Key.URL
 	if norm, err := config.NormalizeURL(url); err == nil {
 		url = norm
 	}
-	kept := s.Instances[:0]
-	for _, existing := range s.Instances {
-		if !Matches(existing.Key(), key) {
-			kept = append(kept, existing)
-		}
-	}
-	s.Instances = append(kept, InstanceBaseline{URL: url, TenantID: key.TenantID, State: inst})
+	s.drop(key)
+	s.Instances = append(s.Instances, InstanceBaseline{URL: url, TenantID: key.Key.TenantID, Stack: key.Stack, State: inst})
 }
 
-// Clear drops ONE binding's baseline, leaving every other instance's standing.
+// Clear drops ONE selection's baseline, leaving every other one standing.
 //
 // The whole-file alternative — writing a fresh empty State — is a bug, not a
 // shortcut: a folder bound to localhost, staging and production keeps one
-// baseline each, so discarding against one instance would erase the other two.
-// The next push there sees no baseline against a non-empty remote, which is
-// exactly the shape the drift guard refuses, and the way out it names is
-// --force: overwriting production with no comparison because a staging draft
-// was thrown away.
+// baseline each, so discarding against one would erase the other two. The next
+// push there sees no baseline against a non-empty remote, which is exactly the
+// shape the drift guard refuses, and the way out it names is --force:
+// overwriting production with no comparison because a staging draft was thrown
+// away.
 //
 // Removal rather than an empty entry, because For then answers nil — the same
-// answer a folder that has never synced here gives, which is what this instance
-// now is. Every local file correctly reads as added.
-func (s *State) Clear(key InstanceKey) {
+// answer a folder that has never synced here gives, which is what this
+// selection now is. Every local file correctly reads as added.
+func (s *State) Clear(key BaselineKey) { s.drop(key) }
+
+func (s *State) drop(key BaselineKey) {
 	kept := s.Instances[:0]
 	for _, existing := range s.Instances {
-		if !Matches(existing.Key(), key) {
+		if existing.Stack != key.Stack || !Matches(existing.Key(), key.Key) {
 			kept = append(kept, existing)
 		}
 	}
 	s.Instances = kept
+}
+
+// ClaimLegacy gives each legacy record (no "stack") to the one stack it can
+// belong to, in memory; the next SaveState writes the name.
+//
+// A legacy record belongs to the single stack this folder declares on its
+// (instance, organization). When the folder declares none there, it belongs to
+// `selected` — the name a person has just given a legacy instances[] entry —
+// when that names the record's place. Two or more declared stacks there (a git
+// merge brought them together) leave it unclaimed: either one using it would
+// compare its drafts against the other's rows. Those places are returned, so the
+// caller can say why that stack starts from no record.
+//
+// A stack that already has a record of its own keeps it, and the legacy one is
+// left as it is.
+func (s *State) ClaimLegacy(m *Manifest, selected string, selectedKey InstanceKey) (unclaimed []InstanceKey) {
+	if s == nil || m == nil {
+		return nil
+	}
+	for i := range s.Instances {
+		e := &s.Instances[i]
+		if e.Stack != "" {
+			continue
+		}
+		var declared []string
+		for _, name := range m.StackNames() {
+			if Matches(m.Stacks[name].Key(), e.Key()) {
+				declared = append(declared, name)
+			}
+		}
+		owner := ""
+		switch {
+		case len(declared) == 1:
+			owner = declared[0]
+		case len(declared) == 0 && selected != "" && Matches(e.Key(), selectedKey):
+			owner = selected
+		case len(declared) > 1:
+			unclaimed = append(unclaimed, e.Key())
+			continue
+		}
+		if owner == "" || s.find(BaselineKey{Key: e.Key(), Stack: owner}) >= 0 {
+			continue
+		}
+		e.Stack = owner
+	}
+	return unclaimed
 }
 
 // TableStateFor returns one file's recorded table state, or the zero value when

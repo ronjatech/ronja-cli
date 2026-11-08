@@ -83,7 +83,7 @@ report says so.`,
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what changed locally, which is most of the value and costs
 			// nothing. The remote half degrades to "not checked" with a reason.
-			resolved, err := config.Resolve(flagURL, flagProfile)
+			resolved, err := resolveStackCredential("", false, false)
 			if err != nil {
 				return err
 			}
@@ -160,7 +160,7 @@ func pipelineStatusReportAt(ctx context.Context, root string, resolved *config.R
 	if err != nil {
 		return nil, err
 	}
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	// In memory only — status writes nothing. It exists so that removing a
 	// file's entry from ronja.json makes the phantom disappear from THIS
 	// report rather than only from the one after the next push.
@@ -524,7 +524,7 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 		return out
 	}
 
-	client := newClient(resolved.URL, resolved.Token)
+	client := f.client()
 	items, err := client.ListFeatureTables(ctx, f.Binding.FeatureID)
 	if err != nil {
 		if api.StatusOf(err) == 404 {
@@ -564,7 +564,7 @@ func pipelineRemoteStatus(ctx context.Context, resolved *config.Resolved, f *fol
 	if readErr != nil {
 		local = nil
 	}
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	known := baseline.Hashes()
 	reports := make([]pipelineTableReport, len(paths))
 	var needCode []int

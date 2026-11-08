@@ -17,10 +17,11 @@ import (
 // order — modules, pipelines in build order, every workflow created before any
 // workflow's code is written, then apps and automations.
 
-// addStack declares `name` in every folder of an imported tree, deploying to
-// feature with that folder's binds — the hand-written step a `stack add`
-// command would take over (see BL-6179). A folder named in onFeature deploys
-// there instead.
+// addStack writes `name` into every folder of an imported tree by hand,
+// deploying to feature with exactly that folder's binds, for the tests that
+// need binds `sync stack add` would not propose (an original write target, a
+// module folder on another feature). A folder named in onFeature deploys there
+// instead.
 func addStack(t *testing.T, dir, name, feature string, binds map[string]map[string]string, onFeature map[string]string) {
 	t.Helper()
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
@@ -48,8 +49,8 @@ func addStack(t *testing.T, dir, name, feature string, binds map[string]map[stri
 // portable `{{ write() }}` the import report asks for, and declares a `dev`
 // stack on an empty second feature of the same organization: read sources
 // bound to the ORIGINAL rows, the write source to a row of the new feature,
-// and the module — whose package name is unique in the organization — deployed
-// to the one feature that holds it.
+// and the module deployed to the feature that already holds it, so the dev
+// stack shares production's copy.
 func freshStackFixture(t *testing.T) (*fakeImportInstance, string, importReport) {
 	t.Helper()
 	return freshStackFixtureFrom(t, importFixture(t), nil)
@@ -62,12 +63,13 @@ func freshStackFixtureFrom(t *testing.T, f *fakeImportInstance, extra map[string
 	f.app.privilegeLevel = adminPrivilegeLevel
 	f.auto.privilegeLevel = adminPrivilegeLevel
 	f.pipe.privilegeLevel = adminPrivilegeLevel
-	f.wf.mod.nameTaken["sales_helpers"] = true
+	f.wf.mod.nameTaken[importFeature+"/sales_helpers"] = true
 	dir, report := runImport(t, f)
 	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	f.pipe.AddFeature(devFeature, "Sales dev", "organization")
+	f.inv.features[devFeature] = "Sales dev"
 	f.app.featureScope[devFeature] = "organization"
 	f.pipe.AddTable(&api.Table{ID: "table-dev-ledger", Name: "ledger", FeatureID: devFeature, Kind: "dynamic"})
 
@@ -146,7 +148,7 @@ func TestImportedTreeStandsUpAFreshStackInOneApply(t *testing.T) {
 	code := f.wf.FileContents(wf.ID)["main.py"]
 	for _, want := range []string{
 		"{{ ref('" + clean.ID + "') }}",                           // the dev copy of orders_clean, by address
-		"{{ module('module-helpers') }}",                          // the organization's one module
+		"{{ module('module-helpers') }}",                          // production's module, which dev shares
 		"{{ ref('table-fx-rates') }}",                             // read source → the original
 		"{{ secret('secret-crm', 'token') }}",                     // side effect → the original
 		"{{ write('orders_daily') }}",                             // own output, by name, in dev
@@ -213,7 +215,7 @@ func TestImportedTreeStandsUpAFreshStackInOneApply(t *testing.T) {
 func TestSlipScenarioIsRefusedBeforeAnyWrite(t *testing.T) {
 	f := importFixture(t)
 	f.app.privilegeLevel, f.auto.privilegeLevel, f.pipe.privilegeLevel = adminPrivilegeLevel, adminPrivilegeLevel, adminPrivilegeLevel
-	f.wf.mod.nameTaken["sales_helpers"] = true
+	f.wf.mod.nameTaken[importFeature+"/sales_helpers"] = true
 	// The Main table the workflow writes by literal, and its inventory line.
 	f.pipe.AddTable(&api.Table{ID: "table-targets", Name: "targets", FeatureID: importFeature, Kind: "dynamic"})
 	f.wf.files["workflow-report"][0].Content = importWorkflowP + "tools.appendToTable(orders, \"table-targets\")\n"
@@ -239,6 +241,7 @@ func TestSlipScenarioIsRefusedBeforeAnyWrite(t *testing.T) {
 	}
 	dropLocalState(t, dir)
 	f.pipe.AddFeature(devFeature, "Sales dev", "organization")
+	f.inv.features[devFeature] = "Sales dev"
 	f.app.featureScope[devFeature] = "organization"
 	f.pipe.AddTable(&api.Table{ID: "table-dev-ledger", Name: "ledger", FeatureID: devFeature, Kind: "dynamic"})
 	f.pipe.AddTable(&api.Table{ID: "table-dev-targets", Name: "targets", FeatureID: devFeature, Kind: "dynamic"})
@@ -304,7 +307,7 @@ func TestSlipScenarioIsRefusedBeforeAnyWrite(t *testing.T) {
 
 // TestApplyWarnsWhenAModuleIsPublishedIntoAnotherFeature is the shared-module
 // warning: the dev stack deploys its module folder to the feature that holds
-// the organization's one copy, while every other folder goes to dev — so
+// production's copy, while every other folder goes to dev — so
 // applying dev publishes the module production imports. Said in the report
 // (--json and human), never refused; an apply of `main`, where every folder
 // shares the module's feature, says nothing.
@@ -318,7 +321,7 @@ func TestApplyWarnsWhenAModuleIsPublishedIntoAnotherFeature(t *testing.T) {
 		t.Fatalf("warnings = %+v, want the one shared_module", report.Warnings)
 	}
 	w := report.Warnings[0]
-	for _, want := range []string{"single module", `"sales_helpers"`, "into feature " + importFeature, devFeature, "production"} {
+	for _, want := range []string{"outside the feature this run otherwise deploys to", `"sales_helpers"`, "into feature " + importFeature, devFeature, "production"} {
 		if w.Reason != syncWarningSharedModule || w.Path != "modules/sales_helpers" || !strings.Contains(w.Detail, want) {
 			t.Fatalf("warning %+v does not say %q", w, want)
 		}
@@ -330,7 +333,7 @@ func TestApplyWarnsWhenAModuleIsPublishedIntoAnotherFeature(t *testing.T) {
 	// ACTION FIRST: one sentence saying what happens and what to do, then the
 	// why on lines of its own, indented under it.
 	first, why, _ := strings.Cut(w.Detail, "\n")
-	if !strings.Contains(first, "single module") || !strings.Contains(first, "production") || !strings.Contains(first, "apply it only if you mean that change for every feature") || strings.Contains(first, "last published with") {
+	if !strings.Contains(first, "outside the feature this run otherwise deploys to") || !strings.Contains(first, "production") || !strings.Contains(first, "apply it only if you mean that change there too") || strings.Contains(first, "last published with") {
 		t.Fatalf("the warning does not lead with what happens and what to do: %q", first)
 	}
 	if !strings.Contains(human, "\n      "+strings.ReplaceAll(why, "\n", "\n      ")+"\n") {
@@ -365,12 +368,8 @@ func TestApplyWarnsWhenAModuleIsPublishedIntoAnotherFeature(t *testing.T) {
 		t.Fatalf("the warning about a changed module: %+v (%v)", changed.Warnings, err)
 	}
 
-	// From a checkout of its own, as every stack of one organization is
-	// deployed (BL-4e71): this one's local baselines are dev's now, and the
-	// dry run, like the apply, refuses main's live workflow against them.
-	for _, folder := range []string{"workflows/sales-report", "apps/sales-dashboard", "modules/sales_helpers", "pipelines/sales", "automations/sales"} {
-		freshCheckout(t, filepath.Join(dir, folder))
-	}
+	// The main stack, from the same checkout: its local records are its own,
+	// and the module warning is about dev only.
 	main, err := applyStack(t, dir, "main", "--dry-run")
 	if err != nil || len(main.Warnings) != 0 {
 		t.Fatalf("apply --stack main warned %+v (%v)", main.Warnings, err)
@@ -437,11 +436,11 @@ func TestSharedModuleWarningOnAModuleTheRunDidNotPublish(t *testing.T) {
 	}
 }
 
-// Two stacks of one organization share a checkout's local baselines
-// (BL-4e71): once dev is applied, main's workflow is compared with dev's
-// record, and the apply refuses it. The dry run says so too, in the apply's
-// words — it does not promise a push the apply then refuses.
-func TestDryRunRefusesASecondStackOfTheSameOrganizationInASharedCheckout(t *testing.T) {
+// Two stacks of one organization keep a local record each: once dev is applied
+// from this checkout, main is still compared with main's own record, so its
+// apply is not refused as drift — and the records in .ronja/state.json are
+// stamped with their stacks.
+func TestTwoStacksOfOneOrganizationKeepSeparateLocalRecords(t *testing.T) {
 	_, dir, _ := freshStackFixture(t)
 	if deployed, err := applyStack(t, dir, "dev", "--allow-create"); err != nil {
 		t.Fatalf("apply dev: %v\n%s", err, describeApply(deployed))
@@ -456,12 +455,102 @@ func TestDryRunRefusesASecondStackOfTheSameOrganizationInASharedCheckout(t *test
 		return syncApplyFolderReport{}
 	}
 	preview, _ := applyStack(t, dir, "main", "--dry-run")
-	applied, _ := applyStack(t, dir, "main")
-	dry, real := lineOf(preview), lineOf(applied)
-	if real.Verdict != verdictRefused || !strings.Contains(real.Detail, `since stack "main" last applied it`) {
-		t.Fatalf("apply main: %s / %s — %s", real.Verdict, real.Reason, real.Detail)
+	applied, err := applyStack(t, dir, "main")
+	if dry, real := lineOf(preview), lineOf(applied); err != nil || real.Verdict == verdictRefused || dry.Verdict == verdictRefused {
+		t.Fatalf("main was judged against dev's record: dry %s / %s %q, apply %s / %s %q (%v)",
+			dry.Verdict, dry.Reason, dry.Detail, real.Verdict, real.Reason, real.Detail, err)
 	}
-	if dry.Verdict != real.Verdict || dry.Reason != real.Reason || dry.Detail != real.Detail {
-		t.Fatalf("the dry run says %s / %s %q\nthe apply says %s / %s %q", dry.Verdict, dry.Reason, dry.Detail, real.Verdict, real.Reason, real.Detail)
+	state, err := wfdir.LoadState(filepath.Join(dir, "workflows/sales-report"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stacks := map[string]string{}
+	for _, e := range state.Instances {
+		if e.State != nil {
+			stacks[e.Stack] = e.State.SourceID
+		}
+	}
+	if len(stacks) != 2 || stacks["dev"] == "" || stacks["main"] == "" || stacks["dev"] == stacks["main"] {
+		t.Fatalf("the workflow folder's records are %+v, want one each for dev and main naming their own rows", stacks)
+	}
+}
+
+// `sync stack add` over the import fixture, the tree's second stack on an
+// empty feature of the same Space: each read is re-picked by name within the
+// Space (here the rows the code reads today), a write is bound only to the
+// one row of its name in the stack's own feature, and a run outside it is
+// left unbound. Once that is bound by hand, one apply stands the stack up.
+func TestSyncStackAddStandsUpAnImportedTreeOnASecondFeature(t *testing.T) {
+	f := importFixture(t)
+	f.app.privilegeLevel = adminPrivilegeLevel
+	f.auto.privilegeLevel = adminPrivilegeLevel
+	f.pipe.privilegeLevel = adminPrivilegeLevel
+	f.featureSpace = map[string]string{importFeature: "space-main", financeFeature: "space-main", devFeature: "space-main"}
+	f.wf.spaceNames = map[string]string{"space-main": "Main"}
+	f.wf.defaultSpace = "space-main"
+	f.wf.secretIDs["secret-crm"] = true
+	f.wf.secretFeatures = map[string]string{"secret-crm": financeFeature}
+	dir, _ := runImport(t, f)
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.pipe.AddFeature(devFeature, "Sales dev", "organization")
+	f.inv.features[devFeature] = "Sales dev"
+	f.app.featureScope[devFeature] = "organization"
+	f.pipe.AddTable(&api.Table{ID: "table-dev-ledger", Name: "ledger", FeatureID: devFeature, Kind: "dynamic"})
+	main := filepath.Join(dir, "workflows/sales-report/main.py")
+	if err := os.WriteFile(main, []byte(strings.Replace(readFile(t, main), `tools.replaceTable(fx, "table-ledger")`, `tools.replaceTable(fx, {{ write('ledger') }})`, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dropLocalState(t, dir)
+	f.searchHits = []api.SearchHit{
+		{Kind: api.SearchKindTable, ID: "table-raw-orders", Title: "raw_orders", Score: api.SearchScoreExact},
+		{Kind: api.SearchKindTable, ID: "table-fx-rates", Title: "fx_rates", Score: api.SearchScoreExact},
+		{Kind: api.SearchKindTable, ID: "table-ledger", Title: "ledger", Score: api.SearchScoreExact},
+		{Kind: api.SearchKindTable, ID: "table-dev-ledger", Title: "ledger", Score: api.SearchScoreExact},
+		{Kind: api.SearchKindSecret, ID: "secret-crm", Title: "crm", Score: api.SearchScoreExact},
+		{Kind: api.SearchKindWorkflow, ID: "workflow-close", Title: "close_books", Score: api.SearchScoreExact},
+	}
+
+	out, err := runCLI(t, dir, "sync", "stack", "add", "dev", "--feature", devFeature, "--yes")
+	if err == nil || !strings.Contains(err.Error(), `stack "dev" has`) {
+		t.Fatalf("stack add left nothing unbound: %v\n%s", err, out)
+	}
+	bindOf := func(rel string) map[string]string {
+		return loadAnyManifest(t, filepath.Join(dir, rel)).Stacks["dev"].Bind
+	}
+	if got := bindOf("pipelines/sales")["raw_orders"]; got != "table-raw-orders" {
+		t.Fatalf("raw_orders = %q, want the one raw_orders in the Space", got)
+	}
+	report := bindOf("workflows/sales-report")
+	if report["fx_rates"] != "table-fx-rates" || report["crm"] != "secret-crm" || report["ledger"] != "table-dev-ledger" {
+		t.Fatalf("sales-report's dev bind = %v, want the reads re-picked and ledger on the dev feature's own row", report)
+	}
+	if got := bindOf("apps/sales-dashboard")["close_books"]; got != "" {
+		t.Fatalf("close_books = %q: a run outside the stack's feature must be left for a hand bind", got)
+	}
+
+	for rel, binds := range map[string]map[string]string{"apps/sales-dashboard": {"close_books": "workflow-close"}, "automations/sales": {"mcpserver_crm": "mcpsrv-crm"}} {
+		root := filepath.Join(dir, rel)
+		m := loadAnyManifest(t, root)
+		dev := m.Stacks["dev"]
+		if dev.Bind == nil {
+			dev.Bind = map[string]string{}
+		}
+		for alias, id := range binds {
+			dev.Bind[alias] = id
+		}
+		m.Stacks["dev"] = dev
+		if err := wfdir.SaveManifest(root, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	applied, err := applyStack(t, dir, "dev", "--allow-create")
+	if err != nil || applied.Verdict != verdictApplied {
+		t.Fatalf("the declared stack did not go up in one apply: %v\n%s", err, describeApply(applied))
+	}
+	rows := devRows(f, devFeature)
+	if len(rows.workflows) != 1 || len(rows.apps) != 1 || rows.tables["orders_clean"] == nil {
+		t.Fatalf("the dev feature holds tables %v, %d workflows, %d apps", keysOf(rows.tables), len(rows.workflows), len(rows.apps))
 	}
 }

@@ -382,7 +382,7 @@ func decideApplyPushPreflight(f *folder, files map[string]string) (reason, detai
 		// the positional refs over what is actually being SENT — a positional ref
 		// in a file this run would not push cannot mis-resolve anything, and
 		// refusing on it would let one stale file block the rest of the folder.
-		targets := pipelineChangedTargets(f, files, f.State.For(f.Key).Hashes())
+		targets := pipelineChangedTargets(f, files, f.State.For(f.Baseline()).Hashes())
 		if len(targets) == 0 {
 			return "", ""
 		}
@@ -513,7 +513,7 @@ func pipelineMetricDecisions(f *folder) ([]applyDecision, error) {
 	if err != nil {
 		return nil, err
 	}
-	files = resolveMetricIdentities(f, f.live(f.State.For(f.Key)), files)
+	files = resolveMetricIdentities(f, f.live(f.State.For(f.Baseline())), files)
 	out := make([]applyDecision, 0, len(files))
 	for _, file := range files {
 		if file.Problem != "" {

@@ -36,7 +36,7 @@ the folder is unbound so a later push creates a fresh app.
 Asks for confirmation on a terminal; --yes is required without one.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(yes)
 			if err != nil {
 				return err
 			}
@@ -69,7 +69,7 @@ type appDiscardResult struct {
 }
 
 func runAppDiscard(ctx context.Context, f *folder, yes, deleteApp bool) (*appDiscardResult, error) {
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	if !f.Bound || f.Binding.DataAppID == "" {
 		return nil, fmt.Errorf("nothing to discard — this folder has no data app on %s yet", f.Resolved.URL)
 	}
@@ -149,7 +149,7 @@ func deleteUnpublishedApp(ctx context.Context, client *api.Client, f *folder, ap
 	}
 	// Only this binding's baseline is cleared: the folder may be bound to other
 	// stacks whose rows still exist. A save failure is noted, not returned.
-	f.State.Clear(f.Key)
+	f.State.Clear(f.Baseline())
 	noteBaselineRefresh(f.Kind, wfdir.SaveState(f.Root, f.State))
 	return &appDiscardResult{Outcome: outcomeResourceDeleted, DataAppID: app.ID}, nil
 }

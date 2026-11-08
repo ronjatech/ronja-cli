@@ -53,6 +53,12 @@ type fakeAppInstance struct {
 	// case and a fake that defaulted otherwise would turn every init test into
 	// a test of one refusal.
 	featureStatus map[string]int
+	// featureSpace is the Space GET /feature/:id reports per feature and
+	// spaceNames what GET /space/:id answers, as on fakeInstance; spaceSeen
+	// records each request that carried X-Ronja-Space.
+	featureSpace map[string]string
+	spaceNames   map[string]string
+	spaceSeen    []string
 	// privilegeLevel is the signed-in caller's role level (10 = admin, 50 =
 	// ordinary user), mirroring sherlock's downward-counting scale.
 	privilegeLevel int
@@ -354,6 +360,10 @@ func (f *fakeAppInstance) AddDraft(liveID, draftID string, files ...api.DataAppF
 
 func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
+	if space := r.Header.Get(api.HeaderSpace); space != "" {
+		f.spaceSeen = append(f.spaceSeen, r.Method+" "+r.URL.Path+" "+space)
+	}
+	echoSpace(w, r)
 	if f.managed.serve(w, r) {
 		return
 	}
@@ -416,7 +426,20 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 		if !known {
 			scope = "private"
 		}
-		writeJSON(w, map[string]any{"id": featureID, "name": "Feature", "scope": scope})
+		body := map[string]any{"id": featureID, "name": "Feature", "scope": scope}
+		if space := f.featureSpace[featureID]; space != "" {
+			body["spaceID"] = space
+		}
+		writeJSON(w, body)
+		return
+	}
+	if spaceID, ok := strings.CutPrefix(r.URL.Path, "/api/v2/space/"); ok && r.Method == http.MethodGet {
+		name, known := f.spaceNames[spaceID]
+		if !known {
+			http.Error(w, `{"error":"space not found"}`, http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{"id": spaceID, "name": name, "isDefault": false})
 		return
 	}
 

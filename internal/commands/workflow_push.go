@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/markers"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
 )
@@ -56,7 +57,7 @@ Publishing is a separate step:
   ronja wf publish                 commit the draft, or submit it for review`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -78,6 +79,7 @@ Publishing is a separate step:
 						return emitErr
 					}
 				} else {
+					printStackLine(f)
 					printPushReport(result)
 				}
 			}
@@ -289,7 +291,7 @@ func runPush(ctx context.Context, f *folder, opts pushOptions) (*pushResult, err
 }
 
 func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult, error) {
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	result := &pushResult{
 		WorkflowID: f.Binding.WorkflowID,
 		Target:     describeTarget(f.Resolved),
@@ -378,14 +380,15 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		f.Manifest.Runtime, pinned = runtime, true
 	}
 
-	// 2d. THE WRITE GATE, in an ADOPTED folder, before anything asks whether
-	// there is something to deploy: a folder whose code writes or runs outside
-	// its stack's feature is refused whether or not it changed — a web edit
-	// pulled into the folder that writes outside would otherwise deploy green
-	// for ever behind the live-first shortcut below. An adopted folder
-	// validates whatever --no-validate says: the same answer carries the
-	// server's writeTargets, and a gate a flag could skip would not be one.
-	gate := f.adoptedHere()
+	// 2d. THE WRITE GATE, in an ADOPTED folder or on a stack with a Space,
+	// before anything asks whether there is something to deploy: a folder whose
+	// code writes or runs outside its stack's feature (or Space) is refused
+	// whether or not it changed — a web edit pulled into the folder that writes
+	// outside would otherwise deploy green for ever behind the live-first
+	// shortcut below. Such a folder validates whatever --no-validate says: the
+	// same answer carries the server's writeTargets, and a gate a flag could
+	// skip would not be one.
+	gate := f.gateApplies()
 	var validated *api.ValidateResult
 	if gate {
 		var posted []api.ValidateFile
@@ -417,7 +420,7 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		// The drift guard, BEFORE the checkout, when the checkout would only
 		// copy the live row just read: the same answer the guard gives the
 		// copy, without opening a draft only to withdraw it.
-		if opts.Apply && existing.Row() == nil && raw != nil && f.State.For(f.Key) != nil && !opts.Force {
+		if opts.Apply && existing.Row() == nil && raw != nil && f.State.For(f.Baseline()) != nil && !opts.Force {
 			if _, err := checkDrift(f, existing.Workflow, read, hashFiles(f.baselineCodec(), raw), local, false, headAgreement{},
 				driftAsk{apply: true}); err != nil {
 				return nil, err
@@ -564,7 +567,7 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 	// It starts as what is ALREADY acknowledged rather than as the whole remote
 	// (see acknowledgedRemote): a --force push that stops must not hand the
 	// retry a baseline containing the very content it was forcing past.
-	landed := acknowledgedRemote(f.State.For(f.Key), remoteFiles, local, result.Created)
+	landed := acknowledgedRemote(f.State.For(f.Baseline()), remoteFiles, local, result.Created)
 	// The declared calendar is the one metadata field a 2xx does not confirm, so
 	// there is a window in which the row's zone is UNKNOWN to us: the patch was
 	// accepted, the read-back that would tell us what landed failed. `target`
@@ -692,8 +695,8 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		// than the one the next push will compare against. Written only when it
 		// would actually change — a no-op push that re-stamped the baseline
 		// would move its timestamp to describe a sync that never happened.
-		if !baselineDescribes(f.State.For(f.Key), target) {
-			f.State.Set(f.Key, baselineFromLocal(f.Codec, target, landed))
+		if !baselineDescribes(f.State.For(f.Baseline()), target) {
+			f.State.Set(f.Baseline(), baselineFromLocal(f.Codec, target, landed))
 			if err := wfdir.SaveState(f.Root, f.State); err != nil {
 				return result, err
 			}
@@ -721,7 +724,7 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 
 	// 10. The new baseline is what we just pushed: the server now holds exactly
 	// these bytes, and `updated` is the freshest thing we know about the row.
-	f.State.Set(f.Key, baselineFromLocal(f.Codec, updated, local))
+	f.State.Set(f.Baseline(), baselineFromLocal(f.Codec, updated, local))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return result, err
 	}
@@ -769,6 +772,11 @@ func validateWorkflowCandidate(ctx context.Context, client *api.Client, f *folde
 	})
 	if err == nil {
 		return posted, validated, nil
+	}
+	// No verdict on the folder, so neither feature advice nor --no-validate
+	// would help.
+	if _, refused := asSpaceEntry(err); refused {
+		return nil, nil, err
 	}
 	// The feature this folder names is not one this credential can use.
 	// Reported HERE and not only at create, because validate runs FIRST on the
@@ -1108,7 +1116,7 @@ func saveBaseline(f *folder, source *api.Workflow, files map[string]string, zone
 	if zoneUnconfirmed {
 		inst.ReportingTimezone = nil
 	}
-	f.State.Set(f.Key, inst)
+	f.State.Set(f.Baseline(), inst)
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record what was pushed in the local baseline (%v).\n", err)
 	}
@@ -1194,6 +1202,12 @@ func inspectTarget(ctx context.Context, client *api.Client, f *folder) (existing
 			return existingTarget{}, fmt.Errorf("workflow %s no longer exists on %s (or you lost access to it) — clone the workflow you meant into a fresh folder, or remove the binding from %s to start a new one",
 				f.Binding.WorkflowID, f.Resolved.URL, wfdir.ManifestPath(f.Root))
 		}
+		if refusal := f.placeOwnRow(ctx, markers.KindWorkflow, f.Binding.WorkflowID, "", err); refusal != nil {
+			return existingTarget{}, refusal
+		}
+		return existingTarget{}, err
+	}
+	if err := f.placeOwnRow(ctx, markers.KindWorkflow, wf.ID, wf.FeatureID, nil); err != nil {
 		return existingTarget{}, err
 	}
 	if err := refuseUnclonable(wf); err != nil {
@@ -1415,7 +1429,7 @@ type driftVerdict struct {
 // under (baselineCodec), the only rendering the baseline can be compared with;
 // remote is in the folder's current aliases, for every comparison with local.
 func checkDrift(f *folder, target *api.Workflow, remote, atBaseline, local map[string]string, force bool, head headAgreement, ask driftAsk) (driftVerdict, error) {
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
 		remoteHashes[path] = wfdir.HashString(content)

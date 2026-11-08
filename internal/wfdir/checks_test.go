@@ -99,7 +99,7 @@ func TestStateChecksRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	key := InstanceKey{URL: "https://x.example", TenantID: "t1"}
 	state := &State{}
-	state.Set(key, &InstanceState{Checks: map[string]ChecksState{
+	stateSetKey(state, key, &InstanceState{Checks: map[string]ChecksState{
 		"checks/gl.json": {TableID: "table-gl", Managed: map[string]LockCheckEntry{"unik": {CheckID: "c1", LiveSHA256: "abc"}}},
 	}})
 	if err := SaveState(root, state); err != nil {
@@ -109,7 +109,7 @@ func TestStateChecksRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := loaded.For(key).Checks["checks/gl.json"]
+	got := stateForKey(loaded, key).Checks["checks/gl.json"]
 	if got.TableID != "table-gl" || got.Managed["unik"].CheckID != "c1" || got.Managed["unik"].LiveSHA256 != "abc" {
 		t.Fatalf("round trip = %+v", got)
 	}

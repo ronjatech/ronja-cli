@@ -138,7 +138,7 @@ func (f *folder) boundAddress(kind, p string) string {
 	case wfdir.AddressAutomation:
 		return f.Binding.Automations[p]
 	case wfdir.AddressMetric:
-		id, _, _ := f.live(f.State.For(f.Key)).metricSeen(p)
+		id, _, _ := f.live(f.State.For(f.Baseline())).metricSeen(p)
 		return id
 	}
 	return ""
@@ -305,7 +305,7 @@ func appendMove(moves []addressMove, next addressMove) []addressMove {
 // local baseline, the in-memory binding — and, for a table, the checks entry
 // keyed by its stem, since a check is a child of its table and moves with it.
 func (f *folder) rekeyAddress(op addressOp) {
-	inst := f.State.For(f.Key)
+	inst := f.State.For(f.Baseline())
 	paths := [][2]string{{op.from, op.to}}
 	if op.kind == wfdir.AddressTable {
 		if from, to := wfdir.ChecksPath(tableNameFor(op.from)), wfdir.ChecksPath(tableNameFor(op.to)); from != to {
@@ -372,7 +372,7 @@ func (f *folder) carryNameBaseline(op addressOp) {
 // which liveHashes never dereferences on that fork).
 func (f *folder) namedBaseline() *wfdir.InstanceState {
 	if f.Stack != "" {
-		return f.State.For(f.Key)
+		return f.State.For(f.Baseline())
 	}
 	return pipelineBaseline(f)
 }
@@ -380,7 +380,7 @@ func (f *folder) namedBaseline() *wfdir.InstanceState {
 // dropAddress applies one removal: the entry leaves every record this folder
 // keeps for the stack, and nothing is sent anywhere.
 func (f *folder) dropAddress(op addressOp) {
-	inst := f.State.For(f.Key)
+	inst := f.State.For(f.Baseline())
 	paths := []string{op.from}
 	if op.kind == wfdir.AddressTable {
 		// The table's checks stop being managed with it. Left behind, the checks

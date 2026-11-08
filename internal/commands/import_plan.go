@@ -216,6 +216,9 @@ type importDataSource struct {
 	// id the reference carries, and — for a write — treated as outside the
 	// feature.
 	Readable bool `json:"readable"`
+	// CopiedFrom is the table a table data source is a snapshot copy of.
+	CopiedFrom     string `json:"copiedFrom,omitempty"`
+	copiedFromName string
 }
 
 // importAddress is one address dependency the import declared.

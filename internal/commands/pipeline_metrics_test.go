@@ -498,7 +498,7 @@ func seedStagedMetric(t *testing.T, f *fakePipelineInstance, root string, status
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	inst := state.For(f.Key())
+	inst := stateForKey(state, f.Key())
 	inst.Metrics = map[string]wfdir.MetricState{
 		"metrics/average_order.json": {
 			MetricID: "table-aov",

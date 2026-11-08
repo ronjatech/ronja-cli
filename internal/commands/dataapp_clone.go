@@ -69,6 +69,10 @@ flow.`,
 			if err := refuseUnworkableApp(app); err != nil {
 				return err
 			}
+			space, err := settleStackSpace(cmd.Context(), resolved, app.FeatureID)
+			if err != nil {
+				return err
+			}
 
 			// Prefer the caller's own draft: it is their newest state, and cloning
 			// live over it would look like their web-builder edits had vanished.
@@ -101,7 +105,7 @@ flow.`,
 				}
 			}
 
-			files, entrypoint, err := writeDataAppClone(cmd.Context(), client, resolved, app, source, root, cloneHooks{})
+			files, entrypoint, err := writeDataAppClone(cmd.Context(), client, resolved, app, source, root, cloneHooks{space: space})
 			if err != nil {
 				return err
 			}
@@ -205,6 +209,7 @@ func writeDataAppClone(ctx context.Context, client *api.Client, resolved *config
 	if err != nil {
 		return nil, "", err
 	}
+	stampSpace(manifest, flagStack, hooks.space)
 	// The committed anchor — the same decision as `wf clone`'s (a clone
 	// taken from a DRAFT never anchors on the current head), through a
 	// DIFFERENT resolver: rdataapp's base_version_id usually holds the
@@ -241,7 +246,7 @@ func writeDataAppClone(ctx context.Context, client *api.Client, resolved *config
 	// be the draft even though the binding names the live app.
 	// De-aliased by the codec the files were written through (empty, and so
 	// the identity, for a clone — see alias.go).
-	state.Set(key, baselineFromApp(hooks.codec, source, files))
+	state.Set(wfdir.BaselineKey{Key: key, Stack: flagStack}, baselineFromApp(hooks.codec, source, files))
 	if err := wfdir.SaveState(root, state); err != nil {
 		return nil, "", err
 	}

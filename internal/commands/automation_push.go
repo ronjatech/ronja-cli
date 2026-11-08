@@ -74,7 +74,7 @@ It refuses, rather than guessing, when:
     because a file went missing`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -95,6 +95,7 @@ It refuses, rather than guessing, when:
 						return emitErr
 					}
 				} else {
+					printStackLine(f)
 					printAutomationPushReport(result)
 				}
 			}
@@ -226,7 +227,7 @@ func refuseBoundAutomationsWithNoFeature(f *folder) error {
 }
 
 func runAutomationPush(ctx context.Context, f *folder, opts automationPushOptions) (*automationPushResult, error) {
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	result := &automationPushResult{
 		FeatureID: f.Binding.FeatureID,
 		Target:    describeTarget(f.Resolved),

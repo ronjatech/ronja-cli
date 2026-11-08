@@ -39,7 +39,7 @@ With --json, one object carrying all of the above.`,
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what changed locally, which is most of the value and costs
 			// nothing. The remote half degrades to "not checked" with a reason.
-			resolved, err := config.Resolve(flagURL, flagProfile)
+			resolved, err := resolveStackCredential("", false, false)
 			if err != nil {
 				return err
 			}
@@ -97,7 +97,7 @@ func moduleStatusReportAt(ctx context.Context, root string, resolved *config.Res
 	if err != nil {
 		return nil, err
 	}
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	report.Local = wfdir.DiffHashes(enumeration.Files, baseline.Hashes())
 	report.Skipped = enumeration.Skipped
 	if baseline != nil {
@@ -273,7 +273,7 @@ func moduleRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folde
 		return out
 	}
 
-	client := api.New(resolved.URL, resolved.Token)
+	client := f.client()
 	mod, err := client.GetModule(ctx, f.Binding.ModuleID)
 	if err != nil {
 		if api.StatusOf(err) == 404 {
@@ -329,7 +329,7 @@ func moduleRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folde
 	}
 	out.ComparedAgainst = &comparedReport{ID: target.ID, Lifecycle: target.Lifecycle}
 	out.SQLSemanticsNotice = sqlSemanticsNotice(sqlSemanticsSubject(target.Title, target.ID), target.SQLSemantics)
-	baseline := f.State.For(f.Key)
+	baseline := f.State.For(f.Baseline())
 	drift := wfdir.DiffHashes(hashModuleFiles(files), baseline.Hashes())
 	out.Drift = &drift
 

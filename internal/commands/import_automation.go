@@ -178,6 +178,7 @@ func (imp *featureImport) writeAutomations(f *importFolder, root string, hooks c
 	if err := recordFirstBindingInto(manifest, lock, key, binding); err != nil {
 		return err
 	}
+	stampSpace(manifest, flagStack, hooks.space)
 	for _, address := range sortedKeys(f.automations) {
 		row := f.automations[address]
 		lock.SetAutomationSeen(imp.stack, address, row.ID, row.Stamp())

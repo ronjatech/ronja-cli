@@ -106,9 +106,17 @@ thing — a stack to bind against — and --feature declares it in the same comm
 
 The stack's url and organization come from your credential; --feature says which
 feature its resources are created in, which is the one thing nothing can work out
-for you. Without --feature, a stack the folder does not declare is refused rather
-than half-written. --feature will not repoint a stack that already names a
-different feature: that is an edit to ronja.json, not a flag.`,
+for you, and a stack outside the organization's default Space records that
+feature's Space. With --feature and no --stack, the new stack is named after
+the Space (dev), or main in the default Space. A second stack may
+share an organization with the first (a Dev Space beside Main), never a feature.
+Without --feature, a stack the folder does not declare is refused rather than
+half-written. --feature will not repoint a stack that already names a different
+feature: that is an edit to ronja.json, not a flag.
+
+On a stack that names a Space, or one --feature declares on a feature in one,
+a read dependency is proposed only from that Space, and a write or run target
+only from the stack's own feature.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveInstance()
@@ -136,9 +144,18 @@ different feature: that is an edit to ronja.json, not a flag.`,
 			// that confirmed the feature later would rewrite the committed file
 			// and only then refuse. The two things it needs are both known here:
 			// the id came off the command line, and the credential is resolved.
+			if featureID != "" && flagStack == "" {
+				name, err := bindDefaultStack(cmd.Context(), resolved, kind, featureID)
+				if err != nil {
+					return err
+				}
+				flagStack = name
+			}
 			if err := confirmBindFeature(cmd.Context(), featureID, resolved); err != nil {
 				return err
 			}
+			declaringFeature = featureID
+			defer func() { declaringFeature = "" }()
 			f, err := openFolder(cmd.Context(), resolved, kind)
 			if err != nil {
 				return err
@@ -383,6 +400,9 @@ type bindProposal struct {
 	// `qa_import_crm`). Said in the plan, so a reader approving it sees that the
 	// two spellings differ.
 	Loose bool `json:"loose,omitempty"`
+	// Source is the snapshot copy another stack binds this name to, when the
+	// proposal is that copy's source table rather than a name match.
+	Source string `json:"source,omitempty"`
 }
 
 // bindUnresolved is one alias this command will not bind, and why.
@@ -396,6 +416,9 @@ type bindUnresolved struct {
 	// Candidates are the ids that matched, for bindReasonAmbiguous only.
 	// They are the whole answer for a reader picking one by hand.
 	Candidates []string `json:"candidates,omitempty"`
+	// Copy is the `ronja copy` line that makes this stack its own row, when a
+	// table has none here and another stack of the folder binds one.
+	Copy string `json:"copy,omitempty"`
 }
 
 // bindResult is one run of the command.
@@ -421,6 +444,9 @@ type bindResult struct {
 	DeclaresStack string `json:"declaresStack,omitempty"`
 	// Written reports whether the manifest was rewritten.
 	Written bool `json:"written"`
+	// Space is the Space the stack's proposals are picked from, by name; empty
+	// when they are picked across the organization.
+	Space string `json:"space,omitempty"`
 }
 
 // stillUnbound lists every declared alias that has no binding after this run, in
@@ -458,6 +484,9 @@ func (r *bindResult) exitError() error {
 func (r *bindResult) where() string {
 	if r.Stack == "" {
 		return `in the unnamed "instances" entry`
+	}
+	if r.Space != "" {
+		return fmt.Sprintf("in stack %q (Space %s)", r.Stack, r.Space)
 	}
 	return fmt.Sprintf("in stack %q", r.Stack)
 }
@@ -525,6 +554,64 @@ func confirmBindFeature(ctx context.Context, featureID string, resolved *config.
 }
 
 func runBind(ctx context.Context, f *folder, yes bool, featureID string) (*bindResult, error) {
+	p, err := planBind(ctx, f, featureID)
+	if err != nil {
+		return nil, err
+	}
+	if !p.writes() {
+		return p.result, nil
+	}
+	result, target := p.result, p.target
+	if !flagJSON {
+		printBindPlan(result, f.Manifest.Dependencies)
+	}
+	// ONE confirmation covering everything about to be written, the declaration
+	// included. A prompt that mentioned only the bindings would be a prompt that
+	// understated what it was asking for.
+	change := bindCount(len(result.Proposed), "binding")
+	if target.declares != "" {
+		change = target.declares
+		if len(result.Proposed) > 0 {
+			change += " and " + bindCount(len(result.Proposed), "binding")
+		}
+	}
+	ok, err := confirm(
+		fmt.Sprintf("Record %s %s in %s?", change, result.where(), wfdir.ManifestName),
+		fmt.Sprintf("writes %s into %s", change, wfdir.ManifestName),
+		yes)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return result, nil
+	}
+	if err := p.write(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// bindPlan is what one folder's bind would write, decided and not yet
+// written: `bind` writes one, `sync stack add` every folder's after one
+// confirmation.
+type bindPlan struct {
+	f      *folder
+	result *bindResult
+	target bindTarget
+	picker bindPicker
+	// spaceRecorded is the Space this plan records on a stack that already
+	// named the feature, "" when it records none there.
+	spaceRecorded string
+}
+
+// writes reports whether the plan changes the manifest at all.
+func (p *bindPlan) writes() bool {
+	return len(p.result.Proposed) > 0 || p.target.declares != "" || p.f.adoptPending
+}
+
+// planBind resolves every unbound declaration, and where a declaring command
+// will write, without writing anything.
+func planBind(ctx context.Context, f *folder, featureID string) (*bindPlan, error) {
 	// A stack is one organization on one instance, and wfdir.checkStacks refuses
 	// one that names none — so DECLARING a stack needs an organization resolved,
 	// and this is exactly the case resolveBinding skips: it asks only when the
@@ -582,15 +669,25 @@ func runBind(ctx context.Context, f *folder, yes bool, featureID string) (*bindR
 	if err != nil {
 		return nil, err
 	}
+	lookup := newSpaceLookup(ctx, f.Resolved)
+	space, spaceRecorded, err := declaredStackSpace(f, lookup, featureID, &target)
+	if err != nil {
+		return nil, err
+	}
+	if err := refuseDeclaringOverAnotherFeaturesRow(f, lookup, featureID, target); err != nil {
+		return nil, err
+	}
 	result.DeclaresStack = target.declares
+	picker := bindPickerOf(f, lookup, featureID, space)
+	result.Space = picker.spaceName
 
 	aliases := f.Manifest.AliasNames()
 	if len(aliases) == 0 && target.declares == "" {
 		// Nothing to reconcile and nothing to declare.
-		return result, nil
+		return &bindPlan{f: f, result: result, target: target, picker: picker, spaceRecorded: spaceRecorded}, nil
 	}
 
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	for _, alias := range aliases {
 		dep := f.Manifest.Dependencies[alias]
 		// An ADDRESS dependency resolves through the other folder's claim and
@@ -611,6 +708,18 @@ func runBind(ctx context.Context, f *folder, yes bool, featureID string) (*bindR
 		// binding it there turns every run of the copy into a write to the
 		// original. Which table a stack may write is a decision a person makes
 		// per stack, by hand, and it is reported as such.
+		if picker.spaceID != "" {
+			proposal, unresolved, err := picker.propose(ctx, client, f, alias, dep)
+			if err != nil {
+				return nil, err
+			}
+			if proposal != nil {
+				result.Proposed = append(result.Proposed, *proposal)
+			} else {
+				result.Unresolved = append(result.Unresolved, *unresolved)
+			}
+			continue
+		}
 		if dep.Write {
 			result.Unresolved = append(result.Unresolved, bindUnresolved{
 				Alias: alias, Kind: dep.Kind, Reason: bindReasonWriteTarget,
@@ -628,7 +737,7 @@ func runBind(ctx context.Context, f *folder, yes bool, featureID string) (*bindR
 			})
 			continue
 		}
-		proposal, unresolved, err := proposeBind(ctx, client, alias, dep.Kind)
+		proposal, unresolved, err := proposeBind(ctx, client, alias, dep.Kind, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -639,49 +748,48 @@ func runBind(ctx context.Context, f *folder, yes bool, featureID string) (*bindR
 		result.Unresolved = append(result.Unresolved, *unresolved)
 	}
 
-	if len(result.Proposed) == 0 && target.declares == "" {
-		return result, nil
-	}
-	if !flagJSON {
-		printBindPlan(result, f.Manifest.Dependencies)
-	}
-	// ONE confirmation covering everything about to be written, the declaration
-	// included. A prompt that mentioned only the bindings would be a prompt that
-	// understated what it was asking for.
-	change := bindCount(len(result.Proposed), "binding")
-	if target.declares != "" {
-		change = target.declares
-		if len(result.Proposed) > 0 {
-			change += " and " + bindCount(len(result.Proposed), "binding")
-		}
-	}
-	ok, err := confirm(
-		fmt.Sprintf("Record %s %s in %s?", change, result.where(), wfdir.ManifestName),
-		fmt.Sprintf("writes %s into %s", change, wfdir.ManifestName),
-		yes)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return result, nil
-	}
+	return &bindPlan{f: f, result: result, target: target, picker: picker, spaceRecorded: spaceRecorded}, nil
+}
+
+// write records the plan in the folder's committed files.
+func (p *bindPlan) write() error {
+	f, result, target, picker := p.f, p.result, p.target, p.picker
 	if err := target.apply(result.Proposed); err != nil {
-		return nil, err
+		return err
+	}
+	if picker.records {
+		stack := f.Manifest.Stacks[f.Stack]
+		stack.SpaceID, stack.Space = picker.spaceID, picker.spaceName
+		f.Manifest.Stacks[f.Stack] = stack
 	}
 	// SaveFolder rather than SaveManifest, per its own contract — the two
 	// committed files are written together. The lock is unchanged here (a bind is
 	// config, and no id was created), so this is a manifest write with a no-op in
 	// front of it.
 	if err := f.saveFolder(); err != nil {
-		return nil, fmt.Errorf("write %s: %w", wfdir.ManifestPath(f.Root), err)
+		return fmt.Errorf("write %s: %w", wfdir.ManifestPath(f.Root), err)
+	}
+	if f.adoptPending {
+		f.adoptPending = false
+		f.sayAdopted()
+	}
+	// A legacy local record was given to the stack already declared here when
+	// the folder was opened; written now, because once a second stack names this
+	// organization nothing can tell whose it was.
+	if target.declares != "" && len(f.State.Instances) > 0 {
+		if err := wfdir.SaveState(f.Root, f.State); err != nil {
+			return err
+		}
 	}
 	result.Written = true
-	return result, nil
+	return nil
 }
 
 // proposeBind answers one alias: the row to bind it to, or why there is none.
 // Exactly one of the two returns is non-nil when err is nil.
-func proposeBind(ctx context.Context, client *api.Client, alias, dependencyKind string) (*bindProposal, *bindUnresolved, error) {
+// keep, when not nil, narrows the name matches to the rows a Space stack may
+// bind (bindPicker), and says where it looked when none is left.
+func proposeBind(ctx context.Context, client *api.Client, alias, dependencyKind string, keep *bindScope) (*bindProposal, *bindUnresolved, error) {
 	refuse := func(reason, detail string, candidates []string) (*bindProposal, *bindUnresolved, error) {
 		return nil, &bindUnresolved{
 			Alias: alias, Kind: dependencyKind, Reason: reason, Detail: detail, Candidates: candidates,
@@ -765,6 +873,15 @@ func proposeBind(ctx context.Context, client *api.Client, alias, dependencyKind 
 		}
 	}
 
+	if keep != nil {
+		var err error
+		if exact, err = keep.filter(exact); err != nil {
+			return nil, nil, err
+		}
+		if loose, err = keep.filter(loose); err != nil {
+			return nil, nil, err
+		}
+	}
 	// An exact match wins outright, so a folder that bound before loose matching
 	// existed binds to the same row now. Only with none is a loose one offered.
 	matched, how := exact, "called"
@@ -782,6 +899,9 @@ func proposeBind(ctx context.Context, client *api.Client, alias, dependencyKind 
 		return &bindProposal{Alias: alias, Kind: dependencyKind, ID: matched[0].ID, Title: matched[0].Title, Loose: len(exact) == 0}, nil, nil
 	case len(matched) == 0:
 		detail := fmt.Sprintf("no %s here is called %q, even ignoring case and separators", dependencyKind, alias)
+		if keep != nil {
+			detail = keep.noMatch(dependencyKind, alias)
+		}
 		if truncated {
 			// Nothing is written either way, so this is not the invariant above —
 			// it is the reader being told not to trust a flat "nothing is called
@@ -1060,6 +1180,9 @@ func printBindPlan(r *bindResult, deps map[string]wfdir.Dependency) {
 		how := ""
 		if p.Loose {
 			how = "  (matched ignoring case and separators)"
+		}
+		if p.Source != "" {
+			how = fmt.Sprintf("  (the source of %s, the copy another stack binds)", p.Source)
 		}
 		fmt.Fprintf(out, "    %-*s  %-8s  → %s  %q%s\n", width, p.Alias, p.Kind, p.ID, p.Title, how)
 	}

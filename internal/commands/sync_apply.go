@@ -66,8 +66,9 @@ RUN outside that feature — a {{ workflow }} or {{ agent }} marker, an app's
 allowed workflows or agents, an automation's action or workflow reference — is
 refused runs_outside_target unless a "run": true dependency binds it in that
 stack. A module folder pushed into a feature the run's other folders do not
-deploy to is warned about (shared_module): it publishes the organization's one
-module.
+deploy to is warned about (shared_module): it publishes that feature's module,
+which every workflow importing it there picks up. Module names are unique per
+feature, so a stack can deploy its own copy into its own feature.
 
 UPDATE-ONLY is the safety property this command is built around. It refuses,
 per creation unit (each .sql file, metrics/*.json and automation file; the
@@ -85,7 +86,17 @@ whole folder for a workflow, data app or module — the grain the lock records):
 Push the folder on its own to resolve one. --allow-create lifts only the first:
 before making anything it names how many ROWS (not folders — a merge adding
 one file to thirty folders is thirty rows), in which organization AND in which
-features, since a commit can redirect a create by editing one ronja.json.
+features, since a commit can redirect a create by editing one ronja.json. A
+create beside a live workflow, data app, module or automation of the same kind
+and name in the target feature is refused name_taken, naming the row to adopt.
+
+SPACES. A stack that declares a "spaceID" (one outside the organization's
+default Space) deploys only into that Space: its
+feature must be there (space_mismatch), and what the folder writes or runs,
+and every secret it uses, must be too (bind_space_mismatch); an address
+resolves only to a row in that Space (address_space_mismatch). A stack outside
+the organization's default Space writes no files: a run's file writes land in
+the default Space.
 
 There is no --force and no --overwrite-remote. Where apply refuses on drift,
 run the folder's own command (` + "`ronja pipeline publish --overwrite-remote`" + ` and
@@ -133,7 +144,11 @@ reads: the organization can move before the apply.`,
 			// credential here — every folder would be reported unknown — and the
 			// dry-run needs the same organization the apply would use, or it
 			// would preview a stack selection the apply does not make.
-			resolved, err := resolveInstance()
+			resolve := resolveDeployTreeInstance
+			if flagSyncDryRun {
+				resolve = func(dir string, _ bool) (*config.Resolved, error) { return resolveTreeInstance(dir) }
+			}
+			resolved, err := resolve(flagSyncDir, false)
 			if err != nil {
 				return withExitCode(syncExitUnknown, err)
 			}
@@ -164,6 +179,9 @@ type syncApplyReport struct {
 	Dir   string `json:"dir"`
 	URL   string `json:"url"`
 	Stack string `json:"stack,omitempty"`
+	// Space is the Space the stack is declared for, by the label its folders
+	// carry; empty when none declares one.
+	Space string `json:"space,omitempty"`
 	// DryRun reports that nothing was written. It is a field rather than an
 	// absence because every other value in this report reads identically in
 	// both modes, and a reader who cannot tell them apart would take a preview
@@ -302,7 +320,8 @@ type syncApplySummary struct {
 
 // exitError turns the tree verdict into the process exit code, on the same
 // three-valued contract as `sync status`.
-func (r *syncApplyReport) exitError() error {
+func (r *syncApplyReport) exitError() (err error) {
+	defer func() { err = withPrintedSpaceRefusals(err, r.details()) }()
 	// Agreed with the REFUSED count, which is the subject of the sentence: "1 of
 	// 30 folders was not fully deployed", not "were". FULLY, because a
 	// checks_not_applied folder is refused with its tables published.
@@ -323,6 +342,15 @@ func (r *syncApplyReport) exitError() error {
 			r.Summary.Unknown, r.Summary.Folders, plural(r.Summary.Folders, "folder")))
 	}
 	return nil
+}
+
+// details are the folders' details, in which a Space refusal is printed.
+func (r *syncApplyReport) details() []string {
+	out := make([]string, len(r.Folders))
+	for i, line := range r.Folders {
+		out[i] = line.Detail
+	}
+	return out
 }
 
 // syncApplyTree walks the tree and deploys every folder it can.
@@ -367,6 +395,7 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 		Dir:         base,
 		URL:         resolved.URL,
 		Stack:       flagStack,
+		Space:       treeStackSpace(found, flagStack),
 		DryRun:      flagSyncDryRun,
 		AllowCreate: flagSyncAllowCreate,
 		Order:       applyOrderDependency,
@@ -382,6 +411,7 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 	// resolved once above, so the pre-pass makes no request at all.
 	planned := make([]plannedFolder, 0, len(found))
 	creating := 0
+	spaces := newSpaceAttribution()
 	interrupted := false
 	for _, folder := range found {
 		if ctx.Err() != nil {
@@ -395,7 +425,7 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 			interrupted = true
 			break
 		}
-		planned = append(planned, planOneFolder(ctx, folder, resolved, key))
+		planned = append(planned, planOneFolder(ctx, folder, resolved, key, spaces))
 	}
 	// The folders the walk found and the plan never reached. They are `unknown`
 	// for the same reason a folder ruled out before it loaded is: nothing here
@@ -458,8 +488,42 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 	// one has created it) answers the addresses later folders deferred.
 	overlay := newAddressOverlay()
 	runCtx := withAddressOverlay(ctx, overlay)
+	// A Space's refusal stops only the folders on that Space: the folder whose
+	// step met it reports it, and each later one is not attempted, since every
+	// request it would send is refused locally.
+	stoppedBySpace := func(plan *plannedFolder) bool {
+		held := plan.f.heldSpaceRefusal()
+		if held == nil {
+			return false
+		}
+		if plan.line.Verdict == "" {
+			e, _ := asSpaceEntry(held)
+			plan.line.Verdict, plan.line.Reason, plan.line.Detail = verdictUnknown, e.Reason, notAttemptedInSpace(held, spaces.metBy[held], plan.created > 0)
+		}
+		return true
+	}
+	// inSpaceStep runs one of a folder's run-phase steps and reports a Space
+	// refusal the step met on its line, whatever else the step reported. The
+	// folder is taken first because a step that refuses it clears plan.f. What
+	// the line said before stays as a note: it may be what landed.
+	inSpaceStep := func(step func(context.Context, *plannedFolder), plan *plannedFolder) {
+		s := spaces.begin(plan.line.Path, plan.f)
+		step(runCtx, plan)
+		e := s.unreported()
+		if e == nil {
+			return
+		}
+		entry, line := s.entry(e), &plan.line
+		if line.Detail != "" && !strings.Contains(line.Detail, entry.Detail) {
+			line.Notes = append(line.Notes, line.Detail)
+		}
+		line.Verdict, line.Reason, line.Detail = verdictUnknown, entry.Reason, entry.Detail
+	}
 	run := func(i int) {
 		plan := &planned[i]
+		if stoppedBySpace(plan) {
+			return
+		}
 		if ctx.Err() != nil {
 			// ⚠️ FINISH THE REPORT. A tree interrupted 20 folders into 30 is
 			// precisely the state that needs one — some of it is live and some of
@@ -482,7 +546,7 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 		}
 		adopted := plan.f != nil && plan.f.adoptedHere()
 		lockBefore, _ := os.ReadFile(wfdir.LockPath(plan.line.Root))
-		runPlannedFolder(runCtx, plan)
+		inSpaceStep(runPlannedFolder, plan)
 		if !flagSyncDryRun {
 			overlay.recordFolder(plan.f)
 			if lockAfter, err := os.ReadFile(wfdir.LockPath(plan.line.Root)); adopted && err == nil && !bytes.Equal(lockBefore, lockAfter) {
@@ -504,10 +568,10 @@ func syncApplyTree(ctx context.Context, dir string, resolved *config.Resolved) (
 			if ctx.Err() != nil {
 				break
 			}
-			if !chosen[i] {
+			if !chosen[i] || stoppedBySpace(&planned[i]) {
 				continue
 			}
-			createWorkflowFirst(runCtx, &planned[i])
+			inSpaceStep(createWorkflowFirst, &planned[i])
 			overlay.recordFolder(planned[i].f)
 		}
 	}
@@ -638,9 +702,18 @@ func markApplyInterrupted(rest []plannedFolder) {
 // whether it may be acted on at all, and what a push would do to each of its
 // creation units.
 func planOneFolder(ctx context.Context, folder discoveredFolder,
-	resolved *config.Resolved, key wfdir.InstanceKey) plannedFolder {
+	resolved *config.Resolved, key wfdir.InstanceKey, spaces *spaceAttribution) (plan plannedFolder) {
 
-	plan := plannedFolder{line: syncApplyFolderReport{
+	step := spaces.begin(folder.Rel, nil)
+	// A Space refusal the step met and swallowed is the folder's answer.
+	defer func() {
+		if e := step.unreported(); e != nil {
+			r := step.entry(e)
+			plan.line.Verdict, plan.line.Reason, plan.line.Detail = verdictUnknown, r.Reason, r.Detail
+			plan.f = nil
+		}
+	}()
+	plan = plannedFolder{line: syncApplyFolderReport{
 		Path: folder.Rel, Root: folder.Root, Kind: folder.Kind.Name,
 		Units: []syncApplyUnitReport{},
 	}}
@@ -688,6 +761,9 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 	// declined to.
 	f, err := openFolderForStatusAt(ctx, folder.Root, resolved, folder.Kind)
 	if err != nil {
+		if e, ok := step.refusal(err); ok {
+			return unknown(e.Reason, "%s", e.Detail)
+		}
 		// An ADOPTED folder whose server state refuses it: a definite
 		// answer about this folder, under its own reason.
 		if r, ok := asManagedRefusal(err); ok {
@@ -695,6 +771,7 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 		}
 		return unknown(syncReasonFolderRefused, "%s", err.Error())
 	}
+	step.opened(f)
 	// The three refusals openFolder makes that openFolderForStatusAt does not,
 	// as REPORTS rather than as a whole-run abort. A tree legitimately holds
 	// folders belonging to several organizations, and one of them being
@@ -708,6 +785,26 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 	if err := f.requireAdoptedStackFeature(); err != nil {
 		r, _ := asManagedRefusal(err)
 		return refuse(r.Reason, "%s", r.Detail)
+	}
+	if found := f.checkSpaces(ctx, true); found.refusal != nil {
+		if r, ok := asManagedRefusal(found.refusal); ok {
+			return refuse(r.Reason, "%s", r.Detail)
+		}
+		if e, ok := f.spaceRefusal(found.refusal); ok {
+			return unknown(e.Reason, "%s", e.Detail)
+		}
+		return unknown(syncReasonLookupFailed, "%s", found.refusal.Error())
+	}
+	if flagSyncDryRun {
+		if err := f.placeOwnRows(ctx); err != nil {
+			if r, ok := asManagedRefusal(err); ok {
+				return refuse(r.Reason, "%s", r.Detail)
+			}
+			if e, ok := f.spaceRefusal(err); ok {
+				return unknown(e.Reason, "%s", e.Detail)
+			}
+			return unknown(syncReasonLookupFailed, "%s", err.Error())
+		}
 	}
 	// The write gate's notes go on this folder's line (Notes), not to stderr
 	// as a single-folder command prints them.
@@ -800,13 +897,20 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 	if reason, detail := syncApplyGate(f, plan.decisions, flagSyncAllowCreate); reason != "" {
 		return refuse(reason, "%s", detail)
 	}
+	if flagSyncAllowCreate {
+		if reason, detail := nameTakenRefusal(ctx, f, files, plan.decisions); reason == syncReasonNameTaken {
+			return refuse(reason, "%s", detail)
+		} else if reason != "" {
+			return unknown(reason, "%s", detail)
+		}
+	}
 	// The WRITE GATE for a row this run would CREATE, here and not only inside
 	// the push: the create is the first thing written, and a folder whose code
 	// writes outside this stack's feature must not leave an empty, claimed row
 	// behind on its way to being refused. Every other write is gated by the
 	// push itself, before its first byte (write_gate.go).
-	if reason, detail := planWriteGate(ctx, f, files, plan.decisions); reason != "" {
-		if reason == syncReasonWritesOutsideTarget || reason == syncReasonRunsOutsideTarget {
+	if reason, detail := planWriteGate(ctx, f, files, plan.decisions, flagSyncDryRun); reason != "" {
+		if gateRefusalReasons[reason] {
 			return refuse(reason, "%s", detail)
 		}
 		return unknown(reason, "%s", detail)
@@ -901,13 +1005,7 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 		// A create the server's state refused (a tombstone or an unreadable
 		// row holding the address): its own outcome, with its remedy.
 		r, _ := managedRefusalOf(plan.f, err)
-		detail := r.Detail
-		if (r.Reason == syncReasonWritesOutsideTarget || r.Reason == syncReasonRunsOutsideTarget) && plan.f.managed != nil && plan.f.managed.wroteRecords {
-			// The gate refused inside the push, AFTER settle had written this
-			// folder's records — so "nothing was written" would not be true.
-			detail = strings.TrimSuffix(detail, " Nothing was written") +
-				" No row was written; only this folder's records in Ronja (its moved, removed or newly claimed addresses) were settled before the check"
-		}
+		detail := gateRefusalDetail(r, plan.f.managed != nil && plan.f.managed.wroteRecords)
 		if _, direct := asManagedRefusal(err); direct {
 			refuse(r.Reason, "%s", detail)
 		} else {
@@ -1690,7 +1788,9 @@ func printSyncApply(r *syncApplyReport) {
 	out := os.Stdout
 	fmt.Fprintf(out, "  %s\n", r.Dir)
 	fmt.Fprintf(out, "  Instance:   %s\n", r.URL)
-	if r.Stack != "" {
+	if r.Stack != "" && r.Space != "" {
+		fmt.Fprintf(out, "  Stack:      %s · Space %s\n", r.Stack, r.Space)
+	} else if r.Stack != "" {
 		fmt.Fprintf(out, "  Stack:      %s\n", r.Stack)
 	}
 	if r.DryRun {

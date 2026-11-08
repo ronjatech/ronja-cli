@@ -91,7 +91,7 @@ Push first: publish sends what is already on the server, and warns when the
 folder has local changes that are not in the draft.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -174,7 +174,7 @@ type publishResult struct {
 }
 
 func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishResult, error) {
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	parent, draft, err := resolveDraft(ctx, client, f, "nothing to publish")
 	if err != nil {
 		return nil, err
@@ -400,7 +400,7 @@ func warnIfDirty(f *folder) error {
 	if err != nil {
 		return err
 	}
-	diff := wfdir.DiffHashes(enumeration.Files, f.State.For(f.Key).Hashes())
+	diff := wfdir.DiffHashes(enumeration.Files, f.State.For(f.Baseline()).Hashes())
 	if diff.Dirty() {
 		fmt.Fprintf(os.Stderr,
 			"  Warning: %d local file(s) differ from your last sync and are NOT in what is being published — run `%s push` first if you meant to include them.\n",
@@ -442,7 +442,7 @@ func refreshBaselineFromLive(ctx context.Context, client *api.Client, f *folder,
 	if err := wfdir.CheckLocalPaths(pathsOf(files), f.Kind); err != nil {
 		return fmt.Errorf("the files of %s cannot all be tracked locally: %w", liveID, err)
 	}
-	f.State.Set(f.Key, baselineFrom(f.Codec, live, files))
+	f.State.Set(f.Baseline(), baselineFrom(f.Codec, live, files))
 	if err := wfdir.SaveState(f.Root, f.State); err != nil {
 		return fmt.Errorf("write the local baseline: %w", err)
 	}

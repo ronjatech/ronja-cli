@@ -2,6 +2,7 @@ package wfdir
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -520,7 +521,7 @@ func TestLoadAcceptsCrossStackCollisionsAndSelectionResolvesThem(t *testing.T) {
 			t.Fatalf("--stack b resolved to %+v", sel)
 		}
 		// The IMPLICIT match is where the ambiguity is reported, and it names
-		// both stacks plus what makes the pair a problem.
+		// both stacks.
 		_, err = m.Select(lock, devKey(), "")
 		if err == nil {
 			t.Fatal("an implicit selection across two stacks on one organization must refuse")
@@ -528,7 +529,7 @@ func TestLoadAcceptsCrossStackCollisionsAndSelectionResolvesThem(t *testing.T) {
 		if !errors.Is(err, ErrAmbiguousStack) {
 			t.Errorf("refusal = %v, want ErrAmbiguousStack", err)
 		}
-		for _, want := range []string{"--stack", "a, b", "local sync baseline"} {
+		for _, want := range []string{"--stack", `"a" and "b"`} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("refusal = %v, want it to say %q", err, want)
 			}
@@ -890,5 +891,70 @@ func TestLockWithoutAppliedNamesStillReads(t *testing.T) {
 	lock.SetTableLive("prod", "orders.sql", "table-9", "ghi")
 	if got := lock.TableName("prod", "orders.sql"); got != "" {
 		t.Errorf("a rebound table kept the old row's name: %q", got)
+	}
+}
+
+// A stack's Space, and two stacks on one organization, make the file format
+// version 9, so a CLI that has no Space rule and one sync record per
+// organization refuses it by version. A folder with neither keeps its version.
+func TestSpacesStampFormatVersionNine(t *testing.T) {
+	stack := func(feature string) string {
+		return `{"url":"https://acme.ronja.tech","tenantID":"tnt-1","featureID":"` + feature + `"}`
+	}
+	for _, tc := range []struct {
+		name, stacks, space string
+		want                int
+	}{
+		{"a stack with a Space", `{"dev":` + stack("col-dev") + `}`, "space-dev", manifestVersionSpaces},
+		{"two stacks on one organization", `{"dev":` + stack("col-dev") + `,"main":` + stack("col-main") + `}`, "", manifestVersionSpaces},
+		{"one stack with no Space", `{"main":` + stack("col-main") + `}`, "", manifestVersionStacks},
+		{"a stack with a Space beside pipPackages", `{"dev":` + stack("col-dev") + `}`, "space-dev", manifestVersionSpaces},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			pip := ""
+			if strings.Contains(tc.name, "pipPackages") {
+				pip = `"pipPackages":["google-auth"],`
+			}
+			write(t, root, ManifestName, canonicalManifest(t, `{"formatVersion":2,"kind":"workflow","title":"x","entrypoint":"main.py",`+pip+`"stacks":`+tc.stacks+`}`))
+			m, err := LoadManifest(root, WorkflowKind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.space != "" {
+				st := m.Stacks["dev"]
+				st.SpaceID, st.Space = tc.space, "Dev"
+				m.Stacks["dev"] = st
+			}
+			if err := SaveManifest(root, m); err != nil {
+				t.Fatal(err)
+			}
+			raw, _ := os.ReadFile(ManifestPath(root))
+			if want := fmt.Sprintf(`"formatVersion": %d,`, tc.want); !strings.Contains(string(raw), want) {
+				t.Fatalf("saved:\n%s\nwant %s", raw, want)
+			}
+			if _, err := LoadManifest(root, WorkflowKind); err != nil {
+				t.Fatalf("the saved file does not load: %v", err)
+			}
+			if tc.want != manifestVersionSpaces {
+				return
+			}
+			err = checkFormatVersion(ManifestPath(root), raw, manifestVersionPipPackages)
+			if err == nil || !strings.Contains(err.Error(), "format version 9") || !strings.Contains(err.Error(), "upgrade") {
+				t.Fatalf("a version-8 build = %v, want the upgrade refusal", err)
+			}
+		})
+	}
+}
+
+// A "spaceID" written by hand into a file that claims less than 9 is refused
+// at load, naming the line to add: the file is exactly the one an older CLI
+// would open and deploy with no Space rule.
+func TestAHandWrittenSpaceBelowFormatNineIsRefusedAtLoad(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, ManifestName, canonicalManifest(t, `{"formatVersion":8,"kind":"workflow","title":"x","entrypoint":"main.py","stacks":{"dev":{"url":"https://acme.ronja.tech","tenantID":"tnt-1","featureID":"col-dev","spaceID":"space-dev"}}}`))
+	_, err := LoadManifest(root, WorkflowKind)
+	if err == nil || !strings.Contains(err.Error(), `"formatVersion": 9`) || !strings.Contains(err.Error(), `stack "dev"`) {
+		t.Fatalf("load = %v, want the refusal naming \"formatVersion\": 9", err)
 	}
 }

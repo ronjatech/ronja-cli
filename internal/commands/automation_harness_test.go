@@ -196,6 +196,7 @@ func (f *fakeAutomationInstance) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.Requests = append(f.Requests, r.Method+" "+r.URL.Path)
 	f.mu.Unlock()
+	echoSpace(w, r)
 
 	if f.managed.serve(w, r) {
 		return

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -51,6 +52,25 @@ type fakeImportInstance struct {
 	// noInventoryRoute answers the reference inventory as an instance older
 	// than it does: the router's plain-text 404.
 	noInventoryRoute bool
+	// featureSpace is the Space GET /feature/:id adds to a feature's read;
+	// a feature absent here reports none.
+	featureSpace map[string]string
+	// spaceEchoMissing names the "METHOD path"s answered without the
+	// X-Ronja-Space echo, as an older pod would.
+	spaceEchoMissing map[string]bool
+}
+
+// noSpaceEcho drops the X-Ronja-Space echo from whatever the handler writes.
+type noSpaceEcho struct{ http.ResponseWriter }
+
+func (w noSpaceEcho) WriteHeader(status int) {
+	w.Header().Del(api.HeaderSpace)
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w noSpaceEcho) Write(b []byte) (int, error) {
+	w.Header().Del(api.HeaderSpace)
+	return w.ResponseWriter.Write(b)
 }
 
 func newFakeImportInstance(t *testing.T) *fakeImportInstance {
@@ -110,8 +130,12 @@ func (f *fakeImportInstance) resetRequests() {
 }
 
 func (f *fakeImportInstance) serve(w http.ResponseWriter, r *http.Request) {
+	echoSpace(w, r)
 	f.mu.Lock()
 	f.requests = append(f.requests, r.Method+" "+r.URL.Path)
+	if f.spaceEchoMissing[r.Method+" "+r.URL.Path] {
+		w = noSpaceEcho{w}
+	}
 	once := f.failOnce[r.Method+" "+r.URL.Path]
 	delete(f.failOnce, r.Method+" "+r.URL.Path)
 	f.mu.Unlock()
@@ -126,6 +150,19 @@ func (f *fakeImportInstance) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if id, ok := strings.CutPrefix(p, "/api/v2/feature/model/"); ok && f.unreadable[id] {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	if id, ok := strings.CutPrefix(p, "/api/v2/feature/"); ok && r.Method == http.MethodGet && f.featureSpace[id] != "" && !strings.Contains(id, "/") {
+		rec := httptest.NewRecorder()
+		f.pipe.serve(rec, r)
+		var feature map[string]any
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &feature) != nil {
+			w.WriteHeader(rec.Code)
+			_, _ = w.Write(rec.Body.Bytes())
+			return
+		}
+		feature["spaceID"] = f.featureSpace[id]
+		writeJSON(w, feature)
 		return
 	}
 	switch {

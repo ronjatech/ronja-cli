@@ -33,7 +33,7 @@ Asks for confirmation on a terminal; --yes is required without one.`,
 		// File paths, validated by resolveArgPaths.
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(yes)
 			if err != nil {
 				return err
 			}
@@ -81,7 +81,7 @@ type pipelineDiscardedFile struct {
 }
 
 func runPipelineDiscard(ctx context.Context, f *folder, args []string, yes bool) (*pipelineDiscardResult, error) {
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	result := &pipelineDiscardResult{Target: describeTarget(f.Resolved), Files: []pipelineDiscardedFile{}}
 
 	inst := pipelineBaseline(f)

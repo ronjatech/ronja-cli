@@ -701,6 +701,7 @@ func TestBindNeverInfersAnImportedWriteTarget(t *testing.T) {
 	f := importFixture(t)
 	dir, _ := runImport(t, f)
 	f.pipe.AddFeature("collection-dev", "Sales dev", "organization")
+	f.inv.features["collection-dev"] = "Sales dev"
 	root := filepath.Join(dir, "workflows/sales-report")
 	m := loadAnyManifest(t, root)
 	main := m.Stacks["main"]

@@ -172,7 +172,7 @@ func runSyncManagedCommand(ctx context.Context, args []string, verb string, each
 	if len(args) == 1 {
 		dir = args[0]
 	}
-	resolved, err := resolveInstance()
+	resolved, err := resolveTreeInstance(dir)
 	if err != nil {
 		return withExitCode(syncExitUnknown, err)
 	}
@@ -238,11 +238,11 @@ func runSyncManagedCommand(ctx context.Context, args []string, verb string, each
 // before writing a folder id that the instance serves /managed, that this
 // credential may read it, and that the feature is one it can use — the
 // refusals describeManagedReadError names, without a folder to name them for.
-func probeManagedState(ctx context.Context, resolved *config.Resolved, stack, featureID, folderID string) error {
+func probeManagedState(ctx context.Context, resolved *config.Resolved, stack string, st wfdir.Stack, folderID string) error {
 	if resolved.Token == "" {
 		return fmt.Errorf("an adopted folder keeps its state on %s, and this credential has no token to read it with. Sign in (`ronja login`) or set RONJA_TOKEN", resolved.URL)
 	}
-	_, err := newClient(resolved.URL, resolved.Token).ReadManaged(ctx, featureID, folderID)
+	_, err := stackClient(resolved, st.Key(), st).ReadManaged(ctx, st.FeatureID, folderID)
 	switch {
 	case err == nil:
 		return nil
@@ -251,7 +251,7 @@ func probeManagedState(ctx context.Context, resolved *config.Resolved, stack, fe
 	case api.WireCodeOf(err) == api.InsufficientScopeCode:
 		return fmt.Errorf("an adopted folder keeps its state on the server, and this token may not read it: adopting needs the structure:read and structure:write scopes, beside each kind's own. %w", err)
 	}
-	return fmt.Errorf("read the state of stack %q (feature %s) from %s: %w", stack, featureID, resolved.URL, err)
+	return fmt.Errorf("read the state of stack %q (feature %s) from %s: %w", stack, st.FeatureID, resolved.URL, err)
 }
 
 // syncAdoptFolder is adopt's work on one folder.
@@ -281,8 +281,11 @@ func syncAdoptFolder(ctx context.Context, folder discoveredFolder, resolved *con
 		}
 		id = minted
 	}
-	if err := probeManagedState(ctx, resolved, flagStack, stack.FeatureID, id); err != nil {
+	if err := probeManagedState(ctx, resolved, flagStack, stack, id); err != nil {
 		line.Verdict, line.Reason, line.Detail = verdictUnknown, syncReasonLookupFailed, err.Error()+". Nothing was written"
+		if e, ok := asSpaceEntry(err); ok {
+			line.Reason, line.Detail = e.Reason, e.Detail
+		}
 		return
 	}
 
@@ -340,7 +343,7 @@ func syncAdoptFolder(ctx context.Context, folder discoveredFolder, resolved *con
 
 	// 3. Claim every row the lock records and the server has no claim for —
 	// each item on its own, reported on its own.
-	client := newClient(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	pending := f.managedBackfill()
 	refused := 0
 	for start := 0; start < len(pending); start += api.MaxManagedClaimItems {
@@ -443,7 +446,7 @@ func syncUnmanageFolder(ctx context.Context, folder discoveredFolder, resolved *
 			fmt.Sprintf("stack %q names no featureID in %s, so it has no claims to release", flagStack, wfdir.ManifestName)
 		return
 	}
-	client := newClient(resolved.URL, resolved.Token)
+	client := stackClient(resolved, stack.Key(), stack)
 	var claims []api.ManagedClaim
 	var folderAnchor *api.ManagedFolderAnchor
 	state, err := client.ReadManaged(ctx, stack.FeatureID, m.ID)
@@ -458,6 +461,9 @@ func syncUnmanageFolder(ctx context.Context, folder discoveredFolder, resolved *
 	default:
 		line.Verdict, line.Reason, line.Detail = verdictUnknown, syncReasonLookupFailed,
 			fmt.Sprintf("read this folder's claims in feature %s: %v", stack.FeatureID, err)
+		if e, ok := asSpaceEntry(err); ok {
+			line.Reason, line.Detail = e.Reason, e.Detail
+		}
 		return
 	}
 	lock, err := wfdir.LoadLock(folder.Root)

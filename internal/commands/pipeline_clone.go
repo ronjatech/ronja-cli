@@ -83,6 +83,10 @@ directory must be empty or absent.`,
 				}
 				return err
 			}
+			space, err := settleStackSpace(cmd.Context(), resolved, featureID)
+			if err != nil {
+				return err
+			}
 			items, err := client.ListFeatureTables(cmd.Context(), featureID)
 			if err != nil {
 				return fmt.Errorf("list the tables of %s: %w", featureID, err)
@@ -109,7 +113,7 @@ directory must be empty or absent.`,
 			}
 			sources, metricSources, checkFiles := set.sources, set.metrics, set.checks
 			skipped = set.skipped
-			if err := writePipelineClone(cmd.Context(), resolved, featureID, feature.Name, root, set, cloneHooks{}); err != nil {
+			if err := writePipelineClone(cmd.Context(), resolved, featureID, feature.Name, root, set, cloneHooks{space: space}); err != nil {
 				return err
 			}
 
@@ -816,12 +820,13 @@ func writePipelineClone(ctx context.Context, resolved *config.Resolved, featureI
 	if err := recordFirstBindingInto(manifest, lock, key, binding); err != nil {
 		return err
 	}
+	stampSpace(manifest, flagStack, hooks.space)
 	hooks.finishManifest(manifest)
 	if err := wfdir.SaveFolder(root, manifest, lock); err != nil {
 		return err
 	}
 	state := &wfdir.State{}
-	state.Set(key, baseline)
+	state.Set(wfdir.BaselineKey{Key: key, Stack: flagStack}, baseline)
 	if err := wfdir.SaveState(root, state); err != nil {
 		return err
 	}

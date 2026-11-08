@@ -56,7 +56,7 @@ Push first: publish sends what is already on the server, and warns when the
 folder has local changes that are not in the draft.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveInstance()
+			resolved, err := resolveDeployInstance(false)
 			if err != nil {
 				return err
 			}
@@ -128,7 +128,7 @@ type modulePublishResult struct {
 }
 
 func runModulePublish(ctx context.Context, f *folder, opts publishOptions) (*modulePublishResult, error) {
-	client := api.New(f.Resolved.URL, f.Resolved.Token)
+	client := f.client()
 	parent, draft, err := resolveModuleDraft(ctx, client, f, "nothing to publish")
 	if err != nil {
 		return nil, err

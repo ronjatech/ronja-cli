@@ -208,7 +208,7 @@ func TestTableStateRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	key := InstanceKey{URL: "https://cloud.ronja.tech", TenantID: "tenant-1"}
 	s := &State{}
-	s.Set(key, &InstanceState{
+	stateSetKey(s, key, &InstanceState{
 		SourceID: "collection-9",
 		Files:    map[string]FileState{"revenue.sql": {SHA256: "abc"}},
 		Tables: map[string]TableState{
@@ -224,7 +224,7 @@ func TestTableStateRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inst := loaded.For(key)
+	inst := stateForKey(loaded, key)
 	if inst == nil {
 		t.Fatal("baseline not found")
 	}
@@ -243,7 +243,7 @@ func TestTableStateIsAbsentWhenUnmanaged(t *testing.T) {
 	root := t.TempDir()
 	key := InstanceKey{URL: "https://cloud.ronja.tech"}
 	s := &State{}
-	s.Set(key, &InstanceState{SourceID: "wf-1", Files: map[string]FileState{"main.py": {SHA256: "x"}}})
+	stateSetKey(s, key, &InstanceState{SourceID: "wf-1", Files: map[string]FileState{"main.py": {SHA256: "x"}}})
 	if err := SaveState(root, s); err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +270,7 @@ func TestTableStateIsAbsentWhenUnmanaged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tables := loaded.For(key).Tables; tables != nil {
+	if tables := stateForKey(loaded, key).Tables; tables != nil {
 		t.Errorf("an unmanaged baseline must read back nil, got %+v", tables)
 	}
 }
