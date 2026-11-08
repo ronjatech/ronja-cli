@@ -113,7 +113,7 @@ type WorkflowRunTableOutput struct {
 	ModelID     string `json:"modelID"`
 	LogicalName string `json:"logicalName"`
 	DisplayName string `json:"displayName"`
-	// WriteMode is replace|append.
+	// WriteMode is replace|append|sql.
 	WriteMode string `json:"writeMode"`
 	FileCount int    `json:"fileCount"`
 }
