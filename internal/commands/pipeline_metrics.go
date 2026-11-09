@@ -1395,7 +1395,9 @@ func metricNeedsRename(file pipelineMetricFile, liveRow, draft *api.Table) bool 
 // It cannot be answered by comparing the file against the row: the row holds
 // the recipe the server CANONICALIZED, and the file holds aliases and may omit
 // a defaultable key. Every path that leaves work undone clears that
-// fingerprint rather than relying on a second condition here.
+// fingerprint rather than relying on a second condition here. With a draft
+// open, that draft must hold the file too: anyone can write to it after this
+// folder's push, and the publish that follows commits whatever it holds.
 //
 // liveFirst (`sync apply` only) adds the live row's answer, because the
 // recording can be STALE — a CI checkout carries the lock from before the last
@@ -1409,12 +1411,19 @@ func metricHeld(file pipelineMetricFile, declared string, needRename bool, draft
 		return false
 	}
 	if declared != "" && declared == file.Declared {
-		return true
+		return draft == nil || metricRowHolds(file, draft)
 	}
-	return liveFirst && draft == nil && liveRow != nil &&
-		sameRecipe(liveRow.MetricRecipe, file.Resolved) &&
-		metricZoneHeld(file.File.ReportingTimezone, liveRow.ReportingTimezone) &&
-		(file.File.Description == nil || *file.File.Description == liveRow.Description)
+	return liveFirst && draft == nil && liveRow != nil && metricRowHolds(file, liveRow)
+}
+
+// metricRowHolds is that a row holds exactly what the file declares: the same
+// recipe (sameRecipe), the calendar it declares, and its prose and name if it
+// declares them.
+func metricRowHolds(file pipelineMetricFile, row *api.Table) bool {
+	return sameRecipe(row.MetricRecipe, file.Resolved) &&
+		metricZoneHeld(file.File.ReportingTimezone, row.ReportingTimezone) &&
+		(file.File.Description == nil || *file.File.Description == row.Description) &&
+		(file.File.Name == nil || sameName(row.Name, *file.File.Name))
 }
 
 // pipelineMetricStatuses is the metric files' half of `pipeline status`: for

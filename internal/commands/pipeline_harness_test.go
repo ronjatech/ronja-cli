@@ -198,13 +198,15 @@ type fakePipelineInstance struct {
 	// metricsCreated and recipeWrites are the metric half's record of what was
 	// asked, kept apart from `created`/`updates` because the bodies are entirely
 	// different types and a shared slice would have to be one of them.
-	metricsCreated  []api.CreateMetricInput
-	recipeWrites    []recordedRecipeWrite
-	created         []api.CreateTableInput
-	updates         []recordedTableUpdate
-	checkouts       []string
-	syncs           []string
-	committed       []string
+	metricsCreated []api.CreateMetricInput
+	recipeWrites   []recordedRecipeWrite
+	created        []api.CreateTableInput
+	updates        []recordedTableUpdate
+	checkouts      []string
+	syncs          []string
+	committed      []string
+	// draftVersions records the ifDraftVersion of every commit.
+	draftVersions   []string
 	discarded       []string
 	reviewRequested []string
 	queries         []string
@@ -744,7 +746,11 @@ func (f *fakePipelineInstance) serveModel(w http.ResponseWriter, r *http.Request
 	case action == "commit" && r.Method == http.MethodPost:
 		var in api.TableCommitDraftInput
 		decodeOptionalBody(f.t, r, &in)
-		f.serveCommit(w, id, in.ConfirmHeadVersionID)
+		f.draftVersions = append(f.draftVersions, in.IfDraftVersion)
+		if draft := f.tables[id]; draft != nil && refuseDraftAt(w, "table "+strconv.Quote(draft.Name), in.IfDraftVersion, draft.UpdatedAt) {
+			return
+		}
+		f.serveCommit(w, id, in.ConfirmHeadVersionID, in.IfDraftVersion)
 
 	case action == "discard" && r.Method == http.MethodPost:
 		draft := f.tables[id]
@@ -1139,7 +1145,7 @@ func (f *fakePipelineInstance) applyBuildOutcome(id string) {
 	}
 }
 
-func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confirmHeadVersionID string) {
+func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confirmHeadVersionID, ifDraftVersion string) {
 	if status := f.failCommit[draftID]; status != 0 {
 		http.Error(w, `{"error":"admin required to commit into a shared feature"}`, status)
 		return
@@ -1229,7 +1235,7 @@ func (f *fakePipelineInstance) serveCommit(w http.ResponseWriter, draftID, confi
 		f.synced[parent.ID] = true
 	}
 	f.dropDraft(draftID)
-	writeJSON(w, nil)
+	writeJSON(w, echoOf(ifDraftVersion))
 }
 
 // nameHolder answers the id of a LIVE root row in the feature already holding

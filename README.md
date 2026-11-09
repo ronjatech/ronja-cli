@@ -1201,6 +1201,7 @@ script that already holds a value calls `PUT /api/v2/secret/:id`.
 
 ```
 ronja secret connect <service> [--feature <id>] [--scope <scope>...] [--no-browser] [--json]
+ronja secret connect <service> --link --feature <id> [--company <id>] [--replace] [--scope <scope>...] [--json]
 ```
 
 Connects one of Ronja's managed OAuth services (`gmail`, `google_sheets`,
@@ -1220,7 +1221,10 @@ initiate returns no `url`, the CLI opens the `authURL` itself, as it used to;
 the callback page, opened in a plain tab, then first tries to close itself and
 otherwise says "Connected. You can close this tab — if you started from a
 terminal, return to it." A failed sign-in there says "If you started from a
-terminal, return to it, press Ctrl-C and run the command again."
+terminal, return to it, press Ctrl-C and run the command again." A sign-in
+finished from a prepared link (below) has no terminal: its redirect carries
+`via=link`, and the page stays open and says only "Connected. You can close
+this tab."; a refused one is the backend's own error page.
 
 1. Initiate answers `{authURL, secretID, requestedScopes}` — `requestedScopes`
    is exactly what this run asks the provider for. Without `--scope`, a
@@ -1267,6 +1271,27 @@ terminal, return to it, press Ctrl-C and run the command again."
    consent finished without granting anything new: the recorded grant is
    unchanged", the second reading offered only for a connect that started from
    `ready`. From the page the timeout adds that connecting there still works.
+6. **`--link` prepares the connection for someone else to finish**, for a
+   company account (`fortnox`, `hubspot`; a personal login is refused). It
+   opens nothing and does not wait: steps 2 to 5 do not run. Initiate answers a
+   link to Ronja's public `/connect/<token>` page, valid 14 days and shown only
+   this once, and the link alone goes to stdout, so `| pbcopy` carries nothing
+   else; who may finish it, until when, the company and the follow-up command
+   go to stderr. `--json` has `secretID`, `url`, `expiresAt`, `requestedScopes`
+   and `company` when one was named. `--feature` is required, and the command
+   needs a login that acts as a person. Anyone holding the link can finish the
+   sign-in with no Ronja login, so treat it as a password. `--company` is
+   optional: it names the one company that may sign in (a Fortnox organization
+   number, with or without its hyphen, or a HubSpot Hub ID); without it,
+   whichever company signs in is connected, unless the connection already
+   holds one, which then takes only that one. `--company` and `--replace` are
+   refused without `--link`. A link already out on the connection is a 409
+   unless `--replace` is passed, which ends the old one and makes a new one:
+   the old link cannot be shown again, and a retry must not end the one
+   already sent. See the result with `ronja api /api/v2/secret/<id>`: `status`
+   reaches `ready`, and until the link is used or replaced `signInLink` carries `expiresAt`
+   and, when a sign-in was refused for its company, `lastRefusal` and
+   `lastRefusalAt`.
 
 An older server answers without `requestedScopes`: the command then never
 claims "already connected", always opens the sign-in, and skips the coverage
@@ -6060,9 +6085,13 @@ about to refuse. Metadata is written in one place, after the guard.
 One consequence is stated rather than hidden: while a module is still
 **unpublished** (a parentless draft, or a proposal in a shared feature) there is
 no live row to patch and no draft *of* one, so its metadata cannot be patched at
-all. The create carried the manifest's values; a manifest edited since reaches
-the row at the first publish. `push` reports that as `metadataDeferred` instead
-of sending a request that would be refused.
+all. The create carried the manifest's values, and the first publish (or an
+admin's approval of the proposal) makes the module live as it was created; a
+manifest edited since reaches it at the first push after that. `push` reports
+that as `metadataDeferred` instead of sending a request that would be refused.
+`sync apply` (and so `ronja propose`) refuses such a folder before writing
+anything, since publishing it would put live a name or title the folder no
+longer declares: publish it once as it is, then apply again to rename it.
 
 ### Publishing says what it did not change
 
@@ -7025,6 +7054,26 @@ baseline is left alone, since it describes a draft and none was written.
   `ronja module push` still check a draft out when they have nothing to write: that is the classic
   check-out gesture, and `wf test` runs the draft and refuses without one.
 
+**Apply publishes only the draft it checked.** Before each commit, apply reads
+the draft's `updatedAt`, then checks that the draft holds exactly the folder
+(files and the metadata the push writes, the declared title included; a folder
+that declares no title does not manage it, so it is not compared), and sends
+that `updatedAt` as the commit's `ifDraftVersion`. Anyone
+who writes to the draft after the check (an agent on the same sign-in, the web
+app, the in-app agent) moves it, and the server refuses the commit with a `409`
+coded `draft_changed` that names the item: that unit is refused and nothing of
+it goes live. A pipeline table is checked by its SQL, its header's prose (a
+column's only for the columns the draft has measured) and its declared name, its
+input models taken as the ones its SQL implies; a metric by its recipe,
+calendar, prose and declared name. A metric draft that no longer holds the file is restaged
+from the file by the push, even when the file itself has not changed.
+
+Every publish `sync apply` makes carries this check, and the guarantee needs a
+Ronja that has it. A Ronja that checked answers `draftVersionChecked: true`; an
+older one ignores the field and publishes anyway, and apply then prints
+"Warning: this Ronja does not check draft versions yet; the … draft … was
+published without that check" for that item and carries on.
+
 A pipeline folder gets the same question per file, because its fresh-checkout
 case was worse: the local baseline that tells a bare push which `.sql` files
 changed lives in the git-ignored `.ronja/`, and the committed lock's fingerprints
@@ -7169,6 +7218,101 @@ written)"), any kind, and the folder's `claims` and the summary's `claims` count
 them (the human summary adds a line). A dry run's human summary line reads
 "would apply — N would apply, N would be refused, …", and a folder-kind unit is
 labelled by its kind's label ("the data app").
+
+Each folder line of the `--json` report also carries **`feature`**: the stack's
+feature, where the folder's creates land. It is absent for a folder ruled out
+before its stack resolved. It is what a change list shows the person for each
+create, and what its deploy job holds the re-plan to (`ronja propose`, below).
+
+A real apply (not a dry run) also says what happened to each unit, because a
+`refused` folder can still have live writes: `checks_not_applied` and
+`tags_not_applied` publish the SQL, an anchor refusal follows a change that is
+live, and an automation folder's loop goes on past a refused file. Each unit
+carries **`outcome`**: `applied` (it is live), `refused`, or `not_attempted`,
+with **`outcomeDetail`** saying why when the loop said. It is absent where the
+instance did not answer, since the write may have landed:
+
+```json
+{"path": "nightly.json", "action": "create", "outcome": "refused", "outcomeDetail": "…"}
+```
+
+## Asking for approval: `ronja propose`
+
+```bash
+ronja propose          # the tree here
+ronja propose apps/    # another directory
+ronja propose --json   # the same report, as data
+```
+
+`propose` asks the person you work for (the person whose token this is) to
+approve a deploy. **It changes nothing in Ronja itself.** It is the verb an
+agent runs where `sync apply` would be blocked: the agent proposes, the person
+approves in Ronja, and their click runs the deploy in Ronja, as them.
+
+What it does:
+
+1. **Plans** the tree with the same code as `ronja sync apply --dry-run
+   --allow-create --json`, in process, under the same read-only guard `pull`
+   uses: any request but a read (and the workflow validate, which saves
+   nothing) is refused before it is sent. Under the same guard it asks each
+   migrations folder bound to a managed database on this instance and
+   organization (its `.ronja/database.json`) what a push would apply, as
+   `ronja db migrate status` does, always as a dry run. A folder with nothing
+   pending is not in the list.
+2. **Refuses**, and uploads nothing, when:
+   - a folder is **not adopted** (no folder id, or its stack is
+     `"unmanaged"`). The approved deploy runs on a copy whose lock never comes
+     back, so only a folder whose ids Ronja keeps is safe from creating its
+     resources twice. The refusal names `ronja sync adopt --stack <name>`.
+   - any folder's verdict is not `applied`: the dry run's own reason and
+     detail are printed, by folder. A change list has to plan cleanly.
+   - a migration has drifted, as `db migrate status` would say.
+   - a folder names by address (`"from"`) a folder **outside the directory
+     proposed**, even inside one git repository: `address_outside_repository`.
+     The copy holds only that directory. Propose from one that holds both.
+3. **Uploads** (`POST /api/v2/change-list`, multipart) the plan, the server
+   address and stack it planned against, and a gzipped tar of the directory.
+   The tar holds exactly the files each folder's push reads (a pipeline
+   folder's `.sql` files and its `metrics/`, `checks/` and `tables/` files; a
+   README or a key file beside them is left out), its `ronja.json` and
+   `ronja.lock.json`, and each proposed migrations folder's `.sql` files.
+   Nothing under a dot-name is in it (`.ronja/`, `.env`, `.git`), nor any link.
+   Sizes are checked against the caps before any file is read. Profiles and credentials live outside the tree, and a
+   `RONJA_CONFIG_DIR` pointing inside it is refused. The server takes the
+   upload only from a person's own sign-in (a plain API token is refused), and
+   refuses it while that person already has 20 lists waiting for other folders.
+4. **Prints** the counts ("2 modified, 1 created, 1 database migration"), the
+   link to the change list, and "Nothing changes until <person> approves it in
+   Ronja." It exits 0. At a terminal it opens the link (`--no-browser` does
+   not). When nothing would change it uploads nothing and says so. When the
+   instance is busy receiving other change lists it answers 429, and propose
+   says nothing was proposed and to run it again in a few seconds.
+
+**What the person sees** in Ronja: who proposed it, the stack, what is created
+(with the feature each create goes into), modified, and removed from a folder
+(a `removed` declaration, which deletes nothing in Ronja), and each migration
+with its SQL. Their **Approve and deploy** starts a deploy job that runs `ronja db
+migrate push` and then `ronja sync apply --allow-create` on exactly the copy
+uploaded, with a token minted for them for that one list. The job re-plans
+first and refuses any write the person did not see. A list waits 24 hours.
+
+**What a list deploys is never drift for the folder that proposed it.** The
+deploy runs on the copy, so a workflow, data app or module folder's local
+baseline still describes the server before it. Once the upload is accepted,
+`propose` records what the copy held of each such folder in
+`.ronja/proposed.json` (each file's sha256, the manifest and the baseline it
+was proposed over, the last 5 per instance). The drift guard excuses a server
+that holds what one of those proposals held, as it excuses one that holds the
+local bytes, when all of the server's changes since the folder's baseline match
+that ONE proposal, the live version is still the one this stack last deployed,
+and the folder's baseline is still the one it proposed over: its next sync
+that records a baseline retires every proposal before it. So the agent's next
+edit of the same file proposes and pushes without a pull. The other kinds'
+guards read the anchors the deploy records on the server.
+
+**`ronja sync apply` is the direct deploy, and skips approval.** It and the
+per-folder publish commands are unchanged: CI and people deploying by hand
+keep using them.
 
 ## Addresses: `moved` and `removed`
 
@@ -7431,7 +7575,10 @@ form — every key present, `version` defaulted to 1, `source` trimmed, unknown 
 dropped — and compared with the row; a key the row holds that this CLI does not
 know keeps them different), names and titles,
 automation fields, module metadata, and workflow / data-app / module files. A
-file is excused when the server holds the local bytes, or neither side holds it;
+file is excused when the server holds the local bytes, or neither side holds it,
+or (workflow, data app and module files, and workflow and module titles) when
+it holds what one of the folder's own change lists proposed (`ronja propose`,
+above);
 with NO local baseline, a moved head over a row that holds exactly the folder's
 files **and** metadata is let through and re-anchored (files alone are not
 enough). Health checks already worked this way.

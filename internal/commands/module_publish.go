@@ -178,8 +178,15 @@ func runModulePublish(ctx context.Context, f *folder, opts publishOptions) (*mod
 		scoped = draft
 	}
 
-	outcome, commitErr := client.CommitModuleDraft(ctx, draft.ID, "")
+	var ifVersion string
+	if opts.CheckDraft {
+		if ifVersion, err = checkModuleDraft(ctx, client, f, draft.ID); err != nil {
+			return nil, err
+		}
+	}
+	outcome, commitErr := client.CommitModuleDraft(ctx, draft.ID, "", ifVersion)
 	if commitErr == nil {
+		warnUncheckedDraftVersion("module", draft.ID, ifVersion, outcome.DraftVersionEcho)
 		finishModulePublish(ctx, client, f, result, outcome, parent, draft, "")
 		return result, nil
 	}
@@ -189,8 +196,11 @@ func runModulePublish(ctx context.Context, f *folder, opts publishOptions) (*mod
 	// FIRST so it can never fall into the needs-review branch below. That
 	// branch's `!= 400` already excludes it, and this ordering is what keeps
 	// that true if the condition is ever widened.
+	if err := draftChangedError(draft.ID, commitErr); err != nil {
+		return nil, err
+	}
 	if api.StatusOf(commitErr) == api.StatusConflict {
-		return resolveModuleCommitConflict(ctx, client, f, parent, draft, result, opts, commitErr)
+		return resolveModuleCommitConflict(ctx, client, f, parent, draft, result, opts, ifVersion, commitErr)
 	}
 
 	// The needs-review case: a shared feature whose commit the server refused
@@ -276,7 +286,7 @@ func finishModulePublish(ctx context.Context, client *api.Client, f *folder,
 // commit's own transaction, under the row lock — so the draft is fully intact
 // either way, and the only question is what the author does next.
 func resolveModuleCommitConflict(ctx context.Context, client *api.Client, f *folder,
-	parent, draft *api.Module, result *modulePublishResult, opts publishOptions, commitErr error) (*modulePublishResult, error) {
+	parent, draft *api.Module, result *modulePublishResult, opts publishOptions, ifVersion string, commitErr error) (*modulePublishResult, error) {
 
 	conflict := func(err error) (*modulePublishResult, error) {
 		result.Outcome = outcomeConflict
@@ -336,8 +346,11 @@ func resolveModuleCommitConflict(ctx context.Context, client *api.Client, f *fol
 	}
 	fmt.Fprintf(os.Stderr, "  --overwrite-remote: committing over version %s of %q, discarding what it changed.\n", head, draft.Name)
 
-	outcome, err := client.CommitModuleDraft(ctx, draft.ID, head)
+	outcome, err := client.CommitModuleDraft(ctx, draft.ID, head, ifVersion)
 	if err != nil {
+		if err := draftChangedError(draft.ID, err); err != nil {
+			return nil, err
+		}
 		// A SECOND 409 means a third commit landed between the read above and
 		// this write. Deliberately not retried: an override authorizes
 		// overwriting the version it was shown, not whatever happens to be there
@@ -348,6 +361,7 @@ func resolveModuleCommitConflict(ctx context.Context, client *api.Client, f *fol
 		}
 		return nil, fmt.Errorf("commit %s over version %s: %w", draft.ID, head, err)
 	}
+	warnUncheckedDraftVersion("module", draft.ID, ifVersion, outcome.DraftVersionEcho)
 	finishModulePublish(ctx, client, f, result, outcome, parent, draft, head)
 	return result, nil
 }

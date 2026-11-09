@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // SeverityError is mirrored from rworkflow's SeverityError. The CLI branches on
@@ -481,6 +482,25 @@ func (c *Client) DeleteWorkflowFile(ctx context.Context, id, path string, baseSh
 // is why nothing here retries.
 type CommitDraftInput struct {
 	ConfirmHeadVersionID string `json:"confirmHeadVersionID,omitempty"`
+	// IfDraftVersion is the draft's updatedAt as the caller read it: the server
+	// refuses the publish with a 409 coded DraftChangedCode when the draft has
+	// changed since. Empty checks nothing.
+	IfDraftVersion string `json:"ifDraftVersion,omitempty"`
+}
+
+// DraftChangedCode is the `code` on the 409 a publish answers when its
+// IfDraftVersion is no longer the draft's.
+const DraftChangedCode = "draft_changed"
+
+// DraftVersionEcho is what a publish answers about the IfDraftVersion it was
+// sent. DraftVersionChecked is false from a Ronja that ignores the field.
+type DraftVersionEcho struct {
+	DraftVersionChecked bool `json:"draftVersionChecked"`
+}
+
+// DraftVersion is a draft's updatedAt as IfDraftVersion carries it.
+func DraftVersion(updatedAt time.Time) string {
+	return updatedAt.Format(time.RFC3339Nano)
 }
 
 // CommitWorkflowDraft applies a draft onto its parent. Takes the DRAFT id.
@@ -489,12 +509,14 @@ type CommitDraftInput struct {
 // all — the shape this route took before the CAS existed. Supply it only after
 // a 409 has named the version being overwritten, and only on a deliberate
 // override (`wf publish --overwrite-remote`).
-func (c *Client) CommitWorkflowDraft(ctx context.Context, draftID, confirmHeadVersionID string) error {
+func (c *Client) CommitWorkflowDraft(ctx context.Context, draftID, confirmHeadVersionID, ifDraftVersion string) (DraftVersionEcho, error) {
 	var body any
-	if confirmHeadVersionID != "" {
-		body = CommitDraftInput{ConfirmHeadVersionID: confirmHeadVersionID}
+	if confirmHeadVersionID != "" || ifDraftVersion != "" {
+		body = CommitDraftInput{ConfirmHeadVersionID: confirmHeadVersionID, IfDraftVersion: ifDraftVersion}
 	}
-	return c.Do(ctx, "POST", "workflow/"+url.PathEscape(draftID)+"/commit", body, nil)
+	var out DraftVersionEcho
+	err := c.Do(ctx, "POST", "workflow/"+url.PathEscape(draftID)+"/commit", body, &out)
+	return out, err
 }
 
 // ListWorkflowVersions reads a workflow's committed version history, newest
@@ -541,8 +563,14 @@ func (c *Client) HeadVersionID(ctx context.Context, parentID string) (string, er
 
 // PublishWorkflowDraft takes a PARENTLESS draft live. Takes the draft's own id,
 // which for a parentless draft is also the workflow's stable identity.
-func (c *Client) PublishWorkflowDraft(ctx context.Context, draftID string) error {
-	return c.Do(ctx, "POST", "workflow/"+url.PathEscape(draftID)+"/publish", nil, nil)
+func (c *Client) PublishWorkflowDraft(ctx context.Context, draftID, ifDraftVersion string) (DraftVersionEcho, error) {
+	var body any
+	if ifDraftVersion != "" {
+		body = CommitDraftInput{IfDraftVersion: ifDraftVersion}
+	}
+	var out DraftVersionEcho
+	err := c.Do(ctx, "POST", "workflow/"+url.PathEscape(draftID)+"/publish", body, &out)
+	return out, err
 }
 
 // DiscardWorkflowDraft deletes a draft, throwing its uncommitted changes away.

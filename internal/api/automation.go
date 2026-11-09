@@ -239,12 +239,6 @@ type Automation struct {
 	// WebhookHasSigningSecret reports whether HMAC verification is on. Only the
 	// BOOLEAN is readable afterwards.
 	WebhookHasSigningSecret bool `json:"webhookHasSigningSecret"`
-	// WebhookSigningSecret is the real HMAC key, revealed ONCE in a create or
-	// rotate response and never again — the get and list paths never set it. A
-	// caller that does not store it here cannot get it back, and clearing a
-	// secret is a human-only route, so a folder declares signing on or off at
-	// create and can never re-assert it.
-	WebhookSigningSecret string `json:"webhookSigningSecret"`
 
 	// Warnings are NON-BLOCKING advisories about a write that SUCCEEDED — today
 	// the two mailbox-trigger ones. A property of the WRITE, never of the row,
@@ -353,11 +347,6 @@ type CreateAutomationInput struct {
 	EventName     string                   `json:"eventName,omitempty"`
 	MailboxID     string                   `json:"mailboxID,omitempty"`
 	MailboxFilter *AutomationMailboxFilter `json:"mailboxFilter,omitempty"`
-
-	// WebhookSigningSecret asks the server to mint an HMAC key, returned ONCE in
-	// the response. Create-only: there is no way to re-assert it later, and
-	// clearing one is a human-only route.
-	WebhookSigningSecret *bool `json:"webhookSigningSecret,omitempty"`
 
 	RateLimitPerMinute *int `json:"rateLimitPerMinute,omitempty"`
 	RateLimitPerDay    *int `json:"rateLimitPerDay,omitempty"`
@@ -593,10 +582,6 @@ func (c *Client) ListAutomations(ctx context.Context, featureID string) ([]*Auto
 }
 
 // CreateAutomation creates one automation and returns the row it made.
-//
-// The response carries the action and, for a webhook trigger that asked for one,
-// the HMAC signing secret in its ONLY appearance anywhere — a caller that
-// discards this response cannot get it back.
 func (c *Client) CreateAutomation(ctx context.Context, in CreateAutomationInput) (*Automation, error) {
 	var out Automation
 	if err := c.Do(ctx, "POST", "automations", in, &out); err != nil {

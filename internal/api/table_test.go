@@ -315,7 +315,7 @@ func TestUpdateTableCodeSendsBaseCodeSha256OnlyWhenAsserting(t *testing.T) {
 func TestCommitTableDraftSendsNoBodyWithoutAnOverride(t *testing.T) {
 	var got []capture
 	client := serveCapturing(t, 200, "", &got)
-	if err := client.CommitTableDraft(context.Background(), "table-draft-1", ""); err != nil {
+	if _, err := client.CommitTableDraft(context.Background(), "table-draft-1", "", ""); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if len(got[0].body) != 0 {
@@ -323,7 +323,7 @@ func TestCommitTableDraftSendsNoBodyWithoutAnOverride(t *testing.T) {
 	}
 	got = nil
 	client = serveCapturing(t, 200, "", &got)
-	if err := client.CommitTableDraft(context.Background(), "table-draft-1", "table-v2"); err != nil {
+	if _, err := client.CommitTableDraft(context.Background(), "table-draft-1", "table-v2", ""); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if got[0].body["confirmHeadVersionID"] != "table-v2" {
@@ -508,7 +508,8 @@ func TestLifecycleVerbsHitTheRightRoutes(t *testing.T) {
 			return c.SyncTable(context.Background(), "table-draft-1")
 		}, "/api/v2/feature/model/table-draft-1/sync"},
 		{"commit", func(c *Client) error {
-			return c.CommitTableDraft(context.Background(), "table-draft-1", "")
+			_, err := c.CommitTableDraft(context.Background(), "table-draft-1", "", "")
+			return err
 		}, "/api/v2/feature/model/table-draft-1/commit"},
 		{"discard", func(c *Client) error {
 			return c.DiscardTableDraft(context.Background(), "table-draft-1")

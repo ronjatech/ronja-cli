@@ -82,7 +82,7 @@ folder has local changes that are not in the drafts.`,
 			if err != nil {
 				return err
 			}
-			result, err := runPipelinePublish(cmd.Context(), f, args, noRequestReview, overwriteRemote)
+			result, err := runPipelinePublish(cmd.Context(), f, args, noRequestReview, overwriteRemote, false)
 			// Emitted even on failure, exactly like push: a refusal that carries a
 			// result is one the caller has to be able to READ.
 			printManagedNotices(f.notices)
@@ -206,7 +206,7 @@ func pipelineStagedDrafts(inst *wfdir.InstanceState) []string {
 	return out
 }
 
-func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequestReview, overwriteRemote bool) (*pipelinePublishResult, error) {
+func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequestReview, overwriteRemote, checkDraft bool) (*pipelinePublishResult, error) {
 	client := f.client()
 	result := &pipelinePublishResult{
 		FeatureID: f.Binding.FeatureID,
@@ -320,7 +320,7 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 	// off the draft's own GET per table — rather than by trying a commit and
 	// reading the rejection prose. Matching on an error message is how a client
 	// silently starts doing the wrong thing the day somebody rewords it.
-	routing := publishRouting{NoRequestReview: noRequestReview, OverwriteRemote: overwriteRemote,
+	routing := publishRouting{NoRequestReview: noRequestReview, OverwriteRemote: overwriteRemote, CheckDraft: checkDraft,
 		callerAdmin: sync.OnceValues(func() (bool, error) { return callerIsAdmin(ctx, client) })}
 	if f.Binding.FeatureID != "" {
 		shared, err := featureIsShared(ctx, client, f.Binding.FeatureID)
@@ -562,6 +562,13 @@ func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *
 		return refuse("draft %s has not been built — publishing it would put %s live with nothing behind it.\n    Run `ronja pipeline push %s` to build it (a queued build finishes there too)",
 			draft.ID, file.MetricID, file.Path)
 	}
+	var ifVersion string
+	if routing.CheckDraft {
+		if !metricRowHolds(file, staged) {
+			return refuse("%v", draftNoLongerFolder("metric", draft.ID))
+		}
+		ifVersion = api.DraftVersion(staged.UpdatedAt)
+	}
 
 	if routing.reviewUpFront(staged) {
 		if err := client.RequestTableReview(ctx, draft.ID); err != nil {
@@ -572,7 +579,10 @@ func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *
 		return out
 	}
 
-	commitErr := client.CommitTableDraft(ctx, draft.ID, "")
+	echo, commitErr := client.CommitTableDraft(ctx, draft.ID, "", ifVersion)
+	if err := draftChangedError(draft.ID, commitErr); err != nil {
+		return refuse("%v", err)
+	}
 	if why, taken := api.AsNameTaken(commitErr); taken {
 		return refuse("committing %s was refused — the name your draft would publish is taken:\n      %s\n    Nothing was committed and your draft is intact. A metric and a table share one namespace inside a feature; change this file's \"name\" (if it has one) and push again, or rename the other one in the web app, then publish again",
 			file.MetricID, why)
@@ -593,7 +603,11 @@ func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *
 		}
 		fmt.Fprintf(os.Stderr, "  --overwrite-remote: committing %s over version %s of %s, discarding what it changed.\n",
 			file.Path, head.HeadVersionID, file.MetricID)
-		if err := client.CommitTableDraft(ctx, draft.ID, head.HeadVersionID); err != nil {
+		var err error
+		if echo, err = client.CommitTableDraft(ctx, draft.ID, head.HeadVersionID, ifVersion); err != nil {
+			if err := draftChangedError(draft.ID, err); err != nil {
+				return refuse("%v", err)
+			}
 			// Deliberately not retried: an override authorizes overwriting the
 			// version it was shown, not whatever happens to be there by the time
 			// the request arrives.
@@ -621,6 +635,7 @@ func publishOneMetric(ctx context.Context, client *api.Client, f *folder, inst *
 		return out
 	}
 
+	warnUncheckedDraftVersion("metric", draft.ID, ifVersion, echo)
 	out.Outcome = outcomePublished
 	out.Detail = fmt.Sprintf("committed onto %s", file.MetricID)
 	if out.OverwroteVersionID != "" {
@@ -719,6 +734,10 @@ type publishRouting struct {
 	// commit's two refusals (400 needs-review, 409 moved) are decided in one
 	// place, from one value.
 	OverwriteRemote bool
+	// CheckDraft is `sync apply`'s: commit only a draft that holds exactly this
+	// folder's file, under the version that check read
+	// (sync_apply_draft_version.go).
+	CheckDraft bool
 	// callerAdmin is the signed-in caller's admin role, read at most once per
 	// run and only for a draft without canDecide.
 	callerAdmin func() (bool, error)
@@ -813,6 +832,13 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 		return refuse("draft %s has not been built — publishing it would put %s live with nothing behind it.\n    Run `ronja pipeline push %s` to build it (a queued build finishes there too)",
 			draft.ID, out.TableID, path)
 	}
+	var ifVersion string
+	if routing.CheckDraft {
+		if !tableDraftHolds(codec, path, local[path], staged) {
+			return refuse("%v", draftNoLongerFolder("table", draft.ID))
+		}
+		ifVersion = api.DraftVersion(staged.UpdatedAt)
+	}
 
 	// Two staleness warnings, both before the commit and neither a refusal. The
 	// first now says early what the commit's own CAS would say anyway, which is
@@ -888,7 +914,10 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 	// somebody else's work was discarded, so it must not be reported by a run
 	// that then refuses because it could not prove the commit landed at all.
 	overwroteVersionID := ""
-	commitErr := client.CommitTableDraft(ctx, draft.ID, "")
+	echo, commitErr := client.CommitTableDraft(ctx, draft.ID, "", ifVersion)
+	if err := draftChangedError(draft.ID, commitErr); err != nil {
+		return refuse("%v", err)
+	}
 	// A commit lands the draft's NAME on the live row, so a second 409 now wears
 	// this status: the name is taken in the feature. It is answered first and on
 	// the CODE, because the branch below is about somebody else's work and sends
@@ -932,7 +961,11 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 				draft.ID, commitErr, out.TableID, out.TableID)
 		}
 		fmt.Fprintf(os.Stderr, "  --overwrite-remote: committing %s over version %s of %s, discarding what it changed.\n", path, head.HeadVersionID, out.TableID)
-		if err := client.CommitTableDraft(ctx, draft.ID, head.HeadVersionID); err != nil {
+		var err error
+		if echo, err = client.CommitTableDraft(ctx, draft.ID, head.HeadVersionID, ifVersion); err != nil {
+			if err := draftChangedError(draft.ID, err); err != nil {
+				return refuse("%v", err)
+			}
 			// A SECOND 409 means a third commit landed between the read above and
 			// this write. Deliberately not retried: an override authorizes
 			// overwriting the version it was shown, not whatever happens to be there
@@ -1012,6 +1045,9 @@ func publishOneTable(ctx context.Context, client *api.Client, f *folder, codec p
 		return out
 	}
 
+	if !unconfirmed {
+		warnUncheckedDraftVersion("table", draft.ID, ifVersion, echo)
+	}
 	// The draft is gone, so the recorded pointer has to go with it — otherwise
 	// the next publish tries to commit a row that no longer exists.
 	recordDraftPointer(inst, path, out.TableID, "")

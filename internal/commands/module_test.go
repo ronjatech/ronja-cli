@@ -370,7 +370,7 @@ func TestModuleMetadataDriftAndPatch(t *testing.T) {
 	baseline := &wfdir.InstanceState{Name: "emab_tracker", Title: "EMAB tracker"}
 	renamedLive := &api.Module{ID: "module-1", Lifecycle: api.LifecycleLive,
 		Name: "renamed_by_colleague", Title: "EMAB tracker"}
-	got := moduleMetadataDriftOf(baseline, renamedLive, manifest)
+	got := moduleMetadataDriftOf(baseline, renamedLive, manifest, nil)
 	if len(got) != 1 || got[0].Field != "package name" {
 		t.Fatalf("drift = %+v, want one package-name entry", got)
 	}
@@ -381,20 +381,20 @@ func TestModuleMetadataDriftAndPatch(t *testing.T) {
 		Name: "emab_tracker", Title: "EMAB tracker"}
 	staleDraft := &api.Module{ID: "module-draft", ParentModuleID: "module-1",
 		Lifecycle: api.LifecycleDraft, Name: "emab_tracker", Title: "The title before the edit"}
-	if got := moduleMetadataDriftOf(baseline, patchedLive, manifest); len(got) != 0 {
+	if got := moduleMetadataDriftOf(baseline, patchedLive, manifest, nil); len(got) != 0 {
 		t.Fatalf("the live row agrees with the baseline, so there is no drift: %+v", got)
 	}
-	if got := moduleMetadataDriftOf(baseline, staleDraft, manifest); len(got) == 0 {
+	if got := moduleMetadataDriftOf(baseline, staleDraft, manifest, nil); len(got) == 0 {
 		t.Fatal("sanity: the draft's stale copy DOES differ — which is why the guard must not read it")
 	}
 	drifted := renamedLive
 	// A baseline with no metadata recorded at all is a state file written before
 	// the guard existed. It reports NO drift rather than turning every such
 	// folder into a refusal.
-	if got := moduleMetadataDriftOf(nil, drifted, manifest); got != nil {
+	if got := moduleMetadataDriftOf(nil, drifted, manifest, nil); got != nil {
 		t.Fatalf("a nil baseline must report no drift, got %+v", got)
 	}
-	if got := moduleMetadataDriftOf(&wfdir.InstanceState{}, drifted, manifest); len(got) != 0 {
+	if got := moduleMetadataDriftOf(&wfdir.InstanceState{}, drifted, manifest, nil); len(got) != 0 {
 		t.Fatalf("an unrecorded baseline must report no drift, got %+v", got)
 	}
 }

@@ -64,6 +64,55 @@ func filesAgree(remote, local map[string]string) bool {
 	return true
 }
 
+// baselineDigest is what a proposal records as Over and what the guard holds
+// it to: one helper, so the two read the same in-memory baseline the same way.
+func (f *folder) baselineDigest() string {
+	return wfdir.BaselineDigest(f.State.For(f.Baseline()))
+}
+
+// excuseOwnProposal clears drift that one of this folder's recorded proposals
+// (wfdir.Proposal) accounts for, and reports whether it did. It excuses only
+// when all three hold:
+//   - the head vouches: live is the version this stack last deployed;
+//   - the proposal was made over the baseline the guard holds now;
+//   - one proposal holds every drifted path and metadata field.
+//
+// metaHeld asks the kind's metadata leg whether nothing drifted beyond what
+// that proposal's manifest declared (nil when it recorded none).
+func (f *folder) excuseOwnProposal(head headAgreement, drift wfdir.Diff, remote map[string]string, metaHeld func(*wfdir.Manifest) bool) (wfdir.Diff, bool) {
+	over := f.baselineDigest()
+	if !head.Vouches() || over == "" {
+		return drift, false
+	}
+	hashes := make(map[string]string, len(remote))
+	for path, content := range remote {
+		hashes[path] = wfdir.HashString(content)
+	}
+	for _, p := range wfdir.LoadProposals(f.Root, f.Key) {
+		if p.Over != over {
+			continue
+		}
+		if rest, _ := excuseAgreedFiles(drift, hashes, p.Files); rest.Dirty() {
+			continue
+		}
+		if metaHeld(p.ParsedManifest()) {
+			return wfdir.Diff{Added: []string{}, Modified: []string{}, Deleted: []string{}, Unchanged: drift.Unchanged}, true
+		}
+	}
+	return drift, false
+}
+
+// armedAfterProposals is the per-file preconditions of a push whose guard came
+// out clean: the baseline's, unless a proposal excused the drift. Live then no
+// longer holds the baseline's bytes, so the writes assert the listing the
+// guard just read.
+func armedAfterProposals(baseline *wfdir.InstanceState, remoteHashes map[string]string, proposed bool) map[string]string {
+	if !proposed {
+		return baseline.Hashes()
+	}
+	return remoteHashes
+}
+
 // noteLiveEqualsDesired says why a push with no baseline to hold it to was let
 // through: the row already is this folder.
 func noteLiveEqualsDesired(rowID string) {

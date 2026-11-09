@@ -206,10 +206,12 @@ func TestLifecycleVerbsHitTheirRoutes(t *testing.T) {
 			return err
 		}, "/api/v2/workflow/wf-1/checkout"},
 		{"commit", func(c *Client) error {
-			return c.CommitWorkflowDraft(context.Background(), "draft-1", "")
+			_, err := c.CommitWorkflowDraft(context.Background(), "draft-1", "", "")
+			return err
 		}, "/api/v2/workflow/draft-1/commit"},
 		{"publish", func(c *Client) error {
-			return c.PublishWorkflowDraft(context.Background(), "draft-1")
+			_, err := c.PublishWorkflowDraft(context.Background(), "draft-1", "")
+			return err
 		}, "/api/v2/workflow/draft-1/publish"},
 		{"discard", func(c *Client) error {
 			return c.DiscardWorkflowDraft(context.Background(), "draft-1")
@@ -358,10 +360,12 @@ func TestOptionalBodiesAreOmittedEntirely(t *testing.T) {
 			return err
 		}, `{"baseSha256":"` + digest + `"}`},
 		{"commit without a confirmation", func(c *Client) error {
-			return c.CommitWorkflowDraft(context.Background(), "draft-1", "")
+			_, err := c.CommitWorkflowDraft(context.Background(), "draft-1", "", "")
+			return err
 		}, ""},
 		{"commit with one", func(c *Client) error {
-			return c.CommitWorkflowDraft(context.Background(), "draft-1", "ver-9")
+			_, err := c.CommitWorkflowDraft(context.Background(), "draft-1", "ver-9", "")
+			return err
 		}, `{"confirmHeadVersionID":"ver-9"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

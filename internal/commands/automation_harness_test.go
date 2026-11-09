@@ -56,9 +56,12 @@ type fakeAutomationInstance struct {
 	// --- failure injection ---------------------------------------------------
 	failList   int
 	failCreate int
-	failUpdate map[string]int
-	failDelete map[string]int
-	failGet    map[string]int
+	// failCreateNamed answers the create of an automation of this name with
+	// this status, as the server refuses one file of a folder.
+	failCreateNamed map[string]int
+	failUpdate      map[string]int
+	failDelete      map[string]int
+	failGet         map[string]int
 	// halfApply makes an UPDATE write the row's scalar fields and then answer an
 	// error — the non-transactional shape §5.4 is about, where the schedule lands
 	// and the references do not.
@@ -290,6 +293,10 @@ func (f *fakeAutomationInstance) serveCreate(w http.ResponseWriter, r *http.Requ
 	}
 	var in api.CreateAutomationInput
 	decodeBody(f.t, r, &in)
+	if status := f.failCreateNamed[in.Name]; status != 0 {
+		http.Error(w, `{"error":"refused by the fake"}`, status)
+		return
+	}
 	f.created = append(f.created, in)
 	f.nextID++
 	row := &api.Automation{

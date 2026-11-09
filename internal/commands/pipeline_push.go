@@ -346,6 +346,9 @@ type pipelinePushResult struct {
 	// ManagedInGit is every table or metric this command read whose `managedBy` names a
 	// repository folder other than this one (managed_notice.go).
 	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
+	// liveAlready are the files left out of Files because their live table
+	// already held them.
+	liveAlready []string
 }
 
 // pipelineFileResult is what happened to one file.
@@ -865,6 +868,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		file := pushOneTable(ctx, client, f, codec, inst, path, local[path],
 			upstreamsInPush(codec, local[path], pushing), created, opts)
 		if file.Outcome == pushOutcomeUpToDate {
+			result.liveAlready = append(result.liveAlready, file.Path)
 			// Recorded as synced, and reported as what it is to a bare push: a
 			// file with nothing to send. The baseline write is what lets a
 			// re-run in the same checkout skip it without asking the server.
@@ -1259,6 +1263,26 @@ func tableHeldLive(codec pipelineCodec, liveHash liveHashes, path, content strin
 	}
 	action, _ := tableNameLeg(liveHash, path, declared, live, nil)
 	return action == nameAgrees
+}
+
+// tableDraftHolds is the publish check's question for a table: does the draft
+// about to be committed hold everything this file writes into it — the SQL, the
+// header's prose, the declared name? The prose is judged under the join rule
+// (docsLanded), not docsHeldExactly: prose for a column the draft has not
+// measured is stored server-side and never reported back, so the stricter test
+// would refuse every file that documents a column ahead of its data.
+//
+// The commit also publishes input_models, which the push derives from the SQL
+// rather than reads from the file, so a matching SQL is taken to imply them.
+func tableDraftHolds(codec pipelineCodec, path, content string, staged *api.Table) bool {
+	if wire, err := codec.toWire(path, content); err != nil || staged.Code != wire {
+		return false
+	}
+	if docs, _ := tabledocs.ParseHeader(content); !docs.Empty() && !docsLanded(docs, staged) {
+		return false
+	}
+	declared, _ := tabledocs.ParseName(content)
+	return declared == nil || sameName(staged.Name, *declared)
 }
 
 // pushOneTable runs the whole edit cycle for one file.

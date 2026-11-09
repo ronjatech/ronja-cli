@@ -48,7 +48,9 @@ import (
 // because that is what the real one does and the CLI's nil-pointer decode is
 // built around it.
 type fakeInstance struct {
-	t *testing.T
+	// changeLists answers the change-list upload and the migrations route.
+	changeLists *fakeChangeLists
+	t           *testing.T
 
 	workflows map[string]*api.Workflow
 	files     map[string][]api.WorkflowFile
@@ -158,6 +160,12 @@ type fakeInstance struct {
 	// attempt, "" for a commit that sent none. Its LENGTH is what pins "no
 	// retry loop".
 	commitConfirmations []string
+	// draftVersions records the ifDraftVersion of every commit and publish, ""
+	// for one that sent none.
+	draftVersions []string
+	// ignoresDraftVersion models a Ronja older than the precondition: a commit
+	// or publish answers without saying it checked the version.
+	ignoresDraftVersion bool
 	// beforeFileWrite, when set, runs at the top of every file PUT/DELETE.
 	//
 	// It is the only way to stage the race the preconditions exist for: a
@@ -518,6 +526,7 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 	t.Helper()
 	f := &fakeInstance{
 		t:                   t,
+		changeLists:         newFakeChangeLists(),
 		workflows:           map[string]*api.Workflow{},
 		files:               map[string][]api.WorkflowFile{},
 		draftOf:             map[string]string{},
@@ -687,6 +696,9 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if f.managed.serve(w, r) {
+		return
+	}
+	if f.changeLists.serve(w, r) {
 		return
 	}
 	if r.URL.Path == "/api/v2/authentication/me" {
@@ -1422,6 +1434,9 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		var in api.CommitDraftInput
 		decodeOptionalBody(f.t, r, &in)
 		f.commitConfirmations = append(f.commitConfirmations, in.ConfirmHeadVersionID)
+		if f.refuseChangedDraft(w, id, in.IfDraftVersion) {
+			return true
+		}
 		if f.failCommit != 0 {
 			http.Error(w, `{"error":"admin required to commit a shared workflow draft"}`, f.failCommit)
 			return true
@@ -1458,15 +1473,20 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			delete(f.draftOf, parent)
 			delete(f.workflows, id)
 		}
-		writeJSON(w, nil)
+		writeJSON(w, f.draftVersionEcho(in.IfDraftVersion))
 		return true
 	case "publish":
+		var in api.CommitDraftInput
+		decodeOptionalBody(f.t, r, &in)
+		if f.refuseChangedDraft(w, id, in.IfDraftVersion) {
+			return true
+		}
 		f.publishedIDs = append(f.publishedIDs, id)
 		if wf := f.workflows[id]; wf != nil {
 			wf.Lifecycle = api.LifecycleLive
 			wf.Hidden = false
 		}
-		writeJSON(w, nil)
+		writeJSON(w, f.draftVersionEcho(in.IfDraftVersion))
 		return true
 	case "discard":
 		f.discardedIDs = append(f.discardedIDs, id)
@@ -1603,6 +1623,41 @@ func (f *fakeInstance) snapshotHead(id string) {
 			f.versionFiles[versions[0].ID] = slices.Clone(f.files[id])
 		}
 	}
+}
+
+// refuseChangedDraft mirrors lib/draftversion.Check on the commit and the
+// publish, recording what was sent.
+func (f *fakeInstance) refuseChangedDraft(w http.ResponseWriter, id, ifVersion string) bool {
+	f.draftVersions = append(f.draftVersions, ifVersion)
+	wf := f.workflows[id]
+	return wf != nil && refuseDraftAt(w, "workflow "+strconv.Quote(wf.Title), ifVersion, wf.UpdatedAt)
+}
+
+// refuseDraftAt answers the server's draft_changed 409 when ifVersion is set
+// and is not updatedAt.
+// draftVersionEcho is what a publish answers about the ifDraftVersion it was
+// sent; nothing, from a fake that models an older Ronja.
+func (f *fakeInstance) draftVersionEcho(sent string) any {
+	if f.ignoresDraftVersion {
+		return nil
+	}
+	return echoOf(sent)
+}
+
+func echoOf(sent string) api.DraftVersionEcho {
+	return api.DraftVersionEcho{DraftVersionChecked: sent != ""}
+}
+
+func refuseDraftAt(w http.ResponseWriter, name, ifVersion string, updatedAt time.Time) bool {
+	if ifVersion == "" || ifVersion == api.DraftVersion(updatedAt) {
+		return false
+	}
+	body, _ := json.Marshal(map[string]string{
+		"error": name + ": its draft changed after it was checked; nothing was published",
+		"code":  api.DraftChangedCode,
+	})
+	http.Error(w, string(body), http.StatusConflict)
+	return true
 }
 
 func (f *fakeInstance) putFile(id, path, content string) {

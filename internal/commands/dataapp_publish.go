@@ -59,7 +59,7 @@ folder has local changes that are not in the draft.`,
 			if err != nil {
 				return err
 			}
-			result, err := runAppPublish(cmd.Context(), f, noRequestReview)
+			result, err := runAppPublish(cmd.Context(), f, noRequestReview, false)
 			printManagedNotices(f.notices)
 			if err != nil {
 				return err
@@ -112,7 +112,8 @@ type appPublishResult struct {
 	ManagedInGit []managedNotice `json:"managedInGit,omitempty"`
 }
 
-func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPublishResult, error) {
+// checkDraft is `sync apply`'s publishOptions.CheckDraft.
+func runAppPublish(ctx context.Context, f *folder, noRequestReview, checkDraft bool) (*appPublishResult, error) {
 	client := f.client()
 	parent, draft, err := resolveAppDraft(ctx, client, f, "nothing to publish")
 	if err != nil {
@@ -196,7 +197,14 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 		}
 	}
 
-	outcome, commitErr := client.CommitDataAppDraft(ctx, draft.ID)
+	// After the validate above, which stamps the draft and so moves its version.
+	var ifVersion string
+	if checkDraft {
+		if ifVersion, err = checkAppDraft(ctx, client, f, draft.ID); err != nil {
+			return nil, err
+		}
+	}
+	outcome, commitErr := client.CommitDataAppDraft(ctx, draft.ID, ifVersion)
 	if commitErr == nil {
 		result.Audience, result.Warnings = audienceAndWarnings(outcome)
 		// Nothing went live: a first publish into a shared feature by a
@@ -208,6 +216,9 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 			result.Outcome = outcomeSubmittedForReview
 			result.Detail = fmt.Sprintf("a new app in the shared feature %q needs the approval of an admin or a maintainer of it, so it was submitted for one", parent.Name)
 			return result, nil
+		}
+		if outcome != nil {
+			warnUncheckedDraftVersion("app", draft.ID, ifVersion, outcome.DraftVersionEcho)
 		}
 		result.Outcome = outcomePublished
 		result.Detail = fmt.Sprintf("committed to %q", parent.Name)
@@ -224,6 +235,9 @@ func runAppPublish(ctx context.Context, f *folder, noRequestReview bool) (*appPu
 	// the organization disallows approving one's own draft. A first
 	// publish is excluded because request-review cannot express it — its refusal
 	// would replace the commit's real diagnostic with an unrelated one.
+	if err := draftChangedError(draft.ID, commitErr); err != nil {
+		return nil, err
+	}
 	if noRequestReview || firstPublish || api.StatusOf(commitErr) != 400 {
 		return nil, fmt.Errorf("commit %s: %w", draft.ID, commitErr)
 	}

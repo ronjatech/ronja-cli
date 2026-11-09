@@ -40,6 +40,9 @@ func newSecretConnectCmd() *cobra.Command {
 		featureID string
 		scopes    []string
 		noBrowser bool
+		link      bool
+		company   string
+		replace   bool
 	)
 
 	cmd := &cobra.Command{
@@ -65,6 +68,17 @@ holds, which is the only way to make a connection narrower.
 --no-browser prints the link instead of opening it. The page lets only you
 connect, signed in to Ronja.
 
+--link prepares the connection for someone else to finish, for a company
+account (Fortnox, HubSpot). It opens nothing and does not wait: it prints a link
+to send, on stdout, valid 14 days and shown only this once. Anyone holding the
+link can finish the sign-in with no Ronja login, so treat it like a password.
+--company names the one company that may sign in; without it, whichever company
+signs in is connected, unless the connection already holds one:
+
+  ronja secret connect fortnox --link --feature <feature-id> --company 556677-8899
+
+--replace ends a link already out and makes a new one.
+
 Prints the secret's id, its name and the permissions it holds — never a token.
 An unknown service is refused with the list of service names.`,
 		Args: cobra.ExactArgs(1),
@@ -74,8 +88,19 @@ An unknown service is refused with the list of service names.`,
 				return errors.New("name the service to connect, e.g. gmail")
 			}
 			featureID = strings.TrimSpace(featureID)
+			if link && featureID == "" {
+				return errors.New("--link needs --feature: name the Feature the connection is prepared in")
+			}
+			if !link && (cmd.Flags().Changed("company") || cmd.Flags().Changed("replace")) {
+				return errors.New("--company and --replace apply only with --link")
+			}
 			var in api.OAuthInitiateInput
 			in.FeatureID = featureID
+			in.Link = link
+			in.Replace = replace
+			if cmd.Flags().Changed("company") {
+				in.ExpectedCompany = &company
+			}
 			if cmd.Flags().Changed("scope") {
 				chosen := make([]string, 0, len(scopes))
 				for _, s := range scopes {
@@ -91,14 +116,59 @@ An unknown service is refused with the list of service names.`,
 				return err
 			}
 			client := newClient(resolved.URL, resolved.Token)
+			if link {
+				return runSecretConnectLink(cmd.Context(), client, service, in)
+			}
 			return runSecretConnect(cmd.Context(), client, service, in, noBrowser)
 		},
 	}
 
-	cmd.Flags().StringVar(&featureID, "feature", "", "the Feature a NEW connection is created in (default: one per provider). An existing connection stays where it is")
+	cmd.Flags().StringVar(&featureID, "feature", "", "the Feature a NEW connection is created in (default: one per provider). An existing connection stays where it is; --link needs this and refuses a connection in another Feature")
 	cmd.Flags().StringArrayVar(&scopes, "scope", nil, "a permission to ask for, on a service that offers a choice (repeatable). Replaces what the connection holds")
 	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "print the link instead of opening it")
+	cmd.Flags().BoolVar(&link, "link", false, "prepare the connection and print a link anyone holding it can finish, with no Ronja login (needs --feature)")
+	cmd.Flags().StringVar(&company, "company", "", "with --link, the one company that may sign in, e.g. a Fortnox organization number")
+	cmd.Flags().BoolVar(&replace, "replace", false, "with --link, end a link already out and make a new one")
 	return cmd
+}
+
+// runSecretConnectLink opens nothing and does not wait: whoever the link goes
+// to may sign in days from now. The link is a bearer credential, printed only
+// because this command was asked for it.
+func runSecretConnectLink(ctx context.Context, client *api.Client, service string, in api.OAuthInitiateInput) error {
+	started, err := client.InitiateOAuth(ctx, service, in)
+	if err != nil {
+		return connectInitiateError(err)
+	}
+	// A server without links ignores `link` and starts an ordinary sign-in, which
+	// signs whoever finishes it into the caller's own secret.
+	if started.ExpiresAt == nil {
+		return errors.New("this Ronja server can't prepare a sign-in link; update it and try again")
+	}
+
+	if flagJSON {
+		out := map[string]any{
+			"secretID":        started.SecretID,
+			"url":             started.URL,
+			"expiresAt":       started.ExpiresAt,
+			"requestedScopes": started.RequestedScopes,
+		}
+		if in.ExpectedCompany != nil {
+			out["company"] = *in.ExpectedCompany
+		}
+		return emitJSON(out)
+	}
+
+	fmt.Fprintf(os.Stderr, "Send this link to whoever signs in to %s. Anyone holding it can finish the sign-in, with no Ronja login, until %s.\n",
+		service, started.ExpiresAt.Local().Format("2006-01-02 15:04 MST"))
+	if in.ExpectedCompany != nil {
+		fmt.Fprintf(os.Stderr, "Only company %s can be connected; a sign-in to any other is refused.\n", *in.ExpectedCompany)
+	} else {
+		fmt.Fprintln(os.Stderr, "No company was named, so whichever company signs in is connected, unless the connection already holds one.")
+	}
+	fmt.Fprintf(os.Stderr, "`ronja api /api/v2/secret/%s` shows its status and any sign-in refused for its company.\n\n", started.SecretID)
+	fmt.Fprintln(os.Stdout, started.URL)
+	return nil
 }
 
 func runSecretConnect(ctx context.Context, client *api.Client, service string, in api.OAuthInitiateInput, noBrowser bool) error {

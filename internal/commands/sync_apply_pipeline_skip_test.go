@@ -22,7 +22,7 @@ func webCommitTable(t *testing.T, f *fakePipelineInstance, liveID string) {
 		t.Fatalf("no open draft of %s to publish", liveID)
 	}
 	rec := httptest.NewRecorder()
-	f.serveCommit(rec, draftID, f.headVersionOf(liveID))
+	f.serveCommit(rec, draftID, f.headVersionOf(liveID), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("web publish of %s: %d %s", draftID, rec.Code, rec.Body)
 	}

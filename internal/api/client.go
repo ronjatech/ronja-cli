@@ -513,6 +513,11 @@ func (c *Client) do(ctx context.Context, timeout time.Duration, method, path str
 	// answer into a decode error. A non-JSON body fails on its first byte
 	// anyway, which is the case a cap would otherwise be for.
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		// A commit or publish has landed by now, and an older Ronja answers it
+		// with nothing: no echo is the answer, never a failed publish.
+		if _, ok := out.(*DraftVersionEcho); ok {
+			return nil
+		}
 		return fmt.Errorf("decode response from %s: %w", url, err)
 	}
 	return nil

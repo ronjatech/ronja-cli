@@ -383,7 +383,7 @@ credentials entirely and never touch disk.`,
 	root.AddCommand(newLoginCmd(), newLogoutCmd(), newWhoamiCmd(), newProfileCmd(),
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
 		newPipelineCmd(), newModuleCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(), newImportCmd(), newCopyCmd(),
-		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newSecretCmd(), newTokenCmd(), newUpdateCmd())
+		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newSecretCmd(), newTokenCmd(), newUpdateCmd(), newProposeCmd())
 	return root
 }
 

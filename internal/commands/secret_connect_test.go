@@ -49,6 +49,9 @@ type connectFake struct {
 	// pageURL is initiate's `url`, the secret's page in Ronja; empty omits it,
 	// as an older server does.
 	pageURL string
+	// linkExpiresAt turns initiate's answer into a prepared link's: url plus
+	// expiresAt and no authURL.
+	linkExpiresAt string
 
 	answers  []secretAnswer
 	gets     int
@@ -85,6 +88,10 @@ func (f *connectFake) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out := map[string]any{"authURL": connectAuthURL, "secretID": connectSecretID}
+		if f.linkExpiresAt != "" {
+			delete(out, "authURL")
+			out["expiresAt"] = f.linkExpiresAt
+		}
 		if f.requested != nil {
 			out["requestedScopes"] = f.requested
 		}
@@ -845,5 +852,167 @@ func TestSecretConnectOpensRonjasPage(t *testing.T) {
 	}
 	if want := "connected: " + connectSecretID + " (Google OAuth, scopes: " + gMail + ")\n"; stdout != want {
 		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+}
+
+const connectPreparedLink = "https://app.example.test/connect/LINK-SENTINEL-77ab"
+
+func newLinkFake(t *testing.T) *connectFake {
+	t.Helper()
+	f := newConnectFake(t, []string{"companyinformation"})
+	f.pageURL = connectPreparedLink
+	f.linkExpiresAt = "2026-11-22T12:00:00Z"
+	return f
+}
+
+// --link is the one flow that opens nothing and does not wait, and whose link
+// is on stdout. A GET /secret/:id here fails the fake: no answers are scripted.
+func TestSecretConnectLinkOpensNothingAndDoesNotPoll(t *testing.T) {
+	fastConnect(t, 5*time.Second)
+	opened := fakeBrowser(t)
+	f := newLinkFake(t)
+
+	stdout, stderr, errText := runConnect(t, "fortnox", "--link", "--feature", "feature-1", "--company", "556677-8899")
+	if errText != "" {
+		t.Fatalf("connect failed: %s", errText)
+	}
+	if len(*opened) != 0 {
+		t.Errorf("--link opened a browser: %v", *opened)
+	}
+	if n := f.getCount(); n != 0 {
+		t.Errorf("--link read the secret %d times, want 0", n)
+	}
+	if strings.TrimSpace(stdout) != connectPreparedLink {
+		t.Errorf("stdout = %q, want only the link", stdout)
+	}
+	for _, want := range []string{"Anyone holding it", "2026-11-22", "556677-8899", "is refused", "ronja api /api/v2/secret/" + connectSecretID, "refused for its company"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr = %q, want %q", stderr, want)
+		}
+	}
+	body := f.initBodies[0]
+	if body["link"] != true || body["featureID"] != "feature-1" || body["expectedCompany"] != "556677-8899" {
+		t.Errorf("initiate body = %v", body)
+	}
+	if _, sent := body["replace"]; sent {
+		t.Errorf("replace sent without --replace: %v", body)
+	}
+}
+
+func TestSecretConnectLinkJSONCarriesTheURL(t *testing.T) {
+	fastConnect(t, 5*time.Second)
+	fakeBrowser(t)
+	newLinkFake(t)
+
+	stdout, _, errText := runConnect(t, "fortnox", "--link", "--feature", "feature-1", "--json")
+	if errText != "" {
+		t.Fatalf("connect failed: %s", errText)
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
+	}
+	if out["url"] != connectPreparedLink || out["secretID"] != connectSecretID || out["expiresAt"] != "2026-11-22T12:00:00Z" {
+		t.Errorf("json = %v", out)
+	}
+}
+
+// A company flag left blank by an unset variable must reach the server's 400,
+// never mint a link any company can finish.
+func TestSecretConnectLinkSendsCompanyOnlyWhenGiven(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		wantSent bool
+	}{
+		{"not given", nil, false},
+		{"given blank", []string{"--company", ""}, true},
+		{"given", []string{"--company", "5566778899"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fastConnect(t, 5*time.Second)
+			fakeBrowser(t)
+			f := newLinkFake(t)
+			args := append([]string{"fortnox", "--link", "--feature", "feature-1"}, tc.args...)
+			if _, _, errText := runConnect(t, args...); errText != "" {
+				t.Fatalf("connect failed: %s", errText)
+			}
+			_, sent := f.initBodies[0]["expectedCompany"]
+			if sent != tc.wantSent {
+				t.Errorf("expectedCompany sent = %v, want %v: %v", sent, tc.wantSent, f.initBodies[0])
+			}
+		})
+	}
+}
+
+func TestSecretConnectLinkRefusalsSurface(t *testing.T) {
+	fastConnect(t, 5*time.Second)
+	opened := fakeBrowser(t)
+	f := newLinkFake(t)
+	f.initStatus = http.StatusConflict
+	f.initBody = `{"error":"this company already has a working Fortnox connection, held by Lars; signing in again would end it"}`
+
+	stdout, _, errText := runConnect(t, "fortnox", "--link", "--feature", "feature-1", "--company", "5566778899")
+	if !strings.Contains(errText, "held by Lars") {
+		t.Errorf("error = %q, want the server's sentence", errText)
+	}
+	if stdout != "" || len(*opened) != 0 {
+		t.Errorf("a refusal printed %q and opened %v", stdout, *opened)
+	}
+}
+
+func TestSecretConnectLinkReplaceIsSent(t *testing.T) {
+	fastConnect(t, 5*time.Second)
+	fakeBrowser(t)
+	f := newLinkFake(t)
+	if _, _, errText := runConnect(t, "fortnox", "--link", "--feature", "feature-1", "--replace"); errText != "" {
+		t.Fatalf("connect failed: %s", errText)
+	}
+	if f.initBodies[0]["replace"] != true {
+		t.Errorf("initiate body = %v", f.initBodies[0])
+	}
+}
+
+func TestSecretConnectLinkFlagsRefusedBeforeAnyRequest(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"link without feature", []string{"fortnox", "--link"}, "--link needs --feature"},
+		{"company without link", []string{"fortnox", "--company", "5566778899"}, "apply only with --link"},
+		{"replace without link", []string{"fortnox", "--replace"}, "apply only with --link"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fastConnect(t, 5*time.Second)
+			fakeBrowser(t)
+			f := newConnectFake(t, []string{gMail})
+			_, _, errText := runConnect(t, tc.args...)
+			if !strings.Contains(errText, tc.want) {
+				t.Errorf("error = %q, want %q", errText, tc.want)
+			}
+			if len(f.requests) != 0 {
+				t.Errorf("requests = %v, want none", f.requests)
+			}
+		})
+	}
+}
+
+// A server without links would answer an ordinary sign-in, whose authURL must
+// not be handed on as the link to send.
+func TestSecretConnectLinkRefusesAServerWithoutLinks(t *testing.T) {
+	fastConnect(t, 5*time.Second)
+	fakeBrowser(t)
+	f := newConnectFake(t, []string{"companyinformation"})
+	f.pageURL = "https://app.example.test/secrets/s1?connect=fortnox"
+
+	stdout, _, errText := runConnect(t, "fortnox", "--link", "--feature", "feature-1")
+	if !strings.Contains(errText, "can't prepare a sign-in link") {
+		t.Errorf("error = %q", errText)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing", stdout)
 	}
 }

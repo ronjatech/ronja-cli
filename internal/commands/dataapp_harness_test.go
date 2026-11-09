@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -213,7 +214,11 @@ type fakeAppInstance struct {
 	created   []api.CreateDataAppInput
 	patches   []api.DataAppPatch
 	committed []string
-	discarded []string
+	// draftVersions records the ifDraftVersion of every commit.
+	draftVersions []string
+	// beforeServe, when set, runs before each request is answered.
+	beforeServe func(r *http.Request)
+	discarded   []string
 	// deletedApps records every DELETE /dataapp/:id — the whole-app removal
 	// `discard --delete-app` performs, which must never happen without it.
 	deletedApps     []string
@@ -364,6 +369,9 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 		f.spaceSeen = append(f.spaceSeen, r.Method+" "+r.URL.Path+" "+space)
 	}
 	echoSpace(w, r)
+	if f.beforeServe != nil {
+		f.beforeServe(r)
+	}
 	if f.managed.serve(w, r) {
 		return
 	}
@@ -482,6 +490,12 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 		f.servePreview(w, r, id)
 
 	case rest == "commit":
+		var in api.CommitDraftInput
+		decodeOptionalBody(f.t, r, &in)
+		f.draftVersions = append(f.draftVersions, in.IfDraftVersion)
+		if app := f.apps[id]; app != nil && refuseDraftAt(w, "app "+strconv.Quote(app.Name), in.IfDraftVersion, app.UpdatedAt) {
+			return
+		}
 		if f.failCommit != 0 {
 			http.Error(w, `{"error":"admin required to commit a shared data-app draft"}`, f.failCommit)
 			return
@@ -490,11 +504,11 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 		if f.commitProposes {
 			// Nothing is committed: the row becomes a proposal in place, so the
 			// fake deliberately leaves the draft alone.
-			writeJSON(w, api.DataAppCommitOutcome{DataAppID: id, FirstPublish: true, Proposed: true})
+			writeJSON(w, api.DataAppCommitOutcome{DraftVersionEcho: echoOf(in.IfDraftVersion), DataAppID: id, FirstPublish: true, Proposed: true})
 			return
 		}
 		f.commitDraft(id)
-		writeJSON(w, api.DataAppCommitOutcome{DataAppID: id})
+		writeJSON(w, api.DataAppCommitOutcome{DraftVersionEcho: echoOf(in.IfDraftVersion), DataAppID: id})
 
 	case rest == "discard":
 		f.discarded = append(f.discarded, id)

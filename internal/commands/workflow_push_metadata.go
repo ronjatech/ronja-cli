@@ -23,6 +23,30 @@ import (
 // workflow_push_zone.go — it is the one field a 2xx does not confirm, so it has
 // a lifecycle none of these share.
 
+// withoutProposedFields is patch less every field the row already holds as the
+// change list m (nil for none) declared it: the drift guard's view of the
+// patch, since overwriting that field overwrites only this folder's own work.
+// See live_equals_desired.go.
+func withoutProposedFields(patch api.WorkflowPatch, codec aliasCodec, target *api.Workflow, m *wfdir.Manifest) api.WorkflowPatch {
+	if m == nil {
+		return patch
+	}
+	held := metadataPatch(m, codec, target)
+	if m.Title != "" && held.Title == "" {
+		patch.Title = ""
+	}
+	if m.Entrypoint != "" && held.Entrypoint == "" {
+		patch.Entrypoint = ""
+	}
+	if m.ManagesParameters() && held.Parameters == nil {
+		patch.Parameters = nil
+	}
+	if m.ManagesReportingTimezone() && held.ReportingTimezone == nil {
+		patch.ReportingTimezone = nil
+	}
+	return patch
+}
+
 // metadataPatch is the difference between what the manifest says and what the
 // row says. Empty when they agree, so the round trip is skipped.
 //

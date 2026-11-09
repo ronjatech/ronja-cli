@@ -435,6 +435,11 @@ func (f *folder) addressOnDisk(address string) bool {
 	if address == "" || !wfdir.KeysRowsByFile(f.Kind) {
 		return true
 	}
+	// An address is a path inside the folder; one that leaves it names no
+	// file of this folder, and is not looked for outside it.
+	if !filepath.IsLocal(filepath.FromSlash(address)) {
+		return false
+	}
 	_, err := os.Stat(filepath.Join(f.Root, filepath.FromSlash(address)))
 	return err == nil
 }

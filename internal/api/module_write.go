@@ -218,10 +218,12 @@ func (c *Client) DeleteModuleFile(ctx context.Context, id, path string, baseSha2
 // is why nothing here retries.
 type ModuleCommitInput struct {
 	ConfirmHeadVersionID string `json:"confirmHeadVersionID,omitempty"`
+	IfDraftVersion       string `json:"ifDraftVersion,omitempty"`
 }
 
 // ModuleCommitOutcome mirrors rmodule.CommitOutcome — what a commit did.
 type ModuleCommitOutcome struct {
+	DraftVersionEcho
 	// ModuleID is the id the module is known by afterwards: the parent's for an
 	// edit, the draft's own for a first publish.
 	ModuleID string `json:"moduleID"`
@@ -261,10 +263,10 @@ type ModuleCommitOutcome struct {
 // confirmHeadVersionID is empty for an ordinary commit, which sends no body at
 // all. Supply it only after a 409 has named the version being overwritten, and
 // only on a deliberate override (`module publish --overwrite-remote`).
-func (c *Client) CommitModuleDraft(ctx context.Context, draftID, confirmHeadVersionID string) (*ModuleCommitOutcome, error) {
+func (c *Client) CommitModuleDraft(ctx context.Context, draftID, confirmHeadVersionID, ifDraftVersion string) (*ModuleCommitOutcome, error) {
 	var body any
-	if confirmHeadVersionID != "" {
-		body = ModuleCommitInput{ConfirmHeadVersionID: confirmHeadVersionID}
+	if confirmHeadVersionID != "" || ifDraftVersion != "" {
+		body = ModuleCommitInput{ConfirmHeadVersionID: confirmHeadVersionID, IfDraftVersion: ifDraftVersion}
 	}
 	var out ModuleCommitOutcome
 	if err := c.Do(ctx, "POST", "module/"+url.PathEscape(draftID)+"/commit", body, &out); err != nil {

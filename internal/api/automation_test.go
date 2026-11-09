@@ -165,10 +165,6 @@ func TestGetAutomationDecodesEveryMirroredField(t *testing.T) {
 	if a.CreatedAt.IsZero() || a.UpdatedAt.IsZero() {
 		t.Errorf("timestamps did not decode: created=%v updated=%v", a.CreatedAt, a.UpdatedAt)
 	}
-	// The get path never reveals the HMAC secret.
-	if a.WebhookSigningSecret != "" {
-		t.Errorf("a read exposed the signing secret: %q", a.WebhookSigningSecret)
-	}
 }
 
 // The stamp is compared against ITSELF across runs, so it must have one
@@ -324,11 +320,11 @@ func TestCreateAutomationSendsOneSpellingAndNoPrivate(t *testing.T) {
 		if err := json.Unmarshal(raw, &body); err != nil {
 			t.Fatalf("request body: %v", err)
 		}
-		w.Write([]byte(`{"id":"sj-new","webhookSigningSecret":"shhh"}`))
+		w.Write([]byte(`{"id":"sj-new"}`))
 	})
 
 	enabled := false
-	created, err := client.CreateAutomation(context.Background(), CreateAutomationInput{
+	_, err := client.CreateAutomation(context.Background(), CreateAutomationInput{
 		FeatureID:                 "collection-1",
 		Name:                      "Nightly rebuild",
 		TriggerKind:               TriggerKindTable,
@@ -359,10 +355,6 @@ func TestCreateAutomationSendsOneSpellingAndNoPrivate(t *testing.T) {
 	// A false `enabled` must survive: "declared off" is not "not managed".
 	if got, ok := body["enabled"]; !ok || got != false {
 		t.Errorf("enabled = %v (present=%v), want an explicit false", got, ok)
-	}
-	// The one-time reveal appears nowhere else ever.
-	if created.WebhookSigningSecret != "shhh" {
-		t.Errorf("the create response's signing secret was lost: %+v", created)
 	}
 }
 

@@ -689,6 +689,29 @@ func TestSyncApplyAllowCreateNamesTheRowCountBeforeCreating(t *testing.T) {
 	}
 }
 
+// A dry run names each folder's feature, where its creates would land: the
+// destination a change list shows and its deploy job re-checks.
+func TestSyncApplyDryRunNamesTheCreatesFeature(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	seedFeature(f, "private")
+	tree, _ := applyPipelineTree(t, f,
+		map[string]string{"orders.sql": "SELECT * FROM raw", "refunds.sql": "SELECT * FROM raw WHERE refunded"},
+		map[string]string{"orders.sql": "table-orders"},
+		nil)
+
+	var out string
+	captureStderr(t, func() {
+		out, _ = runCLI(t, tree, "sync", "apply", "--stack", "prod", "--allow-create", "--dry-run", "--json")
+	})
+	if got := applyFolderLine(t, applyReportOf(t, out), "sales").Feature; got != "collection-1" {
+		t.Errorf("feature = %q, want the stack's collection-1\n%s", got, out)
+	}
+	if len(f.created) != 0 {
+		t.Fatalf("a dry run created %+v", f.created)
+	}
+}
+
 // The flag opts into ONE refusal. A disarmed automation anchor is not about a
 // row that does not exist, and --allow-create must not quietly relax it — a
 // single flag that loosened all three would be one nobody could reason about

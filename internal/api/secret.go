@@ -47,6 +47,13 @@ func (c *Client) CreateSecret(ctx context.Context, in CreateSecretInput) (*Creat
 type OAuthInitiateInput struct {
 	FeatureID string    `json:"featureID,omitempty"`
 	Scopes    *[]string `json:"scopes,omitempty"`
+	// Link prepares the connection and answers a link anyone may finish the
+	// sign-in from, instead of starting one.
+	Link bool `json:"link,omitempty"`
+	// ExpectedCompany is a pointer because a present blank is the server's 400,
+	// where an absent one prepares a link for any company.
+	ExpectedCompany *string `json:"expectedCompany,omitempty"`
+	Replace         bool    `json:"replace,omitempty"`
 }
 
 // OAuthInitiate is what initiate answers. AuthURL carries the one-shot `state`
@@ -59,7 +66,10 @@ type OAuthInitiate struct {
 	RequestedScopes *[]string `json:"requestedScopes"`
 	// URL is the secret's page in Ronja, where the person presses Continue to
 	// reach the provider; empty from an older server, and the command then opens AuthURL.
+	// With Link it is the prepared link instead, a bearer credential.
 	URL string `json:"url"`
+	// ExpiresAt is set only on a prepared link.
+	ExpiresAt *time.Time `json:"expiresAt"`
 }
 
 // InitiateOAuth starts a Ronja-managed OAuth connection for one registry

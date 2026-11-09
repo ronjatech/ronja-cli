@@ -374,12 +374,14 @@ func (c *Client) SyncTable(ctx context.Context, id string) error {
 // COMMIT TIME, not merely be non-empty, so a caller who learns the head and then
 // deliberates while a third version lands gets another 409 — which is why
 // nothing here retries.
-func (c *Client) CommitTableDraft(ctx context.Context, draftID, confirmHeadVersionID string) error {
+func (c *Client) CommitTableDraft(ctx context.Context, draftID, confirmHeadVersionID, ifDraftVersion string) (DraftVersionEcho, error) {
 	var body any
-	if confirmHeadVersionID != "" {
-		body = TableCommitDraftInput{ConfirmHeadVersionID: confirmHeadVersionID}
+	if confirmHeadVersionID != "" || ifDraftVersion != "" {
+		body = TableCommitDraftInput{ConfirmHeadVersionID: confirmHeadVersionID, IfDraftVersion: ifDraftVersion}
 	}
-	return c.doSlow(ctx, "POST", "feature/model/"+url.PathEscape(draftID)+"/commit", body, nil)
+	var out DraftVersionEcho
+	err := c.doSlow(ctx, "POST", "feature/model/"+url.PathEscape(draftID)+"/commit", body, &out)
+	return out, err
 }
 
 // TableCommitDraftInput is the (optional) body of POST
@@ -393,6 +395,7 @@ func (c *Client) CommitTableDraft(ctx context.Context, draftID, confirmHeadVersi
 // is refused with a 409 when it is not.
 type TableCommitDraftInput struct {
 	ConfirmHeadVersionID string `json:"confirmHeadVersionID,omitempty"`
+	IfDraftVersion       string `json:"ifDraftVersion,omitempty"`
 }
 
 // DiscardTableDraft deletes a draft, throwing its uncommitted changes away. The

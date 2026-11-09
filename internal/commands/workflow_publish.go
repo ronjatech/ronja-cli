@@ -136,6 +136,9 @@ type publishOptions struct {
 	// confirms it explicitly; it never loops, so a version that lands while
 	// this is running produces a fresh refusal rather than a second attempt.
 	OverwriteRemote bool
+	// CheckDraft is `sync apply`'s: publish only a draft that holds exactly
+	// this folder, under the version that check read (sync_apply_draft_version.go).
+	CheckDraft bool
 }
 
 type publishResult struct {
@@ -203,12 +206,21 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 		Target:     describeTarget(f.Resolved),
 	}
 
+	var ifVersion string
+	if opts.CheckDraft {
+		if ifVersion, err = checkWorkflowDraft(ctx, client, f, draft.ID); err != nil {
+			return nil, err
+		}
+	}
+
 	// A parentless draft has nothing to commit ONTO — publishing it is what
 	// makes the workflow exist for everyone else.
 	if parent == nil {
-		if err := client.PublishWorkflowDraft(ctx, draft.ID); err != nil {
+		echo, err := client.PublishWorkflowDraft(ctx, draft.ID, ifVersion)
+		if err != nil {
 			return nil, fmt.Errorf("publish %s: %w", draft.ID, err)
 		}
+		warnUncheckedDraftVersion("workflow", draft.ID, ifVersion, echo)
 		result.Outcome = outcomePublished
 		result.Detail = "the workflow is now live"
 		// The draft's own page: publishing a parentless draft promotes that row
@@ -239,8 +251,9 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 		}
 	}
 
-	commitErr := client.CommitWorkflowDraft(ctx, draft.ID, "")
+	echo, commitErr := client.CommitWorkflowDraft(ctx, draft.ID, "", ifVersion)
 	if commitErr == nil {
+		warnUncheckedDraftVersion("workflow", draft.ID, ifVersion, echo)
 		result.Outcome = outcomePublished
 		result.Detail = fmt.Sprintf("committed to %q", parent.Title)
 		// The PARENT's page, not the draft's: the draft is gone the moment it
@@ -258,8 +271,11 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 	// on stale code" into "an admin will review it" would file a review request
 	// for a draft that still needs reconciling, and report a publish that never
 	// happened as a successful one.
+	if err := draftChangedError(draft.ID, commitErr); err != nil {
+		return nil, err
+	}
 	if api.StatusOf(commitErr) == api.StatusConflict {
-		return resolveCommitConflict(ctx, client, f, parent, draft, result, opts, commitErr)
+		return resolveCommitConflict(ctx, client, f, parent, draft, result, opts, ifVersion, commitErr)
 	}
 
 	// The race the up-front routing cannot close: the feature was shared, or
@@ -287,7 +303,7 @@ func runPublish(ctx context.Context, f *folder, opts publishOptions) (*publishRe
 // own transaction, under the parent's row lock — so the draft is fully intact
 // either way, and the only question is whether the author wants to overwrite.
 func resolveCommitConflict(ctx context.Context, client *api.Client, f *folder,
-	parent, draft *api.Workflow, result *publishResult, opts publishOptions, commitErr error) (*publishResult, error) {
+	parent, draft *api.Workflow, result *publishResult, opts publishOptions, ifVersion string, commitErr error) (*publishResult, error) {
 
 	// conflict finishes the result as the machine-readable refusal it is, and
 	// hands back both halves: the caller prints the payload and then fails.
@@ -318,7 +334,11 @@ func resolveCommitConflict(ctx context.Context, client *api.Client, f *folder,
 	}
 	fmt.Fprintf(os.Stderr, "  --overwrite-remote: committing over version %s of %q, discarding what it changed.\n", head, parent.Title)
 
-	if err := client.CommitWorkflowDraft(ctx, draft.ID, head); err != nil {
+	echo, err := client.CommitWorkflowDraft(ctx, draft.ID, head, ifVersion)
+	if err != nil {
+		if err := draftChangedError(draft.ID, err); err != nil {
+			return nil, err
+		}
 		// A SECOND 409 means a third commit landed between the read above and
 		// this write. Deliberately not retried: an override authorizes
 		// overwriting the version it was shown, not whatever happens to be
@@ -333,6 +353,7 @@ func resolveCommitConflict(ctx context.Context, client *api.Client, f *folder,
 		}
 		return nil, fmt.Errorf("commit %s over version %s: %w", draft.ID, head, err)
 	}
+	warnUncheckedDraftVersion("workflow", draft.ID, ifVersion, echo)
 
 	result.Outcome = outcomePublished
 	result.OverwroteVersionID = head

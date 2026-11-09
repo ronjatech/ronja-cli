@@ -688,12 +688,6 @@ func noteAutomationWarnings(out *automationFileResult, row *api.Automation) {
 	for _, warning := range row.Warnings {
 		out.note("%s", warning)
 	}
-	if row.WebhookSigningSecret != "" {
-		// Its ONLY appearance anywhere. There is no route that reads it back and
-		// clearing one is human-only, so a caller that does not write it down now
-		// cannot get it back.
-		out.note("webhook signing secret (shown once, and never again): %s", row.WebhookSigningSecret)
-	}
 }
 
 // automationReEnableGuard refuses a file that turns an automation back ON after

@@ -72,11 +72,25 @@ func withAddressWalkRoot(ctx context.Context, root string) context.Context {
 	return context.WithValue(ctx, addressWalkRootKey{}, root)
 }
 
+// addressCopyRootKey marks a walk whose tree is copied and deployed elsewhere
+// (`ronja propose`): the walk root is the boundary even inside a git work tree,
+// because the copy holds nothing above it.
+type addressCopyRootKey struct{}
+
+func withAddressCopyRoot(ctx context.Context) context.Context {
+	return context.WithValue(ctx, addressCopyRootKey{}, true)
+}
+
 // addressBoundary is the directory a folder's "from" may not leave, and how to
-// say it: the git work tree holding the folder (the nearest ancestor with a
-// .git entry, file or directory); without one, the tree a `ronja sync` command
-// walks, when it holds the folder; without either, the folder itself.
+// say it: under `ronja propose`, the tree it walks; otherwise the git work tree
+// holding the folder (the nearest ancestor with a .git entry, file or
+// directory); without one, the tree a `ronja sync` command walks, when it
+// holds the folder; without either, the folder itself.
 func addressBoundary(ctx context.Context, root string) (dir, described string) {
+	walk, _ := ctx.Value(addressWalkRootKey{}).(string)
+	if copied, _ := ctx.Value(addressCopyRootKey{}).(bool); copied && walk != "" && pathWithin(realPath(walk), realPath(root)) {
+		return realPath(walk), fmt.Sprintf("the tree being proposed (%s), which is all a change list carries — propose from a directory that holds both folders", walk)
+	}
 	for dir := realPath(root); ; {
 		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
 			return dir, fmt.Sprintf("the git repository at %s", dir)
@@ -87,7 +101,7 @@ func addressBoundary(ctx context.Context, root string) (dir, described string) {
 		}
 		dir = parent
 	}
-	if walk, ok := ctx.Value(addressWalkRootKey{}).(string); ok && walk != "" && pathWithin(realPath(walk), realPath(root)) {
+	if walk != "" && pathWithin(realPath(walk), realPath(root)) {
 		return realPath(walk), fmt.Sprintf("the tree being synced (%s)", walk)
 	}
 	return realPath(root), "this folder — it is in no git repository, so run `ronja sync` from the tree's root, or put the tree under git"

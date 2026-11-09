@@ -229,8 +229,14 @@ type syncApplyFolderReport struct {
 	Path string `json:"path"`
 	Root string `json:"root"`
 	Kind string `json:"kind,omitempty"`
+	// FolderID is the manifest's folder id, absent for a legacy folder and for
+	// one ruled out before it loaded. With Feature it names the folder's target,
+	// which is what a change list is keyed on.
+	FolderID string `json:"folderID,omitempty"`
 	// Title is the manifest's, absent for a folder ruled out before it loaded.
-	Title   string `json:"title,omitempty"`
+	Title string `json:"title,omitempty"`
+	// Feature is the stack's feature, where this folder's creates land.
+	Feature string `json:"feature,omitempty"`
 	Verdict string `json:"verdict"`
 	// Reason is a sync* constant and is the machine contract; Detail is prose
 	// beside it and may be reworded. Same split as `sync status`'s.
@@ -249,6 +255,12 @@ type syncApplyFolderReport struct {
 	// no claim for — the records apply writes in Ronja before anything else
 	// (the lazy backfill), which change no row. In a dry run only.
 	Claims int `json:"claims,omitempty"`
+	// adopted reports that Ronja keeps this folder's state on the stack the
+	// run selected (folder.adoptedHere), which `ronja propose` requires.
+	adopted bool
+	// over is the folder's baseline digest as this run's guard read it, which
+	// `ronja propose` records as Proposal.Over.
+	over string
 }
 
 // syncApplyWarning is one run-level warning: a stable reason (machine
@@ -282,7 +294,19 @@ type syncApplyUnitReport struct {
 	Action string `json:"action"`
 	Reason string `json:"reason,omitempty"`
 	Detail string `json:"detail,omitempty"`
+	// Outcome is what a real apply did to this unit: applied (it is live),
+	// refused, or not_attempted. A folder's verdict can be refused with some of
+	// its units live. Absent in a dry run, and where the instance did not answer.
+	Outcome       string `json:"outcome,omitempty"`
+	OutcomeDetail string `json:"outcomeDetail,omitempty"`
 }
+
+// Unit outcomes of a real apply.
+const (
+	unitOutcomeApplied      = "applied"
+	unitOutcomeRefused      = "refused"
+	unitOutcomeNotAttempted = "not_attempted"
+)
 
 type syncApplySummary struct {
 	Folders int `json:"folders"`
@@ -695,6 +719,9 @@ func markApplyInterrupted(rest []plannedFolder) {
 		// Ctrl-C landed in and false of every folder after it, which is exactly
 		// the set this marks. Reusing the constant here said both things at once.
 		rest[i].line.Detail = "not attempted — the run was interrupted before this folder was reached"
+		if !flagSyncDryRun {
+			markUnitsNotAttempted(&rest[i].line)
+		}
 	}
 }
 
@@ -786,6 +813,10 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 		r, _ := asManagedRefusal(err)
 		return refuse(r.Reason, "%s", r.Detail)
 	}
+	line.Feature = f.Binding.FeatureID
+	line.FolderID = f.Manifest.ID
+	line.adopted = f.adoptedHere()
+	line.over = f.baselineDigest()
 	if found := f.checkSpaces(ctx, true); found.refusal != nil {
 		if r, ok := asManagedRefusal(found.refusal); ok {
 			return refuse(r.Reason, "%s", r.Detail)
@@ -931,6 +962,9 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 		line.Verdict, line.Reason, line.Detail = verdictUnknown, reason, fmt.Sprintf(format, args...)
 	}
 	if plan.f == nil {
+		if !flagSyncDryRun {
+			markUnitsNotAttempted(line)
+		}
 		return
 	}
 	if flagSyncDryRun {
@@ -948,10 +982,12 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 	// disagreed with. A refusal here stops this folder before anything is
 	// pushed. (Once: pass one settles a folder before creating its row.)
 	if !settlePlanned(ctx, plan) {
+		markUnitsNotAttempted(line)
 		return
 	}
-	var adopted map[string]string
-	detail, created, reviewed, notes, err := applyFolder(ctx, plan.f, &adopted)
+	out := &applyFolderOut{}
+	detail, created, reviewed, notes, err := applyFolder(ctx, plan.f, out)
+	adopted := out.adopted
 	// Counted whatever the verdict: a push that made two rows and then failed on
 	// the third made two rows, and a run that reported none would be the report
 	// contradicting the organization. ADDED to what pass one made.
@@ -1060,6 +1096,7 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 	default:
 		line.Verdict, line.Detail = verdictApplied, detail
 	}
+	settleUnitOutcomes(line, plan.f.Kind, out.outcomes, err)
 	// The change is live; its anchor not being on the server is this folder's
 	// one remaining problem, and the next apply's drift guard would read a
 	// stale baseline without it — so a deploy that was otherwise clean says so.
@@ -1288,9 +1325,9 @@ func describeAgainstLive(ctx context.Context, plan *plannedFolder) {
 	case err != nil:
 		return
 	case refusal != nil:
-		// The apply's own drift guard, asked before its checkout: the folder is
-		// refused, in the words the apply would refuse it in.
-		refuseUnit(&line.Units[0], syncReasonNotDeployed, "refused by apply's drift guard before its checkout — the folder's line says why")
+		// The apply's own refusal before its checkout (its drift guard, or an
+		// unpublished module's rename), in the words the apply would use.
+		refuseUnit(&line.Units[0], syncReasonNotDeployed, "refused by apply before its checkout — the folder's line says why")
 		line.Verdict, line.Reason, line.Detail = verdictRefused, syncReasonNotDeployed, refusal.Error()
 		return
 	case held:
@@ -1351,10 +1388,10 @@ const applyNothingToPush = "nothing to push"
 //   - automation: nothing at all. That loop writes production directly, so there
 //     is no publish here to skip.
 //
-// adopted, when not nil, receives the creation units the push resolved by
-// adopting a row that already existed (path → id), so the report can say so
-// rather than list them as rows still to create.
-func applyFolder(ctx context.Context, f *folder, adopted *map[string]string) (detail string, created int, reviewed bool, notes []string, err error) {
+// out receives the creation units the push resolved by adopting a row that
+// already existed (path → id), so the report can say so rather than list them
+// as rows still to create, and the per-unit outcomes the loops report.
+func applyFolder(ctx context.Context, f *folder, out *applyFolderOut) (detail string, created int, reviewed bool, notes []string, err error) {
 	switch f.Kind.Name {
 	case wfdir.KindPipeline:
 		// NoCreate is the create gate a SECOND time, on the path that actually
@@ -1372,9 +1409,8 @@ func applyFolder(ctx context.Context, f *folder, adopted *map[string]string) (de
 		// failed on the third made two tables, and a report that said none would
 		// send the reader looking for rows that are already there.
 		created = countPipelineCreates(push)
-		if adopted != nil {
-			*adopted = adoptedPipelineMetrics(push)
-		}
+		out.adopted = adoptedPipelineMetrics(push)
+		out.pipelinePushed(push)
 		// ⚠️ THE HEALTH-CHECK LEG DOES NOT HOLD THE SQL HOSTAGE. A push whose ONLY
 		// problems are its checks (typed by runPipelinePush from its own tally)
 		// still publishes: checks are ungoverned and advisory — "a failing check
@@ -1428,7 +1464,8 @@ func applyFolder(ctx context.Context, f *folder, adopted *map[string]string) (de
 			}
 			return detail, created, false, notes, nil
 		}
-		published, pubErr := runPipelinePublish(ctx, f, nil, true, false)
+		published, pubErr := runPipelinePublish(ctx, f, nil, true, false, true)
+		out.pipelinePublished(published)
 		// The same split on the publish leg: every commit landed and only the
 		// checks applied after them did not.
 		var pubChecks *checksNotAppliedError
@@ -1492,6 +1529,7 @@ func applyFolder(ctx context.Context, f *folder, adopted *map[string]string) (de
 		// push reads — the plan's read is not the write's.
 		push, pushErr := runAutomationPush(ctx, f, automationPushOptions{RequireAnchor: f.managed != nil})
 		created, written := countAutomationWrites(push)
+		out.automationFiles(push)
 		if pushErr != nil {
 			return "", created, false, notes, pushErr
 		}
@@ -1526,7 +1564,7 @@ func applyFolder(ctx context.Context, f *folder, adopted *map[string]string) (de
 		if push.UpToDate && !draftAwaitsPublish(push.DraftID, push.DraftPreexisted) {
 			return applyNothingToPush, created, false, notes, nil
 		}
-		published, pubErr := runAppPublish(ctx, f, true)
+		published, pubErr := runAppPublish(ctx, f, true, true)
 		if pubErr != nil {
 			return "", created, false, notes, pubErr
 		}
@@ -1556,7 +1594,7 @@ func applyFolder(ctx context.Context, f *folder, adopted *map[string]string) (de
 		if push.UpToDate && !draftAwaitsPublish(push.DraftID, push.DraftPreexisted) {
 			return applyNothingToPush, created, false, notes, nil
 		}
-		published, pubErr := runModulePublish(ctx, f, publishOptions{NoRequestReview: true})
+		published, pubErr := runModulePublish(ctx, f, publishOptions{NoRequestReview: true, CheckDraft: true})
 		if pubErr != nil {
 			return "", created, false, notes, pubErr
 		}
@@ -1583,7 +1621,7 @@ func applyFolder(ctx context.Context, f *folder, adopted *map[string]string) (de
 		if push.UpToDate && !draftAwaitsPublish(push.DraftID, push.DraftPreexisted) {
 			return applyNothingToPush, created, false, notes, nil
 		}
-		published, pubErr := runPublish(ctx, f, publishOptions{NoRequestReview: true})
+		published, pubErr := runPublish(ctx, f, publishOptions{NoRequestReview: true, CheckDraft: true})
 		if pubErr != nil {
 			return "", created, false, notes, pubErr
 		}

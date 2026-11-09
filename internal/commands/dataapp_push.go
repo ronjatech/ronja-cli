@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
@@ -364,6 +365,12 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		}
 	}
 
+	// The committed anchor, read at most once — see appTarget.AnchoredDraft:
+	// both drift guards below ask it about the same live app.
+	readHead := sync.OnceValue(func() headAgreement {
+		return readHeadAgreement(ctx, dataAppHeadReader(client), f, existing.App.ID, existing.AnchoredDraft())
+	})
+
 	// 2c. `sync apply` only: does the LIVE app already hold this folder? Then
 	// there is nothing to deploy, and the push ends here having written nothing
 	// — before the checkout that would leave a draft identical to live behind.
@@ -380,7 +387,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		// The drift guard, BEFORE the checkout, when the checkout would only
 		// copy the live app just read — see the same step in runPush.
 		if live := existing.App; opts.Apply && existing.Row() == nil && live != nil && raw != nil && f.State.For(f.Baseline()) != nil && !opts.Force {
-			if _, err := checkAppDrift(f, read, hashAppFiles(f.baselineCodec(), raw), local, appMetaAgrees(f, live), false, headAgreement{}, live.ID,
+			if _, err := checkAppDrift(f, read, hashAppFiles(f.baselineCodec(), raw), local, appMetaAgrees(f, live), false, readHead(), live.ID,
 				driftAsk{apply: true}); err != nil {
 				return nil, err
 			}
@@ -440,11 +447,9 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 	preconditions := filePreconditions{}
 	head := headAgreement{}
 	if !result.Created {
-		// The committed anchor, read once — see appTarget.AnchoredDraft. (A push
-		// that CREATED the app anchors it in resolveAppPushTarget, in the same
-		// write that records the binding.)
-		head = readHeadAgreement(ctx, dataAppHeadReader(client), f, existing.App.ID,
-			existing.AnchoredDraft())
+		// A push that CREATED the app anchors it in resolveAppPushTarget, in
+		// the same write that records the binding.
+		head = readHead()
 		// Whether the app's metadata already agrees, for the live-equals-desired
 		// leg of the guard: the allowlists, and the title (whose own drift leg is
 		// appTitleLeg). Files alone agreeing is not "nothing to overwrite".
@@ -927,9 +932,10 @@ func appTitleLeg(f *folder, live, target *api.DataApp, head headAgreement, force
 // access diff — which is strictly more informative than a drift line saying
 // they moved.
 //
-// head is the committed anchor and is consulted in ONE place, the branch where
-// there is no local baseline at all — the fresh-checkout path that made --force
-// the documented CI answer. See checkDrift, which draws the same line for a
+// head is the committed anchor and is consulted in two places: the branch
+// where there is no local baseline at all — the fresh-checkout path that made
+// --force the documented CI answer — and whether a change list this folder
+// proposed may excuse drift. See checkDrift, which draws the same line for a
 // workflow, and headAgreement for what the pointer can and cannot vouch for.
 //
 // It answers with checkDrift's own driftVerdict rather than a shape of its own.
@@ -950,20 +956,27 @@ func checkAppDrift(f *folder, remote, atBaseline, local map[string]string, metaA
 		remoteHashes[path] = wfdir.HashString(content)
 	}
 	drift := wfdir.DiffHashes(atBaseline, baseline.Hashes())
-	// Live equals desired is never drift — see live_equals_desired.go.
+	// Live equals desired, and what this folder proposed, is never drift — see
+	// live_equals_desired.go.
 	//
 	// Only against a BASELINE: with none, every remote file reads as added, and
 	// excusing them here would walk a fresh checkout past the head anchor on its
 	// files alone. That case has its own leg below, which asks the metadata too.
-	excused := 0
+	excused, proposed := 0, false
 	if baseline != nil {
 		drift, excused = excuseAgreedFiles(drift, remote, local)
+		if drift.Dirty() {
+			// No metadata leg here: the title has appTitleLeg, the allowlists
+			// the access diff.
+			drift, proposed = f.excuseOwnProposal(head, drift, remote, func(*wfdir.Manifest) bool { return true })
+		}
 	}
 	if !drift.Dirty() {
 		// Bypassed still tracks --force here, even though nothing needed
 		// bypassing — see checkDrift's copy of this branch for why a clean
 		// baseline does not make the flag conditional.
-		return driftVerdict{BaselineClean: baseline != nil && excused == 0, Bypassed: force, Preconditions: baseline.Hashes()}, nil
+		return driftVerdict{BaselineClean: baseline != nil && excused == 0 && !proposed, Bypassed: force,
+			Preconditions: armedAfterProposals(baseline, remoteHashes, proposed)}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %d file(s) that changed on the server since your last sync.\n",

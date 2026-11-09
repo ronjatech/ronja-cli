@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/markers"
@@ -403,6 +404,12 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		}
 	}
 
+	// The committed anchor, read at most once: both drift guards below ask it
+	// about the same live row.
+	readHead := sync.OnceValue(func() headAgreement {
+		return readHeadAgreement(ctx, workflowHeadReader(client), f, existing.Workflow.ID, existing.AnchoredDraft())
+	})
+
 	// 2e. `sync apply` only: does the LIVE row already hold this folder? Then
 	// there is nothing to deploy, and the push ends here having written nothing
 	// — before the validate (a candidate save that is not going to happen) and
@@ -421,7 +428,7 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		// copy the live row just read: the same answer the guard gives the
 		// copy, without opening a draft only to withdraw it.
 		if opts.Apply && existing.Row() == nil && raw != nil && f.State.For(f.Baseline()) != nil && !opts.Force {
-			if _, err := checkDrift(f, existing.Workflow, read, hashFiles(f.baselineCodec(), raw), local, false, headAgreement{},
+			if _, err := checkDrift(f, existing.Workflow, read, hashFiles(f.baselineCodec(), raw), local, false, readHead(),
 				driftAsk{apply: true}); err != nil {
 				return nil, err
 			}
@@ -515,13 +522,9 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 	// title in the create and has nothing to decide.
 	writeTitle := true
 	if !result.Created {
-		// The committed anchor, read once. AnchoredDraft is derived from what
-		// the caller already knows rather than reported back out of
-		// resolvePushTarget — see existingTarget.AnchoredDraft. (A push that
-		// CREATED the row anchors it in resolvePushTarget, in the same write
-		// that records the binding.)
-		head = readHeadAgreement(ctx, workflowHeadReader(client), f, existing.Workflow.ID,
-			existing.AnchoredDraft())
+		// A push that CREATED the row anchors it in resolvePushTarget, in the
+		// same write that records the binding.
+		head = readHead()
 		verdict, err := checkDrift(f, target, remoteFiles, hashFiles(f.baselineCodec(), files), local, opts.Force, head,
 			driftAsk{draft: result.DraftPreexisted, apply: opts.Apply})
 		if err != nil {
@@ -1420,10 +1423,12 @@ type driftVerdict struct {
 // why the writes that follow carry their own per-file preconditions: those
 // close the window between this comparison and the byte that overwrites
 // something, which nothing local can see.
-// head is the committed anchor, and it is consulted in ONE place: the branch
-// where there is no local baseline at all. Everywhere else the baseline is a
-// finer-grained answer to a question the anchor cannot address — the anchor is
-// about the LIVE row, and a baseline is about the draft this push writes to.
+// head is the committed anchor, and it is consulted in two places: the branch
+// where there is no local baseline at all, and whether a change list this
+// folder proposed may excuse drift (live_equals_desired.go). Everywhere else
+// the baseline is a finer-grained answer to a question the anchor cannot
+// address — the anchor is about the LIVE row, and a baseline is about the
+// draft this push writes to.
 //
 // atBaseline is the remote hashed through the codec the baseline was taken
 // under (baselineCodec), the only rendering the baseline can be compared with;
@@ -1435,18 +1440,27 @@ func checkDrift(f *folder, target *api.Workflow, remote, atBaseline, local map[s
 		remoteHashes[path] = wfdir.HashString(content)
 	}
 	drift := wfdir.DiffHashes(atBaseline, baseline.Hashes())
-	// A file that moved since the baseline TO WHAT THIS FOLDER HOLDS is not
-	// drift: there is nothing of anybody's to overwrite. See
-	// live_equals_desired.go.
+	// A file that moved since the baseline TO WHAT THIS FOLDER HOLDS, or to
+	// what one of its change lists proposed, is not drift: there is nothing of
+	// anybody else's to overwrite. See live_equals_desired.go.
 	//
 	// Only against a BASELINE: with none, every remote file reads as added, and
 	// excusing them here would walk a fresh checkout past the head anchor on its
 	// files alone. That case has its own leg below, which asks the metadata too.
-	excused := 0
+	excused, proposed := 0, false
+	patch := metadataPatch(f.Manifest, f.Codec, target)
 	if baseline != nil {
 		drift, excused = excuseAgreedFiles(drift, remote, local)
 	}
-	meta := metadataDriftOf(baseline, target, metadataPatch(f.Manifest, f.Codec, target))
+	meta := metadataDriftOf(baseline, target, patch)
+	if baseline != nil && (drift.Dirty() || len(meta) > 0) {
+		drift, proposed = f.excuseOwnProposal(head, drift, remote, func(m *wfdir.Manifest) bool {
+			return len(metadataDriftOf(baseline, target, withoutProposedFields(patch, f.Codec, target, m))) == 0
+		})
+		if proposed {
+			meta = nil
+		}
+	}
 	if !drift.Dirty() && len(meta) == 0 {
 		// Bypassed still tracks --force here, even though nothing needed
 		// bypassing: it is what suppresses the per-file preconditions, and
@@ -1459,7 +1473,8 @@ func checkDrift(f *folder, target *api.Workflow, remote, atBaseline, local map[s
 		//
 		// An EXCUSED file makes the baseline unclean — it no longer describes the
 		// server — so the push records a fresh one rather than leaving it.
-		return driftVerdict{BaselineClean: baseline != nil && excused == 0, Bypassed: force, Preconditions: baseline.Hashes()}, nil
+		return driftVerdict{BaselineClean: baseline != nil && excused == 0 && !proposed, Bypassed: force,
+			Preconditions: armedAfterProposals(baseline, remoteHashes, proposed)}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s that changed on the server since your last sync.\n",

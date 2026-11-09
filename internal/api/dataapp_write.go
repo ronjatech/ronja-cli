@@ -300,6 +300,7 @@ func (c *Client) ValidateDataApp(ctx context.Context, draftID string) (*DataApp,
 // approve. `proposed` is the only thing on the wire that tells them apart, so a
 // caller that ignores this body necessarily reports one of them wrongly.
 type DataAppCommitOutcome struct {
+	DraftVersionEcho
 	DataAppID    string `json:"dataAppID"`
 	FirstPublish bool   `json:"firstPublish"`
 	Proposed     bool   `json:"proposed"`
@@ -347,9 +348,13 @@ type DataAppAudience struct {
 // CommitDataAppDraft applies a draft onto its parent — or, for a never-published
 // app the caller may not publish itself, submits it for an admin's approval.
 // Takes the DRAFT id. Read the returned outcome before reporting a publish.
-func (c *Client) CommitDataAppDraft(ctx context.Context, draftID string) (*DataAppCommitOutcome, error) {
+func (c *Client) CommitDataAppDraft(ctx context.Context, draftID, ifDraftVersion string) (*DataAppCommitOutcome, error) {
+	var body any
+	if ifDraftVersion != "" {
+		body = CommitDraftInput{IfDraftVersion: ifDraftVersion}
+	}
 	var out DataAppCommitOutcome
-	if err := c.Do(ctx, "POST", "dataapp/"+url.PathEscape(draftID)+"/commit", nil, &out); err != nil {
+	if err := c.Do(ctx, "POST", "dataapp/"+url.PathEscape(draftID)+"/commit", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

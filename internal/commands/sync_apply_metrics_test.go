@@ -219,7 +219,7 @@ func TestPipelinePushNoCreateRefusesEveryCreate(t *testing.T) {
 	allow := flagSyncAllowCreate
 	flagSyncAllowCreate = false
 	t.Cleanup(func() { flagSyncAllowCreate = allow })
-	if _, created, _, _, _ := applyFolder(context.Background(), folder, nil); created != 0 {
+	if _, created, _, _, _ := applyFolder(context.Background(), folder, &applyFolderOut{}); created != 0 {
 		t.Fatalf("applyFolder reported %d row(s) created", created)
 	}
 	if len(f.metricsCreated) != 0 || len(f.created) != 0 {

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -432,5 +433,135 @@ func TestModuleInitOnAStackMintsAFolderID(t *testing.T) {
 	}
 	if strings.Contains(readFile(t, wfdir.ManifestPath(plain)), `"id"`) {
 		t.Fatalf("init without --stack minted a folder id:\n%s", readFile(t, wfdir.ManifestPath(plain)))
+	}
+}
+
+// unpublishedModuleFolder is a module folder on stack prod whose first push
+// created a module nothing has published: a proposal (a shared-feature
+// create), or a parentless draft. A create is born live or proposed, so the
+// parentless draft is the proposal set to the lifecycle trigger's
+// parentless-draft branch.
+func unpublishedModuleFolder(t *testing.T, proposal bool) (*fakeInstance, string, string) {
+	t.Helper()
+	f := newFakeInstance(t)
+	signInAsModuleAdmin(t, f)
+	f.mod.sharedFeature = true
+	tree := t.TempDir()
+	root := filepath.Join(tree, "tracker")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runCLI(t, root, "module", "init", "emab_tracker", "--feature", "collection-1",
+		"--title", "EMAB tracker", "--stack", "prod"); err != nil {
+		t.Fatalf("module init: %v\n%s", err, out)
+	}
+	writeLocal(t, root, "tracker.py", "x = 1\n")
+	if out, err := runCLI(t, root, "module", "push", "--json"); err != nil {
+		t.Fatalf("first push: %v\n%s", err, out)
+	}
+	row := f.mod.rows["module-new-1"]
+	if !proposal {
+		row.Lifecycle = api.LifecycleDraft
+	}
+	if !moduleIsUnpublished(row) {
+		t.Fatalf("the first push did not leave an unpublished module: %+v", row)
+	}
+	return f, tree, root
+}
+
+func setModuleManifestName(t *testing.T, root, name string) {
+	t.Helper()
+	m, err := wfdir.LoadManifest(root, wfdir.ModuleKind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Name = name
+	if err := wfdir.SaveManifest(root, m); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// AN UNPUBLISHED MODULE'S RENAME IS REFUSED UP FRONT. No route writes the name
+// or title of a module that was never published, and its first publish (or an
+// admin's approval of a proposal) makes it live as it was created, so an apply
+// would put live what the folder no longer declares. The dry run (what `ronja
+// propose` plans from) and the apply refuse it alike, before anything is
+// written.
+func TestSyncApplyRefusesRenamingAnUnpublishedModule(t *testing.T) {
+	edits := map[string]func(t *testing.T, root string){
+		"title": func(t *testing.T, root string) { setModuleManifestTitle(t, root, "EMAB tracker v2") },
+		"name":  func(t *testing.T, root string) { setModuleManifestName(t, root, "emab_tracker_v2") },
+	}
+	for _, proposal := range []bool{false, true} {
+		for name, edit := range edits {
+			t.Run(fmt.Sprintf("%s/proposal=%v", name, proposal), func(t *testing.T) {
+				f, tree, root := unpublishedModuleFolder(t, proposal)
+				lifecycle := f.mod.rows["module-new-1"].Lifecycle
+				edit(t, root)
+				writeLocal(t, root, "tracker.py", "x = 2\n")
+				assertApplyAgrees(t, tree, "tracker", syncReasonNotDeployed, "--stack", "prod")
+				line := applyFolderLine(t, applyReportOf(t, mustApplyDry(t, tree)), "tracker")
+				if !strings.Contains(line.Detail, "not published yet") || !strings.Contains(line.Detail, "ronja module publish") {
+					t.Fatalf("detail = %q, want the cause and the remedy", line.Detail)
+				}
+				row := f.mod.rows["module-new-1"]
+				if len(f.mod.committed) != 0 || row.Lifecycle != lifecycle {
+					t.Fatalf("committed %d, lifecycle %s: the module moved", len(f.mod.committed), row.Lifecycle)
+				}
+				if got := f.ModuleFileContents("module-new-1")["tracker.py"]; got != "x = 1\n" {
+					t.Fatalf("tracker.py = %q: the refused apply wrote to the module", got)
+				}
+			})
+		}
+	}
+}
+
+// What a first publish does with a deferred rename: `module push` reports it,
+// the publish (or an admin's approval of a proposal) makes the module live as
+// it was created, and the first apply after that renames the now-live module,
+// so what is live is what the folder declares.
+func TestModuleRenameDeferredUntilPublishedIsAppliedAfterIt(t *testing.T) {
+	edits := map[string]struct {
+		edit func(t *testing.T, root string)
+		live func(m *api.Module) string
+		was  string
+		want string
+	}{
+		"title": {func(t *testing.T, root string) { setModuleManifestTitle(t, root, "EMAB tracker v2") },
+			func(m *api.Module) string { return m.Title }, "EMAB tracker", "EMAB tracker v2"},
+		"name": {func(t *testing.T, root string) { setModuleManifestName(t, root, "emab_tracker_v2") },
+			func(m *api.Module) string { return m.Name }, "emab_tracker", "emab_tracker_v2"},
+	}
+	for _, proposal := range []bool{false, true} {
+		for name, tc := range edits {
+			t.Run(fmt.Sprintf("%s/proposal=%v", name, proposal), func(t *testing.T) {
+				f, tree, root := unpublishedModuleFolder(t, proposal)
+				tc.edit(t, root)
+				out, err := runCLI(t, root, "module", "push", "--json")
+				if err != nil {
+					t.Fatalf("push: %v\n%s", err, out)
+				}
+				if d, _ := decodeJSON(t, out)["metadataDeferred"].(string); !strings.Contains(d, "first push after that") {
+					t.Fatalf("metadataDeferred = %q", d)
+				}
+				live := f.mod.rows["module-new-1"]
+				if proposal {
+					// rmodule's ApproveProposal: live in place, as proposed.
+					live.Lifecycle, live.DrafterUserID = api.LifecycleLive, ""
+				} else if out, err := runCLI(t, root, "module", "publish", "--json"); err != nil {
+					t.Fatalf("publish: %v\n%s", err, out)
+				}
+				if live.Lifecycle != api.LifecycleLive || tc.live(live) != tc.was {
+					t.Fatalf("published %s %q, want it live as created (%q)", live.Lifecycle, tc.live(live), tc.was)
+				}
+				out, err = runCLI(t, tree, "sync", "apply", "--stack", "prod", "--json")
+				if line := applyFolderLine(t, applyReportOf(t, out), "tracker"); err != nil || line.Verdict != verdictApplied {
+					t.Fatalf("apply after the publish: %v, %+v\n%s", err, line, out)
+				}
+				if got := tc.live(f.mod.rows["module-new-1"]); got != tc.want {
+					t.Fatalf("live %s = %q, want the declared %q", name, got, tc.want)
+				}
+			})
+		}
 	}
 }

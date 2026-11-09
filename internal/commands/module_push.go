@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/markers"
@@ -243,6 +244,9 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 	// behind, and that the next apply would find pre-existing and publish.
 	var liveFiles map[string]string
 	if opts.LiveFirst {
+		if err := unpublishedModuleRenameError(f, existing.Module); err != nil {
+			return nil, err
+		}
 		done, read, err := moduleNothingLiveHolds(ctx, client, f, existing, local, result)
 		if done {
 			return result, err
@@ -323,9 +327,6 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 	baselineClean := false
 	preconditions := filePreconditions{}
 	head := headAgreement{}
-	// writeTitle is the title leg's answer; a push that CREATED the module sent
-	// the title in the create and has nothing to decide.
-	writeTitle := true
 	if !result.Created {
 		head = readHeadAgreement(ctx, moduleHeadReader(client), f, existing.Module.IdentityID(),
 			existing.AnchoredDraft())
@@ -336,12 +337,17 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 		// The TITLE's own leg (name_attr.go's titleLeg), against the committed
 		// applied title as well as the local baseline: moduleMetadataDriftOf
 		// checks it only against a LOCAL baseline, so a fresh checkout patched
-		// the title blind. A module's title is patched on its IDENTITY row (the
-		// live module), so that is the row the leg holds to the rule.
-		// The head anchor can NEVER vouch for it: a live module's title is
-		// patched IN PLACE (rmodule.Update), which files no version, so the
-		// head does not move.
-		if writeTitle, err = titleLeg(f, "module", nil, titledRow{ID: identity.ID, Title: identity.Title}, false, opts.Force); err != nil {
+		// the title blind. Steps 6a and 6b write the declared title onto BOTH
+		// rows, the live module and the draft the commit publishes, so the leg
+		// judges both: a draft retitled elsewhere would otherwise be overwritten
+		// with nobody asked. The head anchor can NEVER vouch for it: a live
+		// module's title is patched IN PLACE (rmodule.Update), which files no
+		// version, so the head does not move.
+		var liveRow *titledRow
+		if identity.ID != target.ID {
+			liveRow = &titledRow{ID: identity.ID, Title: identity.Title, RetitledInPlace: true}
+		}
+		if _, err = titleLeg(f, "module", liveRow, titledRow{ID: target.ID, Title: target.Title}, false, opts.Force); err != nil {
 			return refuseUnwritten(err)
 		}
 		baselineClean = verdict.BaselineClean
@@ -402,11 +408,12 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 	//
 	// An UNPUBLISHED module has neither row: no live row to patch, and its own
 	// row is a parentless draft that DraftEdit does not take either. The create
-	// carried the manifest's values, and a later manifest edit reaches the row
-	// only at the first publish — reported as deferred rather than silently
-	// dropped.
+	// carried the manifest's values; its first publish makes the row live as it
+	// is, and a later manifest edit reaches it only at the first push after that
+	// — reported as deferred rather than silently dropped. `sync apply` refuses
+	// such a folder up front instead (unpublishedModuleRenameError).
 	patch, deferred := moduleMetadataPatchFor(f, existing, target)
-	if !writeTitle {
+	if sameName(identity.Title, f.Manifest.Title) {
 		patch.Title = ""
 	}
 	result.MetadataDeferred = deferred
@@ -456,9 +463,6 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 	// case: this is one extra round trip on the push that changes a title, and
 	// none at all on the pushes after it.
 	draftPatch := moduleDraftMetadataPatchFor(f, target)
-	if !writeTitle {
-		draftPatch.Title = ""
-	}
 	if !draftPatch.Empty() {
 		// Addressed by the PARENT's id: DraftEdit is get-or-create-then-patch on
 		// the live module, and the draft it resolves is the one `target` names.
@@ -820,22 +824,32 @@ func checkModuleDrift(f *folder, identity *api.Module, remote, local map[string]
 		remoteHashes[path] = wfdir.HashString(content)
 	}
 	drift := wfdir.DiffHashes(remoteHashes, baseline.Hashes())
-	// Live equals desired is never drift — see live_equals_desired.go.
+	// Live equals desired, and what this folder proposed, is never drift — see
+	// live_equals_desired.go.
 	//
 	// Only against a BASELINE: with none, every remote file reads as added, and
 	// excusing them here would walk a fresh checkout past the head anchor on its
 	// files alone. That case has its own leg below, which asks the metadata too.
-	excused := 0
+	excused, proposed := 0, false
 	if baseline != nil {
 		drift, excused = excuseAgreedFiles(drift, remote, local)
 	}
-	meta := moduleMetadataDriftOf(baseline, identity, f.Manifest)
+	meta := moduleMetadataDriftOf(baseline, identity, f.Manifest, nil)
+	if baseline != nil && (drift.Dirty() || len(meta) > 0) {
+		drift, proposed = f.excuseOwnProposal(head, drift, remote, func(m *wfdir.Manifest) bool {
+			return len(moduleMetadataDriftOf(baseline, identity, f.Manifest, m)) == 0
+		})
+		if proposed {
+			meta = nil
+		}
+	}
 	if !drift.Dirty() && len(meta) == 0 {
 		// Bypassed still tracks --force here, even though nothing needed
 		// bypassing: it is what suppresses the per-file preconditions, and
 		// --force means "overwrite the remote with what I have" whether or not
 		// the baseline happened to be clean when this check ran.
-		return driftVerdict{BaselineClean: baseline != nil && excused == 0, Bypassed: force, Preconditions: baseline.Hashes()}, nil
+		return driftVerdict{BaselineClean: baseline != nil && excused == 0 && !proposed, Bypassed: force,
+			Preconditions: armedAfterProposals(baseline, remoteHashes, proposed)}, nil
 	}
 	if force {
 		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s that changed on the server since your last sync.\n",
@@ -915,7 +929,7 @@ func checkModuleDrift(f *folder, identity *api.Module, remote, local map[string]
 // this existed. It reports NO drift rather than guessing: turning every folder
 // that predates the guard into a refusal would be a strange way to start
 // protecting them, and the first push to record a baseline arms it.
-func moduleMetadataDriftOf(baseline *wfdir.InstanceState, identity *api.Module, m *wfdir.Manifest) []metadataDrift {
+func moduleMetadataDriftOf(baseline *wfdir.InstanceState, identity *api.Module, m *wfdir.Manifest, proposed *wfdir.Manifest) []metadataDrift {
 	if baseline == nil {
 		return nil
 	}
@@ -924,11 +938,17 @@ func moduleMetadataDriftOf(baseline *wfdir.InstanceState, identity *api.Module, 
 	// far it moved from the baseline: the push would write nothing there (the
 	// patch is empty for that field), so there is nothing to overwrite. This was
 	// the one metadata leg asking only "did it move" — the workflow's asks it of
-	// the patch, which already leaves agreeing fields out.
-	if m.Title != "" && baseline.Title != "" && identity.Title != baseline.Title && identity.Title != m.Title {
+	// the patch, which already leaves agreeing fields out. Nor is the row
+	// holding what the proposal being asked about (nil for none) declared.
+	var declared wfdir.Manifest
+	if proposed != nil {
+		declared = *proposed
+	}
+	held := func(value, live string) bool { return value != "" && value == live }
+	if m.Title != "" && baseline.Title != "" && identity.Title != baseline.Title && identity.Title != m.Title && !held(declared.Title, identity.Title) {
 		out = append(out, metadataDrift{Field: "title", Baseline: baseline.Title, Remote: identity.Title})
 	}
-	if m.Name != "" && baseline.Name != "" && identity.Name != baseline.Name && identity.Name != m.Name {
+	if m.Name != "" && baseline.Name != "" && identity.Name != baseline.Name && identity.Name != m.Name && !held(declared.Name, identity.Name) {
 		out = append(out, metadataDrift{Field: "package name", Baseline: baseline.Name, Remote: identity.Name})
 	}
 	return out
@@ -956,10 +976,40 @@ func moduleMetadataPatchFor(f *folder, existing existingModuleTarget, target *ap
 			return api.ModulePatch{}, ""
 		}
 		return api.ModulePatch{}, fmt.Sprintf(
-			"%s is not published yet, so %s cannot be changed on it — a module's metadata is patched on the LIVE row, and this one has none. It is applied by `ronja module publish`",
+			"%s is not published yet, so %s cannot be changed on it — a module's metadata is patched on the LIVE row, and this one has none. `ronja module publish` publishes it as it was created, and the first push after that applies the change",
 			existing.Module.ID, describeModulePatch(pending))
 	}
 	return moduleMetadataPatch(f.Manifest, existing.Module), ""
+}
+
+// unpublishedModuleRenameError refuses `sync apply` of a folder whose manifest
+// renames or retitles a module that was never published, or nil. No route
+// writes a parentless draft's or a proposal's name or title (PUT /module/:id
+// and checkout take a live row, and the commit takes no metadata), and its
+// first publish makes the row live as it is: the apply would put live a name
+// or title this folder no longer declares, which its publish check refuses on
+// every run. Asked before anything is written, and by the dry run, so a
+// proposal of the folder is refused at plan time.
+func unpublishedModuleRenameError(f *folder, row *api.Module) error {
+	if !moduleIsUnpublished(row) {
+		return nil
+	}
+	pending := moduleMetadataPatch(f.Manifest, row)
+	if pending.Title != "" && sameName(row.Title, f.Manifest.Title) {
+		pending.Title = ""
+	}
+	if pending.Empty() {
+		return nil
+	}
+	var was []string
+	if pending.Title != "" {
+		was = append(was, fmt.Sprintf("title %q", row.Title))
+	}
+	if pending.Name != "" {
+		was = append(was, fmt.Sprintf("package name %q", row.Name))
+	}
+	return fmt.Errorf("module %s is not published yet, and %s changes %s from what it was created with (%s): an unpublished module's metadata cannot be changed, and publishing it would put the old values live.\n  Publish it once as it is (`ronja module publish` in this folder, or an admin's approval of a proposal), then apply again to change it; or set %s back",
+		row.ID, wfdir.ManifestName, describeModulePatch(pending), strings.Join(was, " and "), wfdir.ManifestName)
 }
 
 // moduleDraftMetadataPatchFor is the metadata a push must ALSO write onto the

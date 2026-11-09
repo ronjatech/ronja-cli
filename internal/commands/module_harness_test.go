@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,8 @@ type moduleFake struct {
 	// ATTEMPT, "" for one that sent none. Its LENGTH is what pins "no retry
 	// loop", and on a first publish "no --overwrite-remote leg either".
 	commitConfirmations []string
+	// draftVersions records the ifDraftVersion of every commit.
+	draftVersions []string
 	// patches records every metadata PUT that landed, in order. A LIST rather
 	// than a map keyed by id: "the rename landed once" is a statement about how
 	// many requests were made, which a map would collapse.
@@ -455,6 +458,10 @@ func (f *fakeInstance) serveModuleCommit(w http.ResponseWriter, r *http.Request,
 	var in api.ModuleCommitInput
 	decodeOptionalBody(f.t, r, &in)
 	m.commitConfirmations = append(m.commitConfirmations, in.ConfirmHeadVersionID)
+	m.draftVersions = append(m.draftVersions, in.IfDraftVersion)
+	if refuseDraftAt(w, "module "+strconv.Quote(draft.Name), in.IfDraftVersion, draft.UpdatedAt) {
+		return
+	}
 	if m.failCommit != 0 {
 		http.Error(w, `{"error":"the commit was refused"}`, m.failCommit)
 		return
@@ -493,7 +500,8 @@ func (f *fakeInstance) serveModuleCommit(w http.ResponseWriter, r *http.Request,
 		// than a shortcut: a parentless commit mints no version row, so the
 		// module is live with no committed version behind it.
 		writeJSON(w, api.ModuleCommitOutcome{
-			ModuleID: draft.ID, ParentAttached: false,
+			DraftVersionEcho: echoOf(in.IfDraftVersion),
+			ModuleID:         draft.ID, ParentAttached: false,
 			DependentWorkflowCount: m.dependentCount,
 		})
 		return
@@ -520,7 +528,8 @@ func (f *fakeInstance) serveModuleCommit(w http.ResponseWriter, r *http.Request,
 	delete(m.draftOf, parent.ID)
 	m.committed = append(m.committed, draft.ID)
 	writeJSON(w, api.ModuleCommitOutcome{
-		ModuleID: parent.ID, ParentAttached: true, HeadVersionID: draft.ID,
+		DraftVersionEcho: echoOf(in.IfDraftVersion),
+		ModuleID:         parent.ID, ParentAttached: true, HeadVersionID: draft.ID,
 		DependentWorkflowCount: m.dependentCount,
 	})
 }

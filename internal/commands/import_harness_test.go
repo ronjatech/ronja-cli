@@ -32,6 +32,8 @@ type fakeImportInstance struct {
 	auto    *fakeAutomationInstance
 	managed *fakeManaged
 	inv     *fakeInventory
+	// changeLists answers the change-list upload and the migrations route.
+	changeLists *fakeChangeLists
 
 	// searchHits answers GET /api/v2/search (feature lookup by name).
 	searchHits []api.SearchHit
@@ -78,7 +80,7 @@ func newFakeImportInstance(t *testing.T) *fakeImportInstance {
 	f := &fakeImportInstance{t: t, wf: newFakeInstance(t), app: newFakeAppInstance(t),
 		pipe: newFakePipelineInstance(t), auto: newFakeAutomationInstance(t), inv: newFakeInventory(),
 		mcpServers: map[string]bool{}, fail: map[string]int{}, failOnce: map[string]int{},
-		codexes: map[string]api.Codex{}, unreadable: map[string]bool{}}
+		codexes: map[string]api.Codex{}, unreadable: map[string]bool{}, changeLists: newFakeChangeLists()}
 	// validate's writeTargets resolve against the rows this instance holds,
 	// with the caller's reach (validate_write_targets.go :183-249).
 	f.wf.writeRows = func(kind, id string) (fakeWriteRow, bool) {
@@ -146,6 +148,9 @@ func (f *fakeImportInstance) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if status := f.fail[r.Method+" "+p]; status != 0 {
 		http.Error(w, `{"error":"boom"}`, status)
+		return
+	}
+	if f.changeLists.serve(w, r) {
 		return
 	}
 	if id, ok := strings.CutPrefix(p, "/api/v2/feature/model/"); ok && f.unreadable[id] {

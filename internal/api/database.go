@@ -133,6 +133,12 @@ func (c *Client) ApplyMigrations(ctx context.Context, databaseID string, in Migr
 	return &out, nil
 }
 
+// MigrationStatus asks what an apply of the set would do, applying nothing:
+// ApplyMigrations with DryRun, always.
+func (c *Client) MigrationStatus(ctx context.Context, databaseID string, migrations []Migration, timeout time.Duration) (*MigrationSetResult, error) {
+	return c.ApplyMigrations(ctx, databaseID, MigrationSetInput{Migrations: migrations, DryRun: true}, timeout)
+}
+
 // DatabaseConnection mirrors only the GET :id/roles fields the CLI uses; the
 // roles list is deliberately absent.
 type DatabaseConnection struct {

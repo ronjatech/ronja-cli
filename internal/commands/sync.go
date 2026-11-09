@@ -505,9 +505,10 @@ func liveHoldsFolder(ctx context.Context, f *folder) (bool, error) {
 // compareWithLive is liveHoldsFolder, and with guard the drift guard `sync
 // apply` asks next for a workflow or data app the live row does not hold:
 // before its checkout, when no draft is open and the folder has a baseline
-// (runPush's and runAppPush's LiveFirst step). refusal is the guard's
-// refusal, in the apply's words, so a dry run can say it; nil when the apply
-// would go on to push. Reads only.
+// (runPush's and runAppPush's LiveFirst step), and for a module the refusal
+// of an unpublished one the folder renames (unpublishedModuleRenameError).
+// refusal is that refusal, in the apply's words, so a dry run can say it; nil
+// when the apply would go on to push. Reads only.
 func compareWithLive(ctx context.Context, f *folder, guard bool) (held bool, refusal, err error) {
 	local, _, err := readLocalFiles(f.Root, f.Kind)
 	if err != nil {
@@ -535,7 +536,10 @@ func compareWithLive(ctx context.Context, f *folder, guard bool) (held bool, ref
 		if draft, err := client.GetWorkflowDraft(ctx, live.ID); err != nil || draft != nil {
 			return false, nil, err
 		}
-		_, refusal = checkDrift(f, live, remote, hashFiles(f.baselineCodec(), files), local, false, headAgreement{}, driftAsk{apply: true})
+		// No draft is open, so the apply would check one out of live: the row
+		// the anchor speaks for.
+		head := readHeadAgreement(ctx, workflowHeadReader(client), f, live.ID, true)
+		_, refusal = checkDrift(f, live, remote, hashFiles(f.baselineCodec(), files), local, false, head, driftAsk{apply: true})
 		return false, refusal, nil
 	case wfdir.KindDataApp:
 		if f.Binding.DataAppID == "" {
@@ -556,7 +560,8 @@ func compareWithLive(ctx context.Context, f *folder, guard bool) (held bool, ref
 		if draft, err := client.GetDataAppDraft(ctx, live.ID); err != nil || draft != nil {
 			return false, nil, err
 		}
-		_, refusal = checkAppDrift(f, remote, hashAppFiles(f.baselineCodec(), files), local, appMetaAgrees(f, live), false, headAgreement{}, live.ID,
+		head := readHeadAgreement(ctx, dataAppHeadReader(client), f, live.ID, true)
+		_, refusal = checkAppDrift(f, remote, hashAppFiles(f.baselineCodec(), files), local, appMetaAgrees(f, live), false, head, live.ID,
 			driftAsk{apply: true})
 		return false, refusal, nil
 	case wfdir.KindModule:
@@ -564,8 +569,16 @@ func compareWithLive(ctx context.Context, f *folder, guard bool) (held bool, ref
 			return false, nil, nil
 		}
 		live, err := client.GetModule(ctx, f.Binding.ModuleID)
-		if err != nil || live.Lifecycle != api.LifecycleLive {
+		if err != nil {
 			return false, nil, err
+		}
+		if guard {
+			if refusal := unpublishedModuleRenameError(f, live); refusal != nil {
+				return false, refusal, nil
+			}
+		}
+		if live.Lifecycle != api.LifecycleLive {
+			return false, nil, nil
 		}
 		files, err := client.ListModuleFiles(ctx, live.ID)
 		if err != nil {
