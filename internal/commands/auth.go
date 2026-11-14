@@ -50,6 +50,10 @@ never on top of it. The profile is named after the organization unless
 --profile says otherwise. An organization already signed in here keeps its
 profile's name; 'ronja profile rename' changes it.
 
+--profile naming a profile already stored here renews THAT profile's
+organization, at its own instance unless --url says otherwise: the browser
+offers to switch to it, and an approval in any other organization is refused.
+
 With --with-token, a token is read from stdin instead. That is the path for CI
 and for machines with no browser:
 
@@ -65,7 +69,8 @@ and for machines with no browser:
 				// chooses an instance, and the last one may be the wrong one.
 				target = os.Getenv(config.EnvURL)
 			}
-			if target == "" {
+			urlChosen := target != ""
+			if !urlChosen {
 				target = config.DefaultURL
 			}
 			normalized, err := config.NormalizeURL(target)
@@ -74,16 +79,17 @@ and for machines with no browser:
 			}
 
 			// Checked before anything is minted.
+			renew := renewal{url: normalized}
 			if flagProfile != "" {
-				if err := checkRequestedProfile(flagProfile, normalized); err != nil {
+				if renew, err = checkRequestedProfile(flagProfile, normalized, urlChosen); err != nil {
 					return err
 				}
 			}
 
 			if withToken {
-				return loginWithToken(ctx, normalized)
+				return loginWithToken(ctx, renew.url)
 			}
-			return loginWithDeviceFlow(ctx, normalized, noBrowser)
+			return loginWithDeviceFlow(ctx, renew, noBrowser)
 		},
 	}
 
@@ -94,10 +100,11 @@ and for machines with no browser:
 	return cmd
 }
 
-func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) error {
+func loginWithDeviceFlow(ctx context.Context, renew renewal, noBrowser bool) error {
+	baseURL := renew.url
 	client := api.New(baseURL, "")
 
-	start, err := client.StartDevice(ctx, clientName())
+	start, err := client.StartDevice(ctx, clientName(), renew.tenantID)
 	if err != nil {
 		return fmt.Errorf("start login against %s: %w", baseURL, err)
 	}
@@ -105,6 +112,17 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 	// Stderr, so `--json` stdout stays one object.
 	out := os.Stderr
 	fmt.Fprintf(out, "\n  Your code: %s\n\n", start.UserCode)
+	if renew.tenantID != "" {
+		org := renew.tenantName
+		if org == "" {
+			org = renew.tenantID
+		}
+		// The second line is the way out when the profile's organization is
+		// one you have left: the browser can only say "no access", and the
+		// CLI would otherwise wait out the code in silence.
+		fmt.Fprintf(out, "  Approve in %s (profile %s).\n", org, flagProfile)
+		fmt.Fprintf(out, "  To sign in to a different organization instead, press Ctrl-C and run ronja login without --profile.\n\n")
+	}
 
 	// Only the URL handler's start is known, not that a browser appeared, so
 	// the prefilled URL is printed either way.
@@ -126,7 +144,7 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 		case errors.Is(err, api.ErrDeviceDenied):
 			return errors.New("login was declined in the browser")
 		case errors.Is(err, api.ErrDeviceExpired):
-			return errors.New("the code expired — run `ronja login` again")
+			return errors.New("the code expired — run the same command again")
 		case errors.Is(err, context.Canceled):
 			return errors.New("login cancelled")
 		}
@@ -187,22 +205,41 @@ func loginWithDeviceFlow(ctx context.Context, baseURL string, noBrowser bool) er
 	return nil
 }
 
+// renewal is where a login goes and, when it renews a stored profile, the
+// organization that profile belongs to. An empty tenantID asks for none.
+type renewal struct {
+	url                  string
+	tenantID, tenantName string
+}
+
 // checkRequestedProfile refuses an unusable --profile name before anything is
-// minted. Only the URL can be judged this early; an organization mismatch is
-// handled after approval by claimLogin.
-func checkRequestedProfile(name, instanceURL string) error {
+// minted. A stored profile renews at its own instance unless urlChosen names
+// another, and its organization is sent so the server refuses an approval in
+// any other; claimLogin still guards the name after approval.
+func checkRequestedProfile(name, instanceURL string, urlChosen bool) (renewal, error) {
 	if err := config.ValidateName(name); err != nil {
-		return err
+		return renewal{}, err
 	}
 	f, err := config.Load()
 	if err != nil {
-		return err
+		return renewal{}, err
 	}
-	if p, ok := f.Profiles[name]; ok && p != nil && p.URL != instanceURL {
-		return fmt.Errorf("profile %q is signed in to %s, not %s — pick another name, or drop --url to renew it where it is",
-			name, p.URL, instanceURL)
+	p, ok := f.Profiles[name]
+	if !ok || p == nil {
+		return renewal{url: instanceURL}, nil
 	}
-	return nil
+	if p.URL != instanceURL {
+		if urlChosen {
+			drop := "drop --url"
+			if flagURL == "" {
+				drop = "unset $" + config.EnvURL
+			}
+			return renewal{}, fmt.Errorf("profile %q is signed in to %s, not %s — pick another name, or %s to renew it where it is",
+				name, p.URL, instanceURL, drop)
+		}
+		instanceURL = p.URL
+	}
+	return renewal{url: instanceURL, tenantID: p.TenantID, tenantName: p.TenantName}, nil
 }
 
 // loginClaim is where a login's credential landed and why it has that name.
@@ -341,7 +378,7 @@ func reportLogin(baseURL string, me *api.Me, expiresAt string, claim loginClaim)
 	}
 	fmt.Fprintf(os.Stderr, "\n  Profile %q — now current. Token stored in %s\n", profile, path)
 	if when := describeExpiry(expiresAt); when != "" {
-		fmt.Fprintf(os.Stderr, "  Expires %s — run `ronja login` again to renew.\n", when)
+		fmt.Fprintf(os.Stderr, "  Expires %s — run `ronja login --profile %s` again to renew.\n", when, profile)
 	}
 
 	if me.Tenant == nil {
@@ -433,6 +470,9 @@ Reports the selected profile. To see them all without contacting a server, use
 					// while an env token overrides the stored one.
 					if resolved.FromEnv {
 						return fmt.Errorf("the token in $%s was rejected by %s", config.EnvToken, resolved.URL)
+					}
+					if resolved.Profile != "" {
+						return fmt.Errorf("the stored token for %s is no longer valid — run `ronja login --profile %s` again", resolved.URL, resolved.Profile)
 					}
 					return fmt.Errorf("the stored token for %s is no longer valid — run `ronja login` again", resolved.URL)
 				}

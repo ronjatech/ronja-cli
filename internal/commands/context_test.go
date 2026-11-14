@@ -4,8 +4,10 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/config"
 )
 
 // The organization policy on `ronja context`: every way it can be missing must
@@ -616,5 +618,36 @@ func TestContextJSONIsUnchangedForAnAdmin(t *testing.T) {
 	}
 	if strings.Contains(out, "expectedVersion") {
 		t.Errorf("the write recipe leaked into --json:\n%s", out)
+	}
+}
+
+// A stored profile's renewal hints name it, so renewing takes the path that
+// carries its organization.
+func TestContextRenewalHintsNameTheStoredProfile(t *testing.T) {
+	f := newFakeInstance(t)
+	f.failMe = http.StatusForbidden
+	f.failMeMessage = roleNotFound403
+	f.failPolicy = http.StatusForbidden
+	f.failPolicyMessage = roleNotFound403
+	signOutFrom(t, "")
+	writeProfiles(t, "presso", testProfile{Name: "presso", URL: f.URL(), TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"})
+	if err := config.Update(func(file *config.File) error {
+		file.Profiles["presso"].TokenExpiry = time.Now().Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runCLI(t, t.TempDir(), "context", "--no-docs")
+	if err != nil {
+		t.Fatalf("context: %v", err)
+	}
+	for _, want := range []string{
+		"Signed in: NO — the stored token was rejected. Run `ronja login --profile presso`.",
+		"re-run `ronja login --profile presso` to renew.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("context lacks %q:\n%s", want, out)
+		}
 	}
 }

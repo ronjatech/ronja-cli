@@ -81,7 +81,8 @@ same distinction: a scope-denied `/me` reads `Signed in: as a scoped token — �
 the calls it is scoped for still work` (keep going), while a 403 with any
 other words — the server's answer for a removed user, a deleted organization
 or a PAT with no bound user — reads `Signed in: NO — the stored token was
-rejected. Run `ronja login`.` and the policy line falls to the generic
+rejected. Run `ronja login --profile <name>`.` (plain `ronja login` for a
+`$RONJA_TOKEN` credential) and the policy line falls to the generic
 `HTTP 403`. The two reads go out side by side, so a degraded instance costs
 one client timeout, not two. `--no-docs` skips the API index and keeps the
 policy — it is context about the organization, not the docs.
@@ -154,7 +155,7 @@ of why. The credential gets the same treatment: `authenticated` stays the
 boolean it always was (`/me` answered) and `identityStatus` beside it is
 `ok` / `scoped` (`/me` refused with the scope verdict — a working scoped
 token, do not sign in again) / `rejected` (any other `/me` failure — run
-`ronja login`) / `none` (no token), because `authenticated: false` beside
+`ronja login --profile <name>`) / `none` (no token), because `authenticated: false` beside
 `organizationPolicyStatus: "ok"` sent a consumer keyed on the boolean off to
 replace a token that had just read the policy. `propertyPolicies` is the
 list of applied sections (`propertyKey`, `valueKey`, `propertyLabel`,
@@ -870,6 +871,21 @@ the approval screen names it. To add a second one, switch organization in the
 web app and run `ronja login` again. The new token is stored as its own
 profile beside the first, never on top of it.
 
+**Renewing a stored profile by name is the exception.** `ronja login --profile
+acme-retail`, where `acme-retail` is already stored with an organization, sends
+that organization's id when the flow starts. The terminal says `Approve in Acme
+Retail (profile acme-retail).`, the link opens the app's "This link opens in Acme
+Retail · Switch / Stay" screen when the browser is on another organization, and
+an approval in any other organization is **refused** by the server (403
+`cli_auth_wrong_organization`); the code stays valid, so switching and
+authorizing again works. Plain `ronja login`, a name nothing is stored under,
+and `$RONJA_PROFILE` send no organization. That is why every "renew" hint
+(`login`'s expiry line and an expired code, `whoami` on a rejected token,
+`context` on a rejected or expiring one, `profile list` on an expired one)
+prints `ronja login --profile <name>`. With no `--url` and no `$RONJA_URL`,
+`--profile <stored name>` signs in at that profile's own instance; a `--url` or
+`$RONJA_URL` that differs from it is refused.
+
 The name is derived from the organization (`Acme Retail` → `acme-retail`),
 except on a loopback instance or when that name is already taken by the same
 organization on a different URL — where the host label says more. On loopback
@@ -922,9 +938,13 @@ under the other organization's token.
 `ronja login` runs an RFC 8628 device-authorization flow:
 
 1. `POST /authentication/cli/device` (unauthenticated) returns a secret
-   `deviceCode` for the CLI and a short `userCode` for the human.
-2. The human approves at `/cli-auth?code=<userCode>` in a browser, where they
-   have a real session. That request is what actually authorizes anything.
+   `deviceCode` for the CLI and a short `userCode` for the human. An optional
+   `tenantID` (sent only when renewing a stored profile) names the one
+   organization the approval may happen in; it is shape-checked (at most 64
+   characters of `[A-Za-z0-9_-]`, else 400) and never checked for existence.
+2. The human approves at `/cli-auth?code=<userCode>` (plus `&org=<tenantID>`
+   when one was sent) in a browser, where they have a real session. That
+   request is what actually authorizes anything.
 3. `POST /authentication/cli/token` (unauthenticated) polls with the
    `deviceCode`. The first successful poll mints a Personal Access Token for
    the approving user and returns it exactly once.

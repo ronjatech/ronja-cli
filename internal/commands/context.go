@@ -121,7 +121,7 @@ func storedExpiry(resolved *config.Resolved) string {
 //	"ok"       — /me answered
 //	"scoped"   — /me refused with the server's scope verdict (scopeDenied): a
 //	             scoped token, still working for the routes it is scoped for
-//	"rejected" — /me failed any other way: run `ronja login`
+//	"rejected" — /me failed any other way: run `ronja login --profile <name>`
 //	"none"     — there was no token
 //
 // `authenticated` alone would tell a consumer to replace a working scoped
@@ -241,6 +241,11 @@ func printContext(resolved *config.Resolved, me *api.Me, authErr error, policy *
 		fmt.Fprintf(out, "Profile:   %s\n", resolved.Profile)
 	}
 
+	renew := "ronja login"
+	if !resolved.FromEnv && resolved.Profile != "" {
+		renew = "ronja login --profile " + resolved.Profile
+	}
+
 	switch identityStatus(resolved, me, authErr) {
 	case "ok":
 		fmt.Fprintf(out, "Signed in: %s", describeUser(me))
@@ -255,7 +260,7 @@ func printContext(resolved *config.Resolved, me *api.Me, authErr error, policy *
 		fmt.Fprintf(out, "Signed in: as a scoped token — it cannot call /api/v2/authentication/me, so who you\n")
 		fmt.Fprintf(out, "are is not shown; the calls it is scoped for still work.\n")
 	case "rejected":
-		fmt.Fprintf(out, "Signed in: NO — the stored token was rejected. Run `ronja login`.\n")
+		fmt.Fprintf(out, "Signed in: NO — the stored token was rejected. Run `%s`.\n", renew)
 	default:
 		fmt.Fprintf(out, "Signed in: NO — run `ronja login` first.\n")
 	}
@@ -302,7 +307,7 @@ func printContext(resolved *config.Resolved, me *api.Me, authErr error, policy *
 	fmt.Fprintf(out, "\nThe token acts as you, with your current permissions — it can do no more\n")
 	fmt.Fprintf(out, "than you can, and a route your role can't reach returns 403.\n")
 	if when := describeExpiry(storedExpiry(resolved)); when != "" {
-		fmt.Fprintf(out, "It expires %s — re-run `ronja login` to renew.\n", when)
+		fmt.Fprintf(out, "It expires %s — re-run `%s` to renew.\n", when, renew)
 	}
 
 	fmt.Fprintf(out, "\n## Reference\n\n")

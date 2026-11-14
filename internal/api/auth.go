@@ -70,10 +70,15 @@ type Me struct {
 }
 
 // StartDevice opens a device-authorization flow. No authentication required.
-func (c *Client) StartDevice(ctx context.Context, clientName string) (*DeviceStart, error) {
+// A non-empty tenantID is the organization the sign-in is for: the server then
+// refuses an approval in any other.
+func (c *Client) StartDevice(ctx context.Context, clientName, tenantID string) (*DeviceStart, error) {
+	body := map[string]string{"clientName": clientName}
+	if tenantID != "" {
+		body["tenantID"] = tenantID
+	}
 	var out DeviceStart
-	err := c.Do(ctx, "POST", "authentication/cli/device",
-		map[string]string{"clientName": clientName}, &out)
+	err := c.Do(ctx, "POST", "authentication/cli/device", body, &out)
 	if err != nil {
 		return nil, err
 	}

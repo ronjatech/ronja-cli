@@ -111,7 +111,7 @@ func printProfiles(rows []profileRow) {
 			org = "—"
 		}
 		if r.Expired {
-			org += "  (token expired — run `ronja login`)"
+			org += "  (token expired — run `ronja login --profile " + r.Name + "`)"
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t\n", marker, r.Name, r.URL, org)
 	}

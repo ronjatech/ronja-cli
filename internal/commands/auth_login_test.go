@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,11 +17,26 @@ import (
 // the first poll.
 func loginFake(t *testing.T, tenantID, tenantName, token string) string {
 	t.Helper()
+	url, _ := recordingLoginFake(t, tenantID, tenantName, token)
+	return url
+}
+
+// recordingLoginFake is loginFake that also keeps each device-start body. Its
+// verificationUriComplete carries a marker the CLI could not have built, so a
+// test can tell the CLI opened the server's link.
+func recordingLoginFake(t *testing.T, tenantID, tenantName, token string) (string, *[]map[string]any) {
+	t.Helper()
+	starts := &[]map[string]any{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
 		case "POST /api/v2/authentication/cli/device":
+			body := map[string]any{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode device start: %v", err)
+			}
+			*starts = append(*starts, body)
 			writeJSON(w, api.DeviceStart{DeviceCode: "dev", UserCode: "ABCD-EFGH", ExpiresIn: 600,
-				VerificationURI: "http://x/cli-auth", VerificationURIComplete: "http://x/cli-auth?code=ABCD-EFGH"})
+				VerificationURI: "http://x/cli-auth", VerificationURIComplete: "http://x/cli-auth?code=ABCD-EFGH&server=built"})
 		case "POST /api/v2/authentication/cli/token":
 			writeJSON(w, api.DeviceToken{Token: token, TokenID: "tok-" + token, TokenName: "ronja-cli on test",
 				UserID: "user-1", TenantID: tenantID, ExpiresAt: "2027-01-01T00:00:00Z"})
@@ -35,7 +51,7 @@ func loginFake(t *testing.T, tenantID, tenantName, token string) string {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return srv.URL
+	return srv.URL, starts
 }
 
 func loginEnv(t *testing.T) {
@@ -237,5 +253,227 @@ func TestLoginWithoutAProfileNameNamesItAutomatically(t *testing.T) {
 	want := config.HostLabel(url)
 	if p := f.Profiles[want]; p == nil || p.Token != "pat-3" {
 		t.Fatalf("profiles %v; want the automatic name %q", f.Names(), want)
+	}
+}
+
+// openedURLs replaces openBrowser with a recorder.
+func openedURLs(t *testing.T) *[]string {
+	t.Helper()
+	opened := &[]string{}
+	saved := openBrowser
+	openBrowser = func(u string) error { *opened = append(*opened, u); return nil }
+	t.Cleanup(func() { openBrowser = saved })
+	return opened
+}
+
+// Renewing a stored profile by name tells the server which organization it is
+// for, and opens the link the server built from that.
+func TestLoginWithAStoredProfileNamesItsOrganization(t *testing.T) {
+	loginEnv(t)
+	opened := openedURLs(t)
+	url, starts := recordingLoginFake(t, "ten-presso", "Presso", "pat-new")
+	writeProfiles(t, "presso", testProfile{Name: "presso", URL: url, TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"})
+
+	var err error
+	stderr := captureStderr(t, func() {
+		_, err = runCLI(t, t.TempDir(), "login", "--url", url, "--profile", "presso")
+	})
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	if len(*starts) != 1 || (*starts)[0]["tenantID"] != "ten-presso" {
+		t.Fatalf("device start bodies %v, want one naming tenantID ten-presso", *starts)
+	}
+	if len(*opened) != 1 || (*opened)[0] != "http://x/cli-auth?code=ABCD-EFGH&server=built" {
+		t.Errorf("opened %v, want the server's verificationUriComplete", *opened)
+	}
+	for _, want := range []string{
+		"Approve in Presso (profile presso).",
+		"press Ctrl-C and run ronja login without --profile",
+		"run `ronja login --profile presso` again to renew",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, stderr)
+		}
+	}
+	if p := loadProfiles(t).Profiles["presso"]; p == nil || p.Token != "pat-new" {
+		t.Errorf("presso was not renewed: %+v", p)
+	}
+}
+
+// Negative controls: a plain login is how a second organization is added, and a
+// name nothing is stored under, or a stored profile with no organization
+// recorded, knows no organization. None of them sends one.
+func TestLoginWithoutAStoredOrganizationSendsNone(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+		args   []string
+	}{
+		{"plain login", false, nil},
+		{"unknown profile", false, []string{"--profile", "unknown"}},
+		{"stored profile with no organization", true, []string{"--profile", "presso"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loginEnv(t)
+			url, starts := recordingLoginFake(t, "ten-presso", "Presso", "pat-new")
+			stored := testProfile{Name: "presso", URL: url, TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"}
+			if tc.legacy {
+				stored.TenantID, stored.TenantName = "", ""
+			}
+			writeProfiles(t, "presso", stored)
+
+			var err error
+			stderr := captureStderr(t, func() {
+				_, err = runCLI(t, t.TempDir(), append([]string{"login", "--url", url}, tc.args...)...)
+			})
+			if err != nil {
+				t.Fatalf("login: %v", err)
+			}
+			if len(*starts) != 1 {
+				t.Fatalf("%d device starts, want 1", len(*starts))
+			}
+			if v, sent := (*starts)[0]["tenantID"]; sent {
+				t.Errorf("device start sent tenantID %v, want none", v)
+			}
+			if strings.Contains(stderr, "Approve in") {
+				t.Errorf("stderr names a target organization:\n%s", stderr)
+			}
+		})
+	}
+}
+
+// The renewal hint prints `ronja login --profile <name>`, which must work for a
+// profile stored on another instance: with no --url and no $RONJA_URL, the
+// login goes to that profile's instance.
+func TestLoginWithAStoredProfileRenewsAtItsInstance(t *testing.T) {
+	loginEnv(t)
+	url, starts := recordingLoginFake(t, "ten-presso", "Presso", "pat-new")
+	writeProfiles(t, "presso", testProfile{Name: "presso", URL: url, TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"})
+
+	if _, err := runCLI(t, t.TempDir(), "login", "--profile", "presso"); err != nil {
+		t.Fatalf("login --profile presso with no --url: %v", err)
+	}
+	if len(*starts) != 1 || (*starts)[0]["tenantID"] != "ten-presso" {
+		t.Fatalf("device start bodies %v, want one at the stored instance naming ten-presso", *starts)
+	}
+	if p := loadProfiles(t).Profiles["presso"]; p == nil || p.Token != "pat-new" || p.URL != url {
+		t.Errorf("presso = %+v, want renewed at %s", p, url)
+	}
+}
+
+// An explicit --url still decides: a stored profile on another instance is
+// refused rather than renewed somewhere it does not live.
+func TestLoginRefusesAStoredProfileAtAnotherExplicitURL(t *testing.T) {
+	loginEnv(t)
+	url, starts := recordingLoginFake(t, "ten-presso", "Presso", "pat-new")
+	writeProfiles(t, "presso", testProfile{Name: "presso", URL: "https://elsewhere.ronja.test", TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"})
+
+	_, err := runCLI(t, t.TempDir(), "login", "--url", url, "--profile", "presso")
+	if err == nil || !strings.Contains(err.Error(), "drop --url to renew it where it is") {
+		t.Fatalf("login = %v, want the refusal naming the stored instance", err)
+	}
+	if len(*starts) != 0 {
+		t.Errorf("a refused login started %d device flows", len(*starts))
+	}
+}
+
+// whoami on a rejected stored token and `profile list` on an expired one send
+// the person to the renewal that names the profile.
+func TestRenewalHintsNameTheProfile(t *testing.T) {
+	t.Run("whoami", func(t *testing.T) {
+		loginEnv(t)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		}))
+		t.Cleanup(srv.Close)
+		writeProfiles(t, "presso", testProfile{Name: "presso", URL: srv.URL, TenantID: "ten-presso", TenantName: "Presso", Token: "pat-dead"})
+
+		_, err := runCLI(t, t.TempDir(), "whoami")
+		if err == nil || !strings.Contains(err.Error(), "run `ronja login --profile presso` again") {
+			t.Fatalf("whoami = %v, want the hint to name profile presso", err)
+		}
+	})
+	t.Run("profile list", func(t *testing.T) {
+		loginEnv(t)
+		writeProfiles(t, "presso", testProfile{Name: "presso", URL: "https://app.ronja.test", TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"})
+		if err := config.Update(func(f *config.File) error {
+			f.Profiles["presso"].TokenExpiry = "2020-01-01T00:00:00Z"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		out, err := runCLI(t, t.TempDir(), "profile", "list")
+		if err != nil {
+			t.Fatalf("profile list: %v", err)
+		}
+		if !strings.Contains(out, "(token expired — run `ronja login --profile presso`)") {
+			t.Errorf("profile list lacks the named renewal hint:\n%s", out)
+		}
+	})
+}
+
+// $RONJA_URL chooses an instance the way --url does, so the refusal names the
+// one the person actually set.
+func TestLoginRefusesAStoredProfileAtAnotherEnvironmentURL(t *testing.T) {
+	loginEnv(t)
+	url, starts := recordingLoginFake(t, "ten-presso", "Presso", "pat-new")
+	writeProfiles(t, "presso", testProfile{Name: "presso", URL: "https://elsewhere.ronja.test", TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"})
+	t.Setenv(config.EnvURL, url)
+
+	_, err := runCLI(t, t.TempDir(), "login", "--profile", "presso")
+	if err == nil || !strings.Contains(err.Error(), "unset $"+config.EnvURL+" to renew it where it is") {
+		t.Fatalf("login = %v, want the refusal to name $%s", err, config.EnvURL)
+	}
+	if len(*starts) != 0 {
+		t.Errorf("a refused login started %d device flows", len(*starts))
+	}
+}
+
+// An expired code is retried with the command that started it, whatever its
+// flags, so a renewal keeps its guard.
+func TestLoginExpiryAsksForTheSameCommand(t *testing.T) {
+	loginEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/v2/authentication/cli/device":
+			writeJSON(w, api.DeviceStart{DeviceCode: "dev", UserCode: "ABCD-EFGH", ExpiresIn: 600,
+				VerificationURI: "http://x/cli-auth", VerificationURIComplete: "http://x/cli-auth?code=ABCD-EFGH"})
+		case "POST /api/v2/authentication/cli/token":
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": api.ErrExpiredToken})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeProfiles(t, "presso", testProfile{Name: "presso", URL: srv.URL, TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"})
+
+	for _, args := range [][]string{
+		{"login", "--profile", "presso"},
+		{"login", "--url", srv.URL, "--profile", "fresh"},
+		{"login", "--url", srv.URL},
+	} {
+		_, err := runCLI(t, t.TempDir(), args...)
+		if err == nil || err.Error() != "the code expired — run the same command again" {
+			t.Errorf("%v = %v, want the expiry to ask for the same command", args, err)
+		}
+	}
+}
+
+// --with-token renewing a stored profile verifies the token at that profile's
+// instance, as the browser path does, when no --url names another.
+func TestLoginWithTokenRenewsAStoredProfileAtItsOwnInstance(t *testing.T) {
+	loginEnv(t)
+	url := loginFake(t, "ten-presso", "Presso", "unused")
+	writeProfiles(t, "presso", testProfile{Name: "presso", URL: url, TenantID: "ten-presso", TenantName: "Presso", Token: "pat-old"})
+	withStdin(t, "pat-pasted\n")
+
+	if _, err := runCLI(t, t.TempDir(), "login", "--profile", "presso", "--with-token"); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	f := loadProfiles(t)
+	if p := f.Profiles["presso"]; len(f.Profiles) != 1 || p == nil || p.Token != "pat-pasted" || p.URL != url {
+		t.Fatalf("profiles %v; want presso alone, at %s, with the pasted token", f.Names(), url)
 	}
 }
