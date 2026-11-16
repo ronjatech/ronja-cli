@@ -288,6 +288,9 @@ func refuseMissingAppEntrypoint(f *folder, local map[string]string) error {
 // Returns (result, err): a non-nil result with a non-nil error is the
 // partial-push case, and both halves matter.
 func runAppPush(ctx context.Context, f *folder, opts appPushOptions) (*appPushResult, error) {
+	// Here rather than in runAppPushOnce, which a create that adopted its row
+	// runs twice.
+	noteAutoGrantedCapabilities(f.Root, f.Manifest.Access, false)
 	result, err := runAppPushOnce(ctx, f, opts)
 	if adoptedOnCreate(err) {
 		// See runPush: the create adopted the row that won this address, and the
@@ -321,14 +324,6 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 	entrypoint := f.Manifest.Entrypoint
 	if err := refuseMissingAppEntrypoint(f, local); err != nil {
 		return nil, err
-	}
-	// The capability vocabulary is closed and the SERVER does not police it —
-	// an unknown name is dropped at token-mint time, so a typo publishes green
-	// and fails in a viewer's browser. Checked here, before anything is sent.
-	if f.Manifest.ManagesAccess() {
-		if err := checkDeclaredCapabilities(f.declaredAccess(), wfdir.ManifestPath(f.Root)); err != nil {
-			return nil, err
-		}
 	}
 	// The alias pre-flight, still with no network in sight — see runPush. A data
 	// app's files claim no local names, so there are no stems to collide with.

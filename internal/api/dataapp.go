@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/url"
+	"slices"
 	"sort"
 	"time"
 )
@@ -158,11 +159,10 @@ type DataAppAccess struct {
 	AllowedCodexIDs    []string `json:"allowedCodexIDs"`
 	AllowedMetricIDs   []string `json:"allowedMetricIDs"`
 	// Capabilities are the coarse switches the minted script-token carries
-	// alongside the id allowlists. Only five names ever belong here (ai,
-	// embed, query_external, write_external, upload_file) — everything else is
-	// derived server-side from the allowlists. The list lives in
-	// commands.declarableCapabilities, which `app push` refuses against;
-	// `ronja app init --help` describes each one.
+	// alongside the id allowlists. Only DeclarableCapabilities belong here, and
+	// the server refuses any other name except AutoGrantedCapabilities, which
+	// it drops and Normalized drops too. `ronja app init --help` describes each
+	// declarable one.
 	Capabilities []string `json:"capabilities"`
 }
 
@@ -178,16 +178,23 @@ func (a *DataAppAccess) accessSlots() []*[]string {
 	}
 }
 
-// Normalized returns a copy with nil lists replaced by empty ones and every list
-// sorted and de-duplicated.
+// Normalized returns a copy with nil lists replaced by empty ones, every list
+// sorted and de-duplicated, and AutoGrantedCapabilities dropped from
+// Capabilities. A name that is neither declarable nor automatic is kept, so
+// the server's refusal of it reaches the author.
 //
 // Sorting is what makes SameAccess a comparison of MEANING rather than of
 // spelling. An allowlist is a set — the server stores it as one and the token
 // mint reads it as one — so a manifest listing two tables in the other order is
 // the same grant, and treating it as drift would make `app status` report a
-// change forever and `app push` send a patch that changes nothing.
+// change forever and `app push` send a patch that changes nothing. Dropping the
+// automatic names is the same rule: the server never stores them, so a file
+// listing one would otherwise differ from its row forever.
 func (a DataAppAccess) Normalized() DataAppAccess {
 	out := a
+	out.Capabilities = slices.DeleteFunc(slices.Clone(out.Capabilities), func(name string) bool {
+		return slices.Contains(AutoGrantedCapabilities, name)
+	})
 	for _, slot := range out.accessSlots() {
 		*slot = normalizeIDs(*slot)
 	}

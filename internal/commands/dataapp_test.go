@@ -182,17 +182,15 @@ func TestAppInitNeverOverwritesAnExistingEntrypoint(t *testing.T) {
 // The manifest's "capabilities" vocabulary lives in the command, statically, on
 // both surfaces an author meets: `ronja app init --help` describes each name,
 // and the post-init report — printed at the one moment they are about to write
-// the manifest — enumerates them. The authoritative set is the backend's
-// dataAppAllowedCaps minus its auto-granted members (rscripttoken/dataapp.go,
-// which carries its own pin); the CLI is a separate module, so this is the
-// CLI-side half of the drift net.
+// the manifest — enumerates them. api.DeclarableCapabilities is held to the
+// server's list by the backend's TestTheCLIsCapabilityVocabularyMatchesTheServer;
+// this holds the two surfaces to api.DeclarableCapabilities.
 //
 // The help is matched as TABLE ROWS rather than substrings — "ai" alone matches
-// half the English words in it — and the report as the joined list it prints,
-// which is built from declarableCapabilities and so covers whatever that holds.
+// half the English words in it — and the report as the joined list it prints.
 func TestAppInitNamesTheDeclarableCapabilities(t *testing.T) {
 	long := newDataAppInitCmd().Long
-	for _, capability := range declarableCapabilities {
+	for _, capability := range api.DeclarableCapabilities {
 		row := "\n  " + capability + "  "
 		if !strings.Contains(long, row) {
 			t.Errorf("`ronja app init --help` no longer carries the capability table row for %q — the manifest vocabulary must live in the command", capability)
@@ -205,7 +203,7 @@ func TestAppInitNamesTheDeclarableCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	if names := strings.Join(declarableCapabilities, ", "); !strings.Contains(out, names) {
+	if names := strings.Join(api.DeclarableCapabilities, ", "); !strings.Contains(out, names) {
 		t.Errorf("the post-init report no longer names the capabilities (%s) — an author about to write the manifest reads this, not --help. Got:\n%s",
 			names, out)
 	}
@@ -1485,67 +1483,14 @@ func TestAppPushRefusesEntrypointMismatch(t *testing.T) {
 	}
 }
 
-// TestAppPushRefusesAnUnknownCapability covers the one manifest field nothing
-// on the server validates.
-//
-// "capabilities" is a closed vocabulary that is FILTERED at token-mint time
-// rather than checked on the way in, so a typo used to push green, publish
-// green, show no drift, and surface weeks later as a "capability not granted"
-// in one viewer's console with nothing pointing at the manifest. The refusal
-// has to happen before the first request — asserted as the absence of any
-// /dataapp call, since a push that refused only after creating the app would
-// still have left a row behind.
-func TestAppPushRefusesAnUnknownCapability(t *testing.T) {
-	f := newFakeAppInstance(t)
-	signInApp(t, f)
-
-	root := writeAppFolder(t, t.TempDir(), &wfdir.Manifest{Title: "App"},
-		map[string]string{"App.tsx": "x"})
-	m := appManifestOf(t, root)
-	m.SetBinding(f.Key(), wfdir.Binding{FeatureID: "feat-1"})
-	m.SetAccess(api.DataAppAccess{
-		AllowedTableIDs: []string{"table-abc"},
-		Capabilities:    []string{"ai", "upload_fil"},
-	})
-	if err := wfdir.SaveManifest(root, m); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := runCLI(t, root, "app", "push")
-	if err == nil {
-		t.Fatal("expected a push declaring a capability that does not exist to be refused")
-	}
-	if !strings.Contains(err.Error(), "upload_fil\"") {
-		t.Errorf("the refusal must name the offending entry, got %v", err)
-	}
-	for _, capability := range declarableCapabilities {
-		if !strings.Contains(err.Error(), capability) {
-			t.Errorf("the refusal must name the valid capabilities (missing %q), got %v", capability, err)
-		}
-	}
-	// The stale-CLI case, said out loud: the vocabulary is closed but not
-	// frozen, and a CLI older than the server must not sound certain.
-	if !strings.Contains(err.Error(), "update the CLI") {
-		t.Errorf("the refusal should explain what to do if the server knows a capability this CLI does not, got %v", err)
-	}
-	for _, request := range f.Requests {
-		if strings.Contains(request, "/dataapp") {
-			t.Errorf("the refusal is local — nothing should have been sent, got requests %v", f.Requests)
-			break
-		}
-	}
-}
-
-// The other half of the refusal: every name that IS in the vocabulary passes,
-// and so does declaring none. An over-eager guard here would be worse than none
-// at all — it would refuse the exact manifest `ronja app init --help` tells the
-// author to write.
+// Every name `ronja app init --help` tells the author to write is sent as
+// written, and so is declaring none.
 func TestAppPushAcceptsTheDeclarableCapabilities(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		capabilities []string
 	}{
-		{"all five", declarableCapabilities},
+		{"all five", api.DeclarableCapabilities},
 		{"none declared", []string{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

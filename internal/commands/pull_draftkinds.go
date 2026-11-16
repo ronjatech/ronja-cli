@@ -457,6 +457,8 @@ func pullDataApp(ctx context.Context, client *api.Client, f *folder) (*pullPlan,
 			}
 			var literals []pullLiteral
 			if m.ManagesAccess() && len(diffAccess(live.DataAppAccess, f.declaredAccess())) > 0 {
+				// SetAccess normalizes, so the raw list is read before it.
+				noteAutoGrantedCapabilities(f.Root, m.Access, true)
 				before := m.DeclaredAccess()
 				after := aliasedAccess(live.DataAppAccess, f.Codec)
 				m.SetAccess(after)

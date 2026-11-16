@@ -181,7 +181,7 @@ func TestManifestAccessRoundTrip(t *testing.T) {
 		AllowedWorkflowIDs: []string{"workflow-1"},
 		AllowedCodexIDs:    []string{"codex-1"},
 		AllowedMetricIDs:   []string{"table-metric-1"},
-		Capabilities:       []string{"query_ronja"},
+		Capabilities:       []string{"upload_file"},
 	})
 	if err := SaveManifest(root, m); err != nil {
 		t.Fatal(err)

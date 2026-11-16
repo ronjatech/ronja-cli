@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"slices"
 	"sort"
@@ -139,44 +140,31 @@ func checkAppPushable(files map[string]string) error {
 	return nil
 }
 
-// declarableCapabilities is the closed vocabulary of "access"."capabilities" in
-// a data-app manifest: the capabilities the server never hands an app on its
-// own, one per SDK call no allowlist implies. Everything else an app can do —
-// read the tables it lists, run an allowed agent or workflow, evaluate an
-// allowed metric, search a codex, fetch through an allowed secret, read the org
-// roster — is derived server-side from the allowlists, so naming it here grants
-// nothing that listing the resource did not already grant.
-//
-// It is the backend's rscripttoken.dataAppAllowedCaps minus everything
-// dataAppCaps auto-grants, and that correspondence is pinned there by
-// TestDataAppCaps_DeclareOnlySetIsExactlyFive — whose failure message names
-// this variable, because the CLI is a separate module and no compiler relates
-// the two. The same five names are also written out in `ronja app init --help`,
-// in the post-init report, in cli/README.md and on the docs site.
-var declarableCapabilities = []string{"ai", "embed", "query_external", "write_external", "upload_file"}
-
-// checkDeclaredCapabilities refuses a manifest that grants a capability which
-// does not exist.
-//
-// A refusal rather than a warning, because the failure it replaces has no
-// author-visible cause at all: nothing validates "capabilities" on the way in,
-// and the token mint FILTERS the stored list (rscripttoken.dataAppCaps), so
-// `"upload_fil"` pushes green, publishes green, shows no drift, and then
-// surfaces weeks later as a "capability not granted" in one viewer's console.
-// This is the only place that sees both the typo and the person who made it.
-//
-// The message ends by naming the stale-CLI case explicitly. The vocabulary is
-// closed but not frozen: a CLI older than the server would otherwise refuse a
-// perfectly valid capability while sounding certain it does not exist.
-func checkDeclaredCapabilities(access api.DataAppAccess, manifestPath string) error {
-	for _, declared := range access.Capabilities {
-		if slices.Contains(declarableCapabilities, declared) {
+// noteAutoGrantedCapabilities tells the author which automatic capability
+// names root's ronja.json lists, one stderr line per name. It reads the RAW
+// block (Manifest.Access), because every normalized view has already dropped
+// them; a nil block lists nothing. rewritten says the caller is about to write
+// the block without them, so the note says so instead of asking the author to
+// delete them.
+func noteAutoGrantedCapabilities(root string, raw *api.DataAppAccess, rewritten bool) {
+	if raw == nil {
+		return
+	}
+	var listed []string
+	for _, name := range raw.Capabilities {
+		if slices.Contains(api.AutoGrantedCapabilities, name) && !slices.Contains(listed, name) {
+			listed = append(listed, name)
+		}
+	}
+	for _, name := range listed {
+		if rewritten {
+			fmt.Fprintf(os.Stderr, "  Note: %s listed %q under access.capabilities; Ronja grants it on its own, from the app's allowlists or to every app, so pull dropped it from the file.\n",
+				wfdir.ManifestPath(root), name)
 			continue
 		}
-		return fmt.Errorf("%s grants %q under \"access\".\"capabilities\", and that is not a data-app capability.\n  Only these names ever belong there: %s. Everything else — reading tables, running an allowed agent or workflow, evaluating a metric, codex search, HTTP fetch through a secret — is granted by the allowlist naming the resource, not by a capability.\n  Nothing on the server would have told you: an unknown name is dropped when the app's token is minted, so this would have published green and failed in a viewer's browser.\n  A newer Ronja may accept more than these: if the server's docs name this capability, update the CLI",
-			manifestPath, declared, strings.Join(declarableCapabilities, ", "))
+		fmt.Fprintf(os.Stderr, "  Note: %s lists %q under access.capabilities; Ronja grants it on its own, from the app's allowlists or to every app, so it is ignored. Delete it from the file.\n",
+			wfdir.ManifestPath(root), name)
 	}
-	return nil
 }
 
 // refuseUnworkableApp reports why a data-app row cannot back a folder, or nil

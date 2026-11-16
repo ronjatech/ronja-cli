@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"slices"
 	"testing"
 )
 
@@ -26,7 +27,7 @@ const dataAppFixture = `{
   "allowedAgentIDs": ["agent-1"],
   "allowedWorkflowIDs": ["workflow-1"],
   "allowedMetricIDs": ["table-metric-1"],
-  "capabilities": ["query_ronja"],
+  "capabilities": ["upload_file"],
   "reportingTimezone": "Europe/Stockholm",
   "scope": "personal",
   "authorUserID": "user-1",
@@ -105,7 +106,7 @@ func TestGetDataAppDecodesEveryMirroredField(t *testing.T) {
 		{"allowedAgentIDs", app.AllowedAgentIDs, "agent-1"},
 		{"allowedWorkflowIDs", app.AllowedWorkflowIDs, "workflow-1"},
 		{"allowedMetricIDs", app.AllowedMetricIDs, "table-metric-1"},
-		{"capabilities", app.Capabilities, "query_ronja"},
+		{"capabilities", app.Capabilities, "upload_file"},
 	} {
 		if len(tc.got) != 1 || tc.got[0] != tc.want {
 			t.Errorf("%s = %v, want [%s]", tc.label, tc.got, tc.want)
@@ -193,6 +194,27 @@ func TestSameAccessIgnoresOrderAndDuplicates(t *testing.T) {
 	// not see one as drift against the other.
 	if !SameAccess(DataAppAccess{}, DataAppAccess{AllowedTableIDs: []string{}}) {
 		t.Error("nil and empty must compare equal")
+	}
+}
+
+// The server never stores an automatic capability, so a file an older CLI
+// wrote with one must compare equal to its row. A name that is neither
+// declarable nor automatic is kept, so it is sent and the server refuses it.
+func TestNormalizedDropsAutoGrantedCapabilitiesOnly(t *testing.T) {
+	raw := []string{"query_ronja", "upload_fil", "ai", "list_users", "ai"}
+	in := DataAppAccess{Capabilities: raw}
+	got := in.Normalized().Capabilities
+	if want := []string{"ai", "upload_fil"}; !slices.Equal(got, want) {
+		t.Errorf("Normalized().Capabilities = %v, want %v", got, want)
+	}
+	if !slices.Equal(in.Capabilities, raw) {
+		t.Errorf("Normalized changed its receiver's list: %v", in.Capabilities)
+	}
+	if !SameAccess(DataAppAccess{Capabilities: []string{"ai", "query_ronja"}}, DataAppAccess{Capabilities: []string{"ai"}}) {
+		t.Error("a list holding an automatic name must compare equal to the list without it")
+	}
+	if !(DataAppAccess{Capabilities: []string{"query_ronja"}}).IsEmpty() {
+		t.Error("an access set holding only an automatic name grants nothing")
 	}
 }
 

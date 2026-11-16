@@ -87,6 +87,7 @@ func dataAppStatusReportAt(ctx context.Context, root string, resolved *config.Re
 
 	// Reported, never refused — see folder.noteAliases.
 	f.noteAliases()
+	noteAutoGrantedCapabilities(f.Root, f.Manifest.Access, false)
 
 	report := &appStatusReport{
 		opened:        f,

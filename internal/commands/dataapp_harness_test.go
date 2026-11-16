@@ -188,6 +188,11 @@ type fakeAppInstance struct {
 	// (`admin required`, `feature not found`) are what push has to translate.
 	failCreate        int
 	failCreateMessage string
+	// failPatch is the status PUT /dataapp/:id answers with, carrying
+	// failPatchMessage as the `error` field: the server's refusal of a
+	// capability name it does not know, on the access-patch path.
+	failPatch        int
+	failPatchMessage string
 
 	// --- optimistic concurrency -------------------------------------------
 	// fileWrites records every PUT/DELETE of a file WITH the precondition it
@@ -732,13 +737,13 @@ func (f *fakeAppInstance) serveKitFile(w http.ResponseWriter, path string) {
 }
 
 func (f *fakeAppInstance) serveCreate(w http.ResponseWriter, r *http.Request) {
+	var in api.CreateDataAppInput
+	decodeBody(f.t, r, &in)
+	f.created = append(f.created, in)
 	if f.failCreate != 0 {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, f.failCreateMessage), f.failCreate)
 		return
 	}
-	var in api.CreateDataAppInput
-	decodeBody(f.t, r, &in)
-	f.created = append(f.created, in)
 	f.nextID++
 	// Created as a PARENTLESS DRAFT and empty, exactly as rdataapp.Create does
 	// since migration 000495 — the same shape a workflow has always had. The row
@@ -968,6 +973,10 @@ func (f *fakeAppInstance) servePatch(w http.ResponseWriter, r *http.Request, id 
 	var patch api.DataAppPatch
 	decodeBody(f.t, r, &patch)
 	f.patches = append(f.patches, patch)
+	if f.failPatch != 0 {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, f.failPatchMessage), f.failPatch)
+		return
+	}
 	target := f.mutationTarget(id)
 	app := f.apps[target]
 	if app == nil {

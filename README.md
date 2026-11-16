@@ -1772,6 +1772,17 @@ CREATE privilege, so DDL is refused by Postgres itself rather than filtered
 here. Schema changes go through `db migrate`, which runs as the owner and
 ledgers what it did.
 
+**Data that depends on the app's rows goes through `db sql`, not a migration.**
+A migration must also succeed on an empty database, because its history is what
+rebuilds the schema elsewhere. It may seed rows its own tables need and fill a
+new column; a seed pointing at rows the app wrote, a check on what data is
+there, or a repair of the app's data is a `db sql` call, on each database that
+needs it (a dev Space's and the real one's). `db migrate push` refuses a
+migration that writes or checks data and fails on an empty database with a data
+error, naming it, and prints any note the server adds. Each migration already
+runs in one transaction, so a file that wraps itself in `BEGIN; … COMMIT;` (or
+holds any other transaction control) is refused: drop the wrapper.
+
 **Unlike `ronja query`, a failed statement is a real HTTP error.**
 `POST /api/v2/database/:id/sql` answers **400** carrying the Postgres message —
 deliberately not the duckdb endpoint's 200-with-an-`error`-field. So there is no
@@ -4126,15 +4137,20 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
   roster (`users()`) needs neither. `ronja app init --help` names the same
   five, so the vocabulary lives in the command.
 
-  **`push` refuses any other name, locally, before its first request.** The
-  server does not validate this field: an unknown capability is dropped when the
-  app's token is minted, so `"upload_fil"` used to push green, publish green and
-  show no drift, then fail in a viewer's browser with nothing pointing back at
-  the manifest. The refusal names the offending entry and the five valid names —
-  and says so if you are simply older than the server, since the vocabulary is
-  closed but not frozen (`declarableCapabilities` in
-  `internal/commands/dataapp.go`; the backend pins the correspondence in
-  `TestDataAppCaps_DeclareOnlySetIsExactlyFive`).
+  **Ronja refuses any other name.** `push` sends the list as written, and the
+  server answers an unknown name such as `"upload_fil"` with a 400 naming the
+  five valid names. Push writes access first, so the refusal comes before any
+  file lands; a plain push to a live app keeps the draft it checked out.
+  The nine names Ronja grants on its own (`query_ronja`, `http_fetch`, `codex`,
+  `run_agent`, `run_workflow`, `query_metric`, `list_users`, `resource_link`,
+  `call_function`) are never stored: `clone`, `import feature` and `pull`
+  leave them out, and a file an older CLI wrote with one still pushes. `push`
+  sends no change for it, and `push` and `status` print a note to delete it
+  from the file; a `pull` that rewrites the access block drops it and says so. Both lists live in
+  `internal/api/dataapp_caps.go` (`DeclarableCapabilities`,
+  `AutoGrantedCapabilities`); the backend's
+  `TestTheCLIsCapabilityVocabularyMatchesTheServer` fails when they drift from
+  the server's.
 
   It has the same **three states** `parameters` does — absent means "not
   managed, push never touches them", present means "push makes the row match" —

@@ -81,9 +81,9 @@ Nothing else ever goes in "capabilities": reading Ronja tables, running an
 allowed agent or workflow, evaluating an allowed metric, codex search and HTTP
 fetch through an allowed secret are all granted by their "access" allowlists —
 listing the table (or agent, workflow, metric, codex, secret) is all it takes —
-and the org roster (users()) needs neither. Any other name is refused by
-` + "`ronja app push`" + ` before it sends anything, since the server would drop it
-silently and the app would fail in the browser.`,
+and the org roster (users()) needs neither. Ronja refuses any other name when
+` + "`ronja app push`" + ` sends it, before any file lands, except an automatic one
+such as query_ronja, which it ignores.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// MarkFlagRequired only asserts the flag was PASSED, so `--feature ""`
@@ -309,10 +309,10 @@ func printAppInitReport(root, url, target, title, entrypoint, featureID, fromPat
 	fmt.Fprintf(out, "  table is all it takes — reading tables needs no \"capabilities\" entry.\n")
 	// The names, not a pointer to them: this is the one moment the author is
 	// about to write the manifest, and a vocabulary they have to go and look up
-	// is one they will guess at instead. Built from the same list `app push`
-	// refuses against, so the report cannot name a set the push disagrees with.
-	fmt.Fprintf(out, "  \"capabilities\" itself takes only these names — a push refuses any other:\n")
-	fmt.Fprintf(out, "  %s. See `ronja app init --help`.\n", strings.Join(declarableCapabilities, ", "))
+	// is one they will guess at instead.
+	fmt.Fprintf(out, "  \"capabilities\" itself takes only these names — Ronja refuses any other,\n")
+	fmt.Fprintf(out, "  except the automatic ones, which it ignores:\n")
+	fmt.Fprintf(out, "  %s. See `ronja app init --help`.\n", strings.Join(api.DeclarableCapabilities, ", "))
 	fmt.Fprintf(out, "  Your first push creates the app as an unpublished draft only you can see;\n")
 	fmt.Fprintf(out, "  publishing promotes it in place, so its link never changes.\n")
 	fmt.Fprintf(out, "\n  Next: `ronja app status` to see where you stand.\n")

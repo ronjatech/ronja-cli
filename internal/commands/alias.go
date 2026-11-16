@@ -530,7 +530,7 @@ type accessDependency struct {
 // with the dependency kind its entries may be aliases of.
 //
 // Capabilities is absent and never appears here. It is a closed vocabulary of
-// switches (checkDeclaredCapabilities owns it), not a list of rows, so there is
+// switches (api.DeclarableCapabilities), not a list of rows, so there is
 // nothing in it an alias could stand for.
 //
 // ⚠️ METRICS DECLARE `table`, and there is deliberately no `metric` dependency
