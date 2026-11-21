@@ -53,7 +53,7 @@ func newAPICmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "api <path>",
+		Use:   "api [METHOD] <path>",
 		Short: "Make an authenticated request to this Ronja instance",
 		Long: `Make an authenticated request to this Ronja instance.
 
@@ -61,11 +61,12 @@ The path is joined to the instance you are signed in to, and the credential is
 attached for you — so nothing has to load, interpolate or echo a token:
 
   ronja api /api/v2/authentication/me
-  ronja api -X POST /api/v2/feature -d '{"name":"Sales","scope":"private"}'
+  ronja api POST /api/v2/feature -d '{"name":"Sales","scope":"private"}'
   ronja api -X POST /api/v2/feature -d @feature.json
-  cat feature.json | ronja api -X POST /api/v2/feature -d @-
+  cat feature.json | ronja api POST /api/v2/feature -d @-
 
-The method defaults to GET, or to POST when a body is given. A body sets
+The method goes first or in -X, in any case (GET, POST, PUT, PATCH, DELETE,
+HEAD, OPTIONS). It defaults to GET, or to POST when a body is given. A body sets
 Content-Type: application/json unless -H overrides it. A "Host: ..." header is
 honoured rather than dropped, which is not what a bare Go client does.
 
@@ -148,10 +149,20 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 			if err := refuseFlagAsJQExpr(cmd, jqExpr); err != nil {
 				return err
 			}
+			if len(args) == 2 && isHTTPMethod(args[0]) {
+				return nil
+			}
 			return cobra.ExactArgs(1)(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path := args[0]
+			path := args[len(args)-1]
+			if len(args) == 2 {
+				positional := strings.ToUpper(args[0])
+				if method != "" && !strings.EqualFold(method, positional) {
+					return fmt.Errorf("the method is given twice and they disagree: -X %s and %s — give one", strings.ToUpper(method), positional)
+				}
+				method = positional
+			}
 			// Checked before anything else, because it is the mistake this
 			// command's shape invites: a caller reaches for the full URL they
 			// would have given curl. Naming both halves is what turns that into
@@ -273,7 +284,7 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 
 			var resp *api.RawResponse
 			if plan != nil {
-				resp, err = request.wait(cmd.Context(), *plan)
+				resp, err = request.wait(cmd.Context(), *plan, out)
 			} else {
 				resp, err = request.send(cmd.Context())
 			}
@@ -324,7 +335,7 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 		"multipart form part as name=value or name=@path (repeatable; @- reads standard input)")
 	cmd.Flags().StringArrayVarP(&headers, "header", "H", nil,
 		`extra request header as "Name: value" (repeatable; "Host" is honoured)`)
-	cmd.Flags().DurationVar(&timeout, "timeout", api.DefaultRawTimeout,
+	durationFlag(cmd, &timeout, "timeout", api.DefaultRawTimeout,
 		"how long to wait for one request, response body included (0 removes the only bound there is and waits indefinitely)")
 	cmd.Flags().StringVarP(&jqExpr, "jq", "q", "",
 		"filter the JSON response through a jq expression")
@@ -338,11 +349,22 @@ This is a transport, not a wrapper: it knows no endpoints. Read what to call at
 		`exit non-zero when a 2xx response carries a non-empty "error" field`)
 	cmd.Flags().StringVar(&waitUntil, "wait-until", "",
 		"re-send the request until this jq condition holds (GET/HEAD only)")
-	cmd.Flags().DurationVar(&waitInterval, "wait-interval", DefaultWaitInterval,
+	durationFlag(cmd, &waitInterval, "wait-interval", DefaultWaitInterval,
 		"how long to pause between --wait-until attempts")
-	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", DefaultWaitTimeout,
+	durationFlag(cmd, &waitTimeout, "wait-timeout", DefaultWaitTimeout,
 		"how long a --wait-until loop may run in total (0 waits indefinitely)")
 	return cmd
+}
+
+// isHTTPMethod reports whether a positional argument is a method rather than a
+// path: `ronja api GET /api/v2/...` is how an endpoint list writes a call.
+func isHTTPMethod(arg string) bool {
+	switch strings.ToUpper(arg) {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodOptions:
+		return true
+	}
+	return false
 }
 
 // parseWaitPlan validates the three --wait-* flags together, returning nil when

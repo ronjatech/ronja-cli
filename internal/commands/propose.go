@@ -18,7 +18,10 @@ import (
 )
 
 func newProposeCmd() *cobra.Command {
-	var noBrowser bool
+	var (
+		noBrowser bool
+		database  string
+	)
 	cmd := &cobra.Command{
 		Use:   "propose [dir]",
 		Short: "Ask the person you work for to approve these changes; changes nothing in Ronja itself",
@@ -28,6 +31,12 @@ that person approves it in Ronja.
 
   ronja propose            # the tree here
   ronja propose apps/      # another directory
+
+Agents: ship with ` + "`ronja propose`" + `. It is the recommended way for an agent
+to deploy apps, workflows, pipelines and database migrations: the person this
+login belongs to approves it in Ronja, and Ronja applies exactly what was
+uploaded. ` + "`ronja sync apply`" + ` and ` + "`ronja db migrate push`" + ` are for people and CI
+deploying directly, without asking anyone.
 
 It proposes the stack in ronja.json that points at the Ronja this credential
 signs in to; --stack <name> picks one when several do.
@@ -40,22 +49,57 @@ What it does:
 
   1. Plans the tree the way ` + "`ronja sync apply --dry-run --allow-create`" + ` does,
      with the same code, plus each migrations folder bound to a managed
-     database, the way ` + "`ronja db migrate status`" + ` does. It sends only reads.
+     database (or the one --database names), the way
+     ` + "`ronja db migrate status`" + ` does. It sends only reads.
   2. Uploads that plan and a copy of the directory: every file sync reads
      there, ronja.json and ronja.lock.json included. Nothing under a dot-name
      (.ronja/, .env, .git) and no credential is ever in the copy.
-  3. Prints what would be created and modified, and the link to approve it.
+  3. Prints what would be created and modified, the link to approve it, and
+     the ` + "`ronja propose wait <id>`" + ` that hears the outcome.
+
+After proposing, hand the person the link, then run
+` + "`ronja propose wait <id>`" + ` in the background: it ends when the list does, which
+wakes you with what happened, and you carry on. Pass no --timeout there: one
+only wakes you early to start it again. Without background commands,
+ask the person to say when they have approved, then run it in the foreground
+with --timeout under your tool's time limit (` + "`--timeout 9m`" + `), and again for as
+long as it says still deploying. On rejected, tell the person and ask what to
+change; on failed, tell them the reason, fix it, and propose again. When every
+folder that did not go live was sent for review, tell the person and do not
+propose again: an admin or a maintainer of its feature decides it in Ronja, and
+proposing again sends the same review.
 
 It refuses, and uploads nothing, when:
 
   - a folder is not adopted: Ronja has to keep its state, so a deploy can never
     create the same resource twice. Run ` + "`ronja sync adopt --stack <name>`" + ` once.
   - a folder would not apply cleanly: the dry run's own refusal is printed.
+    Each workflow, data app and module is planned as the copy the deploy
+    runs on, with no .ronja/, so what that deploy would refuse is refused
+    here: a folder whose stack records no live version (run
+    ` + "`ronja sync adopt`" + `), or whose recorded version live has moved past.
+    One exception: your own open draft of its row goes through, and the
+    person sees it when they approve. A colleague's module draft refuses.
+  - a database has more than 40 migrations pending: one push applies at most
+    40, so propose up to the one it names first, then the rest.
+  - with --stack, a database outside the Space that stack is for
+    (bind_space_mismatch, the check ` + "`ronja db migrate push --stack`" + ` makes), or
+    a migrations folder outside a git work tree, where no Space can be read.
+    Pass --database with a database in the stack's Space, from inside the
+    repository.
   - a folder names, by address, a folder outside the directory proposed: the
     copy would not hold it. Propose from a directory that holds both.
 
-To deploy directly, without asking anyone, run ` + "`ronja sync apply`" + ` and
-` + "`ronja db migrate push`" + ` yourself.`,
+A migrations folder is proposed for the database it remembers from its last
+push. For a first migration, or to name the database yourself, pass
+--database, as ` + "`ronja db migrate push --database`" + ` takes it:
+
+  ronja propose --database mdb-abc     # the one migrations/ folder here
+
+--database needs exactly one migrations folder holding .sql files under the
+directory proposed, and propose remembers nothing. propose sends every folder
+under the directory it is given, so run it from the folder that holds
+migrations/, not from a repository root holding folders that are not adopted.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dir := "."
@@ -71,7 +115,7 @@ To deploy directly, without asking anyone, run ` + "`ronja sync apply`" + ` and
 			if err != nil {
 				return err
 			}
-			report, err := runPropose(cmd.Context(), dir, resolved)
+			report, err := runPropose(cmd.Context(), dir, database, resolved)
 			if err != nil {
 				return err
 			}
@@ -87,7 +131,10 @@ To deploy directly, without asking anyone, run ` + "`ronja sync apply`" + ` and
 	}
 	cmd.Flags().StringVar(&flagStack, "stack", "",
 		"stack in ronja.json to propose a deploy of (default: the one matching this credential)")
+	cmd.Flags().StringVar(&database, "database", "",
+		"managed database id for the one migrations folder under [dir] (default: the folder's saved database)")
 	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "print the link without opening it")
+	cmd.AddCommand(newProposeWaitCmd())
 	return cmd
 }
 
@@ -152,7 +199,9 @@ type proposeMigration struct {
 	SQL  string `json:"sql"`
 }
 
-func runPropose(ctx context.Context, dir string, resolved *config.Resolved) (*proposeReport, error) {
+// database, when set, is the database for the one migrations folder under
+// dir, bound or not, in place of its binding.
+func runPropose(ctx context.Context, dir, database string, resolved *config.Resolved) (*proposeReport, error) {
 	base, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", dir, err)
@@ -178,7 +227,7 @@ func runPropose(ctx context.Context, dir string, resolved *config.Resolved) (*pr
 		}
 		plan.Folders = folders
 	}
-	migrations, err := planProposedMigrations(ctx, client, base, key)
+	migrations, err := planProposedMigrations(ctx, client, resolved, base, key, database)
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +366,15 @@ func proposeReadAllow(method, path string) bool {
 	return ok && ok2 && id != "" && !strings.Contains(id, "/")
 }
 
+// proposeGuardError is the refusal of a write planning tried to send, which
+// outranks err, or else err.
+func proposeGuardError(guard *api.ReadOnlyGuard, err error) error {
+	if blocked := guard.Blocked(); len(blocked) > 0 {
+		return fmt.Errorf("nothing was proposed: planning would have sent %s, which propose never sends. This is a bug in ronja worth reporting", strings.Join(blocked, ", "))
+	}
+	return err
+}
+
 // planProposedFolders is `ronja sync apply --dry-run --allow-create` on base,
 // in process, under a guard that refuses any write before it is sent. Every
 // folder has to plan as applied.
@@ -328,10 +386,10 @@ func planProposedFolders(ctx context.Context, base string, resolved *config.Reso
 	guard := &api.ReadOnlyGuard{Allow: proposeReadAllow}
 	gctx := withAddressCopyRoot(api.WithReadOnlyGuard(ctx, guard))
 	report, err := syncApplyTree(gctx, base, resolved)
-	if blocked := guard.Blocked(); len(blocked) > 0 {
-		return nil, fmt.Errorf("nothing was proposed: planning would have sent %s, which propose never sends. This is a bug in ronja worth reporting", strings.Join(blocked, ", "))
+	if err := proposeGuardError(guard, err); err != nil {
+		return nil, err
 	}
-	if err != nil {
+	if err := passOwnDrafts(gctx, api.New(resolved.URL, resolved.Token), report.Folders); err != nil {
 		return nil, err
 	}
 
@@ -365,23 +423,64 @@ func planProposedFolders(ctx context.Context, base string, resolved *config.Reso
 	return report.Folders, nil
 }
 
+// passOwnDrafts turns each folder refused only because the proposer's own
+// draft of its row is open (draft_open) into the update it would be once that
+// draft is gone: the person sees the draft when they approve, and the deploy
+// discards it. A workflow or data-app draft is always the caller's own; a
+// module has one draft, which is the proposer's only when they drafted it and
+// edited it last. Anyone else's stays refused, naming them.
+func passOwnDrafts(ctx context.Context, client *api.Client, folders []syncApplyFolderReport) error {
+	var me string
+	for i := range folders {
+		line := &folders[i]
+		if line.Verdict != verdictRefused || line.Reason != syncReasonDraftOpen || len(line.Units) != 1 || line.Units[0].Draft == nil {
+			continue
+		}
+		u := &line.Units[0]
+		d := u.Draft
+		if line.Kind == wfdir.KindModule {
+			if me == "" {
+				who, err := client.Me(ctx)
+				if err != nil {
+					return fmt.Errorf("ask who is proposing, to tell their own module draft from a colleague's: %w", err)
+				}
+				me = who.User.ID
+			}
+			if d.DrafterUserID != me || d.UpdatedBy != me {
+				line.Detail = fmt.Sprintf("module %s has an open draft (%s) that is not only yours: drafted by %s and last edited by %s at %s. Approving a change list never discards a colleague's draft: ask them to publish or discard it, then propose again",
+					u.ID, d.ID, orUnknown(d.DrafterUserID), orUnknown(d.UpdatedBy), d.UpdatedAt.UTC().Format(time.RFC3339))
+				continue
+			}
+		}
+		edited := d.UpdatedAt.UTC().Format(time.RFC3339)
+		u.Action = string(applyActionUpdate)
+		u.Detail = fmt.Sprintf("your open draft %s (last edited %s) is discarded when this list deploys", d.ID, edited)
+		line.Verdict, line.Reason = verdictApplied, ""
+		kind, _ := wfdir.KindByName(line.Kind)
+		line.Detail = fmt.Sprintf("would push and publish the %s once your open draft %s (last edited %s) is discarded", kind.Label, d.ID, edited)
+	}
+	return nil
+}
+
 // proposedMigrations is what planProposedMigrations found.
 type proposedMigrations struct {
 	// databases are the folders with migrations a push would apply, and dirs
 	// their absolute paths.
 	databases []proposeDatabase
 	dirs      []string
-	// bound counts every migrations folder with a binding file, notes say why
-	// one is not in the list.
+	// bound counts every migrations folder with a binding file, or the one
+	// --database names; notes say why one is not in the list.
 	bound int
 	notes []string
 }
 
 // planProposedMigrations finds every migrations folder under base bound to a
 // database on this instance and organization, and asks the database what a
-// push would apply, as `ronja db migrate status` does. A folder with nothing
-// pending is not part of the list.
-func planProposedMigrations(ctx context.Context, client *api.Client, base string, key wfdir.InstanceKey) (*proposedMigrations, error) {
+// push would apply, as `ronja db migrate status` does, after the Space check
+// `ronja db migrate push` makes with --stack. A folder with nothing pending is
+// not part of the list. With database, base must hold exactly one migrations
+// folder holding .sql files, bound or not, and it targets that database.
+func planProposedMigrations(ctx context.Context, client *api.Client, resolved *config.Resolved, base string, key wfdir.InstanceKey, database string) (*proposedMigrations, error) {
 	var dirs []string
 	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -392,6 +491,12 @@ func planProposedMigrations(ctx context.Context, client *api.Client, base string
 		}
 		if path != base && skipWalkDir(d.Name()) {
 			return fs.SkipDir
+		}
+		if database != "" {
+			if dbdir.HasMigrations(path) {
+				dirs = append(dirs, path)
+			}
+			return nil
 		}
 		if info, err := os.Stat(filepath.Join(path, dbdir.MigrationsDir)); err != nil || !info.IsDir() {
 			return nil
@@ -404,6 +509,9 @@ func planProposedMigrations(ctx context.Context, client *api.Client, base string
 	if err != nil {
 		return nil, err
 	}
+	if database != "" && len(dirs) != 1 {
+		return nil, oneMigrationsFolderError(base, dirs)
+	}
 
 	out := &proposedMigrations{bound: len(dirs)}
 	for _, dir := range dirs {
@@ -412,13 +520,16 @@ func planProposedMigrations(ctx context.Context, client *api.Client, base string
 			return nil, err
 		}
 		rel = filepath.ToSlash(rel)
-		binding, err := dbdir.Load(dir)
-		if err != nil {
-			return nil, err
-		}
-		databaseID, err := binding.DatabaseForStack(key, flagStack)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w — run `ronja db migrate status --database <id>` there to say which database it is", rel, err)
+		databaseID := database
+		if databaseID == "" {
+			binding, err := dbdir.Load(dir)
+			if err != nil {
+				return nil, err
+			}
+			databaseID, err = binding.DatabaseForStack(key, flagStack)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w — run `ronja db migrate status --database <id>` there to say which database it is", rel, err)
+			}
 		}
 		if databaseID == "" {
 			note := fmt.Sprintf("%s/%s is bound to a database on another instance or organization, so it is not part of this change list", rel, dbdir.MigrationsDir)
@@ -433,15 +544,23 @@ func planProposedMigrations(ctx context.Context, client *api.Client, base string
 			return nil, fmt.Errorf("%s: %w", rel, err)
 		}
 		guard := &api.ReadOnlyGuard{Allow: proposeReadAllow}
-		status, err := client.MigrationStatus(api.WithReadOnlyGuard(ctx, guard), databaseID, migrations, api.DefaultMigrationTimeout)
-		if blocked := guard.Blocked(); len(blocked) > 0 {
-			return nil, fmt.Errorf("nothing was proposed: planning would have sent %s, which propose never sends. This is a bug in ronja worth reporting", strings.Join(blocked, ", "))
+		gctx := api.WithReadOnlyGuard(ctx, guard)
+		if err := proposeGuardError(guard, checkDatabaseSpace(gctx, client, resolved, key, dir, databaseID, "proposed", false)); err != nil {
+			return nil, err
+		}
+		status, err := client.MigrationStatus(gctx, databaseID, migrations, api.DefaultMigrationTimeout)
+		if gerr := proposeGuardError(guard, nil); gerr != nil {
+			return nil, gerr
 		}
 		if err != nil {
 			return nil, fmt.Errorf("%s: the migration status of %s: %w", rel, databaseID, err)
 		}
 		if err := migrationDriftError(status); err != nil {
 			return nil, fmt.Errorf("nothing was proposed: %s: %w", rel, err)
+		}
+		if pending := status.Pending(); len(pending) > maxPendingPerPush {
+			return nil, fmt.Errorf("nothing was proposed: %s: %d migrations are not applied yet, and one push applies at most %d (they run in one transaction). Propose up to and including %s first (move the later files out of %s), then the rest, as `ronja db migrate push --help` describes",
+				rel, len(pending), maxPendingPerPush, pending[maxPendingPerPush-1].Name, filepath.ToSlash(filepath.Join(rel, dbdir.MigrationsDir)))
 		}
 		sql := make(map[string]string, len(migrations))
 		for _, m := range migrations {
@@ -458,6 +577,22 @@ func planProposedMigrations(ctx context.Context, client *api.Client, base string
 		out.dirs = append(out.dirs, dir)
 	}
 	return out, nil
+}
+
+func oneMigrationsFolderError(base string, dirs []string) error {
+	if len(dirs) == 0 {
+		return fmt.Errorf("nothing was proposed: --database names the database of the one %[1]s/ folder under %[2]s, and there is no %[1]s/ folder holding .sql files there. Run propose from the folder that holds %[1]s/", dbdir.MigrationsDir, base)
+	}
+	lines := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		rel, err := filepath.Rel(base, dir)
+		if err != nil {
+			rel = dir
+		}
+		lines = append(lines, "  "+filepath.ToSlash(filepath.Join(rel, dbdir.MigrationsDir)))
+	}
+	return fmt.Errorf("nothing was proposed: --database names the database of one %s folder, and %s holds %d. Run propose with --database from the folder that holds the one you mean:\n%s",
+		dbdir.MigrationsDir, base, len(dirs), strings.Join(lines, "\n"))
 }
 
 func countProposed(plan proposePlan) proposeCounts {
@@ -505,4 +640,5 @@ func printPropose(r *proposeReport) {
 		fmt.Fprintf(out, "  %s\n", r.URL)
 	}
 	fmt.Fprintf(out, "Nothing changes until %s approves it in Ronja.\n", r.Approver)
+	fmt.Fprintf(out, "To continue once it is decided, run: ronja propose wait %s   (agents: in the background)\n", r.ID)
 }

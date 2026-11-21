@@ -62,7 +62,7 @@ flow.`,
 			app, err := client.GetDataApp(cmd.Context(), appID)
 			if err != nil {
 				if api.StatusOf(err) == 404 {
-					return fmt.Errorf("no data app %s on %s that you can read", appID, resolved.URL)
+					return fmt.Errorf("no data app %s on %s that you can read — check the id, and `ronja whoami` for the instance and organization you are signed in to", appID, resolved.URL)
 				}
 				return err
 			}

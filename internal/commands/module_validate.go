@@ -37,7 +37,7 @@ this cannot see are whether the package name is free and whether you may write t
 the feature; ` + "`ronja module push`" + ` reports both.
 
 Exits non-zero when there are errors. With --json, one object listing them.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately not resolveInstance: nothing here talks to the
 			// server, so a signed-out caller is not refused, and the binding is

@@ -214,11 +214,14 @@ func run(args []string) int {
 	ctx, stop := signalContext()
 	defer stop()
 	code := 0
-	err := root.ExecuteContext(ctx)
+	err := refuseUnknownCommand(root, args)
+	if err == nil {
+		err = root.ExecuteContext(ctx)
+	}
 	if err != nil {
 		err = runtimeRefusalHint(err)
-		// Cobra has already printed the error for usage problems; this covers
-		// the RunE path. Keep it on stderr so --json output stays parseable.
+		// SilenceErrors leaves every error to this line, usage errors included,
+		// on stderr so --json output stays parseable.
 		if !errors.Is(err, errAlreadyReported) {
 			fmt.Fprintln(os.Stderr, "error:", err)
 		}
@@ -324,6 +327,12 @@ And a repository holds many folders, so one command asks about all of them:
                        have drifted — read-only, and a CI gate on its own
                        (0 clean, 1 drifted, 2 could not tell)
 
+An agent deploys with one command, the recommended way for an agent to ship:
+
+  ronja propose        ask the person this login belongs to for approval
+                       of a deploy of this directory's folders and
+                       migrations; Ronja deploys it when they approve
+
 Each login is stored as a named PROFILE — one instance, one organization, one
 token. An access token belongs to a single organization, so belonging to two
 means two profiles, and a local backend and production can be signed in at the
@@ -384,6 +393,11 @@ credentials entirely and never touch disk.`,
 		newContextCmd(), newEnvCmd(), newWorkflowCmd(), newDataAppCmd(),
 		newPipelineCmd(), newModuleCmd(), newAutomationCmd(), newBindCmd(), newSyncCmd(), newImportCmd(), newCopyCmd(),
 		newAPICmd(), newQueryCmd(), newDatabaseCmd(), newSecretCmd(), newTokenCmd(), newUpdateCmd(), newProposeCmd())
+	// Cobra adds these in Execute; adding them first lets guideMisuse and
+	// refuseUnknownCommand see them. Execute does not add them twice.
+	root.InitDefaultHelpCmd()
+	root.InitDefaultCompletionCmd()
+	guideMisuse(root)
 	return root
 }
 

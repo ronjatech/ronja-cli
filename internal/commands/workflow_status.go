@@ -36,7 +36,7 @@ Read-only: no draft is created and nothing is written. Run it from anywhere
 inside the folder.
 
 With --json, one object carrying all of the above.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what changed locally, which is most of the value and costs
@@ -474,8 +474,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 	// would announce a refusal that is not going to happen. A row that
 	// reported no runtime at all (an older instance) is the other case with
 	// nothing to compare.
-	if f.Manifest.Runtime != 0 && target.RuntimeVersion > 0 &&
-		f.Manifest.RuntimeVersion() != target.RuntimeVersion {
+	if runtimeDiffers(f.Manifest, target) {
 		// The same two refusals checkRuntimeDrift makes: a downgrade, and a
 		// raise that lands on retired 2.
 		refused := f.Manifest.RuntimeVersion() < target.RuntimeVersion ||

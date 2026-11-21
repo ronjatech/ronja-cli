@@ -55,7 +55,7 @@ approve, because a module edit fans out to every workflow that imports it.
 Publishing is a separate step:
 
   ronja module publish             commit the draft, or submit it for review`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(false)
 			if err != nil {
@@ -98,6 +98,8 @@ type modulePushOptions struct {
 	// `sync apply` sets it and nothing else does; a single-folder `module push`
 	// still checks a draft out. See moduleNothingLiveHolds.
 	LiveFirst bool
+	// Apply is pushOptions.Apply for a module.
+	Apply bool
 }
 
 // modulePushResult is the --json shape and the human renderer's input, so the
@@ -330,9 +332,10 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 	if !result.Created {
 		head = readHeadAgreement(ctx, moduleHeadReader(client), f, existing.Module.IdentityID(),
 			existing.AnchoredDraft())
-		verdict, err := checkModuleDrift(f, identity, remoteFiles, local, opts.Force, head)
+		verdict, err := checkModuleDrift(f, identity, remoteFiles, local, opts.Force, head,
+			driftAsk{draft: result.DraftPreexisted, apply: opts.Apply})
 		if err != nil {
-			return refuseUnwritten(err)
+			return refuseUnwritten(beyondDraftOpen(f, identity, err))
 		}
 		// The TITLE's own leg (name_attr.go's titleLeg), against the committed
 		// applied title as well as the local baseline: moduleMetadataDriftOf
@@ -817,7 +820,7 @@ func resolveModulePushTarget(ctx context.Context, client *api.Client, f *folder,
 // inconsistency: the files come from the row the push writes to (the draft),
 // and `identity` is the row whose metadata a push would change (the live one,
 // or the module itself while it is unpublished). See moduleIdentityRow.
-func checkModuleDrift(f *folder, identity *api.Module, remote, local map[string]string, force bool, head headAgreement) (driftVerdict, error) {
+func checkModuleDrift(f *folder, identity *api.Module, remote, local map[string]string, force bool, head headAgreement, ask driftAsk) (driftVerdict, error) {
 	baseline := f.State.For(f.Baseline())
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
@@ -882,6 +885,7 @@ func checkModuleDrift(f *folder, identity *api.Module, remote, local map[string]
 		// and every colleague's `git clone` looks like, and without the committed
 		// anchor the only way through would be --force, which ALSO disarms the
 		// per-file preconditions.
+		// See BL-3370.
 		if head.Vouches() {
 			noteHeadAnchored(identity.ID, head.Current)
 			// Armed on the REMOTE listing rather than bypassed: the anchor
@@ -903,11 +907,11 @@ func checkModuleDrift(f *folder, identity *api.Module, remote, local map[string]
 		// — so the wording says whose work is at stake rather than assuming it is
 		// the reader's.
 		if head.Recorded != "" && head.Recorded == head.Current {
-			return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and module %s already has an open draft there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  A module has ONE draft, so it may be a colleague's: look at it first. `ronja module discard` throws it away and pushes onto the live version, and push --force overwrites it",
-				f.Resolved.URL, f.Binding.ModuleID, wfdir.LockName)
+			return driftVerdict{}, draftOpenRefusal{fmt.Errorf("this folder has no sync baseline for %s, and module %s already has an open draft there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  A module has ONE draft, so it may be a colleague's: look at it first. `ronja module discard` throws it away and %s",
+				f.Resolved.URL, f.Binding.ModuleID, wfdir.LockName, draftOpenRemedy(ask))}
 		}
-		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the module already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the module into a fresh folder to get one, or push --force to overwrite the remote files with what you have here%s",
-			f.Resolved.URL, len(remote), f.pullHint("  "))
+		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the module already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  %s",
+			f.Resolved.URL, len(remote), noBaselineRemedy(f, ask, head, "Clone the module"))
 	}
 	return driftVerdict{}, fmt.Errorf("the draft changed on the server since your last sync — pushing would overwrite it:\n%s  Run `ronja module status` to see the detail, or push --force to overwrite%s",
 		driftSummary(drift, meta), f.pullHint("  "))

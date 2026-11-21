@@ -78,7 +78,7 @@ each table last held, and the definition each metric last held, are in the
 committed ronja.lock.json, so a fresh clone still compares against the live rows
 and can exit non-zero. Only your own open draft reads as unknown there, and the
 report says so.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what changed locally, which is most of the value and costs

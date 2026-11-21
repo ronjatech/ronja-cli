@@ -90,7 +90,7 @@ pushed has none, and is reported as not checked rather than as broken.
 
 With --json, the same answer as one object with every reference in it, carrying
 a stable "verdict" field: exit codes do not survive a wrapper script.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately NOT resolveInstance, for the reason `sync status` is
 			// not: a signed-out caller still gets the walk, and still gets the one
@@ -238,7 +238,7 @@ func (r *syncCheckReport) exitError() (err error) {
 		return withExitCode(syncExitDrifted, fmt.Errorf("%s — see above%s", strings.Join(parts, "; "), r.droppedHatch()))
 	case verdictUnknown:
 		if r.Summary.Folders == 0 {
-			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s — nothing was checked, which is not the same answer as nothing being wrong",
+			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s — nothing was checked, which is not the same answer as nothing being wrong; run this from the tree's root, or pass --dir <tree>",
 				wfdir.ManifestName, r.Dir))
 		}
 		return withExitCode(syncExitUnknown, fmt.Errorf("%d of %d %s could not be fully checked — see above; this is not the same answer as every reference resolving",

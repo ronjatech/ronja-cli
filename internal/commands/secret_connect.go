@@ -257,7 +257,7 @@ func alreadyConnected(granted, requested []string, replace bool) bool {
 // valid service names or the allowed scopes.
 func connectInitiateError(err error) error {
 	if api.StatusOf(err) == http.StatusForbidden && (api.WireCodeOf(err) == api.InsufficientScopeCode || scopeDenied(err)) {
-		return errors.New("this login's token cannot write secrets (needs secrets:write)")
+		return errors.New("this login's token cannot write secrets (needs secrets:write) — use a token that has it; `ronja login` stores one that acts with your full permissions")
 	}
 	return err
 }

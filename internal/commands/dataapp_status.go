@@ -38,7 +38,7 @@ Read-only: no draft is created and nothing is written. Run it from anywhere
 inside the folder.
 
 With --json, one object carrying all of the above.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what changed locally, which is most of the value and costs

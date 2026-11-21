@@ -200,14 +200,25 @@ type WorkflowApprovalGate struct {
 }
 
 // WorkflowFile mirrors rdb.WorkflowFile — one source file of one workflow row.
-// There is no content hash on the wire, so the CLI hashes Content itself.
+// A text file carries no content hash on the wire, so the CLI hashes Content
+// itself. A `.jar` carries Binary instead, and its Content is always empty: its
+// bytes are read with DownloadWorkflowJar.
 type WorkflowFile struct {
-	ID         string    `json:"id"`
-	WorkflowID string    `json:"workflowID"`
-	Path       string    `json:"path"`
-	Content    string    `json:"content"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	ID         string              `json:"id"`
+	WorkflowID string              `json:"workflowID"`
+	Path       string              `json:"path"`
+	Content    string              `json:"content"`
+	CreatedAt  time.Time           `json:"createdAt"`
+	UpdatedAt  time.Time           `json:"updatedAt"`
+	Binary     *WorkflowFileBinary `json:"binary,omitempty"`
+}
+
+// WorkflowFileBinary mirrors rdb.WorkflowFileBinary: a binary file's bytes by
+// their lowercase hex sha256 and size, which is also the digest the server
+// checks a jar's baseSha256 against.
+type WorkflowFileBinary struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 // Normalize replaces nil binding slices with empty ones.

@@ -277,6 +277,9 @@ func (o apiOutput) buffered() bool {
 // always gets the response verbatim, --jq writes the filtered view to stdout,
 // and the unfiltered body reaches stdout only when neither claimed it.
 func (o apiOutput) emit(ctx context.Context, resp *api.RawResponse, method, path string) error {
+	if err := o.refuseWebAppPage(resp.Status, resp.Header, method, path); err != nil {
+		return err
+	}
 	if !o.buffered() {
 		return o.emitStreaming(resp, method, path)
 	}
@@ -404,7 +407,7 @@ var errWaitTimeout = errors.New("wait timed out")
 // satisfying response, rebuilt from the bytes the condition was tested against
 // so the caller's normal emit path handles it. Each polled body is capped like
 // any buffered one.
-func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, error) {
+func (r apiRequest) wait(ctx context.Context, plan waitPlan, out apiOutput) (*api.RawResponse, error) {
 	if plan.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, plan.timeout)
@@ -426,10 +429,20 @@ func (r apiRequest) wait(ctx context.Context, plan waitPlan) (*api.RawResponse, 
 			return nil, fmt.Errorf("read response from %s %s: %w", r.method, r.path, readErr)
 		}
 
+		if err := out.refuseWebAppPage(status, resp.Header, r.method, r.path); err != nil {
+			return nil, err
+		}
 		// An HTTP error ends the wait: a 404 is a wrong path, not "not ready
 		// yet". 429 and 5xx reach here only once --retry is spent or unset.
 		if status >= 400 {
-			os.Stdout.Write(body)
+			if out.out != "" {
+				if err := writeResultFile(out.out, string(body)); err != nil {
+					return nil, err
+				}
+				fmt.Fprintf(os.Stderr, "  %d bytes written to %s\n", len(body), out.out)
+			} else {
+				os.Stdout.Write(body)
+			}
 			fmt.Fprintf(os.Stderr, "HTTP %d %s %s (while waiting)\n", status, r.method, r.path)
 			return nil, errAlreadyReported
 		}

@@ -331,9 +331,41 @@ the answer.
 Neither one moves the line on discovery. There is still no `list`, no `browse`,
 no `delete`: finding out what exists stays on plain HTTP behind `/llms.txt`.
 
+### When a command fails
+
+Every usage error says what to do next, and its first line is cobra's own, so a
+script matching it keeps working, with two exceptions. A command given an
+existing folder as its argument says to run it there (the folder hint below) in
+place of cobra's `unknown command` or arity line. A malformed time value
+(`--timeout abc`) keeps pflag's `invalid argument "abc" for "--timeout" flag:`
+and ends with the CLI's own `not a length of time — give seconds (600) or a
+duration with a unit (10m, 1h30m)` in place of Go's `time: invalid duration
+"abc"`. The lines after the first come from one pass in
+`internal/commands/misuse.go` over the whole tree, so a new command gets them
+without code of its own:
+
+- **too many or too few arguments**: `usage: <the command's usage line>` and
+  `see 'ronja <command> --help'`, each unless the error already carries it. A
+  validator that already says more (the folder hint, `--jq` swallowing a flag,
+  the retired `--env`) keeps its text first and gains both lines;
+- **an unknown flag**: the nearest flag the command takes (edit distance 2,
+  `--json`/`--profile`/`--url` included), then the `--help` pointer. A flag
+  missing its value, or given a bad one, shows that flag's own help;
+- **a mistyped verb under a group** (`ronja wf stauts`): `unknown command ... —
+  did you mean "status"? Run 'ronja workflow --help' for its commands`, exit 1.
+  A bare group (`ronja wf`) still prints its help and exits 0. `ronja help
+  <path>` and `ronja <group> help <path>` are held to the same rule: a real
+  path prints help and exits 0, a mistyped one (`ronja help wf stauts`,
+  `ronja help tabel`) is refused like the command itself, exit 1;
+- **an unknown top-level command**: cobra's "Did you mean this?" and one line
+  saying the commands sync folders and every other call goes through
+  `ronja api`.
+
+`TestEveryCommandGuidesOnMisuse` walks the tree and holds every command to this.
+
 **Nor is there a `ronja mcp` verb.** An AI assistant that should *answer*
-questions from an organization's data connects to the backend's MCP endpoint
-(`POST /api/v2/mcp`, read-only tools) with the Personal Access Token
+questions from an organization's data, or reach the API without a shell,
+connects to the backend's MCP endpoint (`POST /api/v2/mcp`) with the Personal Access Token
 `ronja login` minted — loaded, never printed: the client config names
 `${RONJA_TOKEN}` and the client is started after `eval "$(ronja env)"`. Recipe:
 `backend/lib/api/openapi/guides/mcp.md` (served at `/docs/api/guides/mcp.md`);
@@ -1419,15 +1451,17 @@ Listing and revoking tokens stay on `ronja api`
 ## Requests (`ronja api`)
 
 ```
-ronja api [flags] <path>
+ronja api [flags] [METHOD] <path>
 ```
 
 An authenticated request runner. The path is joined to the resolved instance
-and the credential is attached; nothing else is interpreted.
+and the credential is attached; nothing else is interpreted. The method may come
+first, as an endpoint list writes it (`ronja api GET /api/v2/...`), in any case;
+it is the same as `-X`, and the two together are refused when they disagree.
 
 ```bash
 ronja api /api/v2/authentication/me
-ronja api -X POST /api/v2/feature -d '{"name":"Sales","scope":"private"}'
+ronja api POST /api/v2/feature -d '{"name":"Sales","scope":"private"}'
 ronja api -X POST /api/v2/feature -d @feature.json
 cat feature.json | ronja api -X POST /api/v2/feature -d @-
 
@@ -1456,11 +1490,11 @@ ronja api "/api/v2/workflow/run/$runID/head" \
 
 | Flag | Does |
 |---|---|
-| `-X`, `--method` | HTTP method. Defaults to GET, or **POST when a body is given** — curl's rule, for curl's reason. Upper-cased for you. |
+| `-X`, `--method` | HTTP method, or give it as the first argument. Defaults to GET, or **POST when a body is given** — curl's rule, for curl's reason. Upper-cased for you. |
 | `-d`, `--data` | Request body. `@file` reads a file, `@-` reads stdin, anything else is the literal string. A `@file` is **streamed from disk** at whatever size the instance accepts; a `@-` body comes off a pipe, so it is held in memory and capped at **16 MiB**. A `@path` that is not a plain file — a FIFO, `/dev/fd/N` from process substitution, a character device — is **read into memory** on the same terms as stdin, and capped the same way: it has no size that says what reading it would yield and cannot be re-opened for a retry, so buffering it is what makes it replay-safe and bounded. Only a **directory** is refused, having no bytes to send at all. `--timeout` bounds the whole request, upload included, so raise it — or pass `--timeout 0` — for a large file. |
 | `-F`, `--form` | A `multipart/form-data` part: `name=value` for a literal, `name=@path` for a file (`@-` reads stdin). Repeatable. Mutually exclusive with `-d`, and at most one thing in the whole command may read stdin. Same rule as `-d`: a file streams from disk at any size, a pipe — and any path that is not a plain file — is read into memory and capped at 16 MiB, only a directory is refused, and `--timeout` bounds the upload as well as the answer. Each file part is opened when the encoder reaches it and closed at its end, so an N-file form holds one descriptor, not N. |
 | `-H`, `--header` | `"Name: value"`, repeatable. Repeats of one name are sent as repeats, not collapsed. A `Host:` header is honoured (copied onto `req.Host`) — net/http takes the Host line from there and silently **drops** a `Host` key in the header map, so setting it without that step would do nothing at all. |
-| `--timeout` | How long to wait for **one request**, response body included — the deadline rides on the body's `Close`, not on the request returning. Default 2m; `0` waits as long as it takes; negative is refused. Same semantics and the same `httpFor` plumbing as `ronja query --timeout` (below). |
+| `--timeout` | How long to wait for **one request**, response body included — the deadline rides on the body's `Close`, not on the request returning. Default 2m; `0` waits as long as it takes; negative is refused. A bare number is seconds (`600`, `1.5`), or give a unit (`10m`, `1h30m`) — true of every `--timeout`, `--wait-timeout` and `--wait-interval` in the CLI. Same semantics and the same `httpFor` plumbing as `ronja query --timeout` (below). |
 | `--retry` | Retry a **429 or 5xx** this many times, honouring `Retry-After` (both the seconds and the HTTP-date form), else exponential backoff capped at 30s. Default 0. A 4xx is never retried — that is the server saying the *request* was wrong. Transport failures are not retried either: a connection that dropped mid-request may well have delivered it. |
 
 `-F` exists because the upload endpoints are multipart-only, so without it the
@@ -1539,6 +1573,19 @@ The field it reads is the API-wide error shape (the same one
 drift. A body that is not JSON — a CSV, a zip — has no envelope and is never
 turned into a failure.
 
+**A web-app page is refused, not printed.** A path outside the API (`/tables/<id>`,
+`/v2/table`) is a page of the web app, and the instance answers it with the app's
+HTML and a 200. An HTML answer for any path outside `/api/`, `/service-api/`,
+`/docs/` and `/llms.txt` (judged on the path with its query string dropped and
+dot segments cleaned, as the server routes it) exits 1 with `<path> is a page of
+the web app, not an API endpoint — API paths start with /api/v2/; find the one
+you need in /docs/api/endpoints.md`, and prints no body. On an error status (a
+load balancer's 502 page) it says `HTTP <code> <method> <path> answered with an
+HTML page (not printed)` with the same next step. `--out` still saves it: that is
+an explicit request for the file. HEAD is never refused: it has no body to
+print. A `--wait-until` loop judges each answer the same way, before its own
+error branch, and on an error status writes the body to `--out` when given.
+
 `--out` and `--jq` compose: the file gets the response **verbatim**, stdout gets
 the filtered view. That is what each flag plainly means, so combining them makes
 neither one lie.
@@ -1580,8 +1627,8 @@ why removing the cap cost nothing. Constants and calibration live in
 | Flag | Does |
 |---|---|
 | `--wait-until` | Re-send the request until this jq condition holds. **GET and HEAD only.** |
-| `--wait-interval` | Pause between attempts. Default 3s, and **exact** — it does not back off. A caller who names a cadence has said what they want. Must be positive. |
-| `--wait-timeout` | Bound on the loop as a whole. Default 5m; `0` waits indefinitely. |
+| `--wait-interval` | Pause between attempts, in seconds (`5`) or with a unit (`500ms`). Default 3s, and **exact** — it does not back off. A caller who names a cadence has said what they want. Must be positive. |
+| `--wait-timeout` | Bound on the loop as a whole, in seconds (`600`) or with a unit (`10m`). Default 5m; `0` waits indefinitely. |
 
 This is the shape the doctrine explicitly makes room for: a stateful multi-step
 loop HTTP does badly. Ronja is full of asynchronous state machines — workflow
@@ -1664,7 +1711,7 @@ round trip.
 | `--jq` | Filter the **envelope** through a jq expression — `rowCount`, `truncated`, `zoneUsed`, `error`, not the rows (those are CSV, and jq does not read CSV). Refused together with `--json`: two contradictory descriptions of stdout, and either precedence would silently discard a flag someone typed on purpose. Same rule and bounds as `ronja api --jq`: every matched value or a failure, under the input-scaled work and memory budget and a 10 s deadline. |
 | `-r`, `--raw` | With `--jq`, print string results unquoted. Refused without it. |
 | `--max-rows` | `maxRows` on the request. Omitted means the server's default cap; the server clamps anything above its ceiling. |
-| `--timeout` | How long to wait for the query. Default 2m; `0` waits as long as it takes; negative is refused. |
+| `--timeout` | How long to wait for the query, in seconds (`600`) or with a unit (`10m`). Default 2m; `0` waits as long as it takes; negative is refused. |
 
 `--jq` filters the *decoded* envelope re-encoded, not the raw response — by that
 point it is already a `QueryResult`. That is not a lossy round trip: the struct
@@ -1748,6 +1795,7 @@ ronja db sql <database-id> "INSERT INTO leads (email) VALUES (\$1)" --params '["
 
 ronja db migrate status --database <database-id>
 ronja db migrate push   --database <database-id>
+ronja propose           --database <database-id>   # agents: ask the person to approve
 
 # reach it from outside Ronja, with your own Postgres tools
 eval "$(ronja db env <database-id>)" && pg_dump -Fc > dump.pgc
@@ -1762,6 +1810,18 @@ perfectly well, so there is deliberately no `db list` / `db create` /
 
 `db env` and `db connect` are a different kind of thing again — see
 "psql and pg_dump" below.
+
+**Agents: ship a migration with `ronja propose`, not `push`.** Run it in the
+folder that holds `migrations/`. It applies nothing: it uploads the pending
+migrations as a change list, the person whose sign-in this is sees the database
+and each migration's SQL in Ronja, and their **Approve and deploy** applies
+exactly that SQL as them, refusing one whose SQL changed since. `db migrate
+status` names the command, with the same `--database`, `--stack` and folder,
+whenever a migration is pending and no more than 40 are, the most one push
+applies (on stderr; `--json` is unchanged). `push` is
+the direct path, for people and CI. The assistant must use an Admin's sign-in,
+as for any migration: with anyone else's, `propose` refuses a migrations folder
+before uploading anything. See [Asking for approval: `ronja propose`](#asking-for-approval-ronja-propose).
 
 **Every command runs on the database you name.** To try a migration or a write
 without touching live data, run it against a dev Space's own database first —
@@ -1906,10 +1966,12 @@ libpq 16 or newer.
 other schemas, so a whole-database `pg_dump` of such a database fails on the
 first object in one; restrict it to `public`.
 
-**Two refusals, deliberately distinct.** *"This organization has no psql proxy
-configured, or your role is not admin"* means there is no proxy block to work
-from — the server does not distinguish the two causes, so neither does the
-message. *"No read role Ronja can use"* means the proxy is there and the login
+**Two refusals, deliberately distinct.** No proxy block to work from has two
+causes the server does not distinguish, so the CLI reads your role to pick one:
+a non-admin is told to ask an admin (every `db` command is admin-only), an
+admin that the organization has no psql proxy configured and to use
+`ronja db sql`. When your role cannot be read, the message names both. *"No
+read role Ronja can use"* means the proxy is there and the login
 would authenticate before being refused; mint one with
 
 ```
@@ -2301,6 +2363,51 @@ and `pipeline` share one manifest format:
   one organization**.
 
 - **`stacks` and `ronja.lock.json`.** See **Stacks** below.
+
+### JDBC driver jars (`.jar`)
+
+A Python workflow's folder may hold the `.jar` files of a JDBC driver, such as
+`drivers/pvjdbc2.jar`, which its code connects through with `tools.connectJdbc`
+(`/docs/api/guides/workflow-runtime.md`). A `.jar` is the one binary file a
+workflow folder may hold, and it is synced as its bytes, never as text:
+
+- **`push`** uploads a jar (`Content-Type: application/java-archive`) only when
+  its sha256 differs from the server's, so a second push uploads nothing. It
+  deletes the jars you removed from the folder **before** it uploads any, so a
+  renamed driver (`x-42.7.3.jar` → `x-42.7.4.jar`) fits the total below. A jar
+  that changes on disk while a push runs is refused unsent ("changed while this
+  push was running; run it again"). `validate`, and push's validate step, send a
+  jar as its path, sha256 and size, never its bytes. On a shared workflow the
+  push is a draft for review, as for any code change.
+- **`pull` and `clone`** download every jar (`?raw=1`, then the signed link it
+  redirects to, which is fetched without your token) and check its sha256 and
+  size **before writing anything**: a failed download leaves the folder, its
+  baseline and its manifest as they were, and a failed `clone` creates no folder.
+  Pull's report names a jar by its sha256s and size (`replaced
+  drivers/pvjdbc2.jar (sha256 a1b2c3d4e5f6… → 9f8e7d6c5b4a…, 1.2 MB)`), never as a
+  text diff.
+- **`status`**, the drift guard and `publish` compare a jar by its sha256, the
+  same digest on both sides. `propose` carries a jar's bytes in the change list,
+  and `sync apply` uploads them.
+- **The caps**, checked before any request: each `.jar` at most 20 MB, all of a
+  workflow's jars together at most 25 MB and at most 64 of them, and a file at a
+  `.jar` path must be a jar (its bytes start with the zip signature). The server also refuses a jar on
+  a JavaScript workflow.
+
+**Commit the jars, in a private repository, with the rest of the folder.**
+Never git-ignore them: `push` deletes from the workflow whatever the folder
+lacks, so a teammate's checkout without the jar would remove it from the
+workflow. If a vendor's licence forbids keeping the jar in a repository, manage
+that workflow from chat instead of from a folder.
+
+**A folder cloned or pulled by an older CLI** holds an empty file where each jar
+is, because the older CLI wrote the jar's (empty) text. Pushed back by that
+older CLI, the empty file changes nothing on the server, so the jar survives;
+editing it is refused there ("a `.jar` is saved as bytes, not text; update your
+ronja CLI"). This CLI refuses to push such a folder, naming each empty `.jar` as
+the placeholder an older CLI wrote. The fix is a fresh `ronja wf clone` of the
+workflow, which fetches the jars themselves. An older CLI cannot push a folder
+holding a real jar: its own check refuses the binary file by name.
 
 ### JavaScript workflow folders
 
@@ -2797,6 +2904,18 @@ The verbs:
 | `run` | runs the LIVE workflow this folder is bound to and polls to completion. Takes no workflow id | `--param k=v`, `--follow`, `--timeout`, `--logs` |
 | `discard` | deletes your draft; the live workflow and your local files are untouched. A workflow that has never been published *is* its draft, so removing it needs `--delete-workflow` (a soft delete — it sits in the trash for 30 days) | `--yes`, `--delete-workflow` |
 
+Every verb but `init` and `clone` works on the folder you are in, and takes no
+folder argument. Given one that exists (`ronja wf status ./sync-meta`), it says
+`ronja workflow status reads the folder you are in — run it there: cd ./sync-meta
+&& ronja workflow status`; anything else keeps cobra's "unknown command". The
+rule holds across the CLI: a verb that takes no arguments, given an existing
+folder, says to run it there, and one that takes its folder as `--dir` (`ronja
+sync status`, `ronja db migrate status`) says to pass it there. Given the folder
+you are in (`ronja wf push .`), either says to drop the argument, and a path that
+needs quoting is shell-quoted in the `cd` and `--dir` forms alike. The command does not run in the folder for
+you, because its other flags (`--out`, `-d @file`) take paths relative to where
+you are.
+
 Four behaviours are deliberate and easy to undo by accident:
 
 - **Push validates first.** The file-save path derives bindings from every file
@@ -2870,9 +2989,17 @@ Four behaviours are deliberate and easy to undo by accident:
   is not recorded anywhere the CLI can read. The clone says so and records
   nothing, rather than an anchor that could never match.
 - **`--write-live` on test, and no y/N prompt.** A draft checked out from a live
-  workflow inherits its output tables, and there is no test sandbox, so running
-  it replaces a production table. A prompt would get muscle-memoried; a flag
-  nobody types by accident does not. A workflow that binds no output tables yet
+  workflow inherits its output tables, and a test run writes the live tables
+  whatever the workflow's own parameters (a mode, a dry-run switch) say, so
+  running it replaces a production table. The refusal says whose tables they
+  are from the folder's own record, with no lookup: on a stack that records a
+  Space, they are that Space's tables (`These tables are in Space <label>, the
+  Space stack "<name>" deploys to …`), and `--write-live` writes them there. On
+  a stack that records none, they are live, and the refusal lists the folder's
+  stacks that record a Space (`ronja wf test --stack <name>`), or points to the
+  dev-Space guide when there are none (see **Two stacks of one organization**).
+  `--write-live` stays the flag for writing tables on purpose. A prompt
+  would get muscle-memoried; a flag nobody types by accident does not. A workflow that binds no output tables yet
   — before you push a `{{ write }}` marker — runs without it; the save path
   re-derives the bindings on every push, so a converted script that writes a
   table needs the flag from its first push, published or not. An approval-gated
@@ -3489,18 +3616,37 @@ not obvious enough to lose by accident:
   baseline would green-light a run of the live version the author stopped looking
   at two commands ago. The staleness check cannot see that; only "you have a
   draft, `wf test` runs it, publish or discard first" can.
-- **Then staleness, against live.** With no draft in play the baseline *is* the
+- **Then: is this folder what is live?** First against live itself: `run` lists
+  the live row's files, and a folder that holds exactly them (the same paths and
+  bytes) and whose `ronja.json` asks no change of live's settings (entrypoint,
+  runtime, parameters, packages) runs, whatever its baseline says. That is
+  push's own rule for a folder with no baseline, so the two agree on what "this
+  folder is live" means. It is what lets an agent run what its `ronja propose`
+  list just deployed: the deploy ran on a copy, so the folder's baseline still
+  describes the row before it. `wf status` keeps listing such a file as changed,
+  locally and on the server, until the next push or pull records a baseline;
+  nothing needs pulling. The listing is the one the write gate below then
+  checks, so the gate validates exactly the files compared.
+- **Then staleness, against the baseline**, when the folder is not live's (or the
+  listing failed, which is never a pass). With no draft in play the baseline *is* the
   live row — `publish` and `discard` both refresh it from live — so the ordinary
-  local-changes comparison answers "live is not this folder". A baseline it
+  local-changes comparison answers "live is not this folder". The changes that
+  refusal lists are the folder against live's listing when there is one (a
+  baseline behind live would list files live already holds), then each
+  `ronja.json` setting that differs, named, in push's own words where push
+  would refuse it (a lower runtime, another language). A baseline it
   cannot compare refuses rather than guesses: "I cannot tell" has to stop a live
   run, because the claim this command makes is that it ran the code in front of
   you. That is **two refusals with two messages**, not one: *no baseline at all*
-  is a copy taken from git and the remedy is a fresh `clone`, while *a baseline
-  naming another row* is the review path — `publish` on a shared workflow
-  submits the draft and returns without re-anchoring, so once an admin or a
-  maintainer commits it the folder names a draft that is gone and holds files that are usually
-  exactly what went live. Telling that author to re-clone a perfectly good
-  folder is what the split exists to stop.
+  is a copy taken from git, while *a baseline naming another row* is the review
+  path — `publish` on a shared workflow submits the draft and returns without
+  re-anchoring, so once an admin or a maintainer commits it the folder names a
+  draft that is gone. With live's listing in hand, either is reached only by a
+  folder that differs from live, so both list those differences and say that
+  `push` and `publish` take them live if they are the author's edits and that
+  `pull --dry-run` shows live's side; a re-clone there would run live's code and
+  drop the edits. The fresh `clone` remedy is what is left when live could not
+  be read.
 - **Then the write gate, in an adopted folder**, over the LIVE row's code as
   the server holds it — the code that is about to run, which a republish may
   have changed since this folder synced — exactly as `wf test` gates the draft.
@@ -4601,11 +4747,24 @@ so `Orders` and `orders` land as `Orders.sql` and `orders-2.sql` — a folder th
 round-trips on a case-insensitive filesystem too. `Slug` itself is deliberately
 unchanged.
 
-### Refs are id-form, and that is enforced
+### Refs: three readable forms, stored as ids
 
-Tables reference each other with `{{ ref('table-…') }}`, and the CLI derives each
-table's declared `inputModels` from the id-shaped refs in the file on **every**
-write. Adding an upstream is therefore editing the SQL and nothing else.
+A `{{ ref }}` names a table one of three ways, and the push resolves each to the
+table's id before the SQL is written:
+
+| Form | Names |
+|---|---|
+| `{{ ref('orders') }}` | a **sibling file**, `orders.sql` in this folder. The sibling wins over a declared name, and on a first push it resolves once that file's own create has returned |
+| `{{ ref('Sales.orders') }}` | a table outside the folder, by a name declared under `dependencies` in `ronja.json` and bound to a table per stack (see **Dependencies**) |
+| `{{ ref('table-…') }}` | the table's **id** |
+
+A name that is none of these — an undeclared `Sales.orders` or a bare `orders`
+with no sibling — is refused, because the server would store the id and the file
+would read as drifted for ever (see the alias refusals under **Dependencies**).
+The row stores the id form, and every remote read is turned back into the
+folder's names. The CLI derives each table's declared `inputModels` from the
+resolved refs on **every** write. Adding an upstream is therefore editing the
+SQL and nothing else.
 
 It never omits the field. Server-side derivation fires only when the effective
 declared list is empty, and a checked-out draft inherits its parent's non-empty
@@ -4775,6 +4934,22 @@ live table is untouched, the remaining files are still attempted, and the comman
 exits non-zero. The per-file `--json` `outcome` vocabulary is `pushed`,
 `build_failed`, `refused`, and a caller that read `build_failed` as "nothing
 happened" would discard a draft holding their work.
+
+**The summary ends with the failed files.** Each file's reason prints as the
+push reaches it, which in a long folder is far above the last line. So the
+summary error — `pipeline push`, `pipeline publish` and `automation push` alike —
+keeps its count sentence as the first line and then lists each failed file with
+the first line of its reason, at most 20, then `and N more`:
+
+```
+error: 1 of 4 file(s) did not land:
+    orders_daily.sql: Binder Error: column "region" is ambiguous
+```
+
+`--json`'s top-level `error` carries the same text, so a prefix match on the
+count sentence still holds. The human report ends with the count sentence alone,
+having printed each file's block above it, and `sync apply`'s `detail` is the
+count sentence alone too: its units carry each file's outcome.
 
 **A conflict is machine-readable here too.** A file whose write was refused by
 the server's code precondition — somebody edited that draft between this push's
@@ -5089,8 +5264,11 @@ created under, or an alias a stack binds to a metric that already exists. A file
 may also declare `"name": "…"`, which manages the metric's name on the same
 rule as a table's `-- @name` (see **Names are declared attributes**) and is the
 name a new metric is created under; absent, the name is stamped once and never
-written again. The name is not part of the definition's fingerprint, so a file
-that only gained a `"name"` still stages the rename. `recipe.source` resolves exactly as a `{{ ref }}`
+written again, and the create says so on stderr: `Note: metrics/aov.json —
+created as "aov", after its file; add "name" to the file to give it a display
+name (a later push renames it in place)`. The name is not part of the
+definition's fingerprint, so a file that only gained a `"name"` still stages the
+rename. `recipe.source` resolves exactly as a `{{ ref }}`
 does — a sibling `.sql` stem first, then a declared alias, then a literal
 `table-…` id — which is what lets one committed folder define the same number in
 several organizations.
@@ -6856,6 +7034,7 @@ prints, so the preview and the run cannot disagree about what apply will attempt
 | `would_create` | nothing is bound to this unit — a `.sql` file, a `metrics/*.json` file, an automation `.json`, or a draft-kind folder — so a push would MAKE a row. There is no delete verb to undo one (cascade and purge are `HumanOnly`), and a CI runner that discards its checkout loses the created ids in `ronja.lock.json` and creates again next run — unless the folder is ADOPTED, whose ids the server keeps (see "Server-side state: adopted folders"), so a lost lock is never a create there |
 | `no_drift_anchor` | an automation the folder is bound to and has never recorded agreeing with. An empty `LockAutomation.UpdatedAt` disarms **both** guards at once, so the write would overwrite whatever moved AND flip `enabled` false→true on a row somebody paused during an incident |
 | `manifest_rewrite` | acting here would rewrite a committed `ronja.json` — `adoptStack` adopting a stranded lock stack, or `Manifest.Record` dropping an `instances[]` entry superseded by the **named** stack. Migration stays a per-folder act somebody watched |
+| `draft_open` | a workflow, data-app or module folder with no local baseline (a fresh checkout, CI, a change list's copy), whose recorded live version is still live's, while a draft of its row is open: nothing here can say what the draft holds. Reported only when the draft is all that refuses: what the push would still refuse with the draft gone (the title rule against live, a workflow's runtime or language, an app's entrypoint) is reported as `not_deployed` instead. A dry run's unit carries `draft` (`id`, `updatedAt`, and for a module `drafterUserID` and `updatedBy`); the real apply's line names the draft in its detail. `draft_open` was split out of `not_deployed`: a script that matched `not_deployed` for this refusal should match both. Discard the draft (`ronja wf discard`, `app discard`, `module discard`) and apply again; `ronja propose` lets your own draft through for the approval to show. A checkout with a local baseline is not refused for its own pushed draft: the push compares the draft with the baseline |
 | `orphaned_file` | rename detection: a table, metric or automation this stack binds whose file is gone, with no `moved` or `removed` entry covering it. Apply never infers a rename (which would be a create plus an orphan) or a delete from a missing file; the single-folder pipeline push only NOTES it |
 | `address_unresolved`, `address_stack_mismatch`, `address_not_adopted`, `address_folder_unreadable`, `address_not_written` | a dependency declared by address did not resolve for this stack — see "Dependencies by address" under `ronja bind`. Under `--allow-create` an address whose row the same run deploys is deferred instead (below) |
 | `writes_outside_target` | an ADOPTED folder would write outside its stack's feature through something no write source of that stack binds — a docs sidecar's table prose included — see "The write gate". At plan time for a workflow or app the run would create (so a refused folder leaves no row behind), for a pipeline's docs sidecars, and for every folder in a `--dry-run`; inside the push for every write |
@@ -6867,6 +7046,7 @@ prints, so the preview and the run cannot disagree about what apply will attempt
 | `name_taken` | under `--allow-create`, the target feature already holds a live workflow, app, module or automation of this unit's kind and name, so the create would twin it. The refusal names the row: record its id for the stack in `ronja.lock.json` (`"workflowID"`, `"dataAppID"`, `"moduleID"`, or the automation file's `"automationID"`) and apply again to adopt it, or rename one of the two |
 | `space_mismatch`, `bind_space_mismatch`, `address_space_mismatch` | a stack that declares a Space would deploy outside it — see "Two stacks of one organization: a Dev Space and Main" |
 | `space_header_unsupported`, `space_unavailable`, `space_not_selectable` | `unknown`: the CLI cannot act in the Space a folder's stack records — the instance does not honour the Space header, the person cannot enter the Space, or the credential is an organization API token — see "A stack's requests carry its Space" |
+| `lookup_failed` | `unknown`, in a dry run: a read the preview needs for a workflow, data-app or module folder (its row, its files, its open draft, its version history) did not answer, so nothing can say what the apply would do. Run it again |
 | `address_conflict` | the folder's `moved` / `removed` cannot be applied to this stack: an old file still on disk, a removed file still on disk, both ends of a move already bound, a table moved without its `checks/<stem>.json`, or `moved` below format 5. A folder that could not be READ while evaluating them is `unreadable` instead |
 
 **Dependency order, and a fresh stack in one apply** (`sync_apply_order.go`).
@@ -7202,13 +7382,19 @@ previews as it always did) — does the live row already hold the folder
 (`liveHoldsFolder`, by the same `*RowHoldsFolder` parity functions as
 `pushNothingLiveHolds` and its twins; reads only) — and reports such a unit
 `unchanged` with the line "nothing to push or publish", or the line "would push
-and publish the …" when live differs. When live differs, a workflow or data
-app with a local baseline and no draft open is then asked the drift guard apply
-asks before its checkout (`compareWithLive` → `checkDrift` / `checkAppDrift`),
-and a folder that guard refuses is `refused` (`not_deployed`, exit 1) with the
-apply's own refusal as its detail — "the live … changed in Ronja since stack
-… last applied it", or the re-pointed binding over an older CLI's baseline.
-That is exact as of the read, and it is
+and publish the …" when live differs. When live differs, the folder is then
+asked what apply's push asks before its first write, through the push's own
+functions (`compareWithLive` → `checkDrift` / `checkAppDrift` /
+`checkModuleDrift`, then the title rule), of the row the push would write to:
+your open draft when there is one, else live, with the committed head anchor
+read. With or without a local baseline, a draft open or not: a dry run is
+`refused` exactly when apply would refuse, with the apply's own refusal as its
+detail — "the live … changed in Ronja since stack … last applied it", "has
+been published to since this folder last agreed with it", "this folder has no
+sync baseline", a title renamed elsewhere, or the re-pointed binding over an
+older CLI's baseline — under `not_deployed` (exit 1), or under `draft_open`
+when the only thing that refuses is an open draft of the row in a folder with
+no local baseline. That is exact as of the read, and it is
 one of the two places `unchanged` (`applyActionUnchanged`) appears: the
 decision apply executes never carries it. The other is a **pipeline** or
 **automation** folder (classic or adopted — apply runs both LiveFirst), compared
@@ -7281,9 +7467,24 @@ ronja propose --json   # the same report, as data
 ```
 
 `propose` asks the person you work for (the person whose token this is) to
-approve a deploy. **It changes nothing in Ronja itself.** It is the verb an
-agent runs where `sync apply` would be blocked: the agent proposes, the person
-approves in Ronja, and their click runs the deploy in Ronja, as them.
+approve a deploy. **It changes nothing in Ronja itself.** It is **the
+recommended way for an agent to deploy**, migrations included, and the verb it
+runs where `sync apply`, a publish or `db migrate push` would be blocked: the
+agent proposes, the person approves in Ronja, and their click runs the deploy
+in Ronja, as them.
+
+```bash
+ronja propose --database <database-id>   # a migrations folder, for that database
+```
+
+A migrations folder is proposed for the database it remembers from a direct
+`push` (with `--stack`, that stack's). `--database` names one instead, the
+way it does for `db migrate`, which a first migration on a new database
+needs. It takes exactly one migrations folder holding `.sql` files under the
+directory proposed, bound or not, and refuses zero or several, naming them. `propose` itself
+remembers nothing. It sends every folder under the directory named, so run it
+from the folder that holds `migrations/`, not from a repository root whose app
+folders are not adopted.
 
 What it does:
 
@@ -7301,8 +7502,31 @@ What it does:
      back, so only a folder whose ids Ronja keeps is safe from creating its
      resources twice. The refusal names `ronja sync adopt --stack <name>`.
    - any folder's verdict is not `applied`: the dry run's own reason and
-     detail are printed, by folder. A change list has to plan cleanly.
+     detail are printed, by folder. A change list has to plan cleanly. Each
+     workflow, data app and module folder is planned **as the copy the deploy
+     runs on**, which has no `.ronja/`: the push's own overwrite check and
+     title rule are asked with no local baseline, so whatever the approved
+     deploy would refuse is refused here first, with its remedy. That includes
+     a folder whose stack records no live version (`ronja sync adopt` records
+     it) and one whose recorded version live has moved past. A folder with a
+     local baseline is also asked as itself, so a change this checkout knows
+     was made on live since its last sync is refused too.
+   - one exception: **your own open draft** of a folder's row (`draft_open`).
+     A workflow's or data app's draft is always yours; a module's one draft is
+     yours only when you drafted it and edited it last. Such a folder is
+     uploaded as an `update` whose detail reads "your open draft <id> (last
+     edited <time>) is discarded when this list deploys". The approval page
+     names the draft again, and the deploy discards it only if it is still
+     exactly as the page showed it. A colleague's module draft still refuses,
+     naming them and the draft.
    - a migration has drifted, as `db migrate status` would say.
+   - a database has more than 40 migrations pending, which one push refuses:
+     the refusal names the 40th, to propose up to and including first.
+   - with `--stack`, a database outside the Space that stack is for
+     (`bind_space_mismatch`, the check `db migrate push --stack` makes), or a
+     migrations folder outside a git work tree, where no Space can be read.
+     The way out is a `--database` in the stack's Space, not dropping
+     `--stack`, which would plan the folders for another stack.
    - a folder names by address (`"from"`) a folder **outside the directory
      proposed**, even inside one git repository: `address_outside_repository`.
      The copy holds only that directory. Propose from one that holds both.
@@ -7318,11 +7542,66 @@ What it does:
    upload only from a person's own sign-in (a plain API token is refused), and
    refuses it while that person already has 20 lists waiting for other folders.
 4. **Prints** the counts ("2 modified, 1 created, 1 database migration"), the
-   link to the change list, and "Nothing changes until <person> approves it in
-   Ronja." It exits 0. At a terminal it opens the link (`--no-browser` does
-   not). When nothing would change it uploads nothing and says so. When the
-   instance is busy receiving other change lists it answers 429, and propose
-   says nothing was proposed and to run it again in a few seconds.
+   link to the change list, "Nothing changes until <person> approves it in
+   Ronja.", and the next step, "To continue once it is decided, run: ronja
+   propose wait <id>   (agents: in the background)". It exits 0 at once,
+   without waiting. At a terminal it opens the link (`--no-browser` does
+   not). When nothing would change it uploads nothing and says so, with no
+   wait line. When the instance is busy receiving other change lists it
+   answers 429, and propose says nothing was proposed and to run it again in a
+   few seconds.
+
+### Waiting for the outcome: `ronja propose wait`
+
+```bash
+ronja propose wait changelist-…                # in the background: until the list ends
+ronja propose wait changelist-… --timeout 9m   # in the foreground, under a tool time limit
+ronja propose wait changelist-… --json         # {id, status, reason, result, expiresAt, decidedAt, finishedAt}
+```
+
+`wait` reads the list (`GET /api/v2/change-list/:id?omit=plan`, so never its
+SQL) until it ends, and prints what happened. It only reads: it never
+approves, rejects or deploys, and stopping it leaves the list as it is.
+
+| The list ends | `wait` prints | Exit |
+|---|---|---|
+| deployed | each folder deployed, and each database's count of migrations applied | 0 |
+| deploy failed | the reason, where it stopped (`before_write` nothing was written; `migrations` a migration failed, so no folder deployed; `sync` every migration applied, folders partly deployed), each refusal by folder and path, any folder sent for review instead ("sent for review, not live": the deploy reports it `refused` with reason `submitted_for_review`, which fails the list at `sync`), and "propose again: what already deployed plans as unchanged"; when every folder that did not go live was sent for review, it says so instead: an admin or a maintainer of its feature decides it in Ronja, and proposing again sends the same review | 1 |
+| rejected | the note; nothing was deployed (Ronja does not record who rejected it: the person it was proposed for, or an admin) | 1 |
+| expired | the reason: nobody approved it within a day, or it was replaced by a newer list, with the `wait` command for that list | 1 |
+| still open at `--timeout` | "still waiting for approval" or "still deploying", and the command to run again | 1 |
+
+**An agent runs it in the background**, with no `--timeout`, so the command's
+end wakes it with the outcome (a timeout only wakes it early to start again). An agent that cannot run a command in the background asks the person
+to say when they have approved, then runs `wait` with a `--timeout` under its
+tool's limit, and again for as long as it says still deploying.
+
+It checks every 10 seconds for the first 10 minutes, then every 60 seconds
+while the list waits for approval, and every 10 seconds while it deploys.
+Progress goes to stderr once per status change ("Waiting for <person> to
+approve change list <id> (expires <time>)…", "Approved; deploying…"); the
+outcome goes to stdout. Without `--timeout` it waits until the list ends,
+which Ronja guarantees within a day of proposing, plus the deploy. `--json`
+leaves out a key with no value.
+
+It also ends, with exit 1:
+
+- when a list is still pending 5 minutes past its expiry, or still deploying 5
+  minutes past the 20 minutes Ronja allows a deploy, by Ronja's clock (the
+  answer's `Date` header), not this machine's: Ronja has not closed it,
+  and the wait says it will not deploy (pending) or that Ronja cannot say what
+  landed (deploying);
+- when Ronja has not answered (a network error, a connection lost part-way
+  through an answer, `429`, `5xx`) for 5 minutes,
+  counted from the first failed read of an unbroken run, so a laptop that slept
+  does not end it on its first read; it names the last error and says to run
+  `wait` again;
+- at once on `401`, `403` or `404`, with the server's message, and on an answer
+  that does not decode, naming `ronja api /api/v2/change-list/<id>`;
+- on Ctrl-C or SIGTERM, saying it stopped waiting, the list is unaffected, and
+  the command that picks it up again.
+
+A directory named `wait` is proposed as `ronja propose ./wait`.
 
 **What the person sees** in Ronja: who proposed it, the stack, what is created
 (with the feature each create goes into), modified, and removed from a folder
@@ -7892,9 +8171,35 @@ that declares the stack: it mints an id where there is none (the one write to
 in one batch (each row reports its own outcome — `claimed`, `already_claimed`,
 or `refused` with the server's code), and records the lock's anchors on the
 claims, so the very first lock-less run is guarded. A folder that refuses does
-not stop the others. It is idempotent: run again, it claims nothing and writes
-nothing. Commit `ronja.json`. A legacy `instances[]` folder has no stack to adopt
+not stop the others. Run again, it records a live version and title the lock is still missing
+(below) in `ronja.lock.json`, and otherwise claims nothing and writes nothing. Commit `ronja.json`. A legacy `instances[]` folder has no stack to adopt
 into; name one first (`--stack <name> push`).
+
+**`adopt` records the live version a workflow, data-app or module folder
+holds** when the stack records none (`headVersionID`, the version a push from a
+checkout with no `.ronja/` is held to), into `ronja.lock.json` and onto the
+claim, but only when it can prove the folder descends from it: the live row
+holds the folder exactly, or this checkout's `.ronja/` baseline was taken from
+the live row and nothing on live changed since this checkout last synced with
+it, except to what this folder already holds (the push's drift check against
+that baseline is clean, and live's title is one the folder knows, by the
+title rule with no recorded version vouching for it). With the version it
+records live's title as the stack's applied title, so a change list that
+renames the row deploys. It reads the version before and after live's row and
+files and records nothing if they differ. Otherwise the folder's line carries
+a note saying why nothing was recorded and what to do: adopt again from a
+checkout that last synced with live, or set your change aside,
+`ronja <kind> pull`, put the change back and commit; a row never published
+has no live version, and the note says to publish it once
+(`ronja <kind> publish`) and adopt again. Without a recorded version, a change
+list's deploy of the folder would refuse "no sync baseline", so `ronja propose`
+refuses it first, and `sync apply`'s refusal names `ronja sync adopt` and
+`ronja propose` rather than a re-clone or `--force`. Adopting again fills a
+missing version, so commit `ronja.lock.json` too
+(`TestAdoptRecordsTheLiveVersionTheFolderHolds`,
+`TestAdoptRecordsNothingItCannotProve`, `TestReadoptFillsAMissingVersion`,
+`TestAdoptedFolderRenamesThroughAChangeList`,
+`TestAdoptNamesTheFirstPublishForANeverPublishedRow`).
 
 **`unmanage`** goes serious → classic. First it writes every `ok` claim's row
 and anchor into the lock, and the folder anchor's docs-sidecar baselines, and
@@ -8803,7 +9108,7 @@ and Main" under Stacks):
 
    ```bash
    ronja sync apply --stack dev --allow-create      # --allow-create only the first time
-   (cd workflows/region-report && ronja wf test --stack dev)
+   (cd workflows/region-report && ronja wf test --stack dev --write-live)   # writes the dev Space's tables
    (cd apps/region-board && ronja app test --stack dev)
    ```
 

@@ -183,7 +183,7 @@ func refuseUnworkableApp(app *api.DataApp) error {
 	case api.LifecycleArchived:
 		return fmt.Errorf("data app %s is archived — restore it from the web UI first", app.ID)
 	default:
-		return fmt.Errorf("data app %s has lifecycle %s, which this command does not work with",
+		return fmt.Errorf("data app %s has lifecycle %s, which this command does not work with — `ronja update` may know it",
 			app.ID, api.DescribeLifecycle(app.Lifecycle))
 	}
 }

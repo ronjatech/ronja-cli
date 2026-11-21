@@ -37,6 +37,8 @@ type echoServer struct {
 	// status and body are the answer. Zero status means 200.
 	status int
 	body   string
+	// contentType is the answer's Content-Type; empty means application/json.
+	contentType string
 
 	// script overrides status/body per request, in order, with the LAST entry
 	// repeating forever. That is what makes both "it becomes ready on the third
@@ -87,7 +89,11 @@ func newEchoServer(t *testing.T) *echoServer {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		w.Header().Set("Content-Type", "application/json")
+		contentType := e.contentType
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		w.Header().Set("Content-Type", contentType)
 		for name, values := range e.replyHeader {
 			for _, v := range values {
 				w.Header().Add(name, v)

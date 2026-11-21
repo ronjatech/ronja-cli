@@ -1034,3 +1034,17 @@ func TestDocsResultTellsNoReportFromNoColumnsSent(t *testing.T) {
 		t.Errorf("an empty carrier printed %q", line)
 	}
 }
+
+// The pipeline help names every ref form, not only the id: an agent reading
+// it writes what it says.
+func TestPipelineHelpNamesTheThreeRefForms(t *testing.T) {
+	long := newPipelineCmd().Long
+	for _, want := range []string{"{{ ref('orders') }}", "a sibling file", "{{ ref('Sales.orders') }}", `"dependencies"`, "{{ ref('table-abc') }}", "resolved to the table's id"} {
+		if !strings.Contains(long, want) {
+			t.Errorf("pipeline help does not mention %q", want)
+		}
+	}
+	if strings.Contains(long, "id-form") {
+		t.Error("pipeline help still says refs are id-form")
+	}
+}

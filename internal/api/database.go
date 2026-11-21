@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"net/url"
 	"time"
 )
 
@@ -51,7 +52,7 @@ type DatabaseSQLResult struct {
 // DatabaseSQL runs one statement against a managed database.
 func (c *Client) DatabaseSQL(ctx context.Context, databaseID string, in DatabaseSQLInput, timeout time.Duration) (*DatabaseSQLResult, error) {
 	var out DatabaseSQLResult
-	if err := c.do(ctx, timeout, "POST", "database/"+databaseID+"/sql", in, &out); err != nil {
+	if err := c.do(ctx, timeout, "POST", "database/"+url.PathEscape(databaseID)+"/sql", in, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -127,7 +128,7 @@ func (r *MigrationSetResult) Pending() []MigrationResult {
 // ApplyMigrations applies (or, with DryRun, plans) an ordered migration set.
 func (c *Client) ApplyMigrations(ctx context.Context, databaseID string, in MigrationSetInput, timeout time.Duration) (*MigrationSetResult, error) {
 	var out MigrationSetResult
-	if err := c.do(ctx, timeout, "POST", "database/"+databaseID+"/migrations", in, &out); err != nil {
+	if err := c.do(ctx, timeout, "POST", "database/"+url.PathEscape(databaseID)+"/migrations", in, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -173,7 +174,7 @@ type DatabaseProxy struct {
 // DatabaseConnectionInfo reads a managed database's connection details.
 func (c *Client) DatabaseConnectionInfo(ctx context.Context, databaseID string) (*DatabaseConnection, error) {
 	var out DatabaseConnection
-	if err := c.Do(ctx, "GET", "database/"+databaseID+"/roles", nil, &out); err != nil {
+	if err := c.Do(ctx, "GET", "database/"+url.PathEscape(databaseID)+"/roles", nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -190,7 +191,7 @@ type Database struct {
 // GetDatabase reads one managed database.
 func (c *Client) GetDatabase(ctx context.Context, databaseID string) (*Database, error) {
 	var out Database
-	if err := c.Do(ctx, "GET", "database/"+databaseID, nil, &out); err != nil {
+	if err := c.Do(ctx, "GET", "database/"+url.PathEscape(databaseID), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

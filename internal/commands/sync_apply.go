@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
@@ -47,6 +48,10 @@ publish, against the stack you name, so what comes out is LIVE.
 
 It only updates rows that exist; --allow-create also makes the new ones, after
 saying how many. --dir picks the tree (default: here).
+
+Agents: ship with ` + "`ronja propose`" + `, the recommended way for an agent to
+ship a tree of adopted folders; the person this login belongs to approves it in
+Ronja, which then deploys it as them.
 
 ORDER. Folders deploy in dependency order, which the report names: modules;
 pipelines, a folder whose table another reads by address before the one that
@@ -137,7 +142,7 @@ folder refused. A unit that could not be compared stays "update" and says why.
 A folder whose lock names a row Ronja holds no claim for says how many claims
 apply records (no row changes for them). Every answer is as of the dry run's
 reads: the organization can move before the apply.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// resolveInstance, NOT config.Resolve: unlike `status` and `check`,
 			// this command ACTS. There is no useful degraded answer for a dead
@@ -299,6 +304,9 @@ type syncApplyUnitReport struct {
 	// its units live. Absent in a dry run, and where the instance did not answer.
 	Outcome       string `json:"outcome,omitempty"`
 	OutcomeDetail string `json:"outcomeDetail,omitempty"`
+	// Draft is the open draft a draft_open unit names, which a deploy would
+	// have to discard first.
+	Draft *openDraft `json:"draft,omitempty"`
 }
 
 // Unit outcomes of a real apply.
@@ -359,7 +367,7 @@ func (r *syncApplyReport) exitError() (err error) {
 			r.Summary.Refused, r.Summary.Folders, plural(r.Summary.Folders, "folder"), verb))
 	case verdictUnknown:
 		if r.Summary.Folders == 0 {
-			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s — nothing was deployed, which is not the same answer as nothing needing to be",
+			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s — nothing was deployed, which is not the same answer as nothing needing to be; run this from the tree's root, or pass --dir <tree>",
 				wfdir.ManifestName, r.Dir))
 		}
 		return withExitCode(syncExitUnknown, fmt.Errorf("%d of %d %s could not be deployed or ruled out — see above; this is not the same answer as everything being live",
@@ -1080,6 +1088,8 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 		// as a wrapped error is indistinguishable from a definite refusal here, so
 		// this narrows the lie rather than closing it.
 		unknown(syncReasonUnanswered, "%s", err.Error())
+	case errors.As(err, new(draftOpenRefusal)):
+		refuse(syncReasonDraftOpen, "%s", err.Error())
 	case err != nil:
 		// A push or publish that did not land is a DEFINITE negative: it was
 		// attempted and the server answered. Exit 1, beside the local refusals,
@@ -1121,6 +1131,13 @@ const (
 	// the two need opposite actions: one is somebody's to fix, the other is
 	// somebody's to approve.
 	syncReasonSubmittedForReview = "submitted_for_review"
+	// syncReasonDraftOpen — a workflow, data-app or module folder with no local
+	// baseline, whose recorded live version is still live's, while a draft of
+	// its row is open: nothing here can say what the draft holds. Its own
+	// reason, not folded into not_deployed, because it is the one refusal a
+	// change list carries to its approval: `ronja propose` lets the proposer's
+	// own draft through, and the unit names it (syncApplyUnitReport.Draft).
+	syncReasonDraftOpen = "draft_open"
 	// syncReasonWouldCreate — a creation unit with no row behind it. See
 	// syncApplyGate.
 	syncReasonWouldCreate = "would_create"
@@ -1152,6 +1169,18 @@ const (
 	// and the detail names both.
 	syncReasonTagsNotApplied = "tags_not_applied"
 )
+
+// summaryOf is a pipeline or automation loop's failure as its result's one-line
+// summary, for the folder's detail: the failed-file list the loop's error ends
+// with is in the folder's units already. A loop that sets a summary returns an
+// error of that same text, wrapping nothing, so only the list is dropped.
+func summaryOf(result interface{ failureSummary() string }, err error) error {
+	summary := result.failureSummary()
+	if summary == "" || err == nil {
+		return err
+	}
+	return errors.New(summary)
+}
 
 // checksNotAppliedAfter folds the checks legs of a push and a publish into the
 // folder's error, naming the tables that WERE published. nil when both legs
@@ -1287,11 +1316,12 @@ func describeAttempt(kind wfdir.Kind, decisions []applyDecision) string {
 }
 
 // describeAgainstLive sharpens a dry run's line for an adopted workflow,
-// data-app or module folder whose one unit is an update: it reads the live row and makes
-// the comparison apply makes first (liveHoldsFolder), so the line says what
+// data-app or module folder whose one unit is an update: it reads the live row
+// and asks what the apply's push asks (compareWithLive), so the line says what
 // apply would do rather than what it would attempt — nothing, when live
-// already holds the folder, and a push and publish when it does not. Reads
-// only. A read that fails leaves the line as describeAttempt wrote it.
+// already holds the folder; the push's own refusal, when its overwrite check
+// or title rule refuses; else a push and publish. Reads only. A read that
+// fails leaves the line as describeAttempt wrote it.
 func describeAgainstLive(ctx context.Context, plan *plannedFolder) {
 	line, f := &plan.line, plan.f
 	switch f.Kind.Name {
@@ -1320,17 +1350,23 @@ func describeAgainstLive(ctx context.Context, plan *plannedFolder) {
 	if !f.adoptedHere() || len(plan.pending) > 0 || len(line.Units) != 1 || line.Units[0].Action != string(applyActionUpdate) {
 		return
 	}
-	held, refusal, err := compareWithLive(ctx, f, true)
+	c, err := compareWithLive(ctx, f, true)
 	switch {
 	case err != nil:
+		line.Verdict, line.Reason, line.Detail = verdictUnknown, syncReasonLookupFailed, err.Error()
 		return
-	case refusal != nil:
-		// The apply's own refusal before its checkout (its drift guard, or an
+	case c.draftOpen():
+		refuseUnit(&line.Units[0], syncReasonDraftOpen, fmt.Sprintf("draft %s is open, last edited %s", c.draft.ID, c.draft.UpdatedAt.UTC().Format(time.RFC3339)))
+		line.Units[0].Draft = c.draft
+		line.Verdict, line.Reason, line.Detail = verdictRefused, syncReasonDraftOpen, c.refusal.Error()
+		return
+	case c.refusal != nil:
+		// The apply's own refusal (its overwrite check, its title rule, or an
 		// unpublished module's rename), in the words the apply would use.
-		refuseUnit(&line.Units[0], syncReasonNotDeployed, "refused by apply before its checkout — the folder's line says why")
-		line.Verdict, line.Reason, line.Detail = verdictRefused, syncReasonNotDeployed, refusal.Error()
+		refuseUnit(&line.Units[0], syncReasonNotDeployed, "refused by apply before its first write — the folder's line says why")
+		line.Verdict, line.Reason, line.Detail = verdictRefused, syncReasonNotDeployed, c.refusal.Error()
 		return
-	case held:
+	case c.held:
 		line.Units[0].Action = string(applyActionUnchanged)
 		line.Detail = fmt.Sprintf("nothing to push or publish: the live %s already holds this folder", f.Kind.Label)
 	default:
@@ -1429,12 +1465,12 @@ func applyFolder(ctx context.Context, f *folder, out *applyFolderOut) (detail st
 		switch {
 		case pushErr == nil:
 		case ctx.Err() != nil:
-			return "", created, false, notes, pushErr
+			return "", created, false, notes, summaryOf(push, pushErr)
 		case errors.As(pushErr, &pushTags):
 			pushChecks = pushTags.checks
 		case errors.As(pushErr, &pushChecks):
 		default:
-			return "", created, false, notes, pushErr
+			return "", created, false, notes, summaryOf(push, pushErr)
 		}
 		// Nothing to push AND nothing staged. With a draft recorded the publish
 		// still has work — an earlier run's, whose commit never landed — and
@@ -1470,7 +1506,7 @@ func applyFolder(ctx context.Context, f *folder, out *applyFolderOut) (detail st
 		// checks applied after them did not.
 		var pubChecks *checksNotAppliedError
 		if pubErr != nil && !errors.As(pubErr, &pubChecks) {
-			return "", created, false, notes, pubErr
+			return "", created, false, notes, summaryOf(published, pubErr)
 		}
 		// A TAG change is deployed by the push itself — tags sit on the live
 		// metric and are not drafted — so it is said here, where "no draft was
@@ -1531,7 +1567,7 @@ func applyFolder(ctx context.Context, f *folder, out *applyFolderOut) (detail st
 		created, written := countAutomationWrites(push)
 		out.automationFiles(push)
 		if pushErr != nil {
-			return "", created, false, notes, pushErr
+			return "", created, false, notes, summaryOf(push, pushErr)
 		}
 		if push.UpToDate {
 			return applyNothingToPush, created, false, notes, nil
@@ -1584,7 +1620,7 @@ func applyFolder(ctx context.Context, f *folder, out *applyFolderOut) (detail st
 		// The workflow arm's shape on the module loop — its own arm, because the
 		// `default:` below runs the WORKFLOW push. There is no validate to run: a
 		// module is marker-free, and the push's local guards are its whole check.
-		push, pushErr := runModulePush(ctx, f, modulePushOptions{LiveFirst: true})
+		push, pushErr := runModulePush(ctx, f, modulePushOptions{LiveFirst: true, Apply: true})
 		if push != nil && push.Created {
 			created = 1
 		}

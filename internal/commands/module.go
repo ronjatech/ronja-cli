@@ -122,7 +122,7 @@ func refuseUnclonableModule(m *api.Module) error {
 	case api.LifecycleArchived:
 		return fmt.Errorf("module %s is archived — restore it from the web UI first", m.ID)
 	default:
-		return fmt.Errorf("module %s has lifecycle %s, which this command does not work with",
+		return fmt.Errorf("module %s has lifecycle %s, which this command does not work with — `ronja update` may know it",
 			m.ID, api.DescribeLifecycle(m.Lifecycle))
 	}
 }

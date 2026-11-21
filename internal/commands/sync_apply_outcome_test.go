@@ -73,8 +73,8 @@ func TestSyncApplyChecksNotAppliedKeepsTheTablesApplied(t *testing.T) {
 
 	out, _ := runCLI(t, tree, "sync", "apply", "--stack", "prod", "--json")
 	line := applyFolderLine(t, applyReportOf(t, out), "sales")
-	if line.Reason != syncReasonChecksNotApplied {
-		t.Fatalf("line = %+v", line)
+	if line.Reason != syncReasonChecksNotApplied || strings.Contains(line.Detail, "\n") {
+		t.Fatalf("line = %+v, want checks_not_applied on one line", line)
 	}
 	for _, u := range line.Units {
 		if strings.HasSuffix(u.Path, ".sql") && u.Outcome != unitOutcomeApplied {

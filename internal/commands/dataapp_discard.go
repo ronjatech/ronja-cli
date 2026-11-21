@@ -34,7 +34,7 @@ most often one that failed to compile. Your local files are kept either way, and
 the folder is unbound so a later push creates a fresh app.
 
 Asks for confirmation on a terminal; --yes is required without one.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(yes)
 			if err != nil {

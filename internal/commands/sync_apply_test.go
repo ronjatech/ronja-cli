@@ -1494,8 +1494,8 @@ func TestSyncApplyDoesNotCallAnUnansweredWriteNotDeployed(t *testing.T) {
 		t.Fatalf("exit = %d (%v), want %d\n%s", code, err, syncExitUnknown, out)
 	}
 	folder := applyFolderLine(t, applyReportOf(t, out), filepath.Base(root))
-	if folder.Verdict != verdictUnknown || folder.Reason != syncReasonUnanswered {
-		t.Fatalf("folder = %+v, want %s/%s", folder, verdictUnknown, syncReasonUnanswered)
+	if folder.Verdict != verdictUnknown || folder.Reason != syncReasonUnanswered || strings.Contains(folder.Detail, "\n") {
+		t.Fatalf("folder = %+v, want %s/%s on one line", folder, verdictUnknown, syncReasonUnanswered)
 	}
 }
 

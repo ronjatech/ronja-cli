@@ -160,7 +160,7 @@ Mint one with:
 	bindRetiredEnvFlag(cmd, &env)
 	cmd.Flags().IntVar(&maxRows, "max-rows", 0,
 		"maximum rows to return (default: the server's cap)")
-	cmd.Flags().DurationVar(&timeout, "timeout", api.DefaultDatabaseSQLTimeout,
+	durationFlag(cmd, &timeout, "timeout", api.DefaultDatabaseSQLTimeout,
 		"how long to wait for the statement (0 waits as long as it takes)")
 	return cmd
 }

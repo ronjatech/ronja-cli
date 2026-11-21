@@ -72,7 +72,7 @@ It refuses, rather than guessing, when:
     silently stop one. --prune obeys the
     drift guard too — a row somebody has been editing is the last one to delete
     because a file went missing`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(false)
 			if err != nil {
@@ -91,6 +91,7 @@ It refuses, rather than guessing, when:
 			if result != nil {
 				result.ManagedInGit = f.notices
 				if flagJSON {
+					result.Error = errorLine(result.Error, err)
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
 					}
@@ -447,9 +448,20 @@ func runAutomationPush(ctx context.Context, f *folder, opts automationPushOption
 		if hint := f.pullHint(""); hint != "" && slices.ContainsFunc(result.Files, func(r automationFileResult) bool { return r.drift }) {
 			result.Error += fmt.Sprintf(" — what changed on the server since this folder last applied it is taken into the folder with `%s pull` (then commit it)", f.Kind.Command)
 		}
-		return result, fmt.Errorf("%s", result.Error)
+		return result, fmt.Errorf("%s%s", result.Error, listFailedFiles(result.failedFiles()))
 	}
 	return result, nil
+}
+
+// failedFiles are the files behind the summary's count.
+func (r *automationPushResult) failedFiles() []failedFile {
+	var out []failedFile
+	for _, file := range r.Files {
+		if file.Outcome == automationOutcomeRefused {
+			out = append(out, failedFile{file.Path, file.Error})
+		}
+	}
+	return out
 }
 
 func anyAutomationWritten(files []automationFileResult) bool {

@@ -706,6 +706,11 @@ func pushOneMetric(ctx context.Context, client *api.Client, f *folder, live live
 			// it is the name this folder agrees with, recorded with the id.
 			if file.File.Name != nil {
 				live.setMetricName(file.Path, out.MetricID, *file.File.Name)
+			} else {
+				// The note does not say a publish keeps a rename: an open draft's name
+				// still lands on the live metric at commit (4b).
+				fmt.Fprintf(os.Stderr, "  Note: %s — created as %q, after its file; add \"name\" to the file to give it a display name (a later push renames it in place)\n",
+					file.Path, metricCreateName(file))
 			}
 			if err := f.saveBaseline(); err != nil {
 				out.Outcome = metricOutcomeRefused

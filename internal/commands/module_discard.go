@@ -36,7 +36,7 @@ feature, a proposal), with no live version to fall back to — so discarding it
 would remove the module. That is refused unless you pass --delete-module. Your
 local files are kept either way, and the folder is unbound so a later push
 creates a fresh module.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(yes)
 			if err != nil {

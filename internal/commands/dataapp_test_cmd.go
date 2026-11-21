@@ -167,7 +167,7 @@ is mocked and nothing is rolled back.
 
 With --json, the server's envelope plus the paths written, on stdout; every
 note and warning goes to stderr either way.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runAppTest(cmd.Context(), appTestOptions{
 				Route:         route,
@@ -186,7 +186,7 @@ note and warning goes to stderr either way.`,
 		"JSON file holding an interaction plan to run after the render: a steps array, or {\"steps\": [...]} (admin only; the steps really execute)")
 	cmd.Flags().StringVar(&viewport, "viewport", viewportDesktop,
 		"render size: desktop, mobile, or WxH (each side 240-2560), e.g. 1280x2400")
-	cmd.Flags().DurationVar(&timeout, "timeout", 20*time.Second,
+	durationFlag(cmd, &timeout, "timeout", 20*time.Second,
 		"render budget, steps included (default 40s with --steps; 0 leaves it to the server; the server clamps it either way)")
 	cmd.Flags().StringVar(&outDir, "out-dir", "",
 		"directory to write report.json and the screenshots into (default: .ronja/test inside the app folder, which is never synced)")

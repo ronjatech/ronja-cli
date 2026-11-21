@@ -497,7 +497,7 @@ func TestSecretConnectScopedTokenForbidden(t *testing.T) {
 	f.initBody = `{"error":"token scope \"secrets\" does not permit write","code":"insufficient_scope"}`
 
 	_, _, errText := runConnect(t, "gmail")
-	if errText != "this login's token cannot write secrets (needs secrets:write)" {
+	if !strings.HasPrefix(errText, "this login's token cannot write secrets (needs secrets:write)") {
 		t.Errorf("error = %q", errText)
 	}
 	if len(*opened) != 0 {

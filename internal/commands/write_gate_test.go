@@ -3,6 +3,7 @@ package commands
 import (
 	"encoding/json"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -618,6 +619,49 @@ func TestWriteGateRefusesALiveRunWritingOutside(t *testing.T) {
 	f.resetRequests()
 	out, err := runCLI(t, root, "wf", "run")
 	assertGateRefused(t, f, out, err, "main.py:7 (tools.appendToTable) writes the table table-budget (budget)", "in feature "+financeFeature)
+}
+
+// TestWriteGateChecksTheListingTheRunCompared: an adopted folder's run reads
+// live's files once, so the gate validates the very files the folder was
+// compared with.
+func TestWriteGateChecksTheListingTheRunCompared(t *testing.T) {
+	f, dir := gatedTree(t)
+	root := filepath.Join(dir, "workflows/sales-report")
+	f.wf.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
+	withFastPolling(t)
+	f.resetRequests()
+	if out, err := runCLI(t, root, "wf", "run"); err != nil {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	if len(f.wf.runRequests) != 1 {
+		t.Fatalf("runs = %+v, want one", f.wf.runRequests)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if n := countRequests(f.requests, "GET /api/v2/workflow/workflow-report/files"); n != 1 {
+		t.Fatalf("listed live's files %d times, want once:\n%s", n, strings.Join(f.requests, "\n"))
+	}
+	if n := countRequests(f.requests, "POST /api/v2/workflow/validate"); n != 1 {
+		t.Fatalf("validated %d times, want once:\n%s", n, strings.Join(f.requests, "\n"))
+	}
+}
+
+// TestWriteGateRefusesALiveRunWhoseFilesCannotBeRead: a clean adopted folder
+// passes its record, so only the gate stands between a failed listing and a
+// run of code nobody checked.
+func TestWriteGateRefusesALiveRunWhoseFilesCannotBeRead(t *testing.T) {
+	f, dir := gatedTree(t)
+	root := filepath.Join(dir, "workflows/sales-report")
+	f.wf.runScript = []api.RunResponse{finishedRun(api.RunStatusDone, api.RunHealthDone)}
+	withFastPolling(t)
+	f.wf.failFiles = http.StatusInternalServerError
+	_, err := runCLI(t, root, "wf", "run")
+	if err == nil || !strings.Contains(err.Error(), "read the files of workflow-report to check where they write") {
+		t.Fatalf("err = %v, want the gate's refusal to run unread files", err)
+	}
+	if len(f.wf.runRequests) != 0 {
+		t.Fatalf("started a run anyway: %+v", f.wf.runRequests)
+	}
 }
 
 // TestAnAdoptedFolderWhoseStackNamesNoFeatureIsRefused: a folder with an id

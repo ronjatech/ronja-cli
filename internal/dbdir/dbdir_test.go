@@ -334,3 +334,25 @@ func TestAnOlderCLINeverTakesAStacksDatabase(t *testing.T) {
 		t.Fatalf("dev = %q after an older CLI's save, want none remembered", got)
 	}
 }
+
+// Given the migrations/ folder itself, the refusal names what it read and the
+// folder to pass instead.
+func TestReadMigrationsGivenTheMigrationsFolderNamesItsParent(t *testing.T) {
+	proj := filepath.Join(t.TempDir(), "proj")
+	writeMigration(t, proj, "0001_init.sql", "create table t (id int);")
+	given := filepath.Join(proj, MigrationsDir)
+
+	_, err := ReadMigrations(given)
+	want := "no migrations/ folder in " + given + " — that is the migrations/ folder itself; pass the folder that holds it: --dir " + proj
+	if err == nil || err.Error() != want {
+		t.Errorf("ReadMigrations(%s) = %v\n  want %q", given, err, want)
+	}
+
+	// Negative control: any other folder without one is named, with no --dir.
+	other := t.TempDir()
+	_, err = ReadMigrations(other)
+	want = "no migrations/ folder in " + other + " — create one and put your .sql files in it"
+	if err == nil || err.Error() != want {
+		t.Errorf("ReadMigrations(%s) = %v\n  want %q", other, err, want)
+	}
+}

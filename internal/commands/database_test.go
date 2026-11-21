@@ -65,7 +65,7 @@ func TestReportMigrationsFailsOnDrift(t *testing.T) {
 			{Name: "0001_leads", Outcome: api.MigrationSkipped, Seq: 1},
 			{Name: "0002_score", Outcome: api.MigrationDrifted, Seq: 2},
 		},
-	})
+	}, migrateOpts{})
 	if err == nil {
 		t.Fatal("drift must be an error — a status that reports it quietly is not a gate")
 	}
@@ -145,7 +145,7 @@ func TestReportMigrationsCleanRuns(t *testing.T) {
 				{Name: "0001_leads", Outcome: api.MigrationSkipped, Seq: 1},
 				{Name: "0002_score", Outcome: api.MigrationPending},
 			},
-		})
+		}, migrateOpts{})
 		if err != nil {
 			t.Fatalf("pending work is not a failure: %v", err)
 		}
@@ -153,7 +153,7 @@ func TestReportMigrationsCleanRuns(t *testing.T) {
 	t.Run("applied", func(t *testing.T) {
 		err := reportMigrations(&api.MigrationSetResult{
 			Results: []api.MigrationResult{{Name: "0001_leads", Outcome: api.MigrationApplied, Seq: 1}},
-		})
+		}, migrateOpts{})
 		if err != nil {
 			t.Fatalf("a successful apply is not a failure: %v", err)
 		}
@@ -161,7 +161,7 @@ func TestReportMigrationsCleanRuns(t *testing.T) {
 	t.Run("re-push is all skipped", func(t *testing.T) {
 		err := reportMigrations(&api.MigrationSetResult{
 			Results: []api.MigrationResult{{Name: "0001_leads", Outcome: api.MigrationSkipped, Seq: 1}},
-		})
+		}, migrateOpts{})
 		if err != nil {
 			t.Fatalf("an idempotent re-push is not a failure: %v", err)
 		}
@@ -178,7 +178,7 @@ func TestReportMigrationsPrintsNotes(t *testing.T) {
 			DatabaseID: "mdb-abc",
 			Results:    []api.MigrationResult{{Name: "0003_seed", Outcome: api.MigrationApplied, Seq: 3}},
 			Notes:      []string{note},
-		})
+		}, migrateOpts{})
 	})
 	if err != nil {
 		t.Fatalf("a note must not fail the command: %v", err)
@@ -374,7 +374,7 @@ func TestRetiredDevCopyCallsAreRefusedBeforeAnyRequest(t *testing.T) {
 			if err == nil {
 				t.Fatal("accepted; it must be refused")
 			}
-			if err.Error() != devCopiesRemovedText {
+			if beforeUsage(err) != devCopiesRemovedText {
 				t.Errorf("refusal = %q, want the dev-Space sentence", err.Error())
 			}
 			if len(srv.requests) != 0 {

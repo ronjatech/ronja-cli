@@ -32,7 +32,7 @@ var (
 
 // tokenScopeOrder is the Account page's print order; keep it in step with the
 // backend's gt.AllScopes, though a scope missing here still prints and is accepted.
-var tokenScopeOrder = []string{"data", "structure", "analytics", "automation", "agents", "secrets", "admin"}
+var tokenScopeOrder = []string{"data", "structure", "analytics", "automation", "scripts", "agents", "secrets", "admin"}
 
 var (
 	tokenExpiresDaysRe = regexp.MustCompile(`^[0-9]{1,4}d$`)
@@ -84,7 +84,7 @@ never prints the token itself, and never receives it. --json prints one object
 with status and a tokens array containing only this metadata.
 
 --scope is <scope>:<read|write> and is repeatable; at least one is required.
-Scopes: data, structure, analytics, automation, agents, secrets, admin. A token
+Scopes: data, structure, analytics, automation, scripts, agents, secrets, admin. A token
 with full access is a choice you make on the form, not here.
 
 --expires is a number of days (90d, at most 3650d) or a date (YYYY-MM-DD). A

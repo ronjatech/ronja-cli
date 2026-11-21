@@ -94,9 +94,25 @@ func proxyForDatabase(cmd *cobra.Command, databaseID string) (*api.DatabaseProxy
 		return nil, nil, err
 	}
 	if conn.Proxy == nil {
-		return nil, nil, fmt.Errorf(
-			"%s cannot be reached with psql: this organization has no psql proxy configured, or your role is not admin",
-			databaseID)
+		// The server omits the proxy for both causes, so the caller's role picks
+		// the one that applies; every db command is admin-only, db sql included.
+		me, meErr := client.Me(cmd.Context())
+		switch {
+		case meErr != nil && cmd.Context().Err() != nil:
+			return nil, nil, cmd.Context().Err()
+		case meErr != nil:
+			return nil, nil, fmt.Errorf(
+				"%s cannot be reached with psql: this organization has no psql proxy configured, or your role is not admin — ask an admin, or run queries over HTTP with `ronja db sql %s`",
+				databaseID, databaseID)
+		case !isAdmin(me):
+			return nil, nil, fmt.Errorf(
+				"%s cannot be reached with psql: the ronja db commands need the admin role, and yours is not admin — ask an admin (or to be given the admin role)",
+				databaseID)
+		default:
+			return nil, nil, fmt.Errorf(
+				"%s cannot be reached with psql: this organization has no psql proxy configured — run queries over HTTP with `ronja db sql %s`",
+				databaseID, databaseID)
+		}
 	}
 	if !conn.Proxy.ReadRoleMinted {
 		return nil, nil, fmt.Errorf(

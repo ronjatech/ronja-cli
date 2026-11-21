@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -378,10 +379,53 @@ func TestTestRefusesBoundOutputTablesWithoutWriteLive(t *testing.T) {
 	if len(f.runRequests) != 0 {
 		t.Fatalf("refusal came after the run started: %+v", f.runRequests)
 	}
-	for _, want := range []string{"tbl-1", "Monthly revenue", "tbl-2", "Customer ledger", "--write-live", "2 live tables"} {
+	for _, want := range []string{"tbl-1", "Monthly revenue", "tbl-2", "Customer ledger", "--write-live", "2 live tables",
+		// The way to test without touching live tables, so --write-live is not
+		// read as the only way through.
+		"own parameters", "create a dev Space", "https://ronja.tech/docs/guides/test-in-a-dev-space/"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal missing %q:\n%v", want, err)
 		}
+	}
+	if strings.Contains(err.Error(), "no test sandbox") || strings.Contains(err.Error(), "--stack dev") {
+		t.Errorf("refusal says there is no other way to test, or names a stack this folder does not have:\n%v", err)
+	}
+}
+
+// The refusal states the Space the folder's own record names for the stack,
+// and makes no call to find out: a stack that records a Space writes that
+// Space's tables, and one that does not is pointed at the stacks that do.
+func TestWriteLiveRefusalStatesTheStacksRecordedSpace(t *testing.T) {
+	fake := newFakeInstance(t)
+	fake.tableNames["tbl-1"] = "Monthly revenue"
+	client := api.New(fake.URL(), "tok")
+	manifest := &wfdir.Manifest{Stacks: map[string]wfdir.Stack{
+		"main":    {URL: fake.URL()},
+		"sandbox": {URL: fake.URL(), SpaceID: "space-sb", Space: "Sandbox"},
+	}}
+
+	inSpace := writeLiveRefusal(context.Background(), client, &folder{Stack: "sandbox", Manifest: manifest}, []string{"tbl-1"})
+	for _, want := range []string{"this test run writes to 1 table:\n", "tbl-1  Monthly revenue",
+		`in Space Sandbox, the Space stack "sandbox" deploys to (not your organization's default Space)`,
+		"Re-run with --write-live if writing them is what you mean."} {
+		if !strings.Contains(inSpace, want) {
+			t.Errorf("refusal on a stack that records a Space is missing %q:\n%s", want, inSpace)
+		}
+	}
+	if strings.Contains(inSpace, "LIVE") || strings.Contains(inSpace, "live table") {
+		t.Errorf("refusal on a stack that records a Space calls its tables live:\n%s", inSpace)
+	}
+
+	onMain := writeLiveRefusal(context.Background(), client, &folder{Stack: "main", Manifest: manifest}, []string{"tbl-1"})
+	for _, want := range []string{"this test run writes to 1 live table:\n", "LIVE tables",
+		`"sandbox" (Space Sandbox): ronja wf test --stack sandbox`,
+		"Re-run with --write-live only if writing these live tables is what you mean."} {
+		if !strings.Contains(onMain, want) {
+			t.Errorf("refusal on a stack with no Space is missing %q:\n%s", want, onMain)
+		}
+	}
+	if strings.Contains(onMain, "create a dev Space") {
+		t.Errorf("refusal sends a folder that has a stack in another Space to create one:\n%s", onMain)
 	}
 }
 

@@ -65,7 +65,7 @@ app is refused, never silently reverted. --force overwrites both.
 Publishing is a separate step:
 
   ronja app publish                commit the draft, or submit it for review`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(false)
 			if err != nil {
@@ -338,15 +338,8 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 	if err != nil {
 		return nil, err
 	}
-	// The row's entrypoint is IMMUTABLE (rdataapp.Patch has no field for it), so
-	// a manifest naming a different one is a folder that can never sync — and
-	// silently pushing to the row's entrypoint instead would write the author's
-	// code into a file they are not looking at. Refused, with the only remedy
-	// there is.
-	if existing.App != nil && existing.App.Entrypoint != "" && existing.App.Entrypoint != entrypoint {
-		return nil, fmt.Errorf("this folder's entrypoint is %q but data app %s compiles from %q, and a data app's entrypoint cannot be changed.\n  Point \"entrypoint\" in %s back at %q, or create a new app for the renamed one",
-			entrypoint, existing.App.ID, existing.App.Entrypoint,
-			wfdir.ManifestPath(f.Root), existing.App.Entrypoint)
+	if err := appEntrypointRefusal(f, existing.App); err != nil {
+		return nil, err
 	}
 
 	// 2b. The WRITE GATE (write_gate.go), before the first write AND before the
@@ -453,7 +446,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		verdict, err := checkAppDrift(f, remoteFiles, hashAppFiles(f.baselineCodec(), files), local, metaAgrees, opts.Force, head, target.ID,
 			driftAsk{draft: result.DraftPreexisted, apply: opts.Apply})
 		if err != nil {
-			return refuseUnwritten(err)
+			return refuseUnwritten(beyondDraftOpen(f, existing.App, err))
 		}
 		baselineClean = verdict.BaselineClean
 		// Server-side preconditions are armed EXACTLY where the drift guard
@@ -685,7 +678,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		result.UpToDate = true
 	}
 	if result.Compiles != nil && !*result.Compiles {
-		return result, fmt.Errorf("the draft does not compile — it cannot be published until it does")
+		return result, fmt.Errorf("the draft does not compile — it cannot be published until it does; fix the errors above and push again (`ronja app validate` shows the full diagnostics)")
 	}
 	if result.CompileCheck != nil {
 		// Non-zero: the push promised a verdict and did not deliver one, and a
@@ -909,8 +902,26 @@ func appTitleLeg(f *folder, live, target *api.DataApp, head headAgreement, force
 	if live != nil {
 		liveRow = &titledRow{ID: live.ID, Title: live.Name}
 	}
-	headVouches := head.Vouches() && live != nil && live.ID != target.ID && live.Lifecycle == api.LifecycleLive
-	return titleLeg(f, "data app", liveRow, titledRow{ID: target.ID, Title: target.Name}, headVouches, force)
+	return titleLeg(f, "data app", liveRow, titledRow{ID: target.ID, Title: target.Name}, appTitleHeadVouches(live, target.ID, head), force)
+}
+
+// appEntrypointRefusal refuses a folder whose manifest names an entrypoint other
+// than the app's. The row's entrypoint is IMMUTABLE (rdataapp.Patch has no
+// field for it), so such a folder can never sync — and silently pushing to the
+// row's entrypoint instead would write the author's code into a file they are
+// not looking at.
+func appEntrypointRefusal(f *folder, app *api.DataApp) error {
+	if app == nil || app.Entrypoint == "" || app.Entrypoint == f.Manifest.Entrypoint {
+		return nil
+	}
+	return fmt.Errorf("this folder's entrypoint is %q but data app %s compiles from %q, and a data app's entrypoint cannot be changed.\n  Point \"entrypoint\" in %s back at %q, or create a new app for the renamed one",
+		f.Manifest.Entrypoint, app.ID, app.Entrypoint, wfdir.ManifestPath(f.Root), app.Entrypoint)
+}
+
+// appTitleHeadVouches is appTitleLeg's head-vouch decision for a push writing
+// to targetID ("" for a checkout not yet made).
+func appTitleHeadVouches(live *api.DataApp, targetID string, head headAgreement) bool {
+	return head.Vouches() && live != nil && live.ID != targetID && live.Lifecycle == api.LifecycleLive
 }
 
 // checkAppDrift refuses a push that would overwrite server-side changes made
@@ -1002,11 +1013,11 @@ func checkAppDrift(f *folder, remote, atBaseline, local map[string]string, metaA
 		// is refused and routed to --delete-app, which deletes the app. See the
 		// same branch in checkDrift.
 		if head.Recorded != "" && head.Recorded == head.Current {
-			return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and you already have a draft of %s open there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  Run `ronja app discard` to throw the draft away and push onto the live version, or push --force to overwrite it",
-				f.Resolved.URL, f.Binding.DataAppID, wfdir.LockName)
+			return driftVerdict{}, draftOpenRefusal{fmt.Errorf("this folder has no sync baseline for %s, and you already have a draft of %s open there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  Run `ronja app discard` to throw the draft away and %s",
+				f.Resolved.URL, f.Binding.DataAppID, wfdir.LockName, draftOpenRemedy(ask))}
 		}
-		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the data app already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the app into a fresh folder to get one, or push --force to overwrite the remote files with what you have here%s",
-			f.Resolved.URL, len(remote), f.pullHint("  "))
+		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the data app already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  %s",
+			f.Resolved.URL, len(remote), noBaselineRemedy(f, ask, head, "Clone the app"))
 	}
 	ask.rebound = f.reboundUnrecorded(drift, remote, local)
 	return driftVerdict{}, baselineDriftRefusal(f, ask, driftSummary(drift, nil))

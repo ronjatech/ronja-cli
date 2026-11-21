@@ -241,6 +241,20 @@ func TestLoginWithTokenKeepsTheRequestedProfileName(t *testing.T) {
 	}
 }
 
+// The suggested pipe names the instance this login was for: without --url a
+// copied line signs in to the default instance.
+func TestLoginWithTokenOnEmptyStdinSuggestsThisInstance(t *testing.T) {
+	loginEnv(t)
+	url := loginFake(t, "ten-midas", "Midas Bikes", "unused")
+	withStdin(t, "")
+
+	_, err := runCLI(t, t.TempDir(), "login", "--url", url, "--with-token")
+	want := `echo "$TOKEN" | ronja login --url ` + url + ` --with-token`
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("login with nothing on stdin = %v; want it to suggest %q", err, want)
+	}
+}
+
 func TestLoginWithoutAProfileNameNamesItAutomatically(t *testing.T) {
 	loginEnv(t)
 	url := loginFake(t, "ten-midas", "Midas Bikes", "pat-3")

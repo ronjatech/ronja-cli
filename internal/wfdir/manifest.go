@@ -1073,7 +1073,7 @@ func LoadManifest(root string, kind Kind) (*Manifest, error) {
 			return nil, fmt.Errorf("%s describes a %s, not a %s — use `%s` instead",
 				path, other.Label, kind.Label, other.Command)
 		}
-		return nil, fmt.Errorf("%s describes a %q folder — this command only understands kind %q",
+		return nil, fmt.Errorf("%s describes a %q folder — this command only understands kind %q. Fix the \"kind\" value, or upgrade the CLI if the kind is newer than this build — run: ronja update",
 			path, m.Kind, kind.Name)
 	}
 	// A runtime this build does not know is refused HERE, so it fails at the push

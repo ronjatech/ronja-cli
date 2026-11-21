@@ -38,6 +38,10 @@ What happens depends on the module:
 --no-request-review turns the last case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
 
+Agents: ship with ` + "`ronja propose`" + `, the recommended way for an agent to
+ship an adopted folder; the person this login belongs to approves it in Ronja,
+which then deploys it as them.
+
 The commit is refused when somebody else published a new version of the module
 since the draft was created — nothing is written and the draft is untouched.
 Review what they changed and re-apply on top of it, or re-run with
@@ -54,7 +58,7 @@ workflows that is.
 
 Push first: publish sends what is already on the server, and warns when the
 folder has local changes that are not in the draft.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(false)
 			if err != nil {

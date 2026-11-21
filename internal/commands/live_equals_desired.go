@@ -86,7 +86,7 @@ func (f *folder) excuseOwnProposal(head headAgreement, drift wfdir.Diff, remote 
 	}
 	hashes := make(map[string]string, len(remote))
 	for path, content := range remote {
-		hashes[path] = wfdir.HashString(content)
+		hashes[path] = contentHash(content)
 	}
 	for _, p := range wfdir.LoadProposals(f.Root, f.Key) {
 		if p.Over != over {
@@ -116,6 +116,10 @@ func armedAfterProposals(baseline *wfdir.InstanceState, remoteHashes map[string]
 // noteLiveEqualsDesired says why a push with no baseline to hold it to was let
 // through: the row already is this folder.
 func noteLiveEqualsDesired(rowID string) {
+	// A dry run asks the push's check and pushes nothing.
+	if flagSyncDryRun {
+		return
+	}
 	fmt.Fprintf(os.Stderr, "  Note: this folder has no sync baseline here, but %s already holds exactly its files and metadata — there is nothing to overwrite, so it is treated as this folder's own state.\n",
 		rowID)
 }

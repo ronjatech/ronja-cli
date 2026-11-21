@@ -33,7 +33,7 @@ The folder's own dependency names are checked too — a name no stack binds, or
 one used under the wrong kind of marker. Those exit non-zero even when the draft
 compiles, because ` + "`ronja app push`" + ` refuses the folder. With --json, "ok" is
 the verdict and "compiles" is the draft alone.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveInstance()
 			if err != nil {

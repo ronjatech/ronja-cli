@@ -254,7 +254,7 @@ func (imp *featureImport) resolveFeature(arg string) (*api.Feature, error) {
 		feat, err := imp.client.GetFeature(imp.ctx, arg)
 		if err != nil {
 			if api.StatusOf(err) == 404 || api.StatusOf(err) == 400 {
-				return nil, fmt.Errorf("no feature %s on %s that you can read", arg, imp.resolved.URL)
+				return nil, fmt.Errorf("no feature %s on %s that you can read — check the id, and `ronja whoami` for the instance and organization you are signed in to", arg, imp.resolved.URL)
 			}
 			return nil, err
 		}

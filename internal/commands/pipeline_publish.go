@@ -50,6 +50,10 @@ What happens depends on the feature:
 --no-request-review turns the second case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
 
+Agents: ship with ` + "`ronja propose`" + `, the recommended way for an agent to
+ship an adopted folder; the person this login belongs to approves it in Ronja,
+which then deploys it as them.
+
 A draft whose build failed is refused: publishing it would put a table live with
 no data behind it. Fix the SQL and push again.
 
@@ -89,6 +93,7 @@ folder has local changes that are not in the drafts.`,
 			if result != nil {
 				result.ManagedInGit = f.notices
 				if flagJSON {
+					result.Error = errorLine(result.Error, err)
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
 					}
@@ -462,7 +467,7 @@ func runPipelinePublish(ctx context.Context, f *folder, args []string, noRequest
 		if failed == 0 && ctx.Err() == nil {
 			return result, newChecksNotApplied(result.Error, result.Checks)
 		}
-		return result, fmt.Errorf("%s", result.Error)
+		return result, fmt.Errorf("%s%s", result.Error, listFailedFiles(result.failedFiles()))
 	}
 	return result, nil
 }
@@ -1349,4 +1354,25 @@ func printPipelinePublishReport(r *pipelinePublishResult) {
 	if r.Error != "" {
 		fmt.Fprintf(out, "  %s.\n", r.Error)
 	}
+}
+
+// failedFiles are the files behind the summary's problem counts.
+func (r *pipelinePublishResult) failedFiles() []failedFile {
+	var out []failedFile
+	for _, file := range r.Files {
+		if file.Outcome == pushOutcomeRefused || file.Outcome == outcomeConflict {
+			out = append(out, failedFile{file.Path, file.Error})
+		}
+	}
+	for _, metric := range r.Metrics {
+		if metric.Outcome == pushOutcomeRefused || metric.Outcome == outcomeConflict {
+			out = append(out, failedFile{metric.Path, metric.Error})
+		}
+	}
+	for _, checks := range r.Checks {
+		if checks.failed() {
+			out = append(out, failedFile{checks.Path, checksFailureReason(checks)})
+		}
+	}
+	return out
 }

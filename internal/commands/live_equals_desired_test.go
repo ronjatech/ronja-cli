@@ -127,14 +127,14 @@ func TestModuleDriftExcusesLiveEqualsDesired(t *testing.T) {
 	}
 	f := moduleFolderFor(t, root, key, baseline)
 	f.Manifest.Title = "EMAB tracker"
-	if _, err := checkModuleDrift(f, target, moved, local, false, headAgreement{}); err != nil {
+	if _, err := checkModuleDrift(f, target, moved, local, false, headAgreement{}, driftAsk{}); err != nil {
 		t.Fatalf("a file and a title that already hold what the folder declares were refused: %v", err)
 	}
 	f = moduleFolderFor(t, root, key, nil)
 	f.Manifest.Title = "EMAB tracker"
 	f.Manifest.Name = "emab_tracker"
 	head := headAgreement{Recorded: "cmv-1", Current: "cmv-2", AnchoredDraft: true}
-	verdict, err := checkModuleDrift(f, target, moved, local, false, head)
+	verdict, err := checkModuleDrift(f, target, moved, local, false, head, driftAsk{})
 	if err != nil || !verdict.HeadVouched {
 		t.Fatalf("a moved head over identical files was refused: %+v %v", verdict, err)
 	}

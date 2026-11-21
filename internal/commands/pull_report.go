@@ -15,7 +15,12 @@ import (
 func (r *pullReport) fill(paths []string, before, after map[string]*string) {
 	var diff strings.Builder
 	for _, p := range paths {
-		d := unifiedDiff(p, before[p], after[p])
+		render := unifiedDiff
+		// Only a workflow may hold a jar; another kind's `.jar` path is text.
+		if r.Kind == wfdir.KindWorkflow && isJarPath(p) {
+			render = jarDiff
+		}
+		d := render(p, before[p], after[p])
 		if d == "" {
 			continue
 		}

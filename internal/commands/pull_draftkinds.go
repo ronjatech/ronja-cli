@@ -185,7 +185,7 @@ func unversionedApplied(ctx context.Context, f *folder, liveID string, local map
 	}
 	var differs []string
 	for path, content := range local {
-		if had, ok := base.Files[path]; !ok || had.SHA256 != wfdir.HashString(content) {
+		if had, ok := base.Files[path]; !ok || had.SHA256 != contentHash(content) {
 			differs = append(differs, path)
 		}
 	}
@@ -262,6 +262,9 @@ type draftKindPull[R, F any] struct {
 	list    func(ctx context.Context, id string) ([]F, error)
 	paths   func([]F) []string
 	content func([]F) map[string]string
+	// fetchJar downloads the bytes of the jar at path among a row's files
+	// (nil: the kind holds no jars).
+	fetchJar func(ctx context.Context, rowID string, files []F, path string) (string, error)
 	// draftOpen reads whether the caller has a draft of the live row open.
 	draftOpen func(ctx context.Context, id string) (bool, error)
 	// metadata writes the live metadata the folder manages into m (a copy of
@@ -318,6 +321,11 @@ func pullDraftKind[R, F any](ctx context.Context, f *folder, k draftKindPull[R, 
 	}
 
 	plan := &pullPlan{files: fileSetChanges(local, remote)}
+	if k.fetchJar != nil {
+		plan.fetchJar = func(ctx context.Context, path string) (string, error) {
+			return k.fetchJar(ctx, row.ID, files, path)
+		}
+	}
 	if changed {
 		plan.manifest = m
 	}
@@ -381,9 +389,17 @@ func pullWorkflow(ctx context.Context, client *api.Client, f *folder) (*pullPlan
 		row: func(w *api.Workflow) liveDraftKindRow {
 			return liveDraftKindRow{ID: w.ID, Lifecycle: w.Lifecycle, Title: w.Title}
 		},
-		list:      client.ListWorkflowFiles,
-		paths:     pathsOf,
-		content:   func(files []api.WorkflowFile) map[string]string { return contentByPath(f.Codec, files) },
+		list:    client.ListWorkflowFiles,
+		paths:   pathsOf,
+		content: func(files []api.WorkflowFile) map[string]string { return contentByPath(f.Codec, files) },
+		fetchJar: func(ctx context.Context, rowID string, files []api.WorkflowFile, path string) (string, error) {
+			for _, file := range files {
+				if file.Path == path {
+					return jarDiskBytes(ctx, client, f.Codec, rowID, file)
+				}
+			}
+			return "", fmt.Errorf("%s is not among the files of %s", path, rowID)
+		},
 		draftOpen: draftOpenOf(client.GetWorkflowDraft),
 		metadata: func(m *wfdir.Manifest, live *api.Workflow) (bool, []pullLiteral, error) {
 			changed := false
@@ -408,7 +424,7 @@ func pullWorkflow(ctx context.Context, client *api.Client, f *folder) (*pullPlan
 				m.SetReportingTimezone(live.ReportingTimezone)
 				changed = true
 			}
-			if m.Runtime != 0 && live.RuntimeVersion != 0 && m.RuntimeVersion() != live.RuntimeVersion {
+			if runtimeDiffers(m, live) {
 				if !wfdir.ValidRuntime(live.RuntimeVersion) {
 					return false, nil, pullInexpressible(f, fmt.Sprintf("the live workflow runs runtime %d, which this ronja does not know — upgrade it (`ronja update`)", live.RuntimeVersion))
 				}

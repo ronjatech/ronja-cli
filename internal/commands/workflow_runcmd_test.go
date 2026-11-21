@@ -130,8 +130,10 @@ func TestRunRefusesAFolderWithChangesThatAreNotLive(t *testing.T) {
 	}
 }
 
-// A git clone has no baseline (.ronja/ is local-only), and "cannot tell" must
-// refuse: the command's claim is that it ran the code in front of you.
+// A git clone has no baseline (.ronja/ is local-only), and when it does not
+// hold what is live, "cannot tell" must refuse: the command's claim is that it
+// ran the code in front of you. With live read, the refusal lists what differs
+// and never sends the author to re-clone over their edits.
 func TestRunRefusesAFolderWithNoBaseline(t *testing.T) {
 	f := newFakeInstance(t)
 	signIn(t, f)
@@ -139,13 +141,46 @@ func TestRunRefusesAFolderWithNoBaseline(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(root, ".ronja")); err != nil {
 		t.Fatalf("remove baseline: %v", err)
 	}
+	writeLocal(t, root, "main.py", "print(2)\n")
 
 	_, err := runCLI(t, root, "wf", "run")
 	if err == nil {
 		t.Fatal("ran live from a folder with no baseline")
 	}
-	if !strings.Contains(err.Error(), "no sync baseline") {
-		t.Errorf("refusal does not say what is missing: %v", err)
+	for _, want := range []string{"no sync baseline", "1 change(s) that are not in the live workflow", "changed here   main.py", "wf push", "wf pull --dry-run"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
+		}
+	}
+	for _, stale := range []string{"no way to tell", "wf clone"} {
+		if strings.Contains(err.Error(), stale) {
+			t.Errorf("refusal with live read still says %q: %v", stale, err)
+		}
+	}
+	if len(f.runRequests) != 0 {
+		t.Errorf("started a run anyway: %+v", f.runRequests)
+	}
+}
+
+// With live unread there is nothing to list, so the record's answer stands:
+// nothing to compare, and a fresh clone is the way to get a baseline.
+func TestRunRefusesAFolderWithNoBaselineWhenLiveCannotBeRead(t *testing.T) {
+	f := newFakeInstance(t)
+	signIn(t, f)
+	root := liveFolder(t, f, nil)
+	if err := os.RemoveAll(filepath.Join(root, ".ronja")); err != nil {
+		t.Fatalf("remove baseline: %v", err)
+	}
+	f.failFiles = http.StatusInternalServerError
+
+	_, err := runCLI(t, root, "wf", "run")
+	if err == nil {
+		t.Fatal("ran live from a folder with no baseline")
+	}
+	for _, want := range []string{"no sync baseline", "no way to tell", "wf clone wf-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
+		}
 	}
 	if len(f.runRequests) != 0 {
 		t.Errorf("started a run anyway: %+v", f.runRequests)
@@ -168,21 +203,29 @@ func TestRunTellsAMismatchedBaselineApartFromNoBaselineAtAll(t *testing.T) {
 	if draftID == "" {
 		t.Fatal("push opened no draft")
 	}
-	// An admin commits it server-side.
+	// An admin commits it server-side, and the folder is edited since.
 	delete(f.draftOf, "wf-1")
 	delete(f.workflows, draftID)
+	writeLocal(t, root, "main.py", "print(2)\n")
 
 	_, err := runCLI(t, root, "wf", "run")
 	if err == nil {
 		t.Fatal("ran live from a folder whose baseline names another row")
 	}
-	for _, want := range []string{draftID, "wf-1", "wf status"} {
+	for _, want := range []string{"sync baseline came from " + draftID, "wf-1", "changed here   main.py", "wf push", "wf pull --dry-run"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal missing %q: %v", want, err)
 		}
 	}
 	if strings.Contains(err.Error(), "has no sync baseline") {
 		t.Errorf("a mismatched baseline was reported as a missing one: %v", err)
+	}
+	// The folder provably differs from live, so "the folder is fine, re-clone"
+	// would send the author to run live's code instead of their edits.
+	for _, stale := range []string{"no way to tell", "Usually the folder is fine", "wf clone"} {
+		if strings.Contains(err.Error(), stale) {
+			t.Errorf("refusal with live read still says %q: %v", stale, err)
+		}
 	}
 	if len(f.runRequests) != 0 {
 		t.Errorf("started a run anyway: %+v", f.runRequests)
@@ -274,9 +317,13 @@ func TestRunExplainsRoleOrScopeOn403(t *testing.T) {
 			t.Errorf("403 message missing %q: %v", want, err)
 		}
 	}
+	long := newWorkflowRunCmd().Long
 	for _, stale := range []string{"admin access", "shared feature", "Feature's owner"} {
 		if strings.Contains(err.Error(), stale) {
 			t.Errorf("403 message still names the retired write-gate rule %q: %v", stale, err)
+		}
+		if strings.Contains(strings.ToLower(long), strings.ToLower(stale)) {
+			t.Errorf("wf run --help still names the retired write-gate rule %q", stale)
 		}
 	}
 	if f.runPolls != 0 {

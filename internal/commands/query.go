@@ -213,7 +213,7 @@ is non-zero.`,
 		"write the CSV to this file instead of stdout")
 	cmd.Flags().IntVar(&maxRows, "max-rows", 0,
 		"maximum rows to return (default: the server's cap)")
-	cmd.Flags().DurationVar(&timeout, "timeout", api.DefaultQueryTimeout,
+	durationFlag(cmd, &timeout, "timeout", api.DefaultQueryTimeout,
 		"how long to wait for the query (0 waits as long as it takes)")
 	cmd.Flags().StringVar(&jqExpr, "jq", "",
 		"filter the response envelope through a jq expression")

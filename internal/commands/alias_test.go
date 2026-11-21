@@ -623,6 +623,54 @@ func TestPipelineFirstPushResolvesASiblingStemAfterCreatingIt(t *testing.T) {
 	}
 }
 
+// seedUnpushedUpstream adds fresh.sql, never pushed, to a bound folder and
+// points revenue.sql at it by stem.
+func seedUnpushedUpstream(t *testing.T, f *fakePipelineInstance) string {
+	t.Helper()
+	root := seedBoundFolder(t, f)
+	for path, content := range map[string]string{
+		"fresh.sql":   "SELECT 1",
+		"revenue.sql": "SELECT * FROM {{ ref('fresh') }}",
+	} {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// A narrowed push names the downstream only, so the upstream has no error of
+// its own to point at: the refusal says to push it too.
+func TestPipelinePushNamesAnUpstreamLeftOutOfANarrowedPush(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedUnpushedUpstream(t, f)
+
+	out, stderr, _ := runPipelineCLI(t, root, "pipeline", "push", "revenue.sql")
+	want := `revenue.sql reads "{{ ref('fresh') }}" and no table id is recorded for fresh.sql in this folder yet — push it in the same run (a bare ronja pipeline push, or name fresh.sql too)`
+	if !strings.Contains(out+stderr, want) || strings.Contains(out+stderr, "error is above") {
+		t.Fatalf("want %q and no pointer to an error above:\nstdout:\n%s\nstderr:\n%s", want, out, stderr)
+	}
+	if len(f.created) != 0 {
+		t.Fatalf("a narrowed push created %+v", f.created)
+	}
+}
+
+// In a full push the upstream was attempted first, so its own refusal is the
+// one to read.
+func TestPipelinePushPointsAtTheUpstreamsOwnError(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	root := seedUnpushedUpstream(t, f)
+	f.failCreate = 403
+
+	out, stderr, _ := runPipelineCLI(t, root, "pipeline", "push")
+	want := `revenue.sql reads "{{ ref('fresh') }}" and no table id is recorded for fresh.sql in this folder yet — its own error is above`
+	if !strings.Contains(out+stderr, want) || !strings.Contains(out+stderr, "admin required to create a table") {
+		t.Fatalf("want fresh.sql's refusal, then %q:\nstdout:\n%s\nstderr:\n%s", want, out, stderr)
+	}
+}
+
 // TestPipelinePushLeavesALiteralSiblingIdAlone is the other half of the stem
 // rule, and the reason the de-alias is per FILE rather than per folder: writing
 // a sibling's table id literally is the spelling every pipeline folder written

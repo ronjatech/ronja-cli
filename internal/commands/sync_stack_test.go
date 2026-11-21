@@ -210,6 +210,41 @@ func TestSyncStackAddLiftsAnOutputLiteralIntoAWriteMarker(t *testing.T) {
 	}
 }
 
+// A jar crosses the lift's validate as its sha256 and size, never as text, and
+// the lift leaves its bytes alone even when they spell a raw id.
+func TestSyncStackAddSendsAJarAsItsDigestAndNeverRewritesIt(t *testing.T) {
+	f := newFakeCopyInstance(t)
+	f.rows["table-main-out"] = fakeBindRow{featureID: "col-main", name: "region_totals"}
+	tree := t.TempDir()
+	root := stackTreeFolder(t, f, tree, "workflows/region-report", `{}`, `{}`, "df = load()\ntools.replaceTable(df, \"table-main-out\")\n")
+	jar := append([]byte("PK\x03\x04"), "orders = {{ ref('table-main-orders') }}\ntools.replaceTable(df, \"table-main-out\")\n"...)
+	writeLocalBytes(t, root, testJarPath, jar)
+
+	if out, err := runCLI(t, tree, "sync", "stack", "add", "dev", "--feature", "col-dev", "--yes"); err == nil {
+		t.Fatalf("stack add left nothing unbound:\n%s", out)
+	}
+	if body, _ := os.ReadFile(filepath.Join(root, "main.py")); !strings.Contains(string(body), "{{ write('region_totals') }}") {
+		t.Fatalf("the lift did not run, so it proves nothing about the jar:\n%s", body)
+	}
+	if got := readFile(t, root, testJarPath); got != string(jar) {
+		t.Fatalf("the lift rewrote the jar:\n%q", got)
+	}
+	if len(f.validated) != 1 {
+		t.Fatalf("validate was posted %d times, want once", len(f.validated))
+	}
+	want := api.ValidateFile{Path: testJarPath, Binary: &api.WorkflowFileBinary{SHA256: jarSHA(jar), Size: int64(len(jar))}}
+	for _, file := range f.validated[0].Files {
+		if file.Path != testJarPath {
+			continue
+		}
+		if file.Content != "" || file.Binary == nil || *file.Binary != *want.Binary {
+			t.Fatalf("the jar crossed validate as %+v, want %+v", file, want)
+		}
+		return
+	}
+	t.Fatalf("validate was posted no %s: %+v", testJarPath, f.validated[0].Files)
+}
+
 // A folder that writes files is not declared on a stack outside the default
 // Space: every deploy of it there would be refused, so it is reported instead.
 func TestSyncStackAddReportsAFolderWriterOutsideTheDefaultSpace(t *testing.T) {

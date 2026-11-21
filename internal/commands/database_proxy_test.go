@@ -1,7 +1,10 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/spf13/cobra"
 )
 
 // proxyServer answers GET /api/v2/database/<id>/roles with a canned body and
@@ -115,21 +119,57 @@ func TestDatabaseEnvJSON(t *testing.T) {
 	}
 }
 
-// The two refusals must stay different messages. "No proxy block" has two
-// causes the server does not distinguish (no proxy, or not an admin), so it
-// names both; "no read role" means the proxy is there and is a different fix.
-func TestDatabaseProxyRefusals(t *testing.T) {
-	t.Run("no proxy block", func(t *testing.T) {
-		srv, _ := proxyServer(t, `{"host":"h","port":"5432","database":"t_x_crm","roles":[]}`)
-		signInTo(t, srv.URL)
+// noProxyServer publishes no proxy block, and answers /authentication/me with
+// the given privilege level, or 403 when it is 0.
+func noProxyServer(t *testing.T, privilegeLevel int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v2/authentication/me" {
+			if privilegeLevel == 0 {
+				http.Error(w, `{"error":"insufficient scope"}`, http.StatusForbidden)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"id":"u1","email":"a@example.com","role":{"name":"r","privilegeLevel":%d}}`, privilegeLevel)
+			return
+		}
+		_, _ = io.WriteString(w, `{"host":"h","port":"5432","database":"t_x_crm","roles":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
 
+// The two refusals must stay different messages. "No proxy block" has two
+// causes the server does not distinguish (no proxy, or not an admin), so the
+// caller's role picks the one that applies, and both are named when it cannot
+// be read; "no read role" means the proxy is there and is a different fix.
+func TestDatabaseProxyRefusals(t *testing.T) {
+	noProxy := func(t *testing.T, privilegeLevel int) string {
+		t.Helper()
+		signInTo(t, noProxyServer(t, privilegeLevel).URL)
 		_, err := runCLI(t, t.TempDir(), "db", "env", "mdb-abc")
 		if err == nil {
 			t.Fatal("want a refusal when the instance publishes no proxy")
 		}
-		if !strings.Contains(err.Error(), "no psql proxy configured") ||
-			!strings.Contains(err.Error(), "not admin") {
-			t.Errorf("refusal must name both causes, got: %v", err)
+		return err.Error()
+	}
+	t.Run("no proxy block, admin", func(t *testing.T) {
+		msg := noProxy(t, adminPrivilegeLevel)
+		if !strings.Contains(msg, "no psql proxy configured") || !strings.Contains(msg, "ronja db sql mdb-abc") ||
+			strings.Contains(msg, "ask an admin") {
+			t.Errorf("an admin's refusal must name the missing proxy and the db sql route only, got: %v", msg)
+		}
+	})
+	t.Run("no proxy block, not admin", func(t *testing.T) {
+		msg := noProxy(t, 50)
+		if !strings.Contains(msg, "ask an admin") || strings.Contains(msg, "db sql") {
+			t.Errorf("a non-admin's refusal must say to ask an admin and offer no admin-only command, got: %v", msg)
+		}
+	})
+	t.Run("no proxy block, role unreadable", func(t *testing.T) {
+		msg := noProxy(t, 0)
+		if !strings.Contains(msg, "no psql proxy configured") || !strings.Contains(msg, "not admin") {
+			t.Errorf("refusal must name both causes, got: %v", msg)
 		}
 	})
 
@@ -323,5 +363,29 @@ func TestSplitAtDash(t *testing.T) {
 				t.Errorf("rest = %v, want %d entries", rest, tc.wantLen)
 			}
 		})
+	}
+}
+
+// A Ctrl-C or deadline while the role is read is the answer, not the fallback
+// that guesses between the two causes.
+func TestDatabaseProxyCancelDuringRoleReadReturnsTheCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/authentication/me" {
+			cancel()
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"host":"h","port":"5432","database":"t_x_crm","roles":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	signInTo(t, srv.URL)
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	if _, _, err := proxyForDatabase(cmd, "mdb-abc"); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }

@@ -89,7 +89,7 @@ func pendingCreateError(err error, featureID string) error {
 	case status == http.StatusMethodNotAllowed:
 		return errors.New(inBrowserOlderServer)
 	case status == http.StatusForbidden && (api.WireCodeOf(err) == api.InsufficientScopeCode || scopeDenied(err)):
-		return errors.New("this login's token cannot write secrets (needs secrets:write)")
+		return errors.New("this login's token cannot write secrets (needs secrets:write) — use a token that has it; `ronja login` stores one that acts with your full permissions")
 	case status == http.StatusForbidden && api.CodeOf(err) == "forbidden":
 		return errors.New("you cannot create a secret in this feature: it needs the User role, and on a shared feature an Admin or a maintainer of it")
 	case status == http.StatusConflict, status == http.StatusBadRequest, status == http.StatusForbidden:

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -40,6 +39,12 @@ They apply in filename order, so zero-pad the prefix — 10_x.sql sorts BEFORE
 
 Both send the whole folder every time and let the database decide what is new;
 running push twice is safe, and the second run reports everything as skipped.
+
+Agents: ship with ` + "`ronja propose`" + `. It is the recommended way for an agent to
+apply migrations: run it in the folder that holds migrations/ (or name that
+folder: ronja propose db/crm), with the --database or --stack you would give
+push. The person this login belongs to approves it in Ronja, which then applies
+exactly the SQL they saw. push is for people and CI applying directly.
 
 The database is remembered per instance and organization after the first
 successful push, so --database is only needed once:
@@ -90,12 +95,17 @@ Exits non-zero when anything has drifted, with or without --json (the JSON is
 printed in full first) — that is a broken state, not a status worth reporting
 quietly.
 
+When migrations are pending (and none has drifted), the human report ends with
+the two ways to apply them, with your own flags, unless more than 40 are
+pending. Agents: ship with ` + "`ronja propose`" + `, the recommended way for an agent;
+push is for people and CI applying directly.
+
 When more than 40 migrations are not yet applied (and none has drifted), it
 also prints a note that push would refuse the set and names where to split it.
 That note does not change the exit code: it is a warning about the next push,
 not a broken state, so a passing status does not mean the next push will
 succeed.`,
-		Args: refusingRetiredEnv(&env, cobra.NoArgs),
+		Args: refusingRetiredEnv(&env, folderNoArgs),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMigrate(cmd.Context(), migrateOpts{
 				dir: dir, database: database, timeout: timeout, dryRun: true,
@@ -130,8 +140,13 @@ push, then put them back and push again. The folder itself may hold up to 1000
 migrations.
 
 Refuses the whole set if any migration has drifted, before anything runs. Run
-` + "`status`" + ` first if you want to see what would happen.`,
-		Args: refusingRetiredEnv(&env, cobra.NoArgs),
+` + "`status`" + ` first if you want to see what would happen.
+
+Agents: ship with ` + "`ronja propose`" + `, the recommended way for an agent, rather
+than push. Run it in the folder that holds migrations/, with the same
+--database or --stack; the person this login belongs to approves it in Ronja,
+which then applies exactly the SQL they saw.`,
+		Args: refusingRetiredEnv(&env, folderNoArgs),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMigrate(cmd.Context(), migrateOpts{
 				dir: dir, database: database, timeout: timeout, dryRun: false,
@@ -148,7 +163,7 @@ func bindMigrateFlags(cmd *cobra.Command, database, dir, env *string, timeout *t
 	cmd.Flags().StringVar(dir, "dir", ".",
 		"folder holding the migrations/ directory")
 	bindRetiredEnvFlag(cmd, env)
-	cmd.Flags().DurationVar(timeout, "timeout", api.DefaultMigrationTimeout,
+	durationFlag(cmd, timeout, "timeout", api.DefaultMigrationTimeout,
 		"how long to wait (0 waits as long as it takes)")
 	// Its own flag, not the folder commands' inherited one: a migrations folder
 	// has no ronja.json, so the stack names only which remembered database.
@@ -191,7 +206,7 @@ func runMigrate(ctx context.Context, opts migrateOpts) error {
 	if err != nil {
 		return err
 	}
-	if err := checkDatabaseSpace(ctx, client, resolved, key, opts.dir, databaseID); err != nil {
+	if err := checkDatabaseSpace(ctx, client, resolved, key, opts.dir, databaseID, "applied", true); err != nil {
 		return err
 	}
 
@@ -220,7 +235,7 @@ func runMigrate(ctx context.Context, opts migrateOpts) error {
 		}
 		return migrationDriftError(result)
 	}
-	return reportMigrations(result)
+	return reportMigrations(result, opts)
 }
 
 // resolveDatabaseBinding works out which database to target: the flag if given,
@@ -260,124 +275,8 @@ func resolveDatabaseBinding(ctx context.Context, resolved *config.Resolved, opts
 	return databaseID, key, nil
 }
 
-// checkDatabaseSpace refuses a database outside the Space that --stack's
-// stack declares, on this instance and organization (key), in the
-// repository's folders (bind_space_mismatch), so a Dev migration never runs on
-// Main's database. A stack no folder declares a Space for is not checked; a
-// repository that cannot be read, a migrations folder in none, and a stack two
-// folders declare for two Spaces refuse.
-func checkDatabaseSpace(ctx context.Context, client *api.Client, resolved *config.Resolved, key wfdir.InstanceKey, dir, databaseID string) error {
-	if flagStack == "" {
-		return nil
-	}
-	repo, described := addressBoundary(ctx, dir)
-	if _, err := os.Lstat(filepath.Join(repo, ".git")); err != nil {
-		return withExitCode(syncExitUnknown, errors.New("the migrations folder is not inside a git work tree, so no stack's Space could be read; run it from the repository, or pass --database <id> without --stack, which applies with no Space check. Nothing was applied"))
-	}
-	found, err := discoverFolders(repo)
-	if err != nil {
-		return err
-	}
-	type declaring struct {
-		stack wfdir.Stack
-		root  string
-	}
-	var stacks []declaring
-	for _, folder := range found {
-		m, err := manifestForSpaceScan(folder)
-		if err != nil {
-			return err
-		}
-		if st := m.Stacks[flagStack]; st.SpaceID != "" {
-			stacks = append(stacks, declaring{stack: st, root: folder.Root})
-		}
-	}
-	if len(stacks) == 0 {
-		return nil
-	}
-	if !key.Known() {
-		if err := ensureTenant(ctx, resolved); err != nil {
-			return withExitCode(syncExitUnknown, fmt.Errorf("stack %q declares a Space in %s, and which organization this credential is in could not be read to match it: %w. Nothing was applied", flagStack, described, err))
-		}
-		key.TenantID = resolved.TenantID
-	}
-	declared := map[string]string{}
-	folders := map[string][]string{}
-	var spaces []string
-	for _, d := range stacks {
-		st := d.stack
-		if !wfdir.Matches(st.Key(), key) {
-			continue
-		}
-		if _, seen := declared[st.SpaceID]; !seen {
-			spaces = append(spaces, st.SpaceID)
-		}
-		declared[st.SpaceID] = spaceLabel(st)
-		rel, err := filepath.Rel(repo, d.root)
-		if err != nil {
-			rel = d.root
-		}
-		folders[st.SpaceID] = append(folders[st.SpaceID], filepath.ToSlash(rel))
-	}
-	if len(declared) == 0 {
-		return nil
-	}
-	db, err := client.GetDatabase(ctx, databaseID)
-	if err != nil {
-		return withExitCode(syncExitUnknown, fmt.Errorf("check which Space database %s is in, since stack %q declares a Space in %s: %w — nothing was applied", databaseID, flagStack, described, err))
-	}
-	if db.SpaceID == "" {
-		fmt.Fprintf(os.Stderr, "  Note: %s does not say which Space database %s is in, so it was not checked against stack %q's Space.\n", client.BaseURL, databaseID, flagStack)
-		return nil
-	}
-	if _, ok := declared[db.SpaceID]; ok && len(declared) == 1 {
-		return nil
-	}
-	l := newSpaceLookupOn(ctx, client)
-	labels := make([]string, 0, len(spaces))
-	for _, id := range spaces {
-		label := "Space " + declared[id]
-		if len(spaces) > 1 {
-			label += " (" + strings.Join(folders[id], ", ") + ")"
-		}
-		labels = append(labels, label)
-	}
-	refusal := &managedRefusal{Reason: syncReasonBindSpaceMismatch, Detail: fmt.Sprintf(
-		"stack %q is declared for %s in %s, and database %s (%s) is in %s. Pass --database with a database in the stack's Space; nothing was applied",
-		flagStack, strings.Join(labels, " and "), described, orUnknown(db.Name), databaseID, l.describeSpace(db.SpaceID))}
-	return fmt.Errorf("refused (%s): %w", refusal.Reason, refusal)
-}
-
-// manifestForSpaceScan is a discovered folder's manifest, read here when
-// discovery set it aside unread (a nested root, a copied folder id). A
-// manifest that cannot be read refuses: it could declare the stack's Space.
-func manifestForSpaceScan(folder discoveredFolder) (*wfdir.Manifest, error) {
-	if folder.Manifest != nil {
-		return folder.Manifest, nil
-	}
-	unreadable := func(detail string) error {
-		return withExitCode(syncExitUnknown, fmt.Errorf("cannot read %s, so whether it declares stack %q's Space is unknown: %s. Fix it, or pass --database <id> without --stack, which applies with no Space check. Nothing was applied",
-			wfdir.ManifestPath(folder.Root), flagStack, detail))
-	}
-	if folder.Reason == syncReasonUnreadable {
-		return nil, unreadable(folder.Detail)
-	}
-	kind, known, err := folderKindAt(folder.Root)
-	if err != nil {
-		return nil, unreadable(err.Error())
-	}
-	if !known {
-		return nil, unreadable("it declares no kind this build understands")
-	}
-	m, err := wfdir.LoadManifest(folder.Root, kind)
-	if err != nil {
-		return nil, unreadable(err.Error())
-	}
-	return m, nil
-}
-
 // reportMigrations prints the human summary on stderr and nothing on stdout.
-func reportMigrations(r *api.MigrationSetResult) error {
+func reportMigrations(r *api.MigrationSetResult, opts migrateOpts) error {
 	counts := map[string]int{}
 	for _, res := range r.Results {
 		counts[res.Outcome]++
@@ -405,7 +304,55 @@ func reportMigrations(r *api.MigrationSetResult) error {
 	}
 
 	reportMigrationNotes(r)
+	if r.DryRun && counts[api.MigrationPending] > 0 && counts[api.MigrationPending] <= maxPendingPerPush && counts[api.MigrationDrifted] == 0 {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(os.Stderr, "  %s\n", migrateNextStep(opts))
+	}
 	return migrationDriftError(r)
+}
+
+// migrateNextStep names both ways to apply what status found pending, with the
+// caller's own flags so each command targets the database status checked.
+// --profile and --url are carried as typed: an environment variable that chose
+// them chooses them again on the next run.
+func migrateNextStep(opts migrateOpts) string {
+	var common []string
+	if flagProfile != "" {
+		common = append(common, "--profile", shellArg(flagProfile))
+	}
+	if flagURL != "" {
+		common = append(common, "--url", shellArg(flagURL))
+	}
+	if opts.database != "" {
+		common = append(common, "--database", shellArg(opts.database))
+	}
+	if flagStack != "" {
+		common = append(common, "--stack", shellArg(flagStack))
+	}
+	propose, push := append([]string{"ronja", "propose"}, common...), append([]string{"ronja", "db", "migrate", "push"}, common...)
+	if opts.dir != "" && opts.dir != "." {
+		positional := opts.dir
+		if strings.HasPrefix(positional, "-") {
+			positional = "./" + positional
+		}
+		propose = append(propose, shellArg(positional))
+		push = append(push, "--dir", shellArg(opts.dir))
+	}
+	return fmt.Sprintf("Recommended for agents: %s — the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: %s",
+		strings.Join(propose, " "), strings.Join(push, " "))
+}
+
+// shellArg leaves a plain id or path as it is, so the line reads as typed, and
+// quotes anything else for pasting into a shell.
+func shellArg(s string) string {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', strings.ContainsRune("._/:@=+-", r):
+		default:
+			return shellQuote(s)
+		}
+	}
+	return s
 }
 
 // migrationDriftError is the verdict of both output modes, called after the

@@ -74,9 +74,16 @@ Pushing builds a DRAFT, never the live table, so a failed build changes nothing
 anyone else can see. Publishing commits — and a commit cascades, so every table
 downstream of what you published rebuilds on its own.
 
-Refs between tables are id-form: {{ ref('table-abc') }}. The CLI derives each
-table's declared inputs from the refs in its file, so adding an upstream is
-editing the SQL and nothing else.
+A ref names a table one of three ways, and each is resolved to the table's id
+on push:
+
+  {{ ref('orders') }}         a sibling file, orders.sql in this folder
+  {{ ref('Sales.orders') }}   a name declared under "dependencies" in ronja.json
+                              and bound to a table for the stack
+  {{ ref('table-abc') }}      the table's id
+
+The CLI derives each table's declared inputs from the refs in its file, so
+adding an upstream is editing the SQL and nothing else.
 
 Note the name: api.Workflow also has a "pipeline" KIND, and this command has
 nothing to do with those — it operates on derived tables.

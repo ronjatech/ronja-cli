@@ -50,10 +50,12 @@ const SeverityInfo = "info"
 // the day somebody reworded it.
 const FindingSecretDropped = "secret_dropped"
 
-// ValidateFile is one candidate file, mirroring rworkflow.ValidateFile.
+// ValidateFile is one candidate file, mirroring rworkflow.ValidateFile. A
+// `.jar` goes as Binary with an empty Content: its bytes are never posted.
 type ValidateFile struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
+	Path    string              `json:"path"`
+	Content string              `json:"content"`
+	Binary  *WorkflowFileBinary `json:"binary,omitempty"`
 }
 
 // ValidateInput mirrors rworkflow.ValidateFilesInput — a whole candidate

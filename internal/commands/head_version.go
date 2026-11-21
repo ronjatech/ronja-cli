@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -63,6 +65,9 @@ type headAgreement struct {
 	// which a vouched push would overwrite without ever comparing anything. That
 	// draft falls through to the ordinary refusal.
 	AnchoredDraft bool
+	// Unread is the read of Current that failed, nil when it was not made or
+	// answered.
+	Unread error
 }
 
 // Vouches reports that this folder may be held to the head pointer instead of a
@@ -95,24 +100,35 @@ func dataAppHeadReader(client *api.Client) headReader  { return client.DataAppHe
 // on its next ordinary push instead of only on a re-clone — see anchorAfterPush
 // for the condition that makes that honest.
 //
-// A failed read is NOT fatal and NOT an agreement: Current stays empty, Vouches
-// is false, and the push falls back to the baseline guard it had before. The
-// alternative — failing the push — would make a transient 5xx on a listing route
-// the reason a deploy stopped, for a check whose absence is simply the older,
-// stricter behaviour.
+// A failed read is NOT fatal and NOT an agreement: Current stays empty, Unread
+// holds the error, Vouches is false, and the push falls back to the baseline
+// guard it had before. The alternative — failing the push — would make a
+// transient 5xx on a listing route the reason a deploy stopped, for a check
+// whose absence is simply the older, stricter behaviour.
 func readHeadAgreement(ctx context.Context, read headReader, f *folder, resourceID string, anchoredDraft bool) headAgreement {
-	h := headAgreement{Recorded: f.headVersion(), AnchoredDraft: anchoredDraft}
-	if f.Stack == "" || resourceID == "" {
-		return h
-	}
-	current, err := read(ctx, resourceID)
+	h, err := askHeadAgreement(ctx, read, f, resourceID, anchoredDraft)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not read the version history of %s (%v) — falling back to the local sync baseline.\n",
 			resourceID, err)
-		return h
+	}
+	return h
+}
+
+// askHeadAgreement is readHeadAgreement for a preview, which reports a failed
+// read rather than falling back: the fallback refuses for want of a recorded
+// version, naming a remedy the folder does not need.
+func askHeadAgreement(ctx context.Context, read headReader, f *folder, resourceID string, anchoredDraft bool) (headAgreement, error) {
+	h := headAgreement{Recorded: f.headVersion(), AnchoredDraft: anchoredDraft}
+	if f.Stack == "" || resourceID == "" {
+		return h, nil
+	}
+	current, err := read(ctx, resourceID)
+	if err != nil {
+		h.Unread = err
+		return h, err
 	}
 	h.Current = current
-	return h
+	return h, nil
 }
 
 // anchorAfterPush records the live version this folder now sits on, and
@@ -359,6 +375,76 @@ func refuseHeadMoved(kind, resourceID string, h headAgreement, cloneCmd, pullHin
 // through, or the first thing they do when something goes wrong is assume there
 // was none.
 func noteHeadAnchored(resourceID, versionID string) {
+	// A dry run asks the push's check and pushes nothing.
+	if flagSyncDryRun {
+		return
+	}
 	fmt.Fprintf(os.Stderr, "  Note: no local sync baseline here, but %s is still at version %s — the version %s recorded. Pushing against the live files.\n",
 		resourceID, versionID, wfdir.LockName)
+}
+
+// draftOpenRefusal is the push's refusal of a folder with no local baseline
+// whose recorded live version is still live's, while a draft of the row is
+// open. Its own type because a dry run reports it as `draft_open`: the one
+// refusal a change list carries to its approval, where the person sees the
+// draft before anything discards it.
+type draftOpenRefusal struct{ error }
+
+func (r draftOpenRefusal) Unwrap() error { return r.error }
+
+// beyondDraftOpen answers err, unless err is a draftOpenRefusal and the push
+// would refuse the folder anyway once that draft is discarded: then it answers
+// that refusal instead. A change list's deploy discards an accepted draft before
+// it deploys, so draft_open must mean "only the draft stands in the way", or
+// approving would throw the draft away and deploy nothing.
+//
+// With the draft gone the push checks live out, which the recorded version
+// vouches for, so what is left is the title held to live's. Pure: live is the
+// bound live row, already read.
+func beyondDraftOpen(f *folder, live any, err error) error {
+	if !errors.As(err, new(draftOpenRefusal)) {
+		return err
+	}
+	var gone error
+	switch row := live.(type) {
+	case *api.Workflow:
+		gone = titleRefusal(f, "workflow", nil, titledRow{ID: row.ID, Title: row.Title, Live: true}, false)
+	case *api.DataApp:
+		// The head vouches for an app's live title: see appTitleHeadVouches,
+		// asked of a checkout not yet made.
+		gone = titleRefusal(f, "data app", nil, titledRow{ID: row.ID, Title: row.Name, Live: true}, true)
+	case *api.Module:
+		gone = titleRefusal(f, "module", nil, titledRow{ID: row.ID, Title: row.Title, Live: true}, false)
+	default:
+		panic(fmt.Sprintf("beyondDraftOpen: %T is not a live workflow, data app or module", live))
+	}
+	return cmp.Or(gone, err)
+}
+
+// draftOpenRemedy finishes a draft_open refusal's "throw the draft away and …".
+// `sync apply` has no --force.
+func draftOpenRemedy(ask driftAsk) string {
+	if ask.apply {
+		return "apply again"
+	}
+	return "push onto the live version, or push --force to overwrite it"
+}
+
+// noBaselineRemedy is the way past a push's refusal of a folder with no local
+// baseline and no live version recorded that vouches for it. Under `sync
+// apply` that is a change list's deploy, or CI, on a copy that never has a
+// local baseline, so the remedy is recording the version rather than cloning
+// or --force, which only work in a checkout. clone starts the checkout's
+// sentence ("Clone the workflow").
+func noBaselineRemedy(f *folder, ask driftAsk, head headAgreement, clone string) string {
+	if ask.apply && head.Recorded != "" && head.Unread != nil {
+		return fmt.Sprintf("Ronja could not read the version history of %s (%v), so nothing here shows whether live is still the version %s recorded. Apply again; for a change list, approve a new proposal",
+			cmp.Or(f.Binding.WorkflowID, f.Binding.DataAppID, f.Binding.ModuleID), head.Unread, wfdir.LockName)
+	}
+	if ask.apply {
+		return fmt.Sprintf("Record the live version this folder holds: run `ronja sync adopt --stack %s` in a checkout that last synced with it (`%s pull` first, if live changed), then run `ronja propose` or apply again",
+			cmp.Or(f.Stack, "<name>"), f.Kind.Command)
+	}
+	return fmt.Sprintf("%s into a fresh folder to get one, or push --force to overwrite the remote files with what you have here%s",
+		clone, f.pullHint("  "))
 }

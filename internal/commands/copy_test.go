@@ -24,6 +24,8 @@ type fakeCopyInstance struct {
 	// refuse answers every copy with this status and body instead.
 	refuse     int
 	refuseBody string
+	// validated is every POST /workflow/validate body, in order.
+	validated []api.ValidateInput
 }
 
 type copyRequestSeen struct {
@@ -45,7 +47,7 @@ func newFakeCopyInstance(t *testing.T) *fakeCopyInstance {
 	search.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		echoSpace(w, r)
 		if r.URL.Path == "/api/v2/workflow/validate" {
-			serveOutputLiterals(w, r)
+			f.validated = append(f.validated, serveOutputLiterals(w, r))
 			return
 		}
 		source, isCopy := strings.CutSuffix(strings.TrimPrefix(r.URL.Path, "/api/v2/feature/model/"), "/copy")
@@ -80,11 +82,13 @@ func newFakeCopyInstance(t *testing.T) *fakeCopyInstance {
 }
 
 // serveOutputLiterals answers POST /workflow/validate with the write targets
-// the server's scan reports for the posted files, none of them readable.
-func serveOutputLiterals(w http.ResponseWriter, r *http.Request) {
+// the server's scan reports for the posted files, none of them readable, and
+// returns the body it answered.
+func serveOutputLiterals(w http.ResponseWriter, r *http.Request) api.ValidateInput {
 	var in api.ValidateInput
 	_ = json.NewDecoder(r.Body).Decode(&in)
 	writeJSON(w, map[string]any{"findings": []any{}, "resolved": map[string]any{}, "writeTargets": fakeWriteTargets(in.Files, nil)})
+	return in
 }
 
 // copyFolder is a workflow folder deploying to Main and to Dev, which declares

@@ -82,6 +82,10 @@ What happens depends on the workflow:
 --no-request-review turns the last case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
 
+Agents: ship with ` + "`ronja propose`" + `, the recommended way for an agent to
+ship an adopted folder; the person this login belongs to approves it in Ronja,
+which then deploys it as them.
+
 The commit is refused when somebody else has published a new version of the
 workflow since your draft was created — nothing is written and your draft is
 untouched. Review what they changed and re-apply your work on top of it, or
@@ -89,7 +93,7 @@ re-run with --overwrite-remote to commit over their version deliberately.
 
 Push first: publish sends what is already on the server, and warns when the
 folder has local changes that are not in the draft.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(false)
 			if err != nil {
@@ -376,8 +380,8 @@ func resolveDraft(ctx context.Context, client *api.Client, f *folder, noun strin
 	wf, err := client.GetWorkflow(ctx, f.Binding.WorkflowID)
 	if err != nil {
 		if api.StatusOf(err) == 404 {
-			return nil, nil, fmt.Errorf("workflow %s no longer exists on %s (or you lost access to it)",
-				f.Binding.WorkflowID, f.Resolved.URL)
+			return nil, nil, fmt.Errorf("workflow %s no longer exists on %s (or you lost access to it) — clone the workflow you meant into a fresh folder, or remove the binding from %s and push to start a new one",
+				f.Binding.WorkflowID, f.Resolved.URL, f.bindingFiles())
 		}
 		return nil, nil, err
 	}

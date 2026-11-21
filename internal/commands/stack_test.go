@@ -558,3 +558,27 @@ func TestPushAdoptsAndHealsAStrandedLockEntry(t *testing.T) {
 		}
 	}
 }
+
+// TestAGoneWorkflowNamesTheStackFoldersBindingFiles: a stack folder keeps the
+// workflow id in ronja.lock.json, so the advice to remove the binding names
+// that file, not ronja.json alone.
+func TestAGoneWorkflowNamesTheStackFoldersBindingFiles(t *testing.T) {
+	f := newFakeInstance(t)
+	f.AddWorkflow(&api.Workflow{ID: "wf-1", Lifecycle: api.LifecycleLive, FeatureScope: "private"},
+		api.WorkflowFile{Path: "main.py", Content: "body\n"})
+	signIn(t, f)
+	out, err := runCLI(t, t.TempDir(), "wf", "clone", "wf-1", "--stack", "prod", "--json")
+	if err != nil {
+		t.Fatalf("clone --stack prod: %v", err)
+	}
+	root := decodeJSON(t, out)["root"].(string)
+	delete(f.workflows, "wf-1")
+
+	for _, args := range [][]string{{"discard", "--yes"}, {"publish"}} {
+		verb := args[0]
+		_, err := runCLI(t, root, append([]string{"wf", "--stack", "prod"}, args...)...)
+		if err == nil || !strings.Contains(err.Error(), "remove the binding from "+wfdir.LockPath(root)+" and "+wfdir.ManifestPath(root)) {
+			t.Errorf("wf %s on a gone workflow: %v; want it to name %s and %s", verb, err, wfdir.LockPath(root), wfdir.ManifestPath(root))
+		}
+	}
+}

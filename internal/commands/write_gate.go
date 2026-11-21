@@ -740,16 +740,26 @@ func workflowGateInput(f *folder, local map[string]string, params []api.Workflow
 
 // gateWorkflowRow is the gate over a STORED draft — what `wf publish` would
 // commit and `wf test` would run, which the web app may have edited since the
-// folder pushed it — or the live row `wf run` runs. The files go up exactly as
-// the row holds them. ⚠️ The commit or run is a LATER request: an edit made in
+// folder pushed it — or the live row `wf pull` takes. The files go up exactly
+// as the row holds them. ⚠️ The commit or run is a LATER request: an edit made in
 // between is not seen. See BL-b3c7.
 func gateWorkflowRow(ctx context.Context, client *api.Client, f *folder, row *api.Workflow) error {
 	if !f.gateApplies() || row == nil {
 		return nil
 	}
 	files, err := client.ListWorkflowFiles(ctx, row.ID)
-	if err != nil {
-		return fmt.Errorf("read the files of %s to check where they write: %w", row.ID, err)
+	return gateListedWorkflowRow(ctx, client, f, row, files, err)
+}
+
+// gateListedWorkflowRow is gateWorkflowRow over a listing of row's files the
+// caller already made: `wf run` passes the listing of the live row it compared
+// the folder with. listErr is that listing's failure, which refuses.
+func gateListedWorkflowRow(ctx context.Context, client *api.Client, f *folder, row *api.Workflow, files []api.WorkflowFile, listErr error) error {
+	if !f.gateApplies() || row == nil {
+		return nil
+	}
+	if listErr != nil {
+		return fmt.Errorf("read the files of %s to check where they write: %w", row.ID, listErr)
 	}
 	in := api.ValidateInput{
 		FeatureID:      f.Binding.FeatureID,
@@ -760,7 +770,7 @@ func gateWorkflowRow(ctx context.Context, client *api.Client, f *folder, row *ap
 		Files:          make([]api.ValidateFile, 0, len(files)),
 	}
 	for _, file := range files {
-		in.Files = append(in.Files, api.ValidateFile{Path: file.Path, Content: file.Content})
+		in.Files = append(in.Files, validateFileOfRow(file))
 	}
 	sort.Slice(in.Files, func(i, j int) bool { return in.Files[i].Path < in.Files[j].Path })
 	result, err := client.ValidateWorkflowFiles(ctx, in)

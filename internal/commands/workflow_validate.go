@@ -44,7 +44,7 @@ here and exits non-zero, because ` + "`ronja wf push`" + ` refuses it.
 
 With --json, the server's response verbatim plus an "ok" boolean and any local
 "aliasRefusals".`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveInstance()
 			if err != nil {

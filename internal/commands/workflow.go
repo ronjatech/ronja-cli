@@ -1387,7 +1387,7 @@ func refuseUnclonable(wf *api.Workflow) error {
 	case api.LifecycleArchived:
 		return fmt.Errorf("workflow %s is archived — restore it from the web UI first", wf.ID)
 	default:
-		return fmt.Errorf("workflow %s has lifecycle %s, which this command does not work with",
+		return fmt.Errorf("workflow %s has lifecycle %s, which this command does not work with — `ronja update` may know it",
 			wf.ID, api.DescribeLifecycle(wf.Lifecycle))
 	}
 }
@@ -1401,7 +1401,7 @@ func refuseUnclonable(wf *api.Workflow) error {
 func hashFiles(codec aliasCodec, files []api.WorkflowFile) map[string]string {
 	out := make(map[string]string, len(files))
 	for _, f := range files {
-		out[f.Path] = wfdir.HashString(codec.toDisk(f.Content))
+		out[f.Path] = contentHash(remoteContent(codec, f))
 	}
 	return out
 }
@@ -1411,7 +1411,8 @@ func hashFiles(codec aliasCodec, files []api.WorkflowFile) map[string]string {
 //
 // Content is held in memory on purpose: a workflow is source code, the server
 // stores it in a text column, and the push guard below caps what may be sent
-// anyway — so the whole folder is small by construction.
+// anyway — so the whole folder is small by construction. A workflow's jar is
+// held as its stand-in (workflow_jar.go), not its bytes.
 func readLocalFiles(root string, kind wfdir.Kind) (map[string]string, *wfdir.Enumeration, error) {
 	enumeration, err := wfdir.Enumerate(root, kind)
 	if err != nil {
@@ -1423,7 +1424,7 @@ func readLocalFiles(root string, kind wfdir.Kind) (map[string]string, *wfdir.Enu
 		if err != nil {
 			return nil, nil, fmt.Errorf("read %s: %w", path, err)
 		}
-		files[path] = string(body)
+		files[path] = localContent(kind, path, body)
 	}
 	return files, enumeration, nil
 }
@@ -1498,10 +1499,17 @@ func checkPushable(files map[string]string, kind wfdir.Kind, maxBytes int) error
 			strings.Join(collisions, "\n    "))
 	}
 
+	if kind.Name == wfdir.KindWorkflow {
+		if jars := checkJars(files); len(jars) > 0 {
+			return fmt.Errorf("these .jar files cannot be synced to Ronja:\n    %s", strings.Join(jars, "\n    "))
+		}
+	}
 	var rejected, rejectedPaths []string
 	for _, path := range sortedPaths(files) {
 		content := files[path]
 		switch {
+		case kind.Name == wfdir.KindWorkflow && isJarPath(path):
+			continue
 		case len(content) > maxBytes:
 			rejected = append(rejected, fmt.Sprintf("%s (%d bytes, limit %d)", path, len(content), maxBytes))
 		case strings.ContainsRune(content, 0):
@@ -1537,7 +1545,7 @@ func sortedPaths(files map[string]string) []string {
 func validateFilesOf(codec aliasCodec, files map[string]string) []api.ValidateFile {
 	out := make([]api.ValidateFile, 0, len(files))
 	for _, path := range sortedPaths(files) {
-		out = append(out, api.ValidateFile{Path: path, Content: codec.toWire(files[path])})
+		out = append(out, validateFileOf(codec, path, files[path]))
 	}
 	return out
 }
@@ -1699,7 +1707,7 @@ func baselineFrom(codec aliasCodec, source *api.Workflow, files []api.WorkflowFi
 	}
 	for _, f := range files {
 		inst.Files[f.Path] = wfdir.FileState{
-			SHA256:    wfdir.HashString(codec.toDisk(f.Content)),
+			SHA256:    contentHash(remoteContent(codec, f)),
 			UpdatedAt: f.UpdatedAt.UTC().Format(time.RFC3339),
 		}
 	}
@@ -1734,7 +1742,7 @@ func baselineFromLocal(codec aliasCodec, source *api.Workflow, files map[string]
 		AliasesRecorded:   true,
 	}
 	for path, content := range files {
-		inst.Files[path] = wfdir.FileState{SHA256: wfdir.HashString(content)}
+		inst.Files[path] = wfdir.FileState{SHA256: contentHash(content)}
 	}
 	return inst
 }

@@ -236,9 +236,13 @@ func renameDraft(ctx context.Context, client *api.Client, live liveHashes, path,
 // version being filed — a live workflow in a private feature is retitled in
 // place (rworkflow.Update) — so no commit precondition catches a rename of it,
 // and the title leg must look at it itself.
+//
+// Live (the target only) says the row checked is the live row itself, not a
+// draft, so a refusal names it as such.
 type titledRow struct {
 	ID, Title       string
 	RetitledInPlace bool
+	Live            bool
 }
 
 // titleLeg is the name rule for a FOLDER kind's manifest "title" — a data app, a
@@ -276,42 +280,47 @@ func titleLeg(f *folder, kind string, live *titledRow, target titledRow, headVou
 	if declared == "" {
 		return false, nil
 	}
-	var known []string
-	if t := f.Lock.AppliedTitle(f.Stack); t != "" {
-		known = append(known, t)
+	w, moved := titleMoved(f, kind, live, target, headVouches)
+	if len(moved) > 0 && !force {
+		return false, titleMovedError(f, kind, live, target, w, moved)
 	}
-	// ownPending: the draft holds the declared title and the local baseline says
-	// THIS folder put it there. A live row still carrying the old title is then
-	// just the rename waiting for its publish, not somebody else's.
-	ownPending := false
-	if b := f.State.For(f.Baseline()); b != nil && b.Title != "" &&
-		(b.SourceID == target.ID || (live != nil && b.SourceID == live.ID)) {
-		known = append(known, b.Title)
-		ownPending = b.SourceID == target.ID && sameName(b.Title, declared) && sameName(target.Title, declared)
-	}
-	// The live title: the live row's, or — for a row never published, which IS
-	// the draft — the draft's own.
-	liveTitle := target.Title
-	if live != nil {
-		liveTitle = live.Title
-	}
-	// THE HEAD'S WITNESS, consulted only when nothing is recorded: the anchor
-	// says nobody has published the live row since this folder last agreed with
-	// it, and for this kind only a publish can retitle it — so its title is this
-	// folder's own last state.
-	vouched := false
-	if len(known) == 0 && headVouches {
-		known = append(known, liveTitle)
-		vouched = true
-	}
-	isKnown := func(name string) bool {
-		for _, k := range known {
-			if sameName(name, k) {
-				return true
-			}
+	write := !sameName(target.Title, declared)
+	switch {
+	case len(moved) > 0:
+		fmt.Fprintf(os.Stderr, "  Note: --force — renaming to %q: %s.\n", declared, strings.Join(moved, " and "))
+		// Acknowledged, so the next push does not re-report it before the
+		// rename is published.
+		recordAppliedTitle(f, w.liveTitle)
+	case w.knows(w.liveTitle):
+		// LIVE EQUALS DESIRED — whatever the anchor said, this is now the title
+		// this folder agrees with — or the live row holds this folder's own last
+		// state (recorded, or vouched for by the head anchor). Either way it is
+		// the title to compare the NEXT push against, and recording it is what
+		// lets a push that staged a rename be followed by another before the
+		// publish lands.
+		if w.vouched && write {
+			fmt.Fprintf(os.Stderr, "  Note: no title was recorded for %s %s, but its version history shows nobody has published it since this folder last agreed with it — so %q is this folder's own, and it is renamed to %q.\n",
+				kind, titleResource(live, target), w.liveTitle, declared)
 		}
-		return false
+		recordAppliedTitle(f, w.liveTitle)
 	}
+	return write, nil
+}
+
+// titleRefusal is titleLeg's refusal without --force, nil when the push may go
+// on. It reads and writes nothing, so a dry run can ask it.
+func titleRefusal(f *folder, kind string, live *titledRow, target titledRow, headVouches bool) error {
+	if f.Manifest.Title == "" {
+		return nil
+	}
+	w, moved := titleMoved(f, kind, live, target, headVouches)
+	return titleMovedError(f, kind, live, target, w, moved)
+}
+
+// titleMoved names each row titleLeg holds to the known titles whose title is
+// neither the declared one nor one this folder last agreed with.
+func titleMoved(f *folder, kind string, live *titledRow, target titledRow, headVouches bool) (titleWitness, []string) {
+	w := witnessTitles(f, live, target, headVouches)
 	// With this folder's own rename pending, the live row is left to the
 	// commit's base-version precondition, which catches a live row renamed since
 	// the draft was opened — but only where a rename files a version. A row
@@ -321,49 +330,98 @@ func titleLeg(f *folder, kind string, live *titledRow, target titledRow, headVou
 	// told from a colleague's, and it is left unchecked rather than refuse the
 	// folder's own pending rename (BL-5d0e).
 	checkLive := live != nil && live.ID != target.ID &&
-		(!ownPending || (live.RetitledInPlace && f.Lock.AppliedTitle(f.Stack) != ""))
-	rows := []struct{ what, title string }{{"draft " + target.ID, target.Title}}
+		(!w.ownPending || (live.RetitledInPlace && f.Lock.AppliedTitle(f.Stack) != ""))
+	what := "draft " + target.ID
+	if target.Live {
+		what = "the live " + kind + " " + target.ID
+	}
+	rows := []struct{ what, title string }{{what, target.Title}}
 	if checkLive {
 		rows = append(rows, struct{ what, title string }{"the live " + kind + " " + live.ID, live.Title})
 	}
 	var moved []string
 	for _, row := range rows {
-		if sameName(row.title, declared) || isKnown(row.title) {
+		if w.knows(row.title) {
 			continue
 		}
 		moved = append(moved, fmt.Sprintf("%s is titled %q", row.what, row.title))
 	}
-	write := !sameName(target.Title, declared)
-	resource := target.ID
-	if live != nil {
-		resource = live.ID
+	return w, moved
+}
+
+// titleMovedError is titleLeg's refusal of the moved rows, nil when none moved.
+func titleMovedError(f *folder, kind string, live *titledRow, target titledRow, w titleWitness, moved []string) error {
+	if len(moved) == 0 {
+		return nil
 	}
-	switch {
-	case len(moved) > 0 && len(known) == 0 && !force:
-		return false, fmt.Errorf("the title of %s %s does not match %s (%q): %s — and this folder has no recorded title to tell a rename made here from one made in the web app.\n  Set \"title\" in %s to what it is now, remove the key to stop managing it, or push --force to rename it to %q%s",
+	declared, resource := f.Manifest.Title, titleResource(live, target)
+	if len(w.known) == 0 {
+		return fmt.Errorf("the title of %s %s does not match %s (%q): %s — and this folder has no recorded title to tell a rename made here from one made in the web app.\n  Set \"title\" in %s to what it is now, remove the key to stop managing it, or push --force to rename it to %q%s",
 			kind, resource, wfdir.ManifestName, declared, strings.Join(moved, " and "), wfdir.ManifestName, declared, nameRemedy(f, titlePushCommand(kind), "  "))
-	case len(moved) > 0 && !force:
-		return false, fmt.Errorf("the title of %s %s was renamed somewhere other than this folder since it last agreed with it (%q): %s.\n  Pushing would rename it back to %q from %s. Set \"title\" there to what it is now, remove the key to stop managing it, or push --force to rename it back%s",
-			kind, resource, known[0], strings.Join(moved, " and "), declared, wfdir.ManifestName, nameRemedy(f, titlePushCommand(kind), "  "))
-	case len(moved) > 0:
-		fmt.Fprintf(os.Stderr, "  Note: --force — renaming to %q: %s.\n", declared, strings.Join(moved, " and "))
-		// Acknowledged, so the next push does not re-report it before the
-		// rename is published.
-		recordAppliedTitle(f, liveTitle)
-	case sameName(liveTitle, declared) || isKnown(liveTitle):
-		// LIVE EQUALS DESIRED — whatever the anchor said, this is now the title
-		// this folder agrees with — or the live row holds this folder's own last
-		// state (recorded, or vouched for by the head anchor). Either way it is
-		// the title to compare the NEXT push against, and recording it is what
-		// lets a push that staged a rename be followed by another before the
-		// publish lands.
-		if vouched && write {
-			fmt.Fprintf(os.Stderr, "  Note: no title was recorded for %s %s, but its version history shows nobody has published it since this folder last agreed with it — so %q is this folder's own, and it is renamed to %q.\n",
-				kind, resource, liveTitle, declared)
-		}
-		recordAppliedTitle(f, liveTitle)
 	}
-	return write, nil
+	return fmt.Errorf("the title of %s %s was renamed somewhere other than this folder since it last agreed with it (%q): %s.\n  Pushing would rename it back to %q from %s. Set \"title\" there to what it is now, remove the key to stop managing it, or push --force to rename it back%s",
+		kind, resource, w.known[0], strings.Join(moved, " and "), declared, wfdir.ManifestName, nameRemedy(f, titlePushCommand(kind), "  "))
+}
+
+// titleResource is the row a title refusal names: the live one when there is one.
+func titleResource(live *titledRow, target titledRow) string {
+	if live != nil {
+		return live.ID
+	}
+	return target.ID
+}
+
+// titleWitness is what titleLeg holds a row's title to: the declared title and
+// the titles this folder last agreed the row had (known).
+type titleWitness struct {
+	declared, liveTitle string
+	known               []string
+	// vouched: known is the live title alone, supplied by the head anchor.
+	vouched bool
+	// ownPending: the draft holds the declared title and the local baseline says
+	// THIS folder put it there. A live row still carrying the old title is then
+	// just the rename waiting for its publish, not somebody else's.
+	ownPending bool
+}
+
+// witnessTitles gathers titleLeg's witnesses, and reads and writes nothing.
+func witnessTitles(f *folder, live *titledRow, target titledRow, headVouches bool) titleWitness {
+	w := titleWitness{declared: f.Manifest.Title, liveTitle: target.Title}
+	if t := f.Lock.AppliedTitle(f.Stack); t != "" {
+		w.known = append(w.known, t)
+	}
+	if b := f.State.For(f.Baseline()); b != nil && b.Title != "" &&
+		(b.SourceID == target.ID || (live != nil && b.SourceID == live.ID)) {
+		w.known = append(w.known, b.Title)
+		w.ownPending = b.SourceID == target.ID && sameName(b.Title, w.declared) && sameName(target.Title, w.declared)
+	}
+	// For a row never published, the live title IS the draft's own.
+	if live != nil {
+		w.liveTitle = live.Title
+	}
+	// THE HEAD'S WITNESS, consulted only when nothing is recorded: the anchor
+	// says nobody has published the live row since this folder last agreed with
+	// it, and for this kind only a publish can retitle it — so its title is this
+	// folder's own last state.
+	if len(w.known) == 0 && headVouches {
+		w.known = append(w.known, w.liveTitle)
+		w.vouched = true
+	}
+	return w
+}
+
+// knows reports that a row titled name holds the declared title or one this
+// folder last agreed with.
+func (w titleWitness) knows(name string) bool {
+	if sameName(name, w.declared) {
+		return true
+	}
+	for _, k := range w.known {
+		if sameName(name, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // titlePushCommand is the single-folder push of a folder kind titleLeg serves.

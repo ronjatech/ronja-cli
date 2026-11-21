@@ -286,7 +286,7 @@ func (f *folder) reboundUnrecorded(drift wfdir.Diff, remote, local map[string]st
 	then := newAliasCodec(deps, old)
 	baseline := b.Hashes()
 	for _, path := range drift.Modified {
-		if wfdir.HashString(then.toDisk(remote[path])) != baseline[path] {
+		if contentHash(then.toDisk(remote[path])) != baseline[path] {
 			return nil
 		}
 	}
@@ -370,6 +370,9 @@ func (c aliasCodec) resolve(kind, name string) (string, bool) {
 // and better-aimed than anything invented here — it knows whether the row
 // exists, whether the caller can reach it, and what the id was meant to be.
 func (c aliasCodec) toWire(content string) string {
+	if isJarStandIn(content) {
+		return content
+	}
 	return c.rewriteWrites(c.rewrite(content, c.toID), c.writeToID)
 }
 
@@ -381,6 +384,9 @@ func (c aliasCodec) toWire(content string) string {
 // a remote read would land in the folder under whichever of the two names won a
 // map iteration.
 func (c aliasCodec) toDisk(content string) string {
+	if isJarStandIn(content) {
+		return content
+	}
 	return c.rewriteWrites(c.rewrite(content, c.toAlias), c.writeToAlias)
 }
 
@@ -673,9 +679,14 @@ func (c aliasCodec) writeBindTargets() map[string]string { return c.writeToAlias
 // table does not exist yet: its id arrives only when its own create returns. So
 // toWire reads the binding LIVE, inside the topo loop, and topoOrder — which
 // derives its edges from folderUpstreams, stem refs included — is what
-// guarantees the file a ref names has already been pushed.
+// guarantees the file a ref names has already been pushed when this push holds
+// it.
 type pipelineCodec struct {
 	f *folder
+	// pushing is the files this push sends, set once they are known, so a
+	// sibling with no table id can be told apart: refused earlier in this push,
+	// or left out of it.
+	pushing map[string]bool
 	// pathByStem maps a stem to the folder file that claims it, first in path
 	// order. Fixed for the run, since it comes from the files on disk.
 	//
@@ -718,17 +729,15 @@ func newPipelineCodec(f *folder, local map[string]string) pipelineCodec {
 // a declared alias. `path` is the file being resolved, which is what lets a
 // self-reference be named as one.
 //
-// The error is per-file and the caller refuses that file with it. Three of the
-// four are about what the author wrote; the last is about this program:
+// The error is per-file and the caller refuses that file with it:
 //
 //   - an AMBIGUOUS stem, which no answer here can disambiguate;
 //   - a SELF-reference, which is a cycle of one and which the create could not
 //     resolve in any case, since the table does not exist while it is being made;
 //   - ONE SIBLING SPELLED TWO WAYS in one file — see spelledTwoWays;
-//   - a sibling whose table id is not recorded yet, which means the push reached
-//     a downstream file before its upstream. That is topoOrder failing to do the
-//     one thing it exists for, so it is reported as a bug rather than dressed up
-//     as something the author can fix.
+//   - a sibling whose table id is not recorded yet: either it is in this push,
+//     where topoOrder put it first and its own create was refused or failed (the
+//     push carries on past a failed file), or a narrowed push left it out.
 func (c pipelineCodec) toWire(path, content string) (string, error) {
 	var failure error
 	fail := func(format string, args ...any) {
@@ -759,8 +768,13 @@ func (c pipelineCodec) toWire(path, content string) (string, error) {
 					if id := c.f.Binding.Tables[sibling]; id != "" {
 						return id
 					}
-					fail("%s reads %q and no table id is recorded for %s yet, so this push reached it before its upstream. That is a bug in ronja (topoOrder should have ordered %s first), not something wrong with your folder",
-						path, o.Marker, sibling, sibling)
+					if c.pushing[sibling] {
+						fail("%s reads %q and no table id is recorded for %s in this folder yet — its own error is above",
+							path, o.Marker, sibling)
+					} else {
+						fail("%s reads %q and no table id is recorded for %s in this folder yet — push it in the same run (a bare ronja pipeline push, or name %s too)",
+							path, o.Marker, sibling, sibling)
+					}
 				}
 				return o.Arg
 			}

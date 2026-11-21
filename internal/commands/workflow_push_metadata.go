@@ -198,6 +198,13 @@ func checkRuntimeDrift(f *folder, live *api.Workflow) error {
 		live.RuntimeVersion, wfdir.ManifestPath(f.Root))
 }
 
+// runtimeDiffers reports a runtime the folder declares and the row reports
+// otherwise. Neither side's silence is a value: an absent `runtime` key declares
+// nothing and a row reporting 0 said nothing, as in checkRuntimeDrift.
+func runtimeDiffers(m *wfdir.Manifest, row *api.Workflow) bool {
+	return m.Runtime != 0 && row.RuntimeVersion > 0 && m.RuntimeVersion() != row.RuntimeVersion
+}
+
 // checkLanguageDrift refuses a push of a folder whose language is not the
 // row's. The language is fixed at create, so there is no patch that could
 // reconcile them, and files of one language saved into a workflow of the other

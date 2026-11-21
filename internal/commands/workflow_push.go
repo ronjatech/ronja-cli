@@ -56,7 +56,7 @@ saved, and every run that touches the marker fails. Use
 Publishing is a separate step:
 
   ronja wf publish                 commit the draft, or submit it for review`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(false)
 			if err != nil {
@@ -528,7 +528,7 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		verdict, err := checkDrift(f, target, remoteFiles, hashFiles(f.baselineCodec(), files), local, opts.Force, head,
 			driftAsk{draft: result.DraftPreexisted, apply: opts.Apply})
 		if err != nil {
-			return refuseUnwritten(err)
+			return refuseUnwritten(beyondDraftOpen(f, existing.Workflow, err))
 		}
 		baselineClean = verdict.BaselineClean
 		// The TITLE's own leg (name_attr.go's titleLeg), against the committed
@@ -553,7 +553,7 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		if !verdict.Bypassed {
 			stored := make(map[string]string, len(files))
 			for _, file := range files {
-				stored[file.Path] = file.Content
+				stored[file.Path] = storedContent(file)
 			}
 			preconditions = filePreconditions{Armed: true, Hashes: verdict.Preconditions}.onTheWire(stored, f.Codec, f.baselineCodec())
 		}
@@ -604,11 +604,21 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		return result, err
 	}
 
+	// 5b. Jars removed from the folder go before any write: the server holds a
+	// workflow's jars to a total, and a renamed jar (a driver's version bump)
+	// would otherwise be uploaded beside the one it replaces. A jar is never
+	// the entrypoint, so the server never refuses its delete for that.
+	warnings, err := deleteFiles(ctx, client, target.ID, local, remoteFiles, landed, preconditions, result, isJarPath)
+	result.Warnings = appendDistinct(result.Warnings, warnings...)
+	if err != nil {
+		return stop(err)
+	}
+
 	// 6. Writes first, entrypoint leading: it is the file the server validates
 	// the workflow's shape against, a half-finished sync still has a coherent
 	// entrypoint — and the metadata patch below cannot name an entrypoint the
 	// row holds no file for.
-	warnings, err := putFiles(ctx, client, f.Codec, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
+	warnings, err = putFiles(ctx, client, f.Codec, f.Root, target.ID, entrypoint, local, remoteFiles, landed, preconditions, result)
 	result.Warnings = appendDistinct(result.Warnings, warnings...)
 	if err != nil {
 		return stop(err)
@@ -658,8 +668,8 @@ func runPushOnce(ctx context.Context, f *folder, opts pushOptions) (*pushResult,
 		result.Metadata = describePatch(applied)
 	}
 
-	// 8. Deletions.
-	warnings, err = deleteFiles(ctx, client, target.ID, local, remoteFiles, landed, preconditions, result)
+	// 8. The text deletions.
+	warnings, err = deleteFiles(ctx, client, target.ID, local, remoteFiles, landed, preconditions, result, func(path string) bool { return !isJarPath(path) })
 	result.Warnings = appendDistinct(result.Warnings, warnings...)
 	if err != nil {
 		return stop(err)
@@ -1043,7 +1053,7 @@ func acknowledgedRemote(baseline *wfdir.InstanceState, remote, local map[string]
 	}
 	known := baseline.Hashes()
 	for path, content := range remote {
-		if hash, ok := known[path]; ok && hash == wfdir.HashString(content) {
+		if hash, ok := known[path]; ok && hash == contentHash(content) {
 			out[path] = content
 			continue
 		}
@@ -1437,7 +1447,7 @@ func checkDrift(f *folder, target *api.Workflow, remote, atBaseline, local map[s
 	baseline := f.State.For(f.Baseline())
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
-		remoteHashes[path] = wfdir.HashString(content)
+		remoteHashes[path] = contentHash(content)
 	}
 	drift := wfdir.DiffHashes(atBaseline, baseline.Hashes())
 	// A file that moved since the baseline TO WHAT THIS FOLDER HOLDS, or to
@@ -1509,6 +1519,7 @@ func checkDrift(f *folder, target *api.Workflow, remote, atBaseline, local map[s
 		// carried an anchor the only way through it was --force — which is also
 		// the flag that disarms the per-file preconditions below. The committed
 		// head pointer replaces that with an actual answer.
+		// See BL-3370.
 		if head.Vouches() {
 			noteHeadAnchored(target.ID, head.Current)
 			// Armed on the REMOTE listing rather than bypassed: see
@@ -1537,11 +1548,11 @@ func checkDrift(f *folder, target *api.Workflow, remote, atBaseline, local map[s
 		// condition without widening this message would advertise a remedy that
 		// destroys the thing it was asked to protect.
 		if head.Recorded != "" && head.Recorded == head.Current {
-			return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and you already have a draft of %s open there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  Run `ronja wf discard` to throw the draft away and push onto the live version, or push --force to overwrite it",
-				f.Resolved.URL, f.Binding.WorkflowID, wfdir.LockName)
+			return driftVerdict{}, draftOpenRefusal{fmt.Errorf("this folder has no sync baseline for %s, and you already have a draft of %s open there — %s records which live version this folder forked from, but nothing here can say what is in that draft.\n  Run `ronja wf discard` to throw the draft away and %s",
+				f.Resolved.URL, f.Binding.WorkflowID, wfdir.LockName, draftOpenRemedy(ask))}
 		}
-		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the workflow already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Clone the workflow into a fresh folder to get one, or push --force to overwrite the remote files with what you have here%s",
-			f.Resolved.URL, len(remote), f.pullHint("  "))
+		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the workflow already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  %s",
+			f.Resolved.URL, len(remote), noBaselineRemedy(f, ask, head, "Clone the workflow"))
 	}
 	if len(meta) == 0 {
 		ask.rebound = f.reboundUnrecorded(drift, remote, local)
@@ -1670,8 +1681,8 @@ func (p filePreconditions) onTheWire(stored map[string]string, codecs ...aliasCo
 			continue
 		}
 		for _, codec := range codecs {
-			if wfdir.HashString(codec.toDisk(raw)) == vouched {
-				out.Hashes[path] = wfdir.HashString(raw)
+			if contentHash(codec.toDisk(raw)) == vouched {
+				out.Hashes[path] = contentHash(raw)
 				break
 			}
 		}
@@ -1912,7 +1923,10 @@ func appendDistinct(dst []string, add ...string) []string {
 // holding only what was already acknowledged and gains an entry per successful
 // write, so it describes the folder's honest position whether the sync finishes
 // or stops.
-func putFiles(ctx context.Context, client *api.Client, codec aliasCodec, targetID, entrypoint string, local, remote, landed map[string]string, pre filePreconditions, result *pushResult) ([]string, error) {
+//
+// A jar is uploaded as its bytes, read from root, and only when its sha256
+// differs from the listing's, which the skip decides by their stand-ins.
+func putFiles(ctx context.Context, client *api.Client, codec aliasCodec, root, targetID, entrypoint string, local, remote, landed map[string]string, pre filePreconditions, result *pushResult) ([]string, error) {
 	var warnings []string
 
 	order := []string{}
@@ -1929,7 +1943,7 @@ func putFiles(ctx context.Context, client *api.Client, codec aliasCodec, targetI
 			result.Unchanged++
 			continue
 		}
-		saved, err := client.PutWorkflowFile(ctx, targetID, path, codec.toWire(local[path]), pre.ForWrite(path))
+		saved, err := putWorkflowFile(ctx, client, codec, root, targetID, path, local[path], pre.ForWrite(path))
 		if err != nil {
 			// A 409 is the precondition refusing: the file moved between the
 			// listing this push compared against and this write. Nothing
@@ -1957,6 +1971,19 @@ func putFiles(ctx context.Context, client *api.Client, codec aliasCodec, targetI
 		result.Pushed = append(result.Pushed, path)
 	}
 	return warnings, nil
+}
+
+// putWorkflowFile writes one file of the folder: a jar's bytes with the raw
+// PUT, text in wire form.
+func putWorkflowFile(ctx context.Context, client *api.Client, codec aliasCodec, root, targetID, path, content string, baseSha256 *string) (*api.FileSaveResponse, error) {
+	if !isJarStandIn(content) {
+		return client.PutWorkflowFile(ctx, targetID, path, codec.toWire(content), baseSha256)
+	}
+	body, err := readJarForUpload(root, path, content)
+	if err != nil {
+		return nil, err
+	}
+	return client.PutWorkflowJar(ctx, targetID, path, body, baseSha256)
 }
 
 // reconcileTimedOutPut asks what the server actually holds for one file after a
@@ -1992,24 +2019,25 @@ func reconcileTimedOutPut(ctx context.Context, client *api.Client, codec aliasCo
 	// because what acknowledgeIntendedWrite records is the baseline, which is
 	// hashed against the bytes on disk. Getting this one wrong is expensive: it
 	// is the function that decides whether a write is treated as landed.
-	return acknowledgeIntendedWrite(landed, path, want, codec.toDisk(saved.Content))
+	return acknowledgeIntendedWrite(landed, path, want, remoteContent(codec, *saved))
 }
 
-// deleteFiles removes what the server holds and the folder does not.
+// deleteFiles removes what the server holds and the folder does not, of the
+// paths which admits.
 //
-// Runs LAST, after the metadata patch, so the row has already stopped naming a
-// renamed-away entrypoint by the time its old file is deleted.
+// Text deletions run LAST, after the metadata patch, so the row has already
+// stopped naming a renamed-away entrypoint by the time its old file is deleted.
 //
 // Enumerated from `remote` — everything the server holds — rather than from the
 // baseline-recording `landed`, which no longer describes the whole row: a forced
 // push past a colleague's added file must still delete it, since that is what
 // forcing the folder onto the row means.
-func deleteFiles(ctx context.Context, client *api.Client, targetID string, local, remote, landed map[string]string, pre filePreconditions, result *pushResult) ([]string, error) {
+func deleteFiles(ctx context.Context, client *api.Client, targetID string, local, remote, landed map[string]string, pre filePreconditions, result *pushResult, which func(path string) bool) ([]string, error) {
 	var warnings []string
 
 	deletions := []string{}
 	for path := range remote {
-		if _, ok := local[path]; !ok {
+		if _, ok := local[path]; !ok && which(path) {
 			deletions = append(deletions, path)
 		}
 	}
@@ -2043,7 +2071,7 @@ func deleteFiles(ctx context.Context, client *api.Client, targetID string, local
 func contentByPath(codec aliasCodec, files []api.WorkflowFile) map[string]string {
 	out := make(map[string]string, len(files))
 	for _, f := range files {
-		out[f.Path] = codec.toDisk(f.Content)
+		out[f.Path] = remoteContent(codec, f)
 	}
 	return out
 }

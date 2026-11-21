@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
@@ -52,7 +53,7 @@ logs and outputs.
 It runs the workflow THIS FOLDER is bound to and takes no workflow id. To run
 some other workflow, post to the API directly:
 
-  ronja api POST /api/v2/workflow/<id>/run -f parameterValues='{}'
+  ronja api POST /api/v2/workflow/<id>/run -d '{"parameterValues":{}}'
 
 Everything that can refuse does so before the run starts. An open draft is
 refused: your folder tracks the draft, ` + "`ronja wf test`" + ` runs it, and a live run
@@ -64,9 +65,9 @@ parameters before anything runs:
 
   ronja wf run --param month=2026-07 --param region=EU
 
-A workflow in a SHARED feature runs under admin access, so an ordinary user is
-refused by the server; ask an admin, or let the automation that owns the
-workflow trigger it.
+Read access to the workflow is enough to run it, in a private feature or a
+shared one: running is not a write. It needs the User role (a read-only member
+cannot start runs) and an automation:write token scope.
 
 A Durable workflow can PAUSE mid-run — waiting on an agent, an approval or a
 timer. This stops waiting there and says so loudly: the run has NOT finished,
@@ -87,9 +88,12 @@ steps and health — as one object on stdout, with progress on stderr.
 Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 		// Not cobra.NoArgs: the refusal is the doctrine, so it says what the
 		// doctrine is rather than "unknown command".
-		Args: func(_ *cobra.Command, args []string) error {
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := folderArgHint(cmd, args); err != nil {
+				return err
+			}
 			if len(args) > 0 {
-				return fmt.Errorf("`ronja wf run` takes no workflow id (got %q) — it runs the workflow THIS FOLDER is bound to, which is what makes it part of the folder loop rather than a wrapper around one endpoint.\n  To run another workflow: ronja api POST /api/v2/workflow/%s/run -f parameterValues='{}'",
+				return fmt.Errorf("`ronja wf run` takes no workflow id (got %q) — it runs the workflow THIS FOLDER is bound to, which is what makes it part of the folder loop rather than a wrapper around one endpoint.\n  To run another workflow: ronja api POST /api/v2/workflow/%s/run -d '{\"parameterValues\":{}}'",
 					args[0], args[0])
 			}
 			return nil
@@ -138,7 +142,7 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 	cmd.Flags().StringArrayVar(&params, "param", nil,
 		"a parameter value as key=value (repeat for each parameter)")
 	cmd.Flags().BoolVar(&follow, "follow", false, followFlagHelp)
-	cmd.Flags().DurationVar(&timeout, "timeout", 15*time.Minute,
+	durationFlag(cmd, &timeout, "timeout", 15*time.Minute,
 		"give up waiting after this long (0 waits forever; the run continues either way)")
 	cmd.Flags().StringVar(&logsMode, "logs", logsTail,
 		"how much of the run log to print: full, tail or none")
@@ -190,23 +194,30 @@ func runLive(ctx context.Context, f *folder, opts runOptions) (*testOutcome, err
 			live.ID, draft.ID)
 	}
 
-	// 3. Run what you are looking at. Same rule as `wf test`'s stale check and a
-	// different comparison: there is no draft, so the baseline describes the LIVE
-	// row, and a difference is exactly "live is not this folder".
-	if err := checkFolderIsLive(f, live); err != nil {
-		return nil, err
+	// 3. Run what you are looking at. A folder holding exactly what live holds
+	// runs whatever its sync record says: a deployed change list and a review
+	// an admin committed leave the record behind live, and a fresh git checkout
+	// has none.
+	// Otherwise the record decides, and with no draft in play it describes the
+	// LIVE row. A failed listing is never a pass: the record decides then too.
+	liveFiles, listErr := client.ListWorkflowFiles(ctx, live.ID)
+	if listErr != nil || !folderHoldsLive(f, live, liveFiles) {
+		if err := checkFolderIsLive(f, live, liveFiles, listErr == nil); err != nil {
+			return nil, err
+		}
+		// ...and then the half the record cannot see, as a note rather than a
+		// refusal: a republish since your last sync leaves disk and baseline
+		// agreeing with each other and both behind the row that is about to run.
+		if listErr == nil {
+			noteLiveDrift(f, live, liveFiles)
+		}
 	}
-	// ...and then the half that comparison cannot see, as a note rather than a
-	// refusal: a republish since your last sync leaves disk and baseline
-	// agreeing with each other and both behind the row that is about to run.
-	noteLiveDrift(ctx, client, f, live)
 
 	// 3b. The WRITE GATE over the LIVE code about to run, as `wf test` gates the
 	// draft it runs: in an adopted folder a run of code writing — or running —
-	// outside this stack's feature is the slip the gate exists for. The live
-	// row as the server holds it, which a republish may have changed since
-	// this folder last synced (the note above).
-	if err := gateWorkflowRow(ctx, client, f, live); err != nil {
+	// outside this stack's feature is the slip the gate exists for. It checks
+	// the listing step 3 compared, the live row as the server holds it.
+	if err := gateListedWorkflowRow(ctx, client, f, live, liveFiles, listErr); err != nil {
 		return nil, err
 	}
 
@@ -280,8 +291,28 @@ func runLive(ctx context.Context, f *folder, opts runOptions) (*testOutcome, err
 	return outcome, runVerdict(outcome.Run)
 }
 
+// folderHoldsLive reports whether a push of this folder onto live would write
+// nothing and refuse nothing: push's own predicates (workflowRowHoldsFolder,
+// checkRuntimeDrift, checkLanguageDrift) over push's own reading of the folder,
+// so `wf run` and push agree on what "this folder is live" means. A folder that
+// cannot be read is not live here, and the record decides.
+//
+// live is runLive's GetWorkflow read and liveFiles the listing made after it,
+// so a publish landing between the two pairs one version's settings with
+// another's files; the run is a later request in any case (BL-b3c7).
+func folderHoldsLive(f *folder, live *api.Workflow, liveFiles []api.WorkflowFile) bool {
+	local, _, err := readLocalFiles(f.Root, f.Kind)
+	if err != nil {
+		return false
+	}
+	return checkRuntimeDrift(f, live) == nil && checkLanguageDrift(f, live) == nil &&
+		workflowRowHoldsFolder(f, live, contentByPath(f.Codec, liveFiles), local)
+}
+
 // checkFolderIsLive refuses a run of a live workflow this folder cannot vouch
-// for.
+// for by its sync record. It is asked only when the folder does not hold what
+// live holds (folderHoldsLive), or live's files could not be read; listed says
+// liveFiles is live's listing.
 //
 // Three ways not to be able to vouch, and all of them have to refuse rather
 // than warn, because the whole claim `wf run` makes is "this ran the code in
@@ -296,23 +327,47 @@ func runLive(ctx context.Context, f *folder, opts runOptions) (*testOutcome, err
 //     commits. The way in is the review path: on a shared workflow `wf publish`
 //     SUBMITS the draft and returns without refreshing the baseline, so once an
 //     admin approves it the folder holds a baseline naming a draft that is gone
-//     and a live row it has never synced with. The files are usually exactly
-//     what went live; what is missing is the record that says so, which is why
-//     this must not be worded as "your folder is a stranger's".
+//     and a live row it has never synced with. A folder still holding what
+//     went live never gets here; one edited since, or one whose live files
+//     could not be read, does, and it is still the author's own work missing
+//     a record, which is why this must not be worded as "your folder is a
+//     stranger's".
 //   - the folder differs from it. Same comparison `wf status` calls "local
 //     changes" and `wf test` refuses on — except that with no draft in play the
 //     baseline IS the live row, so the difference is between the files on disk
 //     and the files that would run.
 //
-// Note what it does NOT do: read the live row's files. Both sides of this
-// comparison are local, so what it guarantees is "this folder is what you last
-// synced with the live row" and not "this folder is what the live row holds
-// now" — a colleague who republished over a folder nobody has touched locally
-// leaves disk and baseline in perfect agreement and both of them behind the
-// code that would run. That gap is announced by noteLiveDrift, which costs a
-// round trip and so notes rather than refuses.
-func checkFolderIsLive(f *folder, live *api.Workflow) error {
+// When live was read, the first two are reached only by a folder shown to
+// differ from it, so they list those differences like the third and name the
+// ways to take them live or look at live's side: a re-clone there would run
+// live's code and drop the edits. The clone remedies stand only when live could
+// not be read.
+//
+// Both sides of this comparison are local, so passing it guarantees "this
+// folder is what you last synced with the live row" and not "this folder is
+// what the live row holds now": a colleague who republished over a folder
+// nobody has touched locally leaves disk and baseline in perfect agreement and
+// both of them behind the code that would run. noteLiveDrift announces that.
+func checkFolderIsLive(f *folder, live *api.Workflow, liveFiles []api.WorkflowFile, listed bool) error {
 	baseline := f.State.For(f.Baseline())
+	if listed && (baseline == nil || baseline.SourceID != live.ID) {
+		// Live was read and the folder does not hold it, so the record is no
+		// longer the open question: what differs is, and only the author knows
+		// whether it is their work. A re-clone would throw that work away.
+		enumeration, err := wfdir.Enumerate(f.Root, f.Kind)
+		if err != nil {
+			return err
+		}
+		count, lines := differencesFromLive(f, live, enumeration.Files, liveFiles)
+		first := fmt.Sprintf("this folder has no sync baseline for the live workflow %s on %s (.ronja/ is local-only, so a copy cloned from git starts without one)",
+			live.ID, f.Resolved.URL)
+		if baseline != nil {
+			first = fmt.Sprintf("this folder's sync baseline came from %s (%s), not from the live workflow %s",
+				baseline.SourceID, baseline.SourceLifecycle, live.ID)
+		}
+		return fmt.Errorf("%s, and the folder has %d change(s) that are not in the live workflow, so running it would run code you are not looking at:\n%s  If these are your edits, `ronja wf push` and `ronja wf publish` take them live and `ronja wf test` tries them; `ronja wf pull --dry-run` shows live's side without changing anything",
+			first, count, lines)
+	}
 	if baseline == nil {
 		return fmt.Errorf("this folder has no sync baseline for the live workflow %s on %s, so there is no way to tell whether it holds the code that would run — .ronja/ is local-only, so a copy cloned from git starts without one.\n  Run `ronja wf clone %s` into a fresh folder to get one",
 			live.ID, f.Resolved.URL, live.ID)
@@ -329,12 +384,80 @@ func checkFolderIsLive(f *folder, live *api.Workflow) error {
 	if !diff.Dirty() {
 		return nil
 	}
+	count, lines := diff.Total(), localChangeSummary(diff)
+	if listed {
+		count, lines = differencesFromLive(f, live, enumeration.Files, liveFiles)
+	}
 	return fmt.Errorf("this folder has %d change(s) that are not in the live workflow %s, so running it would run code you are not looking at:\n%s  Run `ronja wf push` and `ronja wf publish` to take them live, or `ronja wf test` to try them out as a draft",
-		diff.Total(), live.ID, localChangeSummary(diff))
+		count, live.ID, lines)
+}
+
+// differencesFromLive is the change list of checkFolderIsLive's refusal when
+// live's files were read. The record may be behind live (a deployed change
+// list), and then its diff would name files that ARE live; this names what
+// differs from live: the files, then the settings.
+func differencesFromLive(f *folder, live *api.Workflow, localHashes map[string]string, liveFiles []api.WorkflowFile) (int, string) {
+	count, out := 0, ""
+	if diff := wfdir.DiffHashes(localHashes, hashFiles(f.Codec, liveFiles)); diff.Dirty() {
+		count, out = diff.Total(), localChangeSummary(diff)
+	}
+	for _, line := range settingsDifferences(f, live) {
+		count++
+		out += "    " + line + "\n"
+	}
+	if count == 0 {
+		// folderHoldsLive said no, yet nothing here names why: a folder read
+		// that failed after the enumeration, or a setting push learned to
+		// write and this list did not.
+		return 1, fmt.Sprintf("    the settings in %s differ from live's; `ronja wf pull --dry-run` shows live's side\n", wfdir.ManifestName)
+	}
+	return count, out
+}
+
+// settingsDifferences names each setting folderHoldsLive finds the folder
+// holding otherwise than live, one line each, by the same predicates: the
+// metadata patch with the title compared trimmed (workflowRowHoldsFolder), the
+// runtime, and the language. A runtime or language push refuses is said in its
+// refusal's own words, since "push and publish" cannot take it live.
+func settingsDifferences(f *folder, live *api.Workflow) []string {
+	m, name := f.Manifest, wfdir.ManifestName
+	var lines []string
+	patch := metadataPatch(m, f.Codec, live)
+	if patch.Title != "" && !sameName(live.Title, m.Title) {
+		lines = append(lines, fmt.Sprintf("%s sets title %q, live has %q", name, m.Title, live.Title))
+	}
+	if patch.Entrypoint != "" {
+		lines = append(lines, fmt.Sprintf("%s sets entrypoint %s, live has %s", name, m.Entrypoint, live.Entrypoint))
+	}
+	if patch.Parameters != nil {
+		lines = append(lines, fmt.Sprintf("%s sets parameters other than live's", name))
+	}
+	if patch.PipPackages != nil {
+		lines = append(lines, fmt.Sprintf("%s sets pipPackages other than live's", name))
+	}
+	if patch.ReportingTimezone != nil {
+		lines = append(lines, fmt.Sprintf("%s sets reportingTimezone %s, live has %s",
+			name, effectiveDeclaredZone(*patch.ReportingTimezone), describeZone(live.ReportingTimezone)))
+	}
+	if err := checkRuntimeDrift(f, live); err != nil {
+		lines = append(lines, indentedRefusal(err))
+	} else if runtimeDiffers(m, live) {
+		lines = append(lines, fmt.Sprintf("%s sets runtime %d, live runs %d", name, m.RuntimeVersion(), live.RuntimeVersion))
+	}
+	if err := checkLanguageDrift(f, live); err != nil {
+		lines = append(lines, indentedRefusal(err))
+	}
+	return lines
+}
+
+// indentedRefusal is a push refusal as one entry of a change list: its
+// continuation lines are indented under the entry rather than at its level.
+func indentedRefusal(err error) string {
+	return strings.ReplaceAll(err.Error(), "\n  ", "\n      ")
 }
 
 // noteLiveDrift says so, without refusing, when the live workflow holds changes
-// this folder never published.
+// this folder never published. liveFiles is the listing runLive compared.
 //
 // It is the drift checkFolderIsLive is structurally blind to: that comparison
 // is local against local, so a colleague's republish over a folder with no
@@ -346,9 +469,9 @@ func checkFolderIsLive(f *folder, live *api.Workflow) error {
 //
 // Compared only when the baseline came from THIS live row, which is the state
 // checkFolderIsLive has already established by the time this runs — and which
-// noteRemoteDrift, which does the work, re-checks in any case.
-func noteLiveDrift(ctx context.Context, client *api.Client, f *folder, live *api.Workflow) {
-	noteRemoteDrift(ctx, client, f, live, "the live workflow "+live.ID,
+// noteListedDrift, which does the work, re-checks in any case.
+func noteLiveDrift(f *folder, live *api.Workflow, liveFiles []api.WorkflowFile) {
+	noteListedDrift(f, live, liveFiles, "the live workflow "+live.ID,
 		"somebody published over it since your last sync.")
 }
 

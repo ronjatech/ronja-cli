@@ -295,7 +295,7 @@ func finishLogin(name string, provisional bool, instanceURL string, me *api.Me) 
 	err := config.Update(func(f *config.File) error {
 		p, ok := f.Profiles[name]
 		if !ok || p == nil {
-			return fmt.Errorf("profile %q disappeared while signing in", name)
+			return fmt.Errorf("profile %q disappeared while signing in — run the same command again", name)
 		}
 		p.UserID = me.User.ID
 		p.UserEmail = me.User.Email
@@ -322,7 +322,7 @@ func finishLogin(name string, provisional bool, instanceURL string, me *api.Me) 
 // opposite order from the device flow is safe because a pasted token can be
 // pasted again.
 func loginWithToken(ctx context.Context, baseURL string) error {
-	token, err := readTokenFromStdin()
+	token, err := readTokenFromStdin(baseURL)
 	if err != nil {
 		return err
 	}
@@ -330,7 +330,7 @@ func loginWithToken(ctx context.Context, baseURL string) error {
 	me, err := api.New(baseURL, token).Me(ctx)
 	if err != nil {
 		if api.StatusOf(err) == 401 || api.StatusOf(err) == 403 {
-			return fmt.Errorf("that token was rejected by %s", baseURL)
+			return fmt.Errorf("that token was rejected by %s — check it was issued by this instance and has not been revoked, or drop --with-token to sign in in the browser", baseURL)
 		}
 		return fmt.Errorf("verify token against %s: %w", baseURL, err)
 	}
@@ -469,7 +469,7 @@ Reports the selected profile. To see them all without contacting a server, use
 					// Name the token that failed: logging in again does not help
 					// while an env token overrides the stored one.
 					if resolved.FromEnv {
-						return fmt.Errorf("the token in $%s was rejected by %s", config.EnvToken, resolved.URL)
+						return fmt.Errorf("the token in $%s was rejected by %s — replace it, or unset %s to use the stored login", config.EnvToken, resolved.URL, config.EnvToken)
 					}
 					if resolved.Profile != "" {
 						return fmt.Errorf("the stored token for %s is no longer valid — run `ronja login --profile %s` again", resolved.URL, resolved.Profile)
@@ -639,8 +639,9 @@ func clientName() string {
 }
 
 // readTokenFromStdin accepts a token piped in, or prompts on a terminal only, so
-// a script that pipes nothing gets EOF rather than a hang.
-func readTokenFromStdin() (string, error) {
+// a script that pipes nothing gets EOF rather than a hang. baseURL is the
+// instance the token is for, so the suggested pipe signs in to it.
+func readTokenFromStdin(baseURL string) (string, error) {
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Fprint(os.Stderr, "Paste your access token: ")
 		raw, err := term.ReadPassword(int(os.Stdin.Fd()))
@@ -657,7 +658,7 @@ func readTokenFromStdin() (string, error) {
 	}
 	token := strings.TrimSpace(string(raw))
 	if token == "" {
-		return "", errors.New("no token on stdin")
+		return "", fmt.Errorf("no token on stdin — pipe one in: echo \"$TOKEN\" | ronja login --url %s --with-token", baseURL)
 	}
 	return token, nil
 }

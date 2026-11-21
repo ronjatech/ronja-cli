@@ -43,7 +43,7 @@ to fall back to, so discarding it would delete the workflow. That is refused
 unless you pass --delete-workflow — the case it exists for is a first push you
 want to abandon. Your local files are kept either way, and the folder is unbound
 so a later push creates a fresh workflow.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(yes)
 			if err != nil {
@@ -85,8 +85,8 @@ func runDiscard(ctx context.Context, f *folder, yes, deleteWorkflow bool) (*disc
 	wf, err := client.GetWorkflow(ctx, f.Binding.WorkflowID)
 	if err != nil {
 		if api.StatusOf(err) == 404 {
-			return nil, fmt.Errorf("workflow %s no longer exists on %s (or you lost access to it)",
-				f.Binding.WorkflowID, f.Resolved.URL)
+			return nil, fmt.Errorf("workflow %s no longer exists on %s (or you lost access to it), so there is no draft of it to discard — remove the binding from %s to start a new one",
+				f.Binding.WorkflowID, f.Resolved.URL, f.bindingFiles())
 		}
 		return nil, err
 	}

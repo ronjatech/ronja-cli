@@ -202,8 +202,8 @@ func refuseDeclaringOverAnotherFeaturesRow(f *folder, l *spaceLookup, featureID 
 		return fmt.Errorf("stack %q already deploys the %s %s, and which feature that row is in could not be read (%v), so it cannot be declared on feature %s — %s was not changed; try again once the instance answers",
 			f.Stack, kind, id, err, featureID, wfdir.ManifestName)
 	case rowFeature == "":
-		return fmt.Errorf("stack %q already deploys the %s %s, which is in no feature, so it cannot be declared on feature %s — %s was not changed",
-			f.Stack, kind, id, featureID, wfdir.ManifestName)
+		return fmt.Errorf("stack %q already deploys the %s %s, which is in no feature, so it cannot be declared on feature %s — %s was not changed; declare a second stack beside it for %s",
+			f.Stack, kind, id, featureID, wfdir.ManifestName, featureID)
 	case rowFeature != featureID:
 		return fmt.Errorf("stack %q already deploys the %s %s, which is in feature %s, so declaring it on feature %s would deploy that row as the other feature's. Declare it on the feature it is in (--feature %s), then declare a second stack beside it for %s — %s was not changed",
 			f.Stack, kind, id, rowFeature, featureID, rowFeature, featureID, wfdir.ManifestName)

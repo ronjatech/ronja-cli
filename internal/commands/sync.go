@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 	"github.com/spf13/cobra"
@@ -123,7 +122,7 @@ declares it pointing at another organization, is reported as not checked rather
 than aborting the run — a repository legitimately holds folders belonging to
 several organizations — and it is never counted as clean, so a mistyped stack
 name cannot report a whole repository healthy.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately NOT resolveInstance, for the reason the three
 			// per-folder status commands are not: a signed-out caller still gets
@@ -222,7 +221,7 @@ func (r *syncStatusReport) exitError() (err error) {
 			agree(r.Summary.Drifted, "is", "are")))
 	case verdictUnknown:
 		if r.Summary.Folders == 0 {
-			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s — nothing was checked, which is not the same answer as nothing being wrong",
+			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s — nothing was checked, which is not the same answer as nothing being wrong; run this from the tree's root, or pass --dir <tree>",
 				wfdir.ManifestName, r.Dir))
 		}
 		return withExitCode(syncExitUnknown, fmt.Errorf("%d of %d %s could not be checked — see above; this is not the same answer as no drift",
@@ -488,105 +487,6 @@ func heldByLive(ctx context.Context, folder discoveredFolder, f *folder, verdict
 	return folderVerdict{Verdict: verdictClean, Detail: fmt.Sprintf(
 		"the live %s holds this folder, so `sync apply` changes nothing for it. Note: your open draft %s differs from the folder — `%s status` compares the folder with that draft, `%s push` would write the folder into it, and `%s discard` throws it away",
 		folder.Kind.Label, orUnknown(draftID), folder.Kind.Command, folder.Kind.Command, folder.Kind.Command)}
-}
-
-// liveHoldsFolder reports whether the LIVE row a workflow, data-app or module
-// folder is bound to already holds the folder exactly: the comparison `sync
-// apply` makes before anything else (pushNothingLiveHolds and its twins), by
-// the same parity functions, so true means an apply pushes and publishes
-// nothing for the folder. Reads only. False, with no error, for a folder bound
-// to nothing, a row that is not live (a parentless draft awaits its publish),
-// and every other kind.
-func liveHoldsFolder(ctx context.Context, f *folder) (bool, error) {
-	held, _, err := compareWithLive(ctx, f, false)
-	return held, err
-}
-
-// compareWithLive is liveHoldsFolder, and with guard the drift guard `sync
-// apply` asks next for a workflow or data app the live row does not hold:
-// before its checkout, when no draft is open and the folder has a baseline
-// (runPush's and runAppPush's LiveFirst step), and for a module the refusal
-// of an unpublished one the folder renames (unpublishedModuleRenameError).
-// refusal is that refusal, in the apply's words, so a dry run can say it; nil
-// when the apply would go on to push. Reads only.
-func compareWithLive(ctx context.Context, f *folder, guard bool) (held bool, refusal, err error) {
-	local, _, err := readLocalFiles(f.Root, f.Kind)
-	if err != nil {
-		return false, nil, err
-	}
-	client := f.client()
-	guarded := guard && f.State.For(f.Baseline()) != nil
-	switch f.Kind.Name {
-	case wfdir.KindWorkflow:
-		if f.Binding.WorkflowID == "" {
-			return false, nil, nil
-		}
-		live, err := client.GetWorkflow(ctx, f.Binding.WorkflowID)
-		if err != nil || live.Lifecycle != api.LifecycleLive {
-			return false, nil, err
-		}
-		files, err := client.ListWorkflowFiles(ctx, live.ID)
-		if err != nil {
-			return false, nil, err
-		}
-		remote := contentByPath(f.Codec, files)
-		if held := workflowRowHoldsFolder(f, live, remote, local); held || !guarded {
-			return held, nil, nil
-		}
-		if draft, err := client.GetWorkflowDraft(ctx, live.ID); err != nil || draft != nil {
-			return false, nil, err
-		}
-		// No draft is open, so the apply would check one out of live: the row
-		// the anchor speaks for.
-		head := readHeadAgreement(ctx, workflowHeadReader(client), f, live.ID, true)
-		_, refusal = checkDrift(f, live, remote, hashFiles(f.baselineCodec(), files), local, false, head, driftAsk{apply: true})
-		return false, refusal, nil
-	case wfdir.KindDataApp:
-		if f.Binding.DataAppID == "" {
-			return false, nil, nil
-		}
-		live, err := client.GetDataApp(ctx, f.Binding.DataAppID)
-		if err != nil || live.Lifecycle != api.LifecycleLive {
-			return false, nil, err
-		}
-		files, err := client.ListDataAppFiles(ctx, live.ID)
-		if err != nil {
-			return false, nil, err
-		}
-		remote := appContentByPath(f.Codec, files)
-		if held := appRowHoldsFolder(f, live, remote, local); held || !guarded {
-			return held, nil, nil
-		}
-		if draft, err := client.GetDataAppDraft(ctx, live.ID); err != nil || draft != nil {
-			return false, nil, err
-		}
-		head := readHeadAgreement(ctx, dataAppHeadReader(client), f, live.ID, true)
-		_, refusal = checkAppDrift(f, remote, hashAppFiles(f.baselineCodec(), files), local, appMetaAgrees(f, live), false, head, live.ID,
-			driftAsk{apply: true})
-		return false, refusal, nil
-	case wfdir.KindModule:
-		if f.Binding.ModuleID == "" {
-			return false, nil, nil
-		}
-		live, err := client.GetModule(ctx, f.Binding.ModuleID)
-		if err != nil {
-			return false, nil, err
-		}
-		if guard {
-			if refusal := unpublishedModuleRenameError(f, live); refusal != nil {
-				return false, refusal, nil
-			}
-		}
-		if live.Lifecycle != api.LifecycleLive {
-			return false, nil, nil
-		}
-		files, err := client.ListModuleFiles(ctx, live.ID)
-		if err != nil {
-			return false, nil, err
-		}
-		return moduleRowHoldsFolder(f, live, moduleContentByPath(files), local), nil, nil
-	}
-	return false, nil, nil
 }
 
 // undeployedAgainstLock names the .sql files whose COMMITTED content differs

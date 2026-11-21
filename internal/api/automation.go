@@ -174,16 +174,19 @@ type Automation struct {
 
 	Enabled bool `json:"enabled"`
 	// DisabledReason is why a disabled row is disabled: "" (nobody said), "user"
-	// (a human paused it), "mailbox_disconnected", or one of the
-	// marked-for-deletion family.
+	// (a human paused it), "mailbox_disconnected", "schedule_below_limit" (the
+	// scheduler paused a schedule faster than the organization's minimum), or
+	// one of the marked-for-deletion family.
 	//
 	// ⚠️ Load-bearing for the re-enable gate, and asymmetric:
-	// CallerMayClearDisabledReason admits "", "user" and
-	// "mailbox_disconnected" and REFUSES the deletion family with an input
+	// CallerMayClearDisabledReason admits "", "user", "mailbox_disconnected"
+	// and "schedule_below_limit" and REFUSES the deletion family with an input
 	// error. So a folder declaring enabled:true against a paused row is
 	// ACCEPTED — silently reversing an incident response — while the same
 	// folder against a row in a workspace pending deletion fails every push
-	// with a message about something else entirely. Enabling an old-model
+	// with a message about something else entirely. A schedule_below_limit row
+	// pushed with enabled:true and its unchanged fast schedule is still refused,
+	// by the schedule check rather than the gate. Enabling an old-model
 	// inline-agent automation whose access group is gone is refused too,
 	// whatever its reason.
 	DisabledReason string `json:"disabledReason"`

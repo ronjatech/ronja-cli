@@ -117,7 +117,7 @@ feature: that is an edit to ronja.json, not a flag.
 On a stack that names a Space, or one --feature declares on a feature in one,
 a read dependency is proposed only from that Space, and a write or run target
 only from the stack's own feature.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveInstance()
 			if err != nil {

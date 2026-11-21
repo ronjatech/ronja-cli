@@ -98,14 +98,26 @@ For each folder that declares --stack, adopt:
      row;
   3. records each row's drift baseline on the server.
 
+For a workflow, data-app or module folder whose stack records no live
+version, adopt also records the live row's current version and title in
+ronja.lock.json and on the server, when it can prove the folder holds it:
+the live row holds the folder exactly, or this checkout's local baseline was
+taken from the live row and nothing on live changed since this checkout last
+synced with it, except to what this folder already holds. Otherwise it
+records nothing, and the folder's line says why: adopt again from a checkout
+that last synced with live, or set your change aside, pull, put the change
+back and commit; a row never published is published once first. A change
+list's deploy of a folder with no recorded version refuses.
+
 From then on the server holds the folder's state: a CI runner that throws its
 checkout away no longer needs a committed ronja.lock.json, two concurrent
 applies cannot both create the same row, and a lock that disagrees with the
 server is rewritten from it.
 
-Running it again is safe: a row already claimed reports already_claimed. A folder that refuses
-(a row already managed somewhere else, a row in the trash) is reported and does
-not stop the others.
+Running it again is safe: a row already claimed reports already_claimed, and
+a live version it could not record before is recorded once it can be. A folder
+that refuses (a row already managed somewhere else, a row in the trash) is
+reported and does not stop the others.
 
 The directory is the positional argument, or --dir, or the working directory.`,
 		Args: cobra.MaximumNArgs(1),
@@ -385,6 +397,15 @@ func syncAdoptFolder(ctx context.Context, folder discoveredFolder, resolved *con
 	}
 	sort.SliceStable(line.Units, func(i, j int) bool { return line.Units[i].Address < line.Units[j].Address })
 
+	note, err := f.adoptLiveVersion(ctx)
+	if err != nil {
+		refuse(syncReasonUnreadable, "record the live version this folder holds in %s: %v", wfdir.LockPath(f.Root), err)
+		return
+	}
+	if note != "" {
+		line.Notes = append(line.Notes, note)
+	}
+
 	// 4. The anchors the lock carries, onto the claims — so a runner that never
 	// sees the lock still has a drift baseline from the first apply.
 	f.ctx = ctx
@@ -403,6 +424,102 @@ func syncAdoptFolder(ctx context.Context, folder discoveredFolder, resolved *con
 	}
 	line.Verdict = verdictApplied
 	line.Detail = fmt.Sprintf("%d %s managed from this folder", len(line.Units), plural(len(line.Units), "row"))
+}
+
+// adoptLiveVersion records, for a workflow, data-app or module folder whose
+// stack records no live version, the live row's current version and title, and
+// answers what it did as a note for the folder's line. It records only what it
+// can prove: live holds the folder exactly, or this checkout's local baseline
+// was taken from the live row, the push's own drift check against it is clean,
+// and live's title is one this folder knows. Either way the folder's files
+// descend from that version, which is what the recorded version lets a
+// baseline-less push assume.
+//
+// The title is held to titleLeg's rule with no head anchor vouching: the data
+// app's push lets a recorded version vouch for live's title, so recording a
+// version taken after a rename elsewhere would let the next push revert it.
+//
+// The version is read before and after live's row and files: a publish in
+// between could make the files read describe a different version than either
+// read names, so a disagreement records nothing.
+//
+// Only a failure to save the lock is an error; a read that fails records
+// nothing and says so.
+func (f *folder) adoptLiveVersion(ctx context.Context) (string, error) {
+	if f.Stack == "" || f.headVersion() != "" {
+		return "", nil
+	}
+	client := f.client()
+	var id string
+	var read headReader
+	switch f.Kind.Name {
+	case wfdir.KindWorkflow:
+		id, read = f.Binding.WorkflowID, workflowHeadReader(client)
+	case wfdir.KindDataApp:
+		id, read = f.Binding.DataAppID, dataAppHeadReader(client)
+	case wfdir.KindModule:
+		id, read = f.Binding.ModuleID, moduleHeadReader(client)
+	default:
+		return "", nil
+	}
+	if id == "" {
+		return "", nil
+	}
+	unread := func(err error) (string, error) {
+		return fmt.Sprintf("recorded no live version for %s: could not read it (%v). Adopt again", id, err), nil
+	}
+	local, _, err := readLocalFiles(f.Root, f.Kind)
+	if err != nil {
+		return unread(err)
+	}
+	before, err := read(ctx, id)
+	if err != nil {
+		return unread(err)
+	}
+	h, err := compareLive(ctx, f, local, liveAsk{guard: f.baselineFrom(id)})
+	if err != nil {
+		return unread(err)
+	}
+	if h.neverPublished {
+		return fmt.Sprintf("recorded no live version for %s: this %s has never been published, so there is no live version to record and a change list cannot deploy it yet. Publish it once from this checkout (`%s publish`), then adopt again", id, f.Kind.Label, f.Kind.Command), nil
+	}
+	if !h.live {
+		return "", nil
+	}
+	after, err := read(ctx, id)
+	if err != nil {
+		return unread(err)
+	}
+	if before != after {
+		return fmt.Sprintf("recorded no live version for %s: it was published while adopt read it (version %s, then %s). Adopt again", id, before, after), nil
+	}
+	remedy := fmt.Sprintf("Adopt again from a checkout that last synced with live; or set your change aside, `%s pull`, put the change back, commit", f.Kind.Command)
+	clean := h.checked && h.refusal == nil
+	if !h.held && !clean && f.baselineFrom(id) {
+		return fmt.Sprintf("recorded no live version for %s: live differs from this folder and changed since this checkout last synced with it, so nothing here shows the folder descends from version %s. %s", id, after, remedy), nil
+	}
+	if !h.held && !clean {
+		return fmt.Sprintf("recorded no live version for %s: live differs from this folder and nothing here shows the folder descends from it. %s", id, remedy), nil
+	}
+	f.setHeadVersion(after)
+	if f.Manifest.Title != "" {
+		f.Lock.SetAppliedTitle(f.Stack, h.title)
+	}
+	if err := wfdir.SaveLock(f.Root, f.Lock); err != nil {
+		return "", err
+	}
+	how := "live holds this folder"
+	if !h.held {
+		how = "nothing on live changed since this checkout last synced with it, except to what this folder already holds"
+	}
+	return fmt.Sprintf("recorded live version %s of %s in %s: %s", after, id, wfdir.LockName, how), nil
+}
+
+// baselineFrom reports that this checkout's local baseline was taken from the
+// row id.
+func (f *folder) baselineFrom(id string) bool {
+	b := f.State.For(f.Baseline())
+	return b != nil && b.SourceID == id
 }
 
 // canonicalLockStack is one stack's managed rows and anchors in the lock, as
@@ -684,7 +801,7 @@ func syncManagedExit(r *syncManagedReport, verb string) error {
 		return withExitCode(syncExitDrifted, fmt.Errorf("`ronja sync %s` refused for at least one folder — see above", verb))
 	case verdictUnknown:
 		if len(r.Folders) == 0 {
-			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s", wfdir.ManifestName, r.Dir))
+			return withExitCode(syncExitUnknown, fmt.Errorf("no %s found under %s — run this from the tree's root, or pass --dir <tree>", wfdir.ManifestName, r.Dir))
 		}
 		return withExitCode(syncExitUnknown, fmt.Errorf("at least one folder could not be %s — see above", map[string]string{"adopt": "adopted", "unmanage": "unmanaged"}[verb]))
 	}

@@ -81,6 +81,13 @@ func withAddressCopyRoot(ctx context.Context) context.Context {
 	return context.WithValue(ctx, addressCopyRootKey{}, true)
 }
 
+// deployedAsCopy reports a walk whose tree is copied and deployed elsewhere,
+// so a folder is planned as its copy, which has no .ronja/.
+func deployedAsCopy(ctx context.Context) bool {
+	copied, _ := ctx.Value(addressCopyRootKey{}).(bool)
+	return copied
+}
+
 // addressBoundary is the directory a folder's "from" may not leave, and how to
 // say it: under `ronja propose`, the tree it walks; otherwise the git work tree
 // holding the folder (the nearest ancestor with a .git entry, file or
@@ -88,7 +95,7 @@ func withAddressCopyRoot(ctx context.Context) context.Context {
 // holds the folder; without either, the folder itself.
 func addressBoundary(ctx context.Context, root string) (dir, described string) {
 	walk, _ := ctx.Value(addressWalkRootKey{}).(string)
-	if copied, _ := ctx.Value(addressCopyRootKey{}).(bool); copied && walk != "" && pathWithin(realPath(walk), realPath(root)) {
+	if deployedAsCopy(ctx) && walk != "" && pathWithin(realPath(walk), realPath(root)) {
 		return realPath(walk), fmt.Sprintf("the tree being proposed (%s), which is all a change list carries — propose from a directory that holds both folders", walk)
 	}
 	for dir := realPath(root); ; {

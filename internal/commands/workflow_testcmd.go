@@ -111,8 +111,8 @@ const maxNamedTables = 10
 // workflow up front rather than letting the run 400 (and never suggests turning
 // the gate off — that edit would ride the draft into the live workflow on
 // publish). And it refuses to run a draft with bound output tables unless
-// --write-live says so: a workflow's table writes target the LIVE table, there
-// is no sandbox, and "replace" means replace.
+// --write-live says so: a test run's table writes target the LIVE table, and
+// "replace" means replace.
 func newWorkflowTestCmd() *cobra.Command {
 	var (
 		params    []string
@@ -139,9 +139,12 @@ parameters before anything runs:
   ronja wf test --param month=2026-07 --param region=EU
 
 Output tables are the reason this command has a flag nobody wants to type. A
-workflow that writes to a table writes to the LIVE table — there is no test
-sandbox — so a draft with bound output tables refuses to run without
---write-live. A workflow that binds no output tables yet — before you push a
+test run that writes to a table writes to the LIVE table, whatever the
+workflow's own parameters say, so a draft with bound output tables refuses to
+run without --write-live. To test without touching live tables, deploy the
+folder to a stack in another Space, such as a dev Space, and test there with
+--stack <name> --write-live: on that stack the writes go to that Space's
+tables. A workflow that binds no output tables yet — before you push a
 {{ write }} marker — runs without it.
 
 --resume restarts the last FAILED run of this workflow instead of starting a
@@ -172,7 +175,7 @@ as last read — row, steps and health — as one object on stdout, with progres
 stderr.
 
 Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Ctrl-C is caught at the ROOT (see signalContext), so cmd.Context()
 			// is already cancelled on a signal and this command's poll loop takes
@@ -235,7 +238,7 @@ Ctrl-C stops the waiting, not the run: it keeps going server-side either way.`,
 	cmd.Flags().BoolVar(&resume, "resume", false,
 		"resume the last failed run instead of starting a new one (durable workflows only)")
 	cmd.Flags().BoolVar(&follow, "follow", false, followFlagHelp)
-	cmd.Flags().DurationVar(&timeout, "timeout", 15*time.Minute,
+	durationFlag(cmd, &timeout, "timeout", 15*time.Minute,
 		"give up waiting after this long (0 waits forever; the run continues either way)")
 	cmd.Flags().StringVar(&logsMode, "logs", logsTail,
 		"how much of the run log to print: full, tail or none")
@@ -407,7 +410,7 @@ func runTest(ctx context.Context, f *folder, opts testOptions) (*testOutcome, er
 	// Not a y/N prompt: prompts get muscle-memoried, and the failure mode here
 	// is a replaced production table.
 	if len(draft.OutputTableIDs) > 0 && !opts.WriteLive {
-		return nil, fmt.Errorf("%s", writeLiveRefusal(ctx, client, draft.OutputTableIDs))
+		return nil, fmt.Errorf("%s", writeLiveRefusal(ctx, client, f, draft.OutputTableIDs))
 	}
 
 	// 6. A heads-up, never a refusal: the draft may hold edits this folder never
@@ -565,19 +568,7 @@ func noteDraftDrift(ctx context.Context, client *api.Client, f *folder, draft *a
 		"the web builder edits the same draft.")
 }
 
-// noteRemoteDrift is the body both drift notes share: read the row's files,
-// compare them against the sync baseline, and say so when they differ.
-//
-// One body rather than two near-copies, because the callers differ only in
-// which row they name and in the clause explaining how it drifted. Everything
-// else — that the baseline has to describe THIS row, that a read failure is
-// best-effort rather than a refusal, that silence is the answer when nothing
-// differs — is the same rule twice, and a fix that landed in one copy would
-// leave `wf test` and `wf run` disagreeing about what drift is.
-//
-// `subject` names the row as the sentence reads it ("draft draft-1", "the live
-// workflow wf-1"); `because` is the clause that follows the dash, punctuation
-// included.
+// noteRemoteDrift is noteListedDrift over a listing it reads itself, best effort.
 func noteRemoteDrift(ctx context.Context, client *api.Client, f *folder, row *api.Workflow, subject, because string) {
 	baseline := f.State.For(f.Baseline())
 	if baseline == nil || baseline.SourceID != row.ID {
@@ -587,6 +578,26 @@ func noteRemoteDrift(ctx context.Context, client *api.Client, f *folder, row *ap
 	if err != nil {
 		// Best effort, like the table-name lookup: not being able to check for
 		// drift is no reason to refuse to run.
+		return
+	}
+	noteListedDrift(f, row, files, subject, because)
+}
+
+// noteListedDrift is the body both drift notes share: compare row's files, as
+// listed, against the sync baseline, and say so when they differ.
+//
+// One body rather than two near-copies, because the callers differ only in
+// which row they name and in the clause explaining how it drifted. Everything
+// else — that the baseline has to describe THIS row, that silence is the answer
+// when nothing differs — is the same rule twice, and a fix that landed in one
+// copy would leave `wf test` and `wf run` disagreeing about what drift is.
+//
+// `subject` names the row as the sentence reads it ("draft draft-1", "the live
+// workflow wf-1"); `because` is the clause that follows the dash, punctuation
+// included.
+func noteListedDrift(f *folder, row *api.Workflow, files []api.WorkflowFile, subject, because string) {
+	baseline := f.State.For(f.Baseline())
+	if baseline == nil || baseline.SourceID != row.ID {
 		return
 	}
 	diff := wfdir.DiffHashes(hashFiles(f.Codec, files), baseline.Hashes())
@@ -639,16 +650,23 @@ func localChangeSummary(diff wfdir.Diff) string {
 	return out
 }
 
-// writeLiveRefusal builds the message for a test run that would write to live
-// tables, naming them where it can.
+// writeLiveRefusal builds the message for a test run that would write to
+// tables, naming them where it can, and saying whose tables they are by the
+// Space the folder records for its stack. It looks nothing up to say so: the
+// write gate (step 1b) has already held the draft to that Space.
 //
 // Names are best effort by design: they come from a second endpoint the
 // caller's token may not reach, and being unable to pretty-print an id is no
 // reason to fail to warn about it.
-func writeLiveRefusal(ctx context.Context, client *api.Client, tableIDs []string) string {
+func writeLiveRefusal(ctx context.Context, client *api.Client, f *folder, tableIDs []string) string {
 	var lines strings.Builder
-	fmt.Fprintf(&lines, "this test run writes to %d live %s:\n",
-		len(tableIDs), plural(len(tableIDs), "table"))
+	space := ""
+	if f.stackSpaceID() != "" {
+		space = spaceLabel(f.Manifest.Stacks[f.Stack])
+		fmt.Fprintf(&lines, "this test run writes to %d %s:\n", len(tableIDs), plural(len(tableIDs), "table"))
+	} else {
+		fmt.Fprintf(&lines, "this test run writes to %d live %s:\n", len(tableIDs), plural(len(tableIDs), "table"))
+	}
 	// One serial request per table, so the list is capped rather than made
 	// concurrent: the count is the warning, the names are decoration, and a
 	// workflow bound to fifty output tables should not make the refusal slower
@@ -674,9 +692,33 @@ func writeLiveRefusal(ctx context.Context, client *api.Client, tableIDs []string
 	if rest := len(tableIDs) - len(named); rest > 0 {
 		fmt.Fprintf(&lines, "    ... and %d more\n", rest)
 	}
-	lines.WriteString("  A workflow's table writes go to the LIVE table — there is no test sandbox, and a\n")
-	lines.WriteString("  replace-mode write replaces what is there now.\n")
-	lines.WriteString("  Re-run with --write-live if that is what you mean.")
+	if space != "" {
+		fmt.Fprintf(&lines, "  These tables are in Space %s, the Space stack %q deploys to (not your organization's default Space).\n", space, f.Stack)
+		lines.WriteString("  A replace-mode write replaces what is there now, and the workflow's own parameters\n")
+		lines.WriteString("  (a mode or a dry-run switch) do not change what it may write.\n")
+		lines.WriteString("  Re-run with --write-live if writing them is what you mean.")
+		return lines.String()
+	}
+	lines.WriteString("  A test run's table writes go to the LIVE tables, and a replace-mode write replaces\n")
+	lines.WriteString("  what is there now. The workflow's own parameters (a mode or a dry-run switch) do\n")
+	lines.WriteString("  not change what it may write.\n")
+	var elsewhere []string
+	if f.Manifest != nil {
+		for _, name := range f.Manifest.StackNames() {
+			if stack := f.Manifest.Stacks[name]; stack.SpaceID != "" {
+				elsewhere = append(elsewhere, fmt.Sprintf("    %q (Space %s): ronja wf test --stack %s\n", name, spaceLabel(stack), name))
+			}
+		}
+	}
+	if len(elsewhere) > 0 {
+		lines.WriteString("  To test without touching live tables, test a stack of this folder that deploys to\n")
+		lines.WriteString("  another Space:\n")
+		lines.WriteString(strings.Join(elsewhere, ""))
+	} else {
+		lines.WriteString("  To test without touching live tables, create a dev Space and deploy this folder to\n")
+		lines.WriteString("  it as a second stack: https://ronja.tech/docs/guides/test-in-a-dev-space/\n")
+	}
+	lines.WriteString("  Re-run with --write-live only if writing these live tables is what you mean.")
 	return lines.String()
 }
 

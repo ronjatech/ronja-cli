@@ -43,13 +43,17 @@ What happens depends on the app's feature:
 --no-request-review turns the second case into an error instead of a review
 request, which is what CI wants when a merge is expected to land directly.
 
+Agents: ship with ` + "`ronja propose`" + `, the recommended way for an agent to
+ship an adopted folder; the person this login belongs to approves it in Ronja,
+which then deploys it as them.
+
 The draft must compile. A data app that does not compile cannot be published —
 the live app would otherwise keep serving its previous bundle while claiming to
 be the new code — so publish checks first and shows you the diagnostics.
 
 Push first: publish sends what is already on the server, and warns when the
 folder has local changes that are not in the draft.`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveDeployInstance(false)
 			if err != nil {

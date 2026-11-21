@@ -6,8 +6,10 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -34,6 +36,10 @@ type fakeChangeLists struct {
 	migrationPushes int
 	// busy answers a proposal as a full instance does: 429 and Retry-After.
 	busy bool
+	// spaces is the Space GET /api/v2/database/:id names for each database.
+	spaces map[string]string
+	// migrationPaths is each migrations request's path as it was sent.
+	migrationPaths []string
 }
 
 type fakeProposal struct {
@@ -44,7 +50,7 @@ type fakeProposal struct {
 }
 
 func newFakeChangeLists() *fakeChangeLists {
-	return &fakeChangeLists{applied: map[string]bool{}}
+	return &fakeChangeLists{applied: map[string]bool{}, spaces: map[string]string{}}
 }
 
 func (c *fakeChangeLists) serve(w http.ResponseWriter, r *http.Request) bool {
@@ -73,6 +79,13 @@ func (c *fakeChangeLists) serve(w http.ResponseWriter, r *http.Request) bool {
 		writeJSON(w, map[string]any{"id": "changelist-1", "status": "pending",
 			"url": "https://app.example.com/change-lists/changelist-1?org=" + testTenantID})
 		return true
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v2/database/") && !strings.Contains(strings.TrimPrefix(r.URL.Path, "/api/v2/database/"), "/"):
+		id := strings.TrimPrefix(r.URL.Path, "/api/v2/database/")
+		c.mu.Lock()
+		space := c.spaces[id]
+		c.mu.Unlock()
+		writeJSON(w, map[string]any{"id": id, "name": id + "-name", "spaceID": space})
+		return true
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v2/database/") && strings.HasSuffix(r.URL.Path, "/migrations"):
 		var in api.MigrationSetInput
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -81,6 +94,7 @@ func (c *fakeChangeLists) serve(w http.ResponseWriter, r *http.Request) bool {
 		}
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		c.migrationPaths = append(c.migrationPaths, r.URL.EscapedPath())
 		if !in.DryRun {
 			c.migrationPushes++
 		}
@@ -533,5 +547,251 @@ func TestProposeSaysToRetryWhenTheInstanceIsBusy(t *testing.T) {
 		if _, statErr := os.Stat(filepath.Join(dir, folder, ".ronja", "proposed.json")); statErr == nil {
 			t.Errorf("%s recorded a proposal that was never made", folder)
 		}
+	}
+}
+
+// migrationsOnlyFolder is a release folder holding only migrations/ (no
+// ronja.json), the first already applied, bound to boundTo unless it is empty.
+func migrationsOnlyFolder(t *testing.T, f *fakeImportInstance, boundTo string) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeLocal(t, dir, "migrations/0001_leads.sql", "CREATE TABLE leads (id int);\n")
+	writeLocal(t, dir, "migrations/0002_score.sql", "ALTER TABLE leads ADD score int;\n")
+	if boundTo != "" {
+		if err := (&dbdir.Binding{}).SaveStack(dir, wfdir.InstanceKey{URL: f.URL(), TenantID: testTenantID}, "", boundTo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.changeLists.applied["0001_leads"] = true
+	return dir
+}
+
+// proposedDatabases is the databases of the one plan uploaded, and its folders.
+func proposedDatabases(t *testing.T, f *fakeImportInstance) ([]proposeDatabase, []json.RawMessage) {
+	t.Helper()
+	if n := len(f.changeLists.proposals); n != 1 {
+		t.Fatalf("%d proposals were uploaded, want 1", n)
+	}
+	var plan struct {
+		Folders   []json.RawMessage `json:"folders"`
+		Databases []proposeDatabase `json:"databases"`
+	}
+	if err := json.Unmarshal(f.changeLists.proposals[0].plan, &plan); err != nil {
+		t.Fatalf("plan: %v\n%s", err, f.changeLists.proposals[0].plan)
+	}
+	return plan.Databases, plan.Folders
+}
+
+// TestProposeFilesAMigrationsOnlyFolder: a folder holding only migrations/
+// and its saved binding proposes the pending migration's exact SQL for the
+// bound database, with no folders, and pushes nothing.
+func TestProposeFilesAMigrationsOnlyFolder(t *testing.T) {
+	f := newFakeImportInstance(t)
+	signInTo(t, f.URL())
+	dir := migrationsOnlyFolder(t, f, "mdb-1")
+
+	out, err := runPropose_(t, dir, "--json")
+	if err != nil {
+		t.Fatalf("propose: %v\n%s", err, out)
+	}
+	if f.changeLists.migrationPushes != 0 {
+		t.Fatalf("propose pushed migrations %d times", f.changeLists.migrationPushes)
+	}
+	databases, folders := proposedDatabases(t, f)
+	if len(folders) != 0 {
+		t.Errorf("the plan has folders: %s", folders)
+	}
+	if len(databases) != 1 || databases[0].Dir != "." || databases[0].DatabaseID != "mdb-1" ||
+		len(databases[0].Migrations) != 1 || databases[0].Migrations[0].Name != "0002_score" ||
+		databases[0].Migrations[0].SQL != "ALTER TABLE leads ADD score int;\n" {
+		t.Errorf("the plan's databases = %+v", databases)
+	}
+	if files := archiveFiles(t, f.changeLists.proposals[0].archive); files["migrations/0002_score.sql"] != "ALTER TABLE leads ADD score int;\n" {
+		t.Errorf("the copy holds %v, want the migrations folder", files)
+	}
+}
+
+// TestProposeDatabaseFlag: --database names the database of the one
+// migrations folder under the directory proposed, bound or not, over its
+// binding, and writes no binding; zero or several folders are refused by name
+// with nothing uploaded.
+func TestProposeDatabaseFlag(t *testing.T) {
+	for _, c := range []struct{ name, boundTo, flag string }{
+		{"an unbound folder", "", "mdb-x"},
+		{"over the folder's binding", "mdb-dev", "mdb-prod"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeImportInstance(t)
+			signInTo(t, f.URL())
+			dir := migrationsOnlyFolder(t, f, c.boundTo)
+			before, _ := os.ReadFile(dbdir.Path(dir))
+
+			out, err := runPropose_(t, dir, "--database", c.flag, "--json")
+			if err != nil {
+				t.Fatalf("propose --database %s: %v\n%s", c.flag, err, out)
+			}
+			databases, _ := proposedDatabases(t, f)
+			if len(databases) != 1 || databases[0].DatabaseID != c.flag || len(databases[0].Migrations) != 1 ||
+				databases[0].Migrations[0].Name != "0002_score" {
+				t.Errorf("the plan's databases = %+v, want 0002_score for %s", databases, c.flag)
+			}
+			if !slices.Contains(f.writes(), "POST /api/v2/database/"+c.flag+"/migrations") {
+				t.Errorf("the status was not asked of %s: %v", c.flag, f.writes())
+			}
+			if after, _ := os.ReadFile(dbdir.Path(dir)); !bytes.Equal(before, after) {
+				t.Errorf("propose changed the binding: %q -> %q", before, after)
+			}
+		})
+	}
+
+	// An id that is not one path segment reaches the migrations route escaped,
+	// never another route through the planning guard.
+	for _, id := range []string{"mdb-x?y", "mdb-a/b"} {
+		t.Run("an id holding "+id, func(t *testing.T) {
+			f := newFakeImportInstance(t)
+			signInTo(t, f.URL())
+			dir := migrationsOnlyFolder(t, f, "")
+
+			out, err := runPropose_(t, dir, "--database", id, "--json")
+			if err != nil {
+				t.Fatalf("propose --database %s: %v\n%s", id, err, out)
+			}
+			want := "/api/v2/database/" + url.PathEscape(id) + "/migrations"
+			if !slices.Equal(f.changeLists.migrationPaths, []string{want}) {
+				t.Errorf("the migrations requests went to %v, want %s", f.changeLists.migrationPaths, want)
+			}
+			if databases, _ := proposedDatabases(t, f); len(databases) != 1 || databases[0].DatabaseID != id {
+				t.Errorf("the plan's databases = %+v, want %s", databases, id)
+			}
+		})
+	}
+
+	t.Run("two migrations folders", func(t *testing.T) {
+		f := newFakeImportInstance(t)
+		signInTo(t, f.URL())
+		dir := t.TempDir()
+		writeLocal(t, dir, "crm/migrations/0001_leads.sql", "CREATE TABLE leads (id int);\n")
+		writeLocal(t, dir, "billing/migrations/0001_invoices.sql", "CREATE TABLE invoices (id int);\n")
+
+		out, err := runPropose_(t, dir, "--database", "mdb-x")
+		if err == nil || !strings.Contains(err.Error(), "crm/migrations") || !strings.Contains(err.Error(), "billing/migrations") {
+			t.Fatalf("propose --database over two migrations folders: %v\n%s", err, out)
+		}
+		if len(f.changeLists.proposals) != 0 {
+			t.Fatal("a list was uploaded")
+		}
+	})
+
+	t.Run("beside another tool's nested migrations folder", func(t *testing.T) {
+		f := newFakeImportInstance(t)
+		signInTo(t, f.URL())
+		dir := migrationsOnlyFolder(t, f, "")
+		writeLocal(t, dir, "app/migrations/env.py", "# Alembic's environment\n")
+		writeLocal(t, dir, "app/migrations/versions/abc_init.py", "# an Alembic revision\n")
+
+		out, err := runPropose_(t, dir, "--database", "mdb-x", "--json")
+		if err != nil {
+			t.Fatalf("propose --database beside app/migrations: %v\n%s", err, out)
+		}
+		if databases, _ := proposedDatabases(t, f); len(databases) != 1 || databases[0].DatabaseID != "mdb-x" || databases[0].Dir != "." {
+			t.Errorf("the plan's databases = %+v, want the base's folder for mdb-x", databases)
+		}
+	})
+
+	t.Run("no migrations folder", func(t *testing.T) {
+		f := newFakeImportInstance(t)
+		signInTo(t, f.URL())
+		out, err := runPropose_(t, t.TempDir(), "--database", "mdb-x")
+		if err == nil || !strings.Contains(err.Error(), "no migrations/ folder holding .sql files") {
+			t.Fatalf("propose --database with no migrations folder: %v\n%s", err, out)
+		}
+		if len(f.changeLists.proposals) != 0 {
+			t.Fatal("a list was uploaded")
+		}
+	})
+}
+
+// TestProposeChecksTheDatabasesSpace: with --stack, propose refuses a
+// database outside the Space that stack declares in the repository, by flag
+// or by binding, as `ronja db migrate push --stack` does, and uploads nothing;
+// a database in the stack's Space is proposed.
+func TestProposeChecksTheDatabasesSpace(t *testing.T) {
+	// The repository's workflow folder declares stack "dev" in Space A; the
+	// migrations folder beside it is the one proposed.
+	repoWithDev := func(t *testing.T, f *fakeImportInstance) string {
+		t.Helper()
+		repo := t.TempDir()
+		if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeDevStackFolder(t, filepath.Join(repo, "workflows", "report"), f.URL(), testTenantID, "space-a")
+		writeLocal(t, repo, "db/migrations/0001_leads.sql", "CREATE TABLE leads (id int);\n")
+		f.changeLists.spaces["mdb-a"], f.changeLists.spaces["mdb-b"] = "space-a", "space-b"
+		return filepath.Join(repo, "db")
+	}
+	refused := func(t *testing.T, f *fakeImportInstance, out string, err error) {
+		t.Helper()
+		r, ok := asManagedRefusal(err)
+		if !ok || r.Reason != syncReasonBindSpaceMismatch || !strings.Contains(r.Detail, "mdb-b") ||
+			!strings.HasSuffix(r.Detail, "Pass --database with a database in the stack's Space; nothing was proposed") {
+			t.Fatalf("propose of a database in Space B on the dev stack: %v\n%s", err, out)
+		}
+		if len(f.changeLists.proposals) != 0 {
+			t.Fatal("a list was uploaded")
+		}
+		if slices.Contains(f.writes(), "POST /api/v2/database/mdb-b/migrations") {
+			t.Errorf("the migration status was read after the refusal: %v", f.writes())
+		}
+	}
+
+	t.Run("by --database, outside the Space", func(t *testing.T) {
+		f := newFakeImportInstance(t)
+		signInTo(t, f.URL())
+		out, err := runPropose_(t, repoWithDev(t, f), "--stack", "dev", "--database", "mdb-b", "--json")
+		refused(t, f, out, err)
+	})
+
+	t.Run("by binding, outside the Space", func(t *testing.T) {
+		f := newFakeImportInstance(t)
+		signInTo(t, f.URL())
+		dir := repoWithDev(t, f)
+		if err := (&dbdir.Binding{}).SaveStack(dir, wfdir.InstanceKey{URL: f.URL(), TenantID: testTenantID}, "dev", "mdb-b"); err != nil {
+			t.Fatal(err)
+		}
+		out, err := runPropose_(t, dir, "--stack", "dev", "--json")
+		refused(t, f, out, err)
+	})
+
+	t.Run("by --database, inside the Space", func(t *testing.T) {
+		f := newFakeImportInstance(t)
+		signInTo(t, f.URL())
+		out, err := runPropose_(t, repoWithDev(t, f), "--stack", "dev", "--database", "mdb-a", "--json")
+		if err != nil {
+			t.Fatalf("propose of a database in the dev stack's Space: %v\n%s", err, out)
+		}
+		if databases, _ := proposedDatabases(t, f); len(databases) != 1 || databases[0].DatabaseID != "mdb-a" {
+			t.Errorf("the plan's databases = %+v, want mdb-a", databases)
+		}
+	})
+}
+
+// TestProposeRefusesMoreThanOnePushHolds: a database with more migrations
+// pending than one push applies is refused, naming the last that fits, and
+// nothing is uploaded: the deploy job's push would refuse it after approval.
+func TestProposeRefusesMoreThanOnePushHolds(t *testing.T) {
+	f := newFakeImportInstance(t)
+	signInTo(t, f.URL())
+	dir := t.TempDir()
+	for i := 1; i <= maxPendingPerPush+1; i++ {
+		writeLocal(t, dir, fmt.Sprintf("migrations/%04d_step.sql", i), fmt.Sprintf("SELECT %d;\n", i))
+	}
+
+	out, err := runPropose_(t, dir, "--database", "mdb-x")
+	if err == nil || !strings.Contains(err.Error(), "41 migrations are not applied yet") ||
+		!strings.Contains(err.Error(), "Propose up to and including 0040_step first") {
+		t.Fatalf("propose of 41 pending: %v\n%s", err, out)
+	}
+	if len(f.changeLists.proposals) != 0 {
+		t.Fatal("a list was uploaded")
 	}
 }

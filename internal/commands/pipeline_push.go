@@ -221,6 +221,7 @@ Publishing is a separate step:
 			if result != nil {
 				result.ManagedInGit = f.notices
 				if flagJSON {
+					result.Error = errorLine(result.Error, err)
 					if emitErr := emitJSON(result); emitErr != nil {
 						return emitErr
 					}
@@ -792,6 +793,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 		pushing[path] = true
 		sending[path] = local[path]
 	}
+	codec.pushing = pushing
 	// Checked on what is actually being SENT: a positional ref in a file this run
 	// is not pushing cannot mis-resolve anything, and refusing on it would let one
 	// stale file block every other table in the folder.
@@ -1028,7 +1030,7 @@ func runPipelinePush(ctx context.Context, f *folder, args []string, opts pipelin
 			return result, newChecksNotApplied(result.Error, result.Checks)
 		}
 	}
-	return result, fmt.Errorf("%s", result.Error)
+	return result, fmt.Errorf("%s%s", result.Error, listFailedFiles(result.failedFiles()))
 }
 
 // refusedForDrift reports whether any unit of this push was refused for drift.
@@ -2423,4 +2425,35 @@ func printPipelineFileResult(out *os.File, file pipelineFileResult) {
 		printSample(out, file.Sample)
 	}
 	printResourceURL(out, reportKeyWidth, file.URL)
+}
+
+// failedFiles are the files behind the summary's problem counts, in the order
+// the push reached them.
+func (r *pipelinePushResult) failedFiles() []failedFile {
+	var out []failedFile
+	for _, file := range r.Files {
+		if file.Outcome != pushOutcomePushed && file.Outcome != pullPending {
+			out = append(out, failedFile{file.Path, file.Error})
+		}
+	}
+	for _, doc := range r.Docs {
+		if doc.Outcome == docsOutcomeRefused {
+			out = append(out, failedFile{doc.Path, doc.Error})
+		}
+	}
+	for _, metric := range r.Metrics {
+		switch {
+		case metric.Outcome == metricOutcomeRefused, metric.Outcome == metricOutcomeBuildFailed,
+			metric.Outcome == metricOutcomeDescriptionFailed:
+			out = append(out, failedFile{metric.Path, metric.Error})
+		case metric.Tags != nil && metric.Tags.Outcome == tagOutcomeFailed:
+			out = append(out, failedFile{metric.Path, metric.Tags.Reason})
+		}
+	}
+	for _, checks := range r.Checks {
+		if checks.failed() {
+			out = append(out, failedFile{checks.Path, checksFailureReason(checks)})
+		}
+	}
+	return out
 }

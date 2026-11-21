@@ -2,8 +2,10 @@ package dbdir
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -21,14 +23,18 @@ func ReadMigrations(dir string) ([]api.Migration, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("no %s/ folder here — create one and put your .sql files in it", MigrationsDir)
+			if abs, aerr := filepath.Abs(dir); aerr == nil && filepath.Base(abs) == MigrationsDir {
+				return nil, fmt.Errorf("no %s/ folder in %s — that is the %s/ folder itself; pass the folder that holds it: --dir %s",
+					MigrationsDir, dir, MigrationsDir, filepath.Join(dir, ".."))
+			}
+			return nil, fmt.Errorf("no %s/ folder in %s — create one and put your .sql files in it", MigrationsDir, dir)
 		}
 		return nil, fmt.Errorf("read %s: %w", root, err)
 	}
 
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".sql") {
+		if !isMigrationFile(e) {
 			continue
 		}
 		names = append(names, e.Name())
@@ -59,4 +65,18 @@ func ReadMigrations(dir string) ([]api.Migration, error) {
 		return nil, fmt.Errorf("no .sql files in %s/", MigrationsDir)
 	}
 	return out, nil
+}
+
+// HasMigrations reports whether dir's migrations/ holds a file ReadMigrations
+// reads, which a migrations/ of another tool (Alembic's, say) does not.
+func HasMigrations(dir string) bool {
+	entries, err := os.ReadDir(filepath.Join(dir, MigrationsDir))
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(entries, isMigrationFile)
+}
+
+func isMigrationFile(e fs.DirEntry) bool {
+	return !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".sql")
 }

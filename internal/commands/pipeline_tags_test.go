@@ -1397,8 +1397,8 @@ func TestSyncApplyPublishesTheSQLPastAFailedTagHalf(t *testing.T) {
 	}
 	line := applyFolderLine(t, applyReportOf(t, out), "sales")
 	if line.Verdict != verdictRefused || line.Reason != syncReasonTagsNotApplied ||
-		!strings.Contains(line.Detail, "orders.sql") || !strings.Contains(line.Detail, taggedPath) {
-		t.Fatalf("line = %+v", line)
+		!strings.Contains(line.Detail, "orders.sql") || !strings.Contains(line.Detail, taggedPath) || strings.Contains(line.Detail, "\n") {
+		t.Fatalf("line = %+v, want one line naming orders.sql and the metric", line)
 	}
 	if strings.Contains(err.Error(), "was not deployed") || !strings.Contains(err.Error(), "not fully deployed") {
 		t.Errorf("summary = %v", err)

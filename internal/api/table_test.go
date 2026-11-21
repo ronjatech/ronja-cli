@@ -710,6 +710,38 @@ func TestWaitForTableBuildStopsOnACancelledContext(t *testing.T) {
 	}
 }
 
+// When the CLI stops watching a build that keeps running, the next step it
+// names watches that build. Running the push again is not it: a push waits for
+// the running build and then starts another.
+func TestABuildNoLongerWatchedNamesHowToWatchIt(t *testing.T) {
+	slow := tableStates(t, `{"id":"table-1","status":"building","buildVerdict":"building"}`)
+	slow.TableBuild.Timeout = 5 * time.Millisecond
+	_, timedOut := slow.WaitForTableBuild(context.Background(), "table-1")
+	unreachable := fastPoll(serve(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	_, lost := unreachable.WaitForTableBuild(context.Background(), "table-1")
+
+	for name, err := range map[string]error{"timeout": timedOut, "lost contact": lost} {
+		if err == nil {
+			t.Fatalf("%s: expected an error", name)
+		}
+		text := err.Error()
+		for _, want := range []string{
+			"ronja api /api/v2/feature/model/table-1 --wait-until '" + buildDoneCondition + "'",
+			"ronja pipeline publish",
+			"Push again only after changing the file",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s: missing %q:\n%s", name, want, text)
+			}
+		}
+		if strings.Contains(text, "run the same command again") {
+			t.Errorf("%s: still sends the caller to push again:\n%s", name, text)
+		}
+	}
+}
+
 // A zero Timeout must default, not mean "no deadline", or a caller who set only
 // the interval would wait forever.
 func TestTableBuildPollDefaultsEveryField(t *testing.T) {

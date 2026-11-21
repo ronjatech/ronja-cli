@@ -78,6 +78,9 @@ type Module struct {
 
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// UpdatedBy is who last edited the row: on a draft, its last editor, who
+	// may not be its drafter.
+	UpdatedBy string `json:"updatedBy"`
 	// ManagedBy names the repository folder that deploys this module, when one
 	// does (backend/api/v2/module/handler.go). Only the
 	// single-row GET carries it; nil on every other route, on a row no

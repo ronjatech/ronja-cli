@@ -450,6 +450,9 @@ type fakeInstance struct {
 	// rather than interleaved with the workflow one it shares nothing with.
 	mod *moduleFake
 
+	// jars is the workflow jar arm (workflow_jar_fake_test.go).
+	jars fakeJars
+
 	// managed is the server-side state behind an adopted folder, for the
 	// workflow and module rows this fake holds (managed_harness_test.go).
 	managed *fakeManaged
@@ -990,6 +993,10 @@ func (f *fakeInstance) serve(w http.ResponseWriter, r *http.Request) {
 		// reads a single file — everything else wants the whole set — and 404
 		// for a path the row does not hold is the answer it acts on.
 		id, filePath, _ := strings.Cut(path, "/files/")
+		if r.URL.Query().Get("raw") == "1" {
+			f.serveJarDownload(w, id, filePath)
+			return
+		}
 		for _, file := range f.files[id] {
 			if file.Path == filePath {
 				writeJSON(w, file)
@@ -1208,12 +1215,19 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		}
 		switch r.Method {
 		case "PUT":
+			if r.Header.Get("Content-Type") == api.JarContentType {
+				f.serveJarPut(w, r, id, filePath)
+				return true
+			}
 			var in struct {
 				Content    string  `json:"content"`
 				BaseSha256 *string `json:"baseSha256"`
 			}
 			decodeBody(f.t, r, &in)
 			f.fileWrites = append(f.fileWrites, recordedFileWrite{Method: "PUT", Path: filePath, BaseSha256: in.BaseSha256})
+			if f.refuseTextOverJar(w, id, filePath, in.Content) {
+				return true
+			}
 			if status := f.failPut[filePath]; status != 0 {
 				http.Error(w, `{"error":"`+filePath+` is not acceptable"}`, status)
 				return true
@@ -1221,7 +1235,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// The precondition is checked BEFORE the write and rolls it back by
 			// simply not doing it, which is what the server's in-transaction
 			// check amounts to from the outside.
-			if f.refusePrecondition(w, "workflow", f.FileContents(id), filePath, in.BaseSha256) {
+			if f.refusePrecondition(w, "workflow", f.preconditionContents(id), filePath, in.BaseSha256) {
 				return true
 			}
 			f.putFile(id, filePath, in.Content)
@@ -1259,7 +1273,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 				http.Error(w, `{"error":"cannot delete the entrypoint file"}`, http.StatusBadRequest)
 				return true
 			}
-			if f.refusePrecondition(w, "workflow", f.FileContents(id), filePath, in.BaseSha256) {
+			if f.refusePrecondition(w, "workflow", f.preconditionContents(id), filePath, in.BaseSha256) {
 				return true
 			}
 			f.deleteFile(id, filePath)
@@ -1742,14 +1756,14 @@ func (f *fakeInstance) refusePrecondition(w http.ResponseWriter, noun string, co
 	case *want == "":
 		http.Error(w, `{"error":"`+path+` already exists on this `+noun+`, but the write asserted it did not"}`,
 			http.StatusConflict)
-	case exists && wfdir.HashString(content) == *want:
+	case exists && contentHash(content) == *want:
 		return false
 	case !exists:
 		http.Error(w, `{"error":"`+path+` does not exist on this `+noun+`, but the write asserted its content hashed to `+*want+`"}`,
 			http.StatusConflict)
 	default:
 		http.Error(w, `{"error":"`+path+` changed since you last read it (it now hashes to `+
-			wfdir.HashString(content)+`, the write expected `+*want+`)"}`, http.StatusConflict)
+			contentHash(content)+`, the write expected `+*want+`)"}`, http.StatusConflict)
 	}
 	return true
 }

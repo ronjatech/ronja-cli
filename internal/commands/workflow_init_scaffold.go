@@ -143,7 +143,7 @@ func writeStarter(root, entrypoint, starter string) (bool, error) {
 		return false, fmt.Errorf("read %s: %w", dest, err)
 	}
 	if strings.TrimSpace(starter) == "" {
-		return false, fmt.Errorf("the instance sent an empty starter for %s", entrypoint)
+		return false, fmt.Errorf("the instance sent an empty starter for %s — write it yourself and run this again (an existing file is kept)", entrypoint)
 	}
 	if err := wfdir.WriteFile(root, entrypoint, starter); err != nil {
 		return false, err

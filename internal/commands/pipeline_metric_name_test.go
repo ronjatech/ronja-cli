@@ -176,3 +176,45 @@ func TestPipelinePushCreatesAMetricUnderItsDeclaredName(t *testing.T) {
 		t.Errorf("lock records %q", got)
 	}
 }
+
+// A NEW METRIC WITHOUT A DECLARED NAME is named after its file, and the push
+// says how to give it a display name instead.
+func TestPipelinePushNotesHowToNameAMetricCreatedAfterItsFile(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	seedFeature(f, "private")
+	_, root := metricApplyTree(t, f, "")
+	writeMetricFile(t, root, `{"recipe":`+aovRecipe+`}`)
+	var out string
+	var err error
+	stderr := captureStderr(t, func() {
+		out, err = runCLI(t, root, "pipeline", "push", "--stack", "prod", "--json")
+	})
+	if err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+	stem := strings.TrimSuffix(strings.TrimPrefix(aovMetricPath, "metrics/"), ".json")
+	want := `Note: ` + aovMetricPath + ` — created as "` + stem + `", after its file; add "name" to the file to give it a display name (a later push renames it in place)`
+	if !strings.Contains(stderr, want) {
+		t.Errorf("stderr does not carry the naming note %q:\n%s", want, stderr)
+	}
+}
+
+// Negative control: a file that declares its name gets no such note.
+func TestPipelinePushDoesNotNoteANamedMetric(t *testing.T) {
+	f := newFakePipelineInstance(t)
+	signInPipeline(t, f)
+	seedFeature(f, "private")
+	_, root := metricApplyTree(t, f, "")
+	writeMetricFile(t, root, namedMetricBody(aovName))
+	var err error
+	stderr := captureStderr(t, func() {
+		_, err = runCLI(t, root, "pipeline", "push", "--stack", "prod", "--json")
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if strings.Contains(stderr, "after its file") {
+		t.Errorf("a named metric got the naming note:\n%s", stderr)
+	}
+}

@@ -265,17 +265,25 @@ func writeWorkflowClone(ctx context.Context, client *api.Client, resolved *confi
 		return nil, "", err
 	}
 
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return nil, "", fmt.Errorf("create %s: %w", root, err)
-	}
-	for _, f := range files {
-		// Validated once more inside WriteFile: the path arrives from
-		// the server, and writing it is a local filesystem operation
-		// that must not be able to escape the folder.
+	// Every jar is downloaded before the folder is created, so a failed
+	// download leaves no half-cloned folder for the next clone to refuse.
+	bodies := make([]string, len(files))
+	for i, f := range files {
 		// In the folder's alias form (an empty codec, for a clone, is the
 		// identity): what the server holds, de-aliased exactly as every later
 		// remote read is, so the first status compares equal.
-		if err := wfdir.WriteFile(root, f.Path, hooks.codec.toDisk(f.Content)); err != nil {
+		if bodies[i], err = jarDiskBytes(ctx, client, hooks.codec, source.ID, f); err != nil {
+			return nil, "", err
+		}
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, "", fmt.Errorf("create %s: %w", root, err)
+	}
+	for i, f := range files {
+		// Validated once more inside WriteFile: the path arrives from
+		// the server, and writing it is a local filesystem operation
+		// that must not be able to escape the folder.
+		if err := wfdir.WriteFile(root, f.Path, bodies[i]); err != nil {
 			return nil, "", fmt.Errorf("write %s: %w", f.Path, err)
 		}
 	}

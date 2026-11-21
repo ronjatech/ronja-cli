@@ -871,8 +871,8 @@ func (c *Client) WaitForTableBuild(ctx context.Context, id string) (*TableBuildR
 				failingSince = now
 			}
 			if failing := now.Sub(failingSince); failing > poll.MaxFailureWindow {
-				return last, fmt.Errorf("lost contact with %s while waiting for the build of %s (%s of failures in a row, last: %w) — the build itself is unaffected and continues server-side",
-					c.BaseURL, id, failing.Round(time.Second), err)
+				return last, fmt.Errorf("lost contact with %s while waiting for the build of %s (%s of failures in a row, last: %w) — the build itself is unaffected and continues server-side%s",
+					c.BaseURL, id, failing.Round(time.Second), err, watchBuildHint(id))
 			}
 			// A 429 is the global rate limiter, and the only transient failure that
 			// says anything about load. The others resume the schedule's own
@@ -962,6 +962,10 @@ func terminalPollFailure(id string, err error) error {
 	return nil
 }
 
+// buildDoneCondition is a jq condition over GET /api/v2/feature/model/:id that
+// holds once no build of the row is in flight (tableBuildInFlight's verdicts).
+const buildDoneCondition = `.buildVerdict != "building" and .buildVerdict != "pending" and .buildVerdict != "invalidated"`
+
 // tableBuildTimeout explains a wait that ran out, naming the codeless-sync cause
 // when the row never left `pending`.
 //
@@ -979,8 +983,17 @@ func tableBuildTimeout(id string, timeout time.Duration, last *TableBuildResult)
 	if last != nil && last.Verdict != "" {
 		verdict = last.Verdict
 	}
-	return fmt.Errorf("gave up waiting for the build of %s after %s (last verdict: %s) — it keeps going whether or not this command is watching",
-		id, timeout, verdict)
+	return fmt.Errorf("gave up waiting for the build of %s after %s (last verdict: %s) — it keeps going whether or not this command is watching%s",
+		id, timeout, verdict, watchBuildHint(id))
+}
+
+// watchBuildHint is the next step once the CLI stops watching a build that
+// keeps running. Pushing again is not it: a push waits for the running build
+// and then builds again, the same bytes included. See BL-8f82.
+func watchBuildHint(id string) string {
+	return fmt.Sprintf("\n  Watch it without starting another build: ronja api /api/v2/feature/model/%s --wait-until '%s' --wait-timeout 3600 --jq .buildVerdict -r"+
+		"\n  When it reads ok, run ronja pipeline publish. Push again only after changing the file: a push waits for the running build, then builds again",
+		id, buildDoneCondition)
 }
 
 // nextTableBuildInterval is the wait before poll number polls+1, given the wait

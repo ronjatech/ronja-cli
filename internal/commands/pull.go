@@ -198,8 +198,12 @@ func (l pullLiteral) describe() string {
 // the report owes the author.
 type pullPlan struct {
 	// files maps a folder-relative path to its new content; nil deletes it.
-	// Only paths whose content changes.
+	// Only paths whose content changes. A workflow's jar is its stand-in
+	// until fetchJars replaces it with the bytes, just before the write.
 	files map[string]*string
+	// fetchJar downloads the live bytes of the jar at a path (nil: the kind
+	// holds no jars).
+	fetchJar func(ctx context.Context, path string) (string, error)
 	// manifest is the folder's manifest with the live metadata, nil when
 	// nothing in it changes. Its dependencies and binds are never touched.
 	manifest *wfdir.Manifest
@@ -342,6 +346,9 @@ func runPull(ctx context.Context, kind wfdir.Kind, dir string, opts pullOptions)
 			return nil, err
 		}
 	}
+	if err := plan.fetchJars(ctx); err != nil {
+		return nil, err
+	}
 	for _, p := range sortedKeys(plan.files) {
 		if err := writePulledFile(f.Root, p, plan.files[p]); err != nil {
 			return nil, err
@@ -378,6 +385,26 @@ func runPull(ctx context.Context, kind wfdir.Kind, dir string, opts pullOptions)
 		}
 	}
 	return report, nil
+}
+
+// fetchJars replaces each jar's stand-in in the plan with its bytes, all of
+// them before the first write, so a failed download writes nothing.
+func (p *pullPlan) fetchJars(ctx context.Context) error {
+	for _, path := range sortedKeys(p.files) {
+		content := p.files[path]
+		if content == nil || !isJarStandIn(*content) {
+			continue
+		}
+		if p.fetchJar == nil {
+			return fmt.Errorf("%s is a jar, and this kind of folder holds none", path)
+		}
+		body, err := p.fetchJar(ctx, path)
+		if err != nil {
+			return err
+		}
+		p.files[path] = &body
+	}
+	return nil
 }
 
 // paths is every file the plan may change, ronja.json last. ronja.json is

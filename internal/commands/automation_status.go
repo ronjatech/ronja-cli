@@ -50,7 +50,7 @@ an automation whose state could not be READ: an unreachable instance, an expired
 token, a binding that no longer resolves, or a feature holding more automations
 than one page carries. "I could not look" is not the same answer as "nothing
 moved".`,
-		Args: cobra.NoArgs,
+		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Deliberately NOT resolveInstance: a signed-out caller can still be
 			// told what its files declare, and the remote half degrades to "not

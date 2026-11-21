@@ -236,7 +236,7 @@ func TestModuleDriftExcusesWhatThisFolderProposed(t *testing.T) {
 		f := moduleFolderFor(t, root, key, baseline)
 		f.Manifest.Name, f.Manifest.Title = "emab_later", "EMAB later"
 		identity := &api.Module{ID: "module-1", Name: "emab_proposed", Title: title, Lifecycle: api.LifecycleLive}
-		return checkModuleDrift(f, identity, remote, local, false, head)
+		return checkModuleDrift(f, identity, remote, local, false, head, driftAsk{})
 	}
 	asProposed := map[string]string{"__init__.py": "", "tracker.py": "x = 2"}
 
