@@ -147,9 +147,18 @@ func describeClaimRefusal(f *folder, a wfdir.ManagedAddress, r api.ManagedClaimR
 		if r.Claim != nil {
 			holder = describeHolderAddress(r.Claim)
 		}
+		remedy := "Point this file at its own row, or release the other claim"
+		switch {
+		case flagTakeOver && takesOver(f.Kind):
+			// A takeover the server judged answers a takeover_* code, so a plain
+			// resource_claimed is a server that ignored the key.
+			remedy = "The claim is held elsewhere and could not be taken over, or this server predates `--take-over`"
+		case planningProposal && takesOver(f.Kind):
+			remedy = fmt.Sprintf("To continue the %s from this folder, propose it on its own with --take-over (this folder based on the live version, the other not in a git repository)", f.Kind.Label)
+		}
 		return managedRefusal{syncReasonClaimedElsewhere, fmt.Sprintf(
-			"%s records %s, and that row is already managed at %s — one row has one address. Point this file at its own row, or release the other claim",
-			where, a.ID, holder)}
+			"%s records %s, and that row is already managed at %s — one row has one address. %s",
+			where, a.ID, holder, remedy)}
 	case api.ManagedCodeAddressClaimed:
 		if revivalMissed(r.Claim) {
 			return managedRefusal{syncReasonMovedOut, fmt.Sprintf(
@@ -176,9 +185,32 @@ func describeClaimRefusal(f *folder, a wfdir.ManagedAddress, r api.ManagedClaimR
 		return managedRefusal{syncReasonLost, fmt.Sprintf(
 			"%s records %s, which no longer exists or which you may not read, so it cannot be claimed. Drop it from %s and apply with --allow-create to create it again, or have its owner publish it",
 			where, a.ID, wfdir.LockName)}
+	case api.ManagedCodeTakeoverHeldInGit:
+		return managedRefusal{syncReasonClaimedElsewhere, fmt.Sprintf(
+			"%s records %s, which is managed from %s in a git repository, and --take-over never displaces a repository's folder. Edit it in a checkout of that repository (git clone it, then `%s pull` in the folder)",
+			where, a.ID, describeFolderOf(r.Claim), f.Kind.Command)}
+	case api.ManagedCodeTakeoverSourceUnknown:
+		return managedRefusal{syncReasonClaimedElsewhere, fmt.Sprintf(
+			"%s records %s, which is managed from %s, whose source is unknown, so --take-over cannot tell it is not a git repository's folder. "+
+				"A person who may write the feature can release it with `ronja sync unmanage --force` in that folder (a computer cannot), then propose this folder again",
+			where, a.ID, describeFolderOf(r.Claim))}
+	case api.ManagedCodeTakeoverStaleBase:
+		id, _ := f.Binding.ResourceID(f.Kind)
+		return managedRefusal{syncReasonClaimedElsewhere, fmt.Sprintf(
+			"%s records %s, which is managed from %s, and was not taken over: %s. Clone the live %s again with `%s clone %s <dir> --stack %s`, apply your change there and propose that folder with --take-over",
+			where, a.ID, describeFolderOf(r.Claim), orUnknown(r.Error), f.Kind.Label, f.Kind.Command, orUnknown(id), f.Stack)}
 	}
 	return managedRefusal{syncReasonClaimRefused, fmt.Sprintf("%s records %s, and the server refused to claim it (%s): %s",
 		where, a.ID, orUnknown(r.Code), orUnknown(r.Error))}
+}
+
+// describeFolderOf names the folder a claim belongs to, by its source label
+// and id.
+func describeFolderOf(c *api.ManagedClaim) string {
+	if c == nil {
+		return "another folder"
+	}
+	return fmt.Sprintf("folder %s (%s, stack %q)", c.FolderID, orUnknown(c.SourceLabel), c.StackLabel)
 }
 
 func describeHolder(c *api.ManagedClaim) string {

@@ -236,6 +236,7 @@ func writeDataAppClone(ctx context.Context, client *api.Client, resolved *config
 	} else {
 		manifest.SetAccess(source.DataAppAccess)
 	}
+	manifest.SetSettings(source.Description, false, source.ServerDataOnly)
 	hooks.finishManifest(manifest)
 	hooks.appliedTitle(lock, source.Name)
 	if err := wfdir.SaveFolder(root, manifest, lock); err != nil {

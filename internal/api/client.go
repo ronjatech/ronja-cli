@@ -272,6 +272,12 @@ func WireCodeOf(err error) string {
 // carries no such code.
 const InsufficientScopeCode = "insufficient_scope"
 
+// ComputerPublishRefusedCode is the wire discriminator on the 403 an agent
+// computer's token gets from a write it may not make (gt.ComputerPublishRefusedCode,
+// backend/lib/api/gt/computer.go): the change goes live through `ronja propose`
+// and the person's approval, never through another credential.
+const ComputerPublishRefusedCode = "computer_publish_refused"
+
 // NameTakenCode is the wire discriminator on the 409 every naming surface
 // answers when a name already identifies another row in the same namespace — a
 // table's feature, a feature's organization — mirrored from gt.NameTakenCode

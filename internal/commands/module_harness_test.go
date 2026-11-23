@@ -93,6 +93,9 @@ type moduleFake struct {
 	// beforeCheckout runs at the start of POST :id/checkout: the instant a
 	// draft the same user opened elsewhere would appear.
 	beforeCheckout func(liveID string)
+	// asComputer answers the metadata PUT as the server answers an agent
+	// computer's token: 403 computer_publish_refused, landing nothing.
+	asComputer bool
 
 	next int
 }
@@ -325,6 +328,10 @@ func (f *fakeInstance) serveModuleRow(w http.ResponseWriter, row *api.Module) {
 func (f *fakeInstance) serveModulePatch(w http.ResponseWriter, r *http.Request, row *api.Module) {
 	var patch api.ModulePatch
 	decodeBody(f.t, r, &patch)
+	if f.mod.asComputer {
+		http.Error(w, `{"error":"a computer cannot put changes live; run `+"`ronja propose`"+`, then call requestPublish","code":"computer_publish_refused"}`, http.StatusForbidden)
+		return
+	}
 	if row.Lifecycle != api.LifecycleLive {
 		// Mirrors the route's own rule: a draft id is refused, since the name is
 		// claimed against the live-uniqueness index.

@@ -435,6 +435,12 @@ func settingsDifferences(f *folder, live *api.Workflow) []string {
 	if patch.PipPackages != nil {
 		lines = append(lines, fmt.Sprintf("%s sets pipPackages other than live's", name))
 	}
+	if patch.Description != nil {
+		lines = append(lines, fmt.Sprintf("%s sets a description other than live's", name))
+	}
+	if patch.UseDedicatedCompute != nil {
+		lines = append(lines, fmt.Sprintf("%s sets useDedicatedCompute %t, live has %t", name, *patch.UseDedicatedCompute, live.UseDedicatedCompute))
+	}
 	if patch.ReportingTimezone != nil {
 		lines = append(lines, fmt.Sprintf("%s sets reportingTimezone %s, live has %s",
 			name, effectiveDeclaredZone(*patch.ReportingTimezone), describeZone(live.ReportingTimezone)))

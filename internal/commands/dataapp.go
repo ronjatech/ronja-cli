@@ -56,7 +56,7 @@ git-ignored for you.
 Files directly in api/ (api/<name>.ts or .js) are server functions: the app's backend,
 run on Ronja's servers and called from the app with functions.call("<name>").
 They push like any other file, and every push builds and checks them; what goes
-inside one is in /docs/api/skills/creating-data-apps.md.
+inside one is in /docs/api/skills/data-apps-server-functions.md.
 
 Two ways in:
 
@@ -382,6 +382,8 @@ func baselineFromApp(codec aliasCodec, source *api.DataApp, files []api.DataAppF
 		Title:             source.Name,
 		Entrypoint:        source.Entrypoint,
 		Access:            baselineAccess(source),
+		Description:       &source.Description,
+		ServerDataOnly:    &source.ServerDataOnly,
 		Files:             map[string]wfdir.FileState{},
 		Aliases:           codec.baselineAliases(),
 		AliasesRecorded:   true,
@@ -414,6 +416,8 @@ func baselineFromAppLocal(codec aliasCodec, source *api.DataApp, files map[strin
 		Title:             source.Name,
 		Entrypoint:        source.Entrypoint,
 		Access:            baselineAccess(source),
+		Description:       &source.Description,
+		ServerDataOnly:    &source.ServerDataOnly,
 		Files:             map[string]wfdir.FileState{},
 		Aliases:           codec.baselineAliases(),
 		AliasesRecorded:   true,

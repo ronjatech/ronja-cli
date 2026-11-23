@@ -76,6 +76,8 @@ type syncManagedUnitView struct {
 	Outcome string `json:"outcome"`
 	Code    string `json:"code,omitempty"`
 	Detail  string `json:"detail,omitempty"`
+	// TakenFrom names the folder a --take-over released this row from.
+	TakenFrom string `json:"takenFrom,omitempty"`
 }
 
 const syncManagedOutcomeUnmanaged = "unmanaged"
@@ -84,10 +86,12 @@ func newSyncAdoptCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "adopt [dir]",
 		Short: "Put every folder beneath a directory under server-side state",
-		Long: `Put every folder beneath a directory under server-side state, for one stack.
-Run it locally, once per stack, and commit ronja.json:
+		Long: `Put every folder beneath a directory under server-side state, for one stack:
 
   ronja sync adopt --stack prod
+
+Run it locally, once per stack, and commit ronja.json. ` + "`ronja propose`" + ` in a lone
+folder does this itself the first time, adopting that folder alone.
 
 For each folder that declares --stack, adopt:
 
@@ -357,12 +361,16 @@ func syncAdoptFolder(ctx context.Context, folder discoveredFolder, resolved *con
 	// each item on its own, reported on its own.
 	client := f.client()
 	pending := f.managedBackfill()
-	refused := 0
+	var problems []managedRefusal
 	for start := 0; start < len(pending); start += api.MaxManagedClaimItems {
 		batch := pending[start:min(start+api.MaxManagedClaimItems, len(pending))]
 		items := make([]api.ManagedClaimItem, 0, len(batch))
 		for _, a := range batch {
-			items = append(items, api.ManagedClaimItem{ResourceKind: a.Kind, ResourceID: a.ID, ManagedClaimInput: *f.managedClaim(a.Address)})
+			item := api.ManagedClaimItem{ResourceKind: a.Kind, ResourceID: a.ID, ManagedClaimInput: *f.managedClaim(a.Address)}
+			if flagTakeOver && takesOver(f.Kind) {
+				item.Takeover = &api.ManagedTakeover{BaseVersionID: f.headVersion()}
+			}
+			items = append(items, item)
 		}
 		results, err := client.ClaimManaged(ctx, st.featureID, items)
 		if err != nil {
@@ -384,9 +392,13 @@ func syncAdoptFolder(ctx context.Context, folder discoveredFolder, resolved *con
 				if r.Claim != nil {
 					st.claims[a.Address] = r.Claim
 				}
+				if r.Released != nil {
+					unit.TakenFrom = describeFolderOf(r.Released)
+				}
 			default:
-				refused++
-				unit.Detail = describeClaimRefusal(f, a, r).Detail
+				refusal := describeClaimRefusal(f, a, r)
+				problems = append(problems, refusal)
+				unit.Detail = refusal.Detail
 				if st.unclaimable == nil {
 					st.unclaimable = map[string]bool{}
 				}
@@ -418,8 +430,15 @@ func syncAdoptFolder(ctx context.Context, folder discoveredFolder, resolved *con
 		}
 		return
 	}
-	if refused > 0 {
-		refuse(syncReasonClaimRefused, "%d of %d %s could not be claimed — see each one; the rest were", refused, len(line.Units), plural(len(line.Units), "row"))
+	if len(problems) > 0 {
+		// The folder carries its rows' own reason and holder, so a caller that
+		// prints only the folder line (propose's setup) still names them.
+		joined := joinManagedRefusals(problems)
+		rest := ""
+		if len(problems) < len(line.Units) {
+			rest = "; the rest were claimed"
+		}
+		refuse(joined.Reason, "%d of %d %s could not be claimed%s:\n  %s", len(problems), len(line.Units), plural(len(line.Units), "row"), rest, joined.Detail)
 		return
 	}
 	line.Verdict = verdictApplied

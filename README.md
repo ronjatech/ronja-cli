@@ -48,9 +48,9 @@ document's, and a PUT of the part shown at that version would drop every
 people-property section. Only an instance older than sections, which serves
 the whole document, still prints `## Organization policy (version N)`. The read goes
 out whenever a token is present and **independently of `/me`**: a role-bound
-scoped API token cannot call `/api/v2/authentication/me` at all (that group is
-admin-scoped) but reads the policy fine with `analytics:read`, and it is
-exactly the caller the policy was invisible to. Every way the document can be
+scoped API token without `structure:read` cannot call `/api/v2/authentication/me`
+but reads the policy fine with `analytics:read`, and it is exactly the caller
+the policy was invisible to. Every way the document can be
 missing is one line, never silence, because a silent omission reads as "no
 rules":
 
@@ -1792,6 +1792,8 @@ badly. All are **USR_ADMIN**, as the underlying API is.
 ronja db sql <database-id> "SELECT * FROM leads LIMIT 10"
 ronja db sql <database-id> --file report.sql --out rows.csv
 ronja db sql <database-id> "INSERT INTO leads (email) VALUES (\$1)" --params '["a@b.c"]'
+ronja db sql <database-id> "SELECT id FROM products ORDER BY embedding <=> \$1::vector LIMIT 5" \
+  --params '[{"embed": "red running shoes"}]'   # Ronja embeds the text
 
 ronja db migrate status --database <database-id>
 ronja db migrate push   --database <database-id>
@@ -2311,6 +2313,30 @@ why the third one exists:
   refuse a non-empty list below 8, naming the line to add, and `wf status`
   says so.
 
+  The **settings** are three keys with the same three states: `description`
+  (a workflow or a data app; `""` clears it), `useDedicatedCompute` (a Python
+  workflow: runs of up to 4 hours with 30 GB of memory instead of the shared
+  pool) and `serverDataOnly` (a data app: its browser code gets data only
+  through its server functions, required before the app opens to guests).
+  Absent leaves the row's value alone; a value makes the row match. `wf clone`
+  and `app clone` write all of them from the row, and `pull` updates the ones
+  a folder has. `push` sends them on the create, patches them on the draft
+  when they differ, and refuses one changed in the web app since your last
+  sync as drift; `status` lists each one a push would change. In `sync apply
+  --dry-run` and `ronja propose`, a changed setting is an `update` whose
+  detail names it (`settings: dedicated compute: off → on`), so the person
+  approving the change list sees it. A row no publish has made live yet (a
+  folder `app init` made and pushed before its first propose) plans as an
+  `update` too, detailed `first publish; settings: description, server-side
+  data only: on` with each setting `ronja.json` declares. `true` for `useDedicatedCompute` or
+  `serverDataOnly` stamps `formatVersion` 10, because an older CLI would push
+  the folder with the setting off; set by hand, it needs `"formatVersion"` 10
+  in the same edit, and push, propose and `sync` refuse it below 10. Other
+  settings stay on the app's or workflow's page in Ronja: an app's folder
+  grants, a workflow's approval defaults (or name approvers in code,
+  `tools.requireApproval(approvers=[...])`), and turning off a legacy pre-run
+  gate.
+
 - **`.ronja/state.json`** — the sync baseline, never committed (`clone` and
   `init` write `.ronja/.gitignore` containing `*`). One entry per (instance,
   organization) binding, exactly like the manifest — the row the baseline came
@@ -2360,7 +2386,8 @@ and `pipeline` share one manifest format:
   `removed`"); **6 is the folder `"id"`**; **7 is a dependency by address, as a
   write target, as an output or as a run edge**; **8 is a non-empty
   `pipPackages` list**; **9 is a stack's Space (`spaceID`), or two stacks on
-  one organization**.
+  one organization**; **10 is `useDedicatedCompute` or `serverDataOnly` set to
+  `true`**.
 
 - **`stacks` and `ronja.lock.json`.** See **Stacks** below.
 
@@ -4205,8 +4232,8 @@ the built-in component.
 **`icon.svg` at the folder root is the app's icon**, shown on its card on the
 Apps page. `push` sends it like any other file (and `clone` brings it down);
 the CLI never parses or checks the icon itself. The server checks it against
-the icon grammar in the `creating-data-apps` skill
-(`/docs/api/skills/creating-data-apps.md`) and refuses a file that breaks it with a 400 naming the problems. That refusal
+the icon grammar in the `data-apps-icon` skill
+(`/docs/api/skills/data-apps-icon.md`) and refuses a file that breaks it with a 400 naming the problems. That refusal
 **stops the push at that file**: the files written before it stay written, and
 the entrypoint, which goes last, is not reached. Fix the file and push again —
 unchanged files are skipped. An icon write compiles nothing, so its response
@@ -4236,7 +4263,7 @@ function runs, not on push. `app test` exercises functions only
 through the app, whose `ops` list each call as `/fn/<name>`. There is no verb
 that calls a function directly, and `ronja api` cannot either, because the route
 takes only the app's own token. The runtime and the limits of one call are in
-the `creating-data-apps` skill (*Server functions*, *Limits and errors*), and
+the `data-apps-server-functions` skill (*Server functions*, *Limits and errors*), and
 the `/service-api/v1/fn/:name` wire contract in the `dataapp-dev` guide (*Server
 functions*).
 
@@ -4415,10 +4442,14 @@ have changed since the app was built, the Remote block carries one line,
 `N recommended updates (optional).`, followed by the two calls that act on it:
 `ronja api /api/v2/dataapp/<id>/updates` lists what changed and what to
 check, and `ronja api -X POST /api/v2/dataapp/<id>/rebuild` rebuilds the app as
-your draft, leaving the live app alone. Nothing is printed when nothing is
+your draft, leaving the live app alone. Under it, each pending update is one
+`- <title> Check: <what to check>` line (at most 10, then how many more), so the
+checks are in front of you after a push, which compiles the draft on the current
+version of Ronja apps. Nothing is printed when nothing is
 recommended, for an app never published, when you cannot draft the app, or on an
 instance without the route; a failed check is one line and never fails `status`.
-`--json` carries it as `remote.updates` (`checked`, `count`, `notCheckedReason`).
+`--json` carries it as `remote.updates` (`checked`, `count`, `pending`, `more`,
+`notCheckedReason`).
 `ronja sync status` does not check.
 
 A draft is its own address. The server renders exactly the row a link names —
@@ -6307,6 +6338,14 @@ that as `metadataDeferred` instead of sending a request that would be refused.
 anything, since publishing it would put live a name or title the folder no
 longer declares: publish it once as it is, then apply again to rename it.
 
+On an agent computer the identity row's `PUT /module/:id` is refused
+(`computer_publish_refused`: a computer writes no live row). The push reports
+the rename as `metadataDeferred`, going live with `ronja propose`, and goes on:
+the open draft is still told (the checkout route is open to a computer), the
+files push, and the approved deploy pushes the folder as the person, which
+patches the live row. A module's description is not a manifest key, so a push
+never sends one.
+
 ### Publishing says what it did not change
 
 A shared-feature module's commit takes an admin or a maintainer of the feature —
@@ -6487,7 +6526,7 @@ Two more move a tree between the two patterns — see "Server-side state:
 adopted folders":
 
 ```bash
-ronja sync adopt --stack prod [dir]     # give folders an id and claim their rows on the server
+ronja sync adopt --stack prod [dir]     # give folders an id and claim their rows on the server (propose does it for a lone folder)
 ronja sync unmanage --stack prod [dir]  # release the claims; back to running off the lock
 ```
 
@@ -7234,7 +7273,8 @@ so publishing on that alone minted a version every second run.
 the workflow, data-app and module pushes with `LiveFirst`: before anything is checked
 out, the folder is compared with the **live** row — files, and every piece of
 metadata the push writes (title, entrypoint, declared parameters, declared
-Python packages (`pipPackages`), declared calendar, a runtime upgrade; a data app's title and `access`; a module's
+Python packages (`pipPackages`), declared calendar, a runtime upgrade, the `description` and
+`useDedicatedCompute` settings; a data app's title, `access`, `description` and `serverDataOnly`; a module's
 package name and title). When live already
 holds it, the push ends there: no checkout, no file write, no patch, no validate
 (a candidate save that is not going to happen — `sync check` is the verb that
@@ -7461,17 +7501,106 @@ instance did not answer, since the write may have landed:
 ## Asking for approval: `ronja propose`
 
 ```bash
-ronja propose          # the tree here
+ronja propose          # the app folder, or the tree, here
 ronja propose apps/    # another directory
 ronja propose --json   # the same report, as data
 ```
 
 `propose` asks the person you work for (the person whose token this is) to
-approve a deploy. **It changes nothing in Ronja itself.** It is **the
-recommended way for an agent to deploy**, migrations included, and the verb it
-runs where `sync apply`, a publish or `db migrate push` would be blocked: the
-agent proposes, the person approves in Ronja, and their click runs the deploy
-in Ronja, as them.
+approve a deploy. **It deploys nothing itself.** It is **the recommended way
+for an agent to deploy**, migrations included, and the verb it runs where
+`sync apply`, a publish or `db migrate push` would be blocked: the agent
+proposes, the person approves in Ronja, and their click runs the deploy in
+Ronja, as them.
+
+**A new folder goes live in one command.** Proposing a lone folder that is
+not adopted, whose `ronja.json` names its feature on this instance (any folder
+`ronja app init` or `ronja app clone` wrote, with or without `--stack`), sets
+it up first, once:
+
+1. where the folder has no stack, it names the folder's binding as one: the
+   default stack name (`main` in the organization's default Space, the Space's
+   name otherwise, as `sync stack add` picks it) or `--stack`;
+2. it adopts that folder alone, exactly as `ronja sync adopt --stack <name>`
+   does: a folder id written into `ronja.json`, and every row the folder
+   already deploys (a cloned app) claimed in Ronja, where the server refuses a
+   row another folder holds.
+
+It prints both steps and that `ronja.json` changed (and `ronja.lock.json`,
+where naming a cloned folder's stack moved its ids there), which on a laptop
+is an uncommitted edit to commit; in `--json` the report's `setup` says the same
+(`stack`, `featureID`, `stackAdded`, `folderID`, `claimed`), and the steps
+print on stderr. Then it plans and proposes as below. Nothing marks a cloned
+folder apart from an initialized one, so the rule reads only `ronja.json`.
+
+**A clone of a row another folder holds: `--take-over`.** A row has one live
+claim, so setting up a clone of an app, workflow or module that another folder
+already deploys is refused `claimed_elsewhere`, naming that folder (its id,
+source label and stack) and the flag. The refusal carries each row's own
+reason: `sync adopt`'s folder line now takes the first refused row's reason and
+every row's detail, where it said `claim_refused` (`TestProposeTakeOverContinuesAnAppAnotherFolderHolds`).
+That is how a chat's fresh computer edits an app an earlier chat's computer
+built: the earlier folder is gone, and a clone never carries a folder id (two
+checkouts sharing one would share the server's anchor, so a stale one would
+vouch, and its list overwrite a newer deploy).
+
+```bash
+ronja app clone <data-app-id> apps/<name> --stack main   # records the live version
+ronja propose apps/<name> --take-over
+```
+
+`--take-over` sends each row's claim with `takeover: {baseVersionID}` (`POST
+/managed/claim`), the base being the lock's head version for the stack. The
+server releases the holder's claim and claims the row for this folder in one
+transaction, audited both ways, and only when:
+
+1. the caller may write the feature and the row (as for any claim; `sync
+   unmanage --force` already lets a feature writer release any claim);
+2. the holder's source label names no git repository (it ends ` (local, no git
+   remote)`): `takeover_held_in_git` when it names one, which propose reads as
+   `claimed_elsewhere` naming the repository and `<kind> pull` there, and
+   `takeover_source_unknown` when it is empty (no CLI writes one; only a raw
+   `POST /managed/claim` sends none), which propose reads as
+   `claimed_elsewhere` saying a person who may write the feature can release
+   the holder with `ronja sync unmanage --force` in that folder (a computer
+   cannot);
+3. the base is the row's head (its newest committed version, else its own id,
+   as `GET :id/versions` element 0 reads): `takeover_stale_base` otherwise,
+   naming both versions, which propose reads as `claimed_elsewhere` naming the
+   clone to take again. A folder cloned before someone published, or from an
+   open draft of a versioned row (which records no head), is refused.
+
+A plain `resource_claimed` under `--take-over` means the server did not judge a
+takeover (it answers a `takeover_*` code when it does): the claim could not be
+taken over, or the server predates `--take-over`. Propose says that, rather
+than suggesting the flag it was given.
+
+It takes one lone folder of one of those kinds, adopted or not, so a propose
+refused without the flag takes over when run again with it (the refused run
+already wrote the folder id). A folder whose lock records no head (cloned
+without `--stack`) is refused before anything is written, naming the clone
+that records one. With no holder, or with this folder already the holder,
+nothing is taken over. The setup names each folder taken over from
+(`setup.tookOverFrom`). Pipeline and automation folders are refused: a
+one-file checkout cannot carry the folder's other addresses.
+
+**The displaced folder is refused, never silently stale.** Its lock still
+records the row, and the server holds no claim of it for that folder, so its
+apply's lazy claim answers `resource_claimed` → `claimed_elsewhere` before
+anything is written, naming the new holder; a dry run reads the feature's
+claims for such a row and refuses the same way (`backfillHeldElsewhere`), so
+its `propose` refuses and a change list it left pending is refused at the
+job's re-plan (`TestTakenOverFolderPendingListIsRefused`: two checkouts, two
+pending lists, approved in either order, live keeps the holder's). A dry run
+that cannot read the feature's claims warns on stderr that its plan may include
+rows another folder holds, which the apply refuses. A clone of such a row says
+so on stderr, naming `--take-over` rather than `<kind> pull`.
+
+**The way back.** Nothing is handed back automatically: the takeover moves the
+claim at propose time, so a rejected list leaves the row with the new folder. A
+displaced folder takes the row back with its own `ronja propose --take-over`,
+which passes while live is unchanged (its lock's head is still the row's head);
+once the new folder has published, clone the live row again instead.
 
 ```bash
 ronja propose --database <database-id>   # a migrations folder, for that database
@@ -7498,9 +7627,13 @@ What it does:
    pending is not in the list.
 2. **Refuses**, and uploads nothing, when:
    - a folder is **not adopted** (no folder id, or its stack is
-     `"unmanaged"`). The approved deploy runs on a copy whose lock never comes
-     back, so only a folder whose ids Ronja keeps is safe from creating its
-     resources twice. The refusal names `ronja sync adopt --stack <name>`.
+     `"unmanaged"`) and propose did not set it up. The approved deploy runs on
+     a copy whose lock never comes back, so only a folder whose ids Ronja
+     keeps is safe from creating its resources twice. The refusal names one
+     command per folder: in a tree, `ronja propose` in a folder with no stack
+     (proposed on its own, it sets itself up), `ronja sync adopt --stack
+     <name>` in one with a stack; for a lone folder whose `ronja.json` names
+     no feature here, `ronja sync stack add --feature <feature-id>`.
    - any folder's verdict is not `applied`: the dry run's own reason and
      detail are printed, by folder. A change list has to plan cleanly. Each
      workflow, data app and module folder is planned **as the copy the deploy
@@ -7511,6 +7644,14 @@ What it does:
      it) and one whose recorded version live has moved past. A folder with a
      local baseline is also asked as itself, so a change this checkout knows
      was made on live since its last sync is refused too.
+   - an app or workflow **changed in Ronja** since its folder last applied it
+     (in the web app, by the chat's tools, from another clone): a change list
+     never overwrites that, and the refusal names the files changed there.
+     `ronja app pull` (`ronja wf pull`) rewrites the folder from the live
+     version, so commit or copy your edits first, then propose again. A change
+     to your own open draft since this checkout's last sync names `discard`
+     instead. The refusal never offers `push --force`, which would deploy
+     without the approval.
    - one exception: **your own open draft** of a folder's row (`draft_open`).
      A workflow's or data app's draft is always yours; a module's one draft is
      yours only when you drafted it and edited it last. Such a folder is
@@ -7927,7 +8068,8 @@ does not build).
 ### Only a local command mints an id
 
 `init --stack <name>` (workflow, data app, pipeline, automation, module), `ronja
-sync adopt` and `ronja import feature`. Never `clone`, `push` or `sync apply` — an
+sync adopt`, `ronja propose` setting up a lone folder (through the same adopt
+code; see "Asking for approval") and `ronja import feature`. Never `clone`, `push` or `sync apply` — an
 id minted on a CI runner and lost with its checkout would make the next run mint
 another and duplicate every row. `init` WITHOUT `--stack` mints nothing: that
 folder is written in the legacy `instances[]` shape and has no stack to key state
@@ -7963,7 +8105,10 @@ leaves a working classic folder adopted and refusing every deploy
 A folder id is a lowercase UUID, validated at load. Two folders in one walked
 tree carrying the same id — a `cp -r` — are both refused
 (`duplicate_folder_id`, each naming the other): one id is one set of addresses,
-so the two would adopt each other's rows.
+so the two would adopt each other's rows. A second checkout of a row from
+outside its repository gets its own id and takes the row over explicitly
+(`ronja propose --take-over`, "Asking for approval"), never the holder's id
+(`TestProposeTakeOverCloneBesideTheOriginalGetsItsOwnID`).
 
 ### The server wins
 
@@ -8327,7 +8472,8 @@ ronja pipeline pull --dry-run # print the diff, write nothing anywhere
    - **workflow / app / module:** the file set (added, rewritten, deleted) via
      the codec's `toDisk`, and the manifest metadata the folder ALREADY manages —
      title, entrypoint, parameters (`parametersToDisk`), Python packages
-     (`pipPackages`), reporting timezone, runtime; an app's title and `access` (each id its codec names written as
+     (`pipPackages`), reporting timezone, runtime, the settings (`description`, `useDedicatedCompute`,
+     `serverDataOnly`); an app's title and `access` (each id its codec names written as
      the alias); a module's title and package name. A key the manifest leaves
      out stays out. The plan must pass the push's own parity function
      (`workflowRowHoldsFolder` / `appRowHoldsFolder` / `moduleRowHoldsFolder`),

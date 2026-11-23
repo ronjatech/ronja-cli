@@ -168,7 +168,14 @@ var ErrNoManifest = errors.New("no ronja.json found")
 // refused at load (checkStacks), on the rule the folder id follows; two
 // stacks on one organization are not, since a merge makes that shape and the
 // folder must stay openable to recover from it.
-const ManifestFormatVersion = manifestVersionSpaces
+//
+// **10 is a setting switched on**: `"useDedicatedCompute": true` on a workflow
+// or `"serverDataOnly": true` on a data app. An older CLI keeps the key and
+// pushes without it: the workflow runs on the shared pool and its long run is
+// stopped, or the app's browser code keeps its direct data access. `false` and
+// an absent key ask an older CLI for nothing it gets wrong, so only `true`
+// stamps 10, and it is demanded at acceptance (CheckDeclarations), as 8 is.
+const ManifestFormatVersion = manifestVersionSettings
 
 // The versions the CONTENT of a manifest can require, named rather than spelled
 // as bare integers at the two places that compare them. See
@@ -184,6 +191,7 @@ const (
 	manifestVersionAddressDeps  = 7
 	manifestVersionPipPackages  = 8
 	manifestVersionSpaces       = 9
+	manifestVersionSettings     = 10
 )
 
 // Manifest is ronja.json — the committed half of a workflow folder.
@@ -357,6 +365,13 @@ type Manifest struct {
 	// three states Parameters has: absent leaves the row's list alone, [] clears
 	// it, and a list makes the row match.
 	PipPackages *[]string `json:"pipPackages,omitempty"`
+	// Description, UseDedicatedCompute (a workflow) and ServerDataOnly (a data
+	// app) are the row's settings, each with the three states Parameters has:
+	// absent leaves the row's value alone, and a value makes the row match ("" a
+	// description clears it). Clone writes them from the row.
+	Description         *string `json:"description,omitempty"`
+	UseDedicatedCompute *bool   `json:"useDedicatedCompute,omitempty"`
+	ServerDataOnly      *bool   `json:"serverDataOnly,omitempty"`
 	// Access is the DATA-APP analogue of Parameters: the capability allowlists
 	// (tables, secrets, agents, workflows, codexes, metrics) and the capability
 	// set the app's minted script-token is scoped from.
@@ -550,6 +565,9 @@ func (m Manifest) StampedFormatVersion() int {
 // folder can perfectly well have both stacks and dependencies, and the answer is
 // the higher of the two.
 func (m Manifest) requiredFormatVersion() int {
+	if m.switchesSettingOn() {
+		return manifestVersionSettings
+	}
 	if m.declaresSpaces() {
 		return manifestVersionSpaces
 	}
@@ -745,6 +763,61 @@ func (m *Manifest) DeclaredReportingTimezone() string {
 func (m *Manifest) SetReportingTimezone(zone string) {
 	zone = strings.TrimSpace(zone)
 	m.ReportingTimezone = &zone
+}
+
+// switchesSettingOn reports a setting declared true, which needs version 10.
+func (m Manifest) switchesSettingOn() bool {
+	return (m.UseDedicatedCompute != nil && *m.UseDedicatedCompute) || (m.ServerDataOnly != nil && *m.ServerDataOnly)
+}
+
+// SetSettings records the row's settings, as clone and pull write them: the
+// description on a workflow or a data app, dedicated compute on a Python
+// workflow, server-side data only on a data app. A setting switched on raises
+// FormatVersion to the 10 a save stamps, for SetPipPackages' reason.
+func (m *Manifest) SetSettings(description string, dedicatedCompute, serverDataOnly bool) {
+	m.Description = &description
+	switch {
+	case m.Kind == KindWorkflow && !m.IsJS():
+		m.SetDedicatedCompute(dedicatedCompute)
+	case m.Kind == KindDataApp:
+		m.SetServerDataOnly(serverDataOnly)
+	}
+}
+
+// SetDedicatedCompute marks the folder as managing dedicated compute.
+func (m *Manifest) SetDedicatedCompute(on bool) {
+	m.UseDedicatedCompute = &on
+	m.stampSettingsVersion()
+}
+
+// SetServerDataOnly marks the folder as managing server-side data only.
+func (m *Manifest) SetServerDataOnly(on bool) {
+	m.ServerDataOnly = &on
+	m.stampSettingsVersion()
+}
+
+func (m *Manifest) stampSettingsVersion() {
+	if m.switchesSettingOn() && m.FormatVersion < manifestVersionSettings {
+		m.FormatVersion = manifestVersionSettings
+	}
+}
+
+// checkSettings refuses a setting on a folder whose kind has no such setting,
+// and dedicated compute on a JavaScript workflow, which the server refuses.
+func (m *Manifest) checkSettings(path string) error {
+	if m.Description != nil && m.Kind != KindWorkflow && m.Kind != KindDataApp {
+		return fmt.Errorf("%s declares \"description\", and only a workflow or data-app folder has one — remove the key", path)
+	}
+	if m.UseDedicatedCompute != nil && m.Kind != KindWorkflow {
+		return fmt.Errorf("%s declares \"useDedicatedCompute\", and only a workflow folder has one — remove the key", path)
+	}
+	if m.UseDedicatedCompute != nil && *m.UseDedicatedCompute && m.IsJS() {
+		return fmt.Errorf("%s declares \"useDedicatedCompute\": true on a JavaScript workflow, which runs on the standard compute only — remove the key", path)
+	}
+	if m.ServerDataOnly != nil && m.Kind != KindDataApp {
+		return fmt.Errorf("%s declares \"serverDataOnly\", and only a data-app folder has one — remove the key", path)
+	}
+	return nil
 }
 
 // ManagesPipPackages reports whether push should sync the workflow's packages.
@@ -1084,6 +1157,9 @@ func LoadManifest(root string, kind Kind) (*Manifest, error) {
 	if !ValidRuntime(m.Runtime) {
 		return nil, fmt.Errorf("%s declares \"runtime\": %d, which this CLI does not know — the runtimes it understands are %s. Upgrade the CLI — run: ronja update — or set a runtime from that list",
 			path, m.Runtime, JoinInts(Runtimes))
+	}
+	if err := m.checkSettings(path); err != nil {
+		return nil, err
 	}
 	if err := m.checkLanguage(path); err != nil {
 		return nil, err

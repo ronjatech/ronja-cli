@@ -34,6 +34,14 @@ func TestAppStatusRecommendedUpdates(t *testing.T) {
 			answer: &fakeUpdatesAnswer{Count: 1},
 			want:   "1 recommended update (optional). See what to check: ronja api /api/v2/dataapp/data_app-1/updates · rebuild as a draft: ronja api -X POST /api/v2/dataapp/data_app-1/rebuild",
 		},
+		{
+			name: "with checks",
+			answer: &fakeUpdatesAnswer{Count: 2, Pending: []api.DataAppUpdate{
+				{ID: "release-12", Title: "Charts take the new palette.", Check: "Open each chart and compare its colours."},
+				{ID: "spec-1", Title: "Styling is the app's own.", Check: "Remove the theme import."},
+			}},
+			want: "2 recommended updates (optional). See what to check: ronja api /api/v2/dataapp/data_app-1/updates · rebuild as a draft: ronja api -X POST /api/v2/dataapp/data_app-1/rebuild",
+		},
 		{name: "none pending", answer: &fakeUpdatesAnswer{Count: 0}},
 		{name: "not a drafter", answer: &fakeUpdatesAnswer{Status: http.StatusForbidden}},
 		{name: "older instance", answer: nil},
@@ -59,6 +67,11 @@ func TestAppStatusRecommendedUpdates(t *testing.T) {
 			for line := range strings.Lines(out) {
 				if strings.Contains(line, updatesWord) {
 					mentions = append(mentions, strings.TrimSpace(line))
+				}
+			}
+			for _, p := range tc.answer.pending() {
+				if want := "      - " + p.Title + " Check: " + p.Check + "\n"; !strings.Contains(out, want) {
+					t.Errorf("want the pending check\n%s\nin:\n%s", want, out)
 				}
 			}
 			switch {
@@ -201,4 +214,11 @@ func TestAppStatusSkipsUpdatesForAnUnpublishedApp(t *testing.T) {
 	if strings.Contains(out, "recommended update") {
 		t.Errorf("want no updates line, got:\n%s", out)
 	}
+}
+
+func (a *fakeUpdatesAnswer) pending() []api.DataAppUpdate {
+	if a == nil {
+		return nil
+	}
+	return a.Pending
 }

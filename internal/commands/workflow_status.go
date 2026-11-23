@@ -254,6 +254,8 @@ type remoteReport struct {
 	ReportingTimezone *timezoneReport `json:"reportingTimezone,omitempty"`
 	// PipPackages is set on the same terms as Parameters.
 	PipPackages *pipPackagesReport `json:"pipPackages,omitempty"`
+	// Settings names each setting a push would change, on the same terms.
+	Settings []string `json:"settings,omitempty"`
 	// TargetUnknown reports that the row a push would WRITE TO could not be
 	// established — the draft lookup failed, so everything below was measured
 	// against the live row while the caller may well have a draft.
@@ -448,6 +450,7 @@ func remoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) (*r
 			Remote: describeParameters(f.Codec.parametersToDisk(target.Parameters)),
 		}
 	}
+	out.Settings = workflowSettingsChanges(metadataPatch(f.Manifest, f.Codec, target), target)
 	if f.Manifest.ManagesPipPackages() && !samePipPackages(f.Manifest.DeclaredPipPackages(), target.PipPackages) {
 		out.PipPackages = &pipPackagesReport{
 			Local:  wfdir.CleanPipPackages(f.Manifest.DeclaredPipPackages()),

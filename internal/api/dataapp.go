@@ -38,6 +38,9 @@ type DataApp struct {
 
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	// ServerDataOnly withholds direct data access from the app's browser code
+	// (rdb.DataApp.ServerDataOnly).
+	ServerDataOnly bool `json:"serverDataOnly"`
 	// SpecVersion is the app's semantics generation: 1 (styling is the author's
 	// job — the entrypoint imports "@/styles/theme" and "@tailwindcss/browser"
 	// itself) or 2 (the compiler installs both, so the entrypoint needs
@@ -329,10 +332,19 @@ func (c *Client) ListDataAppFiles(ctx context.Context, id string) ([]DataAppFile
 }
 
 // DataAppUpdates is the subset of GET dataapp/:id/updates the CLI reads: how
-// many updates Ronja recommends for the app. Recommendations, not obligations:
-// nothing in the CLI acts on them.
+// many updates Ronja recommends for the app, and what to check for each.
+// Recommendations, not obligations: nothing in the CLI acts on them.
 type DataAppUpdates struct {
-	Count int `json:"count"`
+	Count   int             `json:"count"`
+	Pending []DataAppUpdate `json:"pending"`
+	More    int             `json:"more"`
+}
+
+// DataAppUpdate is one recommended update (api/v2/dataapp AppUpdateItem).
+type DataAppUpdate struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Check string `json:"check"`
 }
 
 // GetDataAppUpdates reads a live app's recommended updates. 403 for a caller who

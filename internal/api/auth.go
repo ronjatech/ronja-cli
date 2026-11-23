@@ -183,10 +183,9 @@ func isTransient(err error) bool {
 	}
 }
 
-// Me identifies the caller, the CLI's login verification. /api/v2/authentication
-// is admin-scoped, so a scoped token without that scope fails here, which is why
-// the device flow mints a full-access PAT; a PAT still never exceeds its user's
-// live role.
+// Me identifies the caller, the CLI's login verification. It takes
+// structure:read, so a scoped token without that scope fails here; a PAT still
+// never exceeds its user's live role.
 func (c *Client) Me(ctx context.Context) (*Me, error) {
 	var out Me
 	if err := c.Do(ctx, "GET", "authentication/me", nil, &out); err != nil {

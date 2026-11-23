@@ -55,6 +55,13 @@ const (
 	ManagedCodeAppliedTooLarge = "applied_too_large"
 	// ManagedCodeNoFolderAnchor — a release of a folder that has no anchor.
 	ManagedCodeNoFolderAnchor = "no_folder_anchor"
+	// ManagedCodeTakeoverHeldInGit — a takeover of a row a git repository's
+	// folder holds; ManagedCodeTakeoverSourceUnknown — of a row whose holder
+	// recorded no source label; ManagedCodeTakeoverStaleBase — from a folder
+	// not based on the row's live version. The item's claim names the holder.
+	ManagedCodeTakeoverHeldInGit     = "takeover_held_in_git"
+	ManagedCodeTakeoverSourceUnknown = "takeover_source_unknown"
+	ManagedCodeTakeoverStaleBase     = "takeover_stale_base"
 )
 
 // Claim item outcomes (views.go OutcomeClaimed …).
@@ -250,6 +257,15 @@ type ManagedClaimItem struct {
 	ResourceKind string `json:"resourceKind"`
 	ResourceID   string `json:"resourceID"`
 	ManagedClaimInput
+	// Takeover releases the row's claim held by another folder first, when
+	// that folder is not a git repository's and BaseVersionID is live.
+	Takeover *ManagedTakeover `json:"takeover,omitempty"`
+}
+
+// ManagedTakeover is a claim item's takeover: the live version the folder is
+// based on.
+type ManagedTakeover struct {
+	BaseVersionID string `json:"baseVersionID"`
 }
 
 // ManagedClaimResult is one item's outcome. Exactly one per requested item, in
@@ -260,6 +276,8 @@ type ManagedClaimResult struct {
 	Code    string        `json:"code,omitempty"`
 	Error   string        `json:"error,omitempty"`
 	Claim   *ManagedClaim `json:"claim,omitempty"`
+	// Released is the other folder's claim a takeover released.
+	Released *ManagedClaim `json:"released,omitempty"`
 }
 
 // MaxManagedClaimItems is the server's bound on one POST /managed/claim

@@ -42,6 +42,15 @@ around them:
   ronja db sql mdb-abc "INSERT INTO leads (email, score) VALUES (\$1, \$2)" \
     --params '["a@b.c", 42]'
 
+A parameter {"embed": "<text>"} is bound as the text's vector, embedded and
+billed as AI usage, so ranking rows by meaning is one call:
+
+  ronja db sql mdb-abc "SELECT id, name FROM products ORDER BY embedding <=> \$1::vector LIMIT 20" \
+    --params '[{"embed": "waterproof jacket"}]'
+
+A parameter {"embedImage": "<file id>"} (one per call) is bound as a stored
+image's vector the same way, so the same query ranks rows against a picture.
+
 A call usually runs one statement: a SELECT- or WITH-led body, one with
 RETURNING, or one sent with --params is refused if it holds a second ("cannot
 insert multiple commands into a prepared statement"). A plain write without
@@ -156,7 +165,7 @@ Mint one with:
 	cmd.Flags().StringVar(&out, "out", "",
 		"write the CSV to this file instead of stdout")
 	cmd.Flags().StringVar(&params, "params", "",
-		`bound parameters for $1, $2 … as a JSON array (e.g. '["a@b.c", 42]'). An element may itself be a list, bound as one Postgres array — match it with 'col = ANY($1)', not 'col IN ($1)'`)
+		`bound parameters for $1, $2 … as a JSON array (e.g. '["a@b.c", 42]'). An element may itself be a list, bound as one Postgres array — match it with 'col = ANY($1)', not 'col IN ($1)'. An element {"embed": "<text>"} is bound as the text's vector, and one {"embedImage": "<file id>"} as a stored image's`)
 	bindRetiredEnvFlag(cmd, &env)
 	cmd.Flags().IntVar(&maxRows, "max-rows", 0,
 		"maximum rows to return (default: the server's cap)")

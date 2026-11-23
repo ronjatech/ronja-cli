@@ -32,9 +32,10 @@ import (
 // nothing, and the alternative (create, then patch) leaves a window where the
 // app exists in a state its author never asked for.
 type CreateDataAppInput struct {
-	FeatureID   string `json:"featureID"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	FeatureID      string `json:"featureID"`
+	Name           string `json:"name"`
+	Description    string `json:"description,omitempty"`
+	ServerDataOnly bool   `json:"serverDataOnly,omitempty"`
 
 	DataAppAccess
 	// Managed is the repository address this create claims, in the create's own
@@ -56,7 +57,9 @@ type CreateDataAppInput struct {
 // There is deliberately no Entrypoint: rdataapp.Patch has none, because a data
 // app's entrypoint is stamped at create and never moves.
 type DataAppPatch struct {
-	Name *string `json:"name,omitempty"`
+	Name           *string `json:"name,omitempty"`
+	Description    *string `json:"description,omitempty"`
+	ServerDataOnly *bool   `json:"serverDataOnly,omitempty"`
 
 	AllowedTableIDs    *[]string `json:"allowedTableIDs,omitempty"`
 	AllowedSecretIDs   *[]string `json:"allowedSecretIDs,omitempty"`
@@ -70,7 +73,8 @@ type DataAppPatch struct {
 // Empty reports a patch that would change nothing, so the caller can skip the
 // round trip rather than send `{}`.
 func (p DataAppPatch) Empty() bool {
-	return p.Name == nil && p.AllowedTableIDs == nil && p.AllowedSecretIDs == nil &&
+	return p.Name == nil && p.Description == nil && p.ServerDataOnly == nil &&
+		p.AllowedTableIDs == nil && p.AllowedSecretIDs == nil &&
 		p.AllowedAgentIDs == nil && p.AllowedWorkflowIDs == nil &&
 		p.AllowedCodexIDs == nil && p.AllowedMetricIDs == nil && p.Capabilities == nil
 }

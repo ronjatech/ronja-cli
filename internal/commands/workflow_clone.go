@@ -342,6 +342,7 @@ func writeWorkflowClone(ctx context.Context, client *api.Client, resolved *confi
 	if !manifest.IsJS() {
 		manifest.SetPipPackages(source.PipPackages)
 	}
+	manifest.SetSettings(source.Description, source.UseDedicatedCompute, false)
 	// The declared calendar, but ONLY when the row declares one. An empty
 	// value means the row declares nothing at all — permanently, not
 	// pending a migration — and falls back to the caller's zone at run

@@ -214,6 +214,8 @@ type appRemoteReport struct {
 	// declaration differs from the row's — i.e. only when a push would change
 	// something. Listed per id rather than counted, because these are grants.
 	AccessChanges []accessChange `json:"accessChanges,omitempty"`
+	// Settings names each setting a push would change, on the same terms.
+	Settings []string `json:"settings,omitempty"`
 	// RemoteAccess is what the server currently grants, for context alongside
 	// the changes.
 	RemoteAccess string `json:"remoteAccess,omitempty"`
@@ -232,9 +234,11 @@ type appRemoteReport struct {
 // checked / notCheckedReason split as appRemoteReport, so a failed read is not
 // mistaken for "count 0".
 type appUpdatesReport struct {
-	Checked          bool   `json:"checked"`
-	Count            int    `json:"count"`
-	NotCheckedReason string `json:"notCheckedReason,omitempty"`
+	Checked          bool                `json:"checked"`
+	Count            int                 `json:"count"`
+	Pending          []api.DataAppUpdate `json:"pending,omitempty"`
+	More             int                 `json:"more,omitempty"`
+	NotCheckedReason string              `json:"notCheckedReason,omitempty"`
 }
 
 func (r *appRemoteReport) note(format string, args ...any) {
@@ -347,6 +351,7 @@ func appRemoteStatus(ctx context.Context, resolved *config.Resolved, f *folder) 
 	if f.Manifest.ManagesAccess() {
 		out.AccessChanges = diffAccess(target.Access(), f.declaredAccess())
 	}
+	out.Settings = appSettingsChanges(appSettingsPatch(f.Manifest, row), row)
 	switch {
 	case baseline == nil:
 		out.note("no local baseline — every remote file reads as new (this folder was never synced from here)")
@@ -371,7 +376,7 @@ func addAppUpdates(ctx context.Context, report *appStatusReport) {
 func appUpdatesStatus(ctx context.Context, client *api.Client, liveID string) *appUpdatesReport {
 	updates, err := client.GetDataAppUpdates(ctx, liveID)
 	if err == nil {
-		return &appUpdatesReport{Checked: true, Count: updates.Count}
+		return &appUpdatesReport{Checked: true, Count: updates.Count, Pending: updates.Pending, More: updates.More}
 	}
 	if status := api.StatusOf(err); status == http.StatusForbidden || status == http.StatusNotFound {
 		return nil
@@ -379,8 +384,8 @@ func appUpdatesStatus(ctx context.Context, client *api.Client, liveID string) *a
 	return &appUpdatesReport{NotCheckedReason: strings.Join(strings.Fields(err.Error()), " ")}
 }
 
-// printAppUpdates prints at most one line, and nothing when no update is
-// recommended.
+// printAppUpdates prints a line, then each pending update and what to check
+// for it, and nothing when no update is recommended.
 func printAppUpdates(out *os.File, liveID string, u *appUpdatesReport) {
 	switch {
 	case u == nil:
@@ -394,6 +399,16 @@ func printAppUpdates(out *os.File, liveID string, u *appUpdatesReport) {
 		path := "/api/v2/dataapp/" + liveID
 		fmt.Fprintf(out, "    %d recommended %s (optional). See what to check: ronja api %s/updates · rebuild as a draft: ronja api -X POST %s/rebuild\n",
 			u.Count, noun, path, path)
+		for _, p := range u.Pending {
+			line := "      - " + p.Title
+			if p.Check != "" {
+				line += " Check: " + p.Check
+			}
+			fmt.Fprintln(out, line)
+		}
+		if u.More > 0 {
+			fmt.Fprintf(out, "      and %d more app SDK changes\n", u.More)
+		}
 	}
 }
 

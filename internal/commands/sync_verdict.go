@@ -574,6 +574,9 @@ func workflowMetaChanges(r *remoteReport) []string {
 	if r.PipPackages != nil {
 		out = append(out, "the Python packages")
 	}
+	for _, s := range r.Settings {
+		out = append(out, "the "+s)
+	}
 	if r.Runtime != nil {
 		if r.Runtime.Refused {
 			out = append(out, fmt.Sprintf("the runtime generation (this folder declares %d and the row is on %d, which a push REFUSES rather than lowers)",
@@ -595,6 +598,9 @@ func appMetaChanges(r *appRemoteReport) []string {
 	var out []string
 	for _, change := range r.AccessChanges {
 		out = append(out, fmt.Sprintf("%s (%d added, %d removed)", change.Label, len(change.Added), len(change.Removed)))
+	}
+	for _, s := range r.Settings {
+		out = append(out, "the "+s)
 	}
 	return out
 }

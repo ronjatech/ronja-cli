@@ -24,13 +24,35 @@ func newProposeCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "propose [dir]",
-		Short: "Ask the person you work for to approve these changes; changes nothing in Ronja itself",
-		Long: `Ask the person you work for to approve these changes. propose changes
-nothing in Ronja itself: it uploads a change list, and nothing is deployed until
-that person approves it in Ronja.
+		Short: "Ask the person you work for to approve these changes; deploys nothing itself",
+		Long: `Ask the person you work for to approve these changes:
 
-  ronja propose            # the tree here
-  ronja propose apps/      # another directory
+  ronja propose            # in the app folder, or the tree, to deploy
+
+propose deploys nothing itself: it uploads a change list, and nothing is
+deployed until that person approves it in Ronja. Pass a directory to propose
+another one (` + "`ronja propose apps/`" + `).
+
+The first propose of a lone folder Ronja keeps no state for, whose ronja.json
+names its feature here (as ` + "`ronja app init`" + ` and ` + "`ronja app clone`" + ` write it),
+sets the folder up first, once: it adds the folder's stack for that feature
+under the default stack name (main, in the organization's default Space) or
+--stack, then adopts that folder as ` + "`ronja sync adopt`" + ` does, writing a
+folder id into ronja.json and claiming in Ronja the rows the folder already
+deploys. It prints both steps and the files that changed: commit them.
+
+A row has one folder. Propose refuses a folder whose app, workflow or module
+another folder holds (claimed_elsewhere), naming that folder. To continue the
+row from this folder instead, as a fresh clone of a live app does when its old
+folder is gone, propose with --take-over:
+
+  ronja app clone <data-app-id> apps/<name> --stack main
+  ronja propose apps/<name> --take-over
+
+It releases the other folder's claim and claims the row for this one, only
+when this lone folder is based on the live version (cloned with --stack, which
+records it) and the other folder is not in a git repository. The other
+folder's next deploy, or its pending change list, is refused claimed_elsewhere.
 
 Agents: ship with ` + "`ronja propose`" + `. It is the recommended way for an agent
 to deploy apps, workflows, pipelines and database migrations: the person this
@@ -71,8 +93,11 @@ proposing again sends the same review.
 
 It refuses, and uploads nothing, when:
 
-  - a folder is not adopted: Ronja has to keep its state, so a deploy can never
-    create the same resource twice. Run ` + "`ronja sync adopt --stack <name>`" + ` once.
+  - a folder is not adopted and propose cannot set it up: Ronja has to keep
+    its state, so a deploy can never create the same resource twice. Each
+    folder is named with the one command that sets it up: in a tree,
+    ` + "`ronja propose`" + ` in that folder on its own; where ronja.json names no
+    feature here, ` + "`ronja sync stack add --feature <id>`" + `.
   - a folder would not apply cleanly: the dry run's own refusal is printed.
     Each workflow, data app and module is planned as the copy the deploy
     runs on, with no .ronja/, so what that deploy would refuse is refused
@@ -80,6 +105,10 @@ It refuses, and uploads nothing, when:
     ` + "`ronja sync adopt`" + `), or whose recorded version live has moved past.
     One exception: your own open draft of its row goes through, and the
     person sees it when they approve. A colleague's module draft refuses.
+  - an app or workflow changed in Ronja since its folder last applied it (in
+    the web app, by the chat's tools, from another clone): a change list never
+    overwrites that. ` + "`ronja app pull`" + ` (or ` + "`ronja wf pull`" + `) takes it into the
+    folder; then propose again.
   - a database has more than 40 migrations pending: one push applies at most
     40, so propose up to the one it names first, then the rest.
   - with --stack, a database outside the Space that stack is for
@@ -133,24 +162,34 @@ migrations/, not from a repository root holding folders that are not adopted.`,
 		"stack in ronja.json to propose a deploy of (default: the one matching this credential)")
 	cmd.Flags().StringVar(&database, "database", "",
 		"managed database id for the one migrations folder under [dir] (default: the folder's saved database)")
+	cmd.Flags().BoolVar(&flagTakeOver, "take-over", false,
+		"continue a row another folder holds: release that folder's claim and claim the row for this one (a lone app, workflow or module folder based on the live version, never a git repository's)")
 	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "print the link without opening it")
 	cmd.AddCommand(newProposeWaitCmd())
 	return cmd
 }
 
+// flagTakeOver is `propose --take-over`: the lone folder's claim step takes
+// the row over from the folder that holds it (setUpLoneFolder,
+// syncAdoptFolder).
+var flagTakeOver bool
+
 // proposeReport is the --json shape, and what the human report prints.
 type proposeReport struct {
 	// Status is the change list's, or "unchanged" when nothing would change
 	// and nothing was proposed.
-	Status    string        `json:"status"`
-	ID        string        `json:"id,omitempty"`
-	URL       string        `json:"url,omitempty"`
-	ServerURL string        `json:"serverURL"`
-	Stack     string        `json:"stack,omitempty"`
-	Approver  string        `json:"approver,omitempty"`
-	ExpiresAt *time.Time    `json:"expiresAt,omitempty"`
-	Counts    proposeCounts `json:"counts"`
-	Notes     []string      `json:"notes,omitempty"`
+	Status    string     `json:"status"`
+	ID        string     `json:"id,omitempty"`
+	URL       string     `json:"url,omitempty"`
+	ServerURL string     `json:"serverURL"`
+	Stack     string     `json:"stack,omitempty"`
+	Approver  string     `json:"approver,omitempty"`
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+	// Setup is what propose did to adopt a lone folder first, nil when it
+	// did nothing.
+	Setup  *proposeSetup `json:"setup,omitempty"`
+	Counts proposeCounts `json:"counts"`
+	Notes  []string      `json:"notes,omitempty"`
 }
 
 type proposeCounts struct {
@@ -216,6 +255,21 @@ func runPropose(ctx context.Context, dir, database string, resolved *config.Reso
 	if err != nil {
 		return nil, err
 	}
+	setup, err := setUpLoneFolder(ctx, base, found, resolved)
+	if err != nil {
+		return nil, err
+	}
+	if setup != nil {
+		// Said now: a refusal below must not hide that ronja.json changed.
+		if flagJSON {
+			printProposeSetup(os.Stderr, setup)
+		} else {
+			printProposeSetup(os.Stdout, setup)
+		}
+		if found, err = discoverFolders(base); err != nil {
+			return nil, err
+		}
+	}
 	if err := refuseUnadopted(found); err != nil {
 		return nil, err
 	}
@@ -237,7 +291,7 @@ func runPropose(ctx context.Context, dir, database string, resolved *config.Reso
 		return nil, fmt.Errorf("nothing to propose under %s: it holds no %s and no migrations folder bound to a database", base, wfdir.ManifestName)
 	}
 
-	report := &proposeReport{ServerURL: resolved.URL, Stack: flagStack, Counts: countProposed(plan), Notes: notes}
+	report := &proposeReport{ServerURL: resolved.URL, Stack: flagStack, Setup: setup, Counts: countProposed(plan), Notes: notes}
 	if report.Counts.total() == 0 {
 		report.Status = proposeStatusUnchanged
 		return report, nil
@@ -327,6 +381,10 @@ func refuseUnadopted(found []discoveredFolder) error {
 		if folder.Manifest.Adopted() && (flagStack == "" || !declared || !stack.Unmanaged) {
 			continue
 		}
+		if len(folder.Manifest.Stacks) == 0 {
+			lines = append(lines, fmt.Sprintf("  %s: run `ronja propose` there, on its own: it adds the folder's stack and adopts it", folder.Rel))
+			continue
+		}
 		lines = append(lines, fmt.Sprintf("  %s: run `ronja sync adopt --stack %s` there", folder.Rel, adoptStackName(folder.Manifest)))
 	}
 	return unadoptedError(lines)
@@ -336,7 +394,7 @@ func unadoptedError(lines []string) error {
 	if len(lines) == 0 {
 		return nil
 	}
-	return fmt.Errorf("nothing was proposed: %s not adopted, so Ronja does not keep %s state and a deploy of a copy could create %s resources twice. Adopt once, commit, and propose again:\n%s",
+	return fmt.Errorf("nothing was proposed: %s not adopted, so Ronja does not keep %s state and a deploy of a copy could create %s resources twice. Run the command named for each once, commit, and propose again:\n%s",
 		agree(len(lines), "this folder is", "these folders are"), agree(len(lines), "its", "their"), agree(len(lines), "its", "their"),
 		strings.Join(lines, "\n"))
 }
@@ -350,6 +408,10 @@ func adoptStackName(m *wfdir.Manifest) string {
 	}
 	return "<name>"
 }
+
+// planningProposal is set while propose plans, so a refusal names what to do
+// before proposing again rather than a command that deploys directly.
+var planningProposal bool
 
 // proposeReadAllow admits the non-GETs planning sends, which save nothing:
 // the workflow validate, and a database's migrations route, which propose
@@ -380,8 +442,8 @@ func proposeGuardError(guard *api.ReadOnlyGuard, err error) error {
 // folder has to plan as applied.
 func planProposedFolders(ctx context.Context, base string, resolved *config.Resolved) ([]syncApplyFolderReport, error) {
 	savedDryRun, savedAllowCreate := flagSyncDryRun, flagSyncAllowCreate
-	flagSyncDryRun, flagSyncAllowCreate = true, true
-	defer func() { flagSyncDryRun, flagSyncAllowCreate = savedDryRun, savedAllowCreate }()
+	flagSyncDryRun, flagSyncAllowCreate, planningProposal = true, true, true
+	defer func() { flagSyncDryRun, flagSyncAllowCreate, planningProposal = savedDryRun, savedAllowCreate, false }()
 
 	guard := &api.ReadOnlyGuard{Allow: proposeReadAllow}
 	gctx := withAddressCopyRoot(api.WithReadOnlyGuard(ctx, guard))

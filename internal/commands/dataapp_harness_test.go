@@ -278,7 +278,7 @@ func newFakeAppInstance(t *testing.T) *fakeAppInstance {
 func (f *fakeAppInstance) probeRow(kind, id string) fakeRowFacts {
 	if a := f.apps[id]; kind == "dataapp" && a != nil {
 		return fakeRowFacts{Exists: true, FeatureID: a.FeatureID, Root: a.ParentDataAppID == "", Name: a.Name, Lifecycle: a.Lifecycle,
-			Drafter: a.DrafterUserID}
+			Drafter: a.DrafterUserID, Head: fakeHead(id, len(f.versions[id]) > 0, func() string { return f.versions[id][0].ID })}
 	}
 	return fakeRowFacts{}
 }
@@ -358,6 +358,8 @@ func (f *fakeAppInstance) AddDraft(liveID, draftID string, files ...api.DataAppF
 		ParentDataAppID: liveID,
 		Lifecycle:       api.LifecycleDraft,
 		Name:            live.Name,
+		Description:     live.Description,
+		ServerDataOnly:  live.ServerDataOnly,
 		Entrypoint:      live.Entrypoint,
 		FeatureID:       live.FeatureID,
 		DataAppAccess:   live.DataAppAccess,
@@ -529,10 +531,14 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"`+http.StatusText(f.updates.Status)+`"}`, f.updates.Status)
 			return
 		}
+		pending := f.updates.Pending
+		if pending == nil {
+			pending = []api.DataAppUpdate{}
+		}
 		writeJSON(w, map[string]any{
 			"count":   f.updates.Count,
 			"message": "Ronja's apps have changed since this app was built.",
-			"pending": []any{},
+			"pending": pending,
 		})
 
 	case rest == "files":
@@ -597,8 +603,9 @@ type fakePreviewAnswer struct {
 // fakeUpdatesAnswer is GET :id/updates: a non-zero Status refuses with it,
 // otherwise the route answers 200 with Count pending updates.
 type fakeUpdatesAnswer struct {
-	Status int
-	Count  int
+	Status  int
+	Count   int
+	Pending []api.DataAppUpdate
 }
 
 // fakeBlob is one stored file: the row's storage key and its bytes.
@@ -749,12 +756,14 @@ func (f *fakeAppInstance) serveCreate(w http.ResponseWriter, r *http.Request) {
 	// since migration 000495 — the same shape a workflow has always had. The row
 	// the create returns IS the row the push writes to; there is no checkout.
 	app := f.AddApp(&api.DataApp{
-		ID:            fmt.Sprintf("data_app-new-%d", f.nextID),
-		Name:          in.Name,
-		FeatureID:     in.FeatureID,
-		Lifecycle:     api.LifecycleDraft,
-		DrafterUserID: fakePrincipal,
-		DataAppAccess: in.DataAppAccess,
+		ID:             fmt.Sprintf("data_app-new-%d", f.nextID),
+		Name:           in.Name,
+		FeatureID:      in.FeatureID,
+		Lifecycle:      api.LifecycleDraft,
+		DrafterUserID:  fakePrincipal,
+		DataAppAccess:  in.DataAppAccess,
+		Description:    in.Description,
+		ServerDataOnly: in.ServerDataOnly,
 		// No bundle: nothing has compiled yet.
 		BundleFileKey: " ",
 	})
@@ -790,6 +799,8 @@ func (f *fakeAppInstance) serveCheckout(w http.ResponseWriter, liveID string) {
 		ParentDataAppID: liveID,
 		Lifecycle:       api.LifecycleDraft,
 		Name:            live.Name,
+		Description:     live.Description,
+		ServerDataOnly:  live.ServerDataOnly,
 		Entrypoint:      live.Entrypoint,
 		FeatureID:       live.FeatureID,
 		DataAppAccess:   live.DataAppAccess,
@@ -986,6 +997,12 @@ func (f *fakeAppInstance) servePatch(w http.ResponseWriter, r *http.Request, id 
 	if patch.Name != nil {
 		app.Name = *patch.Name
 	}
+	if patch.Description != nil {
+		app.Description = *patch.Description
+	}
+	if patch.ServerDataOnly != nil {
+		app.ServerDataOnly = *patch.ServerDataOnly
+	}
 	if patch.AllowedTableIDs != nil {
 		app.AllowedTableIDs = *patch.AllowedTableIDs
 	}
@@ -1079,6 +1096,7 @@ func (f *fakeAppInstance) commitDraft(draftID string) {
 	parent := f.apps[draft.ParentDataAppID]
 	if parent != nil {
 		parent.Name = draft.Name
+		parent.Description, parent.ServerDataOnly = draft.Description, draft.ServerDataOnly
 		parent.DataAppAccess = draft.DataAppAccess
 		parent.BundleFileKey = draft.BundleFileKey
 		parent.ValidatedAt = draft.ValidatedAt

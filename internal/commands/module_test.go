@@ -891,6 +891,54 @@ func TestModuleNonAdminLoopEndToEnd(t *testing.T) {
 	}
 }
 
+// TestModuleMetadataDeferredOnAComputer: an agent computer's token is refused
+// the live row's metadata PUT, so the push reports the rename as going live
+// with `ronja propose`, still tells the draft (which the approved commit
+// publishes) and pushes the files.
+func TestModuleMetadataDeferredOnAComputer(t *testing.T) {
+	f := newFakeInstance(t)
+	signInAsModuleUser(t, f)
+
+	root := t.TempDir()
+	if _, err := runCLI(t, root, "module", "init", "emab_tracker",
+		"--feature", "collection-1", "--title", "EMAB tracker"); err != nil {
+		t.Fatalf("module init: %v", err)
+	}
+	if err := wfdir.WriteFile(root, "tracker.py", "x = 1\n"); err != nil {
+		t.Fatalf("write tracker.py: %v", err)
+	}
+	if _, err := runCLI(t, root, "module", "push", "--json"); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	if _, err := runCLI(t, root, "module", "publish", "--json"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	live := f.mod.rows["module-new-1"]
+
+	f.mod.asComputer = true
+	setModuleManifestTitle(t, root, "EMAB tracker v2")
+	if err := wfdir.WriteFile(root, "tracker.py", "x = 2\n"); err != nil {
+		t.Fatalf("edit tracker.py: %v", err)
+	}
+	out, err := runCLI(t, root, "module", "push", "--json")
+	if err != nil {
+		t.Fatalf("the computer's push must go on past the refused metadata PUT: %v (%s)", err, out)
+	}
+	if deferred, _ := decodeJSON(t, out)["metadataDeferred"].(string); !strings.Contains(deferred, "ronja propose") {
+		t.Fatalf("the push must report the rename as going live with `ronja propose`, got %q (%s)", deferred, out)
+	}
+	if live.Title != "EMAB tracker" || len(f.mod.patches) != 0 {
+		t.Fatalf("the live row must be untouched, got title %q and patches %+v", live.Title, f.mod.patches)
+	}
+	if len(f.mod.draftPatches) != 1 || f.mod.draftPatches[0].Title != "EMAB tracker v2" {
+		t.Fatalf("the open draft must still carry the title the commit publishes, got %+v", f.mod.draftPatches)
+	}
+	draft := f.mod.draftOf[live.ID]
+	if got := f.ModuleFileContents(draft)["tracker.py"]; got != "x = 2\n" {
+		t.Fatalf("the files must be pushed to the draft, got %q", got)
+	}
+}
+
 // TestModuleNonAdminSharedFeatureLoop is the same loop in a SHARED feature,
 // where the create lands as a PROPOSAL rather than as a live module.
 //

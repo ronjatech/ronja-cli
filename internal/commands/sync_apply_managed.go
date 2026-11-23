@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
@@ -154,6 +155,45 @@ func automationHeldLive(f *folder, path, body, id string, rows map[string]*api.A
 func orFolder(address string) string { return cmp.Or(address, "the folder") }
 
 func orNothing(id string) string { return cmp.Or(id, "nothing") }
+
+// backfillHeldElsewhere is the refusal the apply's lazy claim
+// (applyManaged) would meet, for a dry run, which sends no claim: a row this
+// folder's lock records, which the server holds for no address of this folder,
+// is held by another folder of the stack's feature — typically one that took
+// it over (`propose --take-over`). Without it a displaced folder's dry run, and
+// so its propose and its change list's re-plan, would plan an update the
+// apply then refuses. One read of the feature's claims, only when the lock
+// records a row the server has not claimed for this folder.
+func backfillHeldElsewhere(ctx context.Context, f *folder) *managedRefusal {
+	backfill := f.managedBackfill()
+	if len(backfill) == 0 {
+		return nil
+	}
+	claims, err := f.client().ListManaged(ctx, f.managed.featureID, "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Warning: could not read feature %s's claims (%v), so the plan may include rows another folder holds; the apply will refuse them.\n", f.managed.featureID, err)
+		return nil
+	}
+	held := map[string]*api.ManagedClaim{}
+	for i := range claims {
+		c := &claims[i]
+		if !c.Departed() && c.ResourceID != "" && c.FolderID != f.managed.folderID {
+			held[c.ResourceKind+"\x00"+c.ResourceID] = c
+		}
+	}
+	var problems []managedRefusal
+	for _, a := range backfill {
+		if c := held[a.Kind+"\x00"+a.ID]; c != nil {
+			problems = append(problems, describeClaimRefusal(f, a, api.ManagedClaimResult{
+				Outcome: api.ManagedOutcomeRefused, Code: api.ManagedCodeResourceClaimed, Claim: c,
+			}))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return joinManagedRefusals(problems)
+}
 
 // markManagedUnits relabels the units an ADOPTED folder's refresh decided:
 // a unit whose lock entry the server's state rewrote is `adopt`, and a

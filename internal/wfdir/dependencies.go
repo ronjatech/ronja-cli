@@ -332,7 +332,13 @@ func (m *Manifest) checkDependencies(path string) error {
 //     hand to the `[]` init wrote, so no save stamps 8, and an older CLI opening
 //     the file deploys the workflow without its packages. Checked first: 8
 //     satisfies every lower demand, so one message fixes them all.
+//   - A SETTING SWITCHED ON (useDedicatedCompute or serverDataOnly true)
+//     DECLARED BELOW 10, for pipPackages' reason, and checked before it.
 func (m *Manifest) CheckDeclarations() error {
+	if m.switchesSettingOn() && m.FormatVersion < manifestVersionSettings {
+		return fmt.Errorf("%s switches on useDedicatedCompute or serverDataOnly but its formatVersion is %d: set \"formatVersion\": %d, so an older ronja refuses this folder instead of deploying it with the setting off",
+			ManifestName, declaredFormatVersion(m.FormatVersion), manifestVersionSettings)
+	}
 	if len(m.DeclaredPipPackages()) > 0 && m.FormatVersion < manifestVersionPipPackages {
 		return fmt.Errorf("%s declares pipPackages but its formatVersion is %d: set \"formatVersion\": %d, so an older ronja refuses this folder instead of deploying it without its packages",
 			ManifestName, declaredFormatVersion(m.FormatVersion), manifestVersionPipPackages)

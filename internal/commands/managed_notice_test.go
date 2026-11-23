@@ -296,3 +296,25 @@ func TestTheSameFolderInAnotherFeatureIsNotTheOwner(t *testing.T) {
 		t.Fatalf("the managing folder itself was told: %+v", n)
 	}
 }
+
+// Under --take-over, a plain resource_claimed means the claim could not be
+// taken (a takeover the server judged answers a takeover_* code) or the server
+// ignored the key; the refusal never sends the person back to the flag they
+// passed.
+func TestTakeOverRefusedAsResourceClaimedDoesNotSuggestTheFlag(t *testing.T) {
+	savedTake, savedPlan := flagTakeOver, planningProposal
+	defer func() { flagTakeOver, planningProposal = savedTake, savedPlan }()
+	f := &folder{Kind: wfdir.WorkflowKind, Stack: "prod", Binding: wfdir.Binding{FeatureID: "feat-1"},
+		Manifest: &wfdir.Manifest{ID: otherFolderID, Stacks: map[string]wfdir.Stack{"prod": {}}}}
+	refused := api.ManagedClaimResult{Code: api.ManagedCodeResourceClaimed}
+
+	flagTakeOver, planningProposal = true, true
+	got := describeClaimRefusal(f, wfdir.ManagedAddress{ID: "wf-1"}, refused).Detail
+	if strings.Contains(got, "with --take-over") || !strings.Contains(got, "predates `--take-over`") {
+		t.Fatalf("under --take-over the refusal reads %q", got)
+	}
+	flagTakeOver = false
+	if got := describeClaimRefusal(f, wfdir.ManagedAddress{ID: "wf-1"}, refused).Detail; !strings.Contains(got, "with --take-over") {
+		t.Fatalf("a propose without --take-over must name it, got %q", got)
+	}
+}

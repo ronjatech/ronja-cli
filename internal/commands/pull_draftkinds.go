@@ -417,6 +417,14 @@ func pullWorkflow(ctx context.Context, client *api.Client, f *folder) (*pullPlan
 				m.SetPipPackages(live.PipPackages)
 				changed = true
 			}
+			if m.Description != nil && *m.Description != live.Description {
+				description := live.Description
+				m.Description, changed = &description, true
+			}
+			if m.UseDedicatedCompute != nil && *m.UseDedicatedCompute != live.UseDedicatedCompute {
+				m.SetDedicatedCompute(live.UseDedicatedCompute)
+				changed = true
+			}
 			if m.ManagesReportingTimezone() && effectiveDeclaredZone(m.DeclaredReportingTimezone()) != live.ReportingTimezone {
 				if live.ReportingTimezone == "" {
 					return false, nil, pullInexpressible(f, "the live workflow declares no reporting timezone, and this folder's \"reportingTimezone\" can only declare one — remove the key to stop managing it, then pull")
@@ -470,6 +478,14 @@ func pullDataApp(ctx context.Context, client *api.Client, f *folder) (*pullPlan,
 			changed := false
 			if m.Title != "" && !sameName(m.Title, live.Name) {
 				m.Title, changed = live.Name, true
+			}
+			if m.Description != nil && *m.Description != live.Description {
+				description := live.Description
+				m.Description, changed = &description, true
+			}
+			if m.ServerDataOnly != nil && *m.ServerDataOnly != live.ServerDataOnly {
+				m.SetServerDataOnly(live.ServerDataOnly)
+				changed = true
 			}
 			var literals []pullLiteral
 			if m.ManagesAccess() && len(diffAccess(live.DataAppAccess, f.declaredAccess())) > 0 {

@@ -1693,17 +1693,19 @@ func baselinePipPackages(source *api.Workflow) *[]string {
 // disk, which are in alias form.
 func baselineFrom(codec aliasCodec, source *api.Workflow, files []api.WorkflowFile) *wfdir.InstanceState {
 	inst := &wfdir.InstanceState{
-		SourceID:          source.ID,
-		SourceLifecycle:   source.Lifecycle,
-		BaselineUpdatedAt: source.UpdatedAt.UTC().Format(time.RFC3339),
-		Title:             source.Title,
-		Entrypoint:        source.Entrypoint,
-		Parameters:        baselineParameters(source),
-		ReportingTimezone: baselineReportingTimezone(source),
-		PipPackages:       baselinePipPackages(source),
-		Files:             map[string]wfdir.FileState{},
-		Aliases:           codec.baselineAliases(),
-		AliasesRecorded:   true,
+		SourceID:            source.ID,
+		SourceLifecycle:     source.Lifecycle,
+		BaselineUpdatedAt:   source.UpdatedAt.UTC().Format(time.RFC3339),
+		Title:               source.Title,
+		Entrypoint:          source.Entrypoint,
+		Parameters:          baselineParameters(source),
+		ReportingTimezone:   baselineReportingTimezone(source),
+		PipPackages:         baselinePipPackages(source),
+		Description:         &source.Description,
+		UseDedicatedCompute: &source.UseDedicatedCompute,
+		Files:               map[string]wfdir.FileState{},
+		Aliases:             codec.baselineAliases(),
+		AliasesRecorded:     true,
 	}
 	for _, f := range files {
 		inst.Files[f.Path] = wfdir.FileState{
@@ -1729,17 +1731,19 @@ func baselineFrom(codec aliasCodec, source *api.Workflow, files []api.WorkflowFi
 // inventing timestamps we did not receive would be worse than saying nothing.
 func baselineFromLocal(codec aliasCodec, source *api.Workflow, files map[string]string) *wfdir.InstanceState {
 	inst := &wfdir.InstanceState{
-		SourceID:          source.ID,
-		SourceLifecycle:   source.Lifecycle,
-		BaselineUpdatedAt: source.UpdatedAt.UTC().Format(time.RFC3339),
-		Title:             source.Title,
-		Entrypoint:        source.Entrypoint,
-		Parameters:        baselineParameters(source),
-		ReportingTimezone: baselineReportingTimezone(source),
-		PipPackages:       baselinePipPackages(source),
-		Files:             map[string]wfdir.FileState{},
-		Aliases:           codec.baselineAliases(),
-		AliasesRecorded:   true,
+		SourceID:            source.ID,
+		SourceLifecycle:     source.Lifecycle,
+		BaselineUpdatedAt:   source.UpdatedAt.UTC().Format(time.RFC3339),
+		Title:               source.Title,
+		Entrypoint:          source.Entrypoint,
+		Parameters:          baselineParameters(source),
+		ReportingTimezone:   baselineReportingTimezone(source),
+		PipPackages:         baselinePipPackages(source),
+		Description:         &source.Description,
+		UseDedicatedCompute: &source.UseDedicatedCompute,
+		Files:               map[string]wfdir.FileState{},
+		Aliases:             codec.baselineAliases(),
+		AliasesRecorded:     true,
 	}
 	for path, content := range files {
 		inst.Files[path] = wfdir.FileState{SHA256: contentHash(content)}

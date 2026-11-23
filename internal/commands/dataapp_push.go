@@ -147,6 +147,9 @@ type appPushResult struct {
 	// "title" — it reaches the live app at publish. Absent when the draft
 	// already held it.
 	Rename *renameResult `json:"rename,omitempty"`
+	// Settings names each setting this push changed on the draft, as
+	// appSettingsChanges words it.
+	Settings []string `json:"settings,omitempty"`
 	// Compiles is the verdict from the closing validate: nil when there is no
 	// verdict — the check was skipped (--no-validate) or the compiler did not
 	// answer (see CompileCheck) — otherwise whether the draft is publishable as
@@ -375,7 +378,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		// The drift guard, BEFORE the checkout, when the checkout would only
 		// copy the live app just read — see the same step in runPush.
 		if live := existing.App; opts.Apply && existing.Row() == nil && live != nil && raw != nil && f.State.For(f.Baseline()) != nil && !opts.Force {
-			if _, err := checkAppDrift(f, read, hashAppFiles(f.baselineCodec(), raw), local, appMetaAgrees(f, live), false, readHead(), live.ID,
+			if _, err := checkAppDrift(f, live, read, hashAppFiles(f.baselineCodec(), raw), local, false, readHead(),
 				driftAsk{apply: true}); err != nil {
 				return nil, err
 			}
@@ -441,9 +444,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		// Whether the app's metadata already agrees, for the live-equals-desired
 		// leg of the guard: the allowlists, and the title (whose own drift leg is
 		// appTitleLeg). Files alone agreeing is not "nothing to overwrite".
-		metaAgrees := (f.Manifest.Title == "" || sameName(f.Manifest.Title, target.Name)) &&
-			(!f.Manifest.ManagesAccess() || len(diffAccess(target.DataAppAccess, f.declaredAccess())) == 0)
-		verdict, err := checkAppDrift(f, remoteFiles, hashAppFiles(f.baselineCodec(), files), local, metaAgrees, opts.Force, head, target.ID,
+		verdict, err := checkAppDrift(f, target, remoteFiles, hashAppFiles(f.baselineCodec(), files), local, opts.Force, head,
 			driftAsk{draft: result.DraftPreexisted, apply: opts.Apply})
 		if err != nil {
 			return refuseUnwritten(beyondDraftOpen(f, existing.App, err))
@@ -479,7 +480,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 		// write — is still a refusal before the first write, and an apply
 		// discards the copy of live it checked out (see the same lines in runPush).
 		// Not when a write's outcome is unknown (Uncertain): it may have landed.
-		if len(result.AccessChanges) == 0 && result.Rename == nil &&
+		if len(result.AccessChanges) == 0 && result.Rename == nil && len(result.Settings) == 0 &&
 			len(result.Pushed) == 0 && len(result.Deleted) == 0 && len(result.Uncertain) == 0 && ownCheckout() {
 			err = discardUnwrittenCheckout(ctx, true, target.ID, "app", client.DiscardDataAppDraft, err)
 			result.Error = err.Error()
@@ -517,6 +518,18 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 			// here on describes.
 			target.DataAppAccess = updated.DataAppAccess
 		}
+	}
+
+	// The SETTINGS a folder manages, on the draft, which publish lands on the
+	// live app. A create carried them in its body.
+	if patch := appSettingsPatch(f.Manifest, target); !result.Created && !patch.Empty() {
+		changes := appSettingsChanges(patch, target)
+		updated, err := client.UpdateDataApp(ctx, target.ID, patch)
+		if err != nil {
+			return stop(fmt.Errorf("update the settings of %s: %w", target.ID, err))
+		}
+		target.Description, target.ServerDataOnly = updated.Description, updated.ServerDataOnly
+		result.Settings = changes
 	}
 
 	// 6. The TITLE, which is the row's `name` — only when appTitleLeg cleared it.
@@ -558,7 +571,7 @@ func runAppPushOnce(ctx context.Context, f *folder, opts appPushOptions) (*appPu
 	// described the server, has nothing to re-read.
 	nothingChanged := !result.Created && baselineClean &&
 		len(result.Pushed) == 0 && len(result.Deleted) == 0 && len(result.AccessChanges) == 0 &&
-		result.Rename == nil
+		result.Rename == nil && len(result.Settings) == 0
 	if nothingChanged && !opts.Validate {
 		result.UpToDate = true
 		if !appBaselineDescribes(f.State.For(f.Baseline()), target) {
@@ -716,20 +729,22 @@ func appPushNothingLiveHolds(ctx context.Context, client *api.Client, f *folder,
 }
 
 // appDraftCopiesLive is workflowDraftCopiesLive for a data app: the same files,
-// name and allowlists as the live app the push read.
+// name, settings and allowlists as the live app the push read.
 func appDraftCopiesLive(live, draft *api.DataApp, liveFiles, draftFiles map[string]string) bool {
 	if live == nil || draft == nil || liveFiles == nil || draftFiles == nil {
 		return false
 	}
 	return filesAgree(liveFiles, draftFiles) && draft.Name == live.Name &&
+		draft.Description == live.Description && draft.ServerDataOnly == live.ServerDataOnly &&
 		len(diffAccess(live.DataAppAccess, draft.DataAppAccess)) == 0
 }
 
-// appMetaAgrees is the metadata half of appRowHoldsFolder — the title and,
-// for a folder managing them, the allowlists — which the drift guard asks
-// beside the files.
+// appMetaAgrees is the metadata half of appRowHoldsFolder — the title, the
+// settings the folder manages and, for a folder managing them, the allowlists
+// — which the drift guard asks beside the files.
 func appMetaAgrees(f *folder, row *api.DataApp) bool {
 	return (f.Manifest.Title == "" || sameName(f.Manifest.Title, row.Name)) &&
+		appSettingsPatch(f.Manifest, row).Empty() &&
 		(!f.Manifest.ManagesAccess() || len(diffAccess(row.DataAppAccess, f.declaredAccess())) == 0)
 }
 
@@ -793,8 +808,10 @@ func resolveAppPushTarget(ctx context.Context, client *api.Client, f *folder, de
 			}
 		}
 		created, err := client.CreateDataApp(ctx, api.CreateDataAppInput{
-			FeatureID: featureID,
-			Name:      f.Manifest.Title,
+			FeatureID:      featureID,
+			Name:           f.Manifest.Title,
+			Description:    derefOr(f.Manifest.Description, ""),
+			ServerDataOnly: derefOr(f.Manifest.ServerDataOnly, false),
 			// Declared at creation rather than left to the patch above: it saves a
 			// round trip, and the compiler checks secret references against
 			// allowed_secret_ids on the very first file write, so the grants have to
@@ -954,8 +971,9 @@ func appTitleHeadVouches(live *api.DataApp, targetID string, head headAgreement)
 // guard decided, not what today's caller happens to consult.
 //
 // atBaseline and remote are the remote in the baseline's aliases and the
-// folder's current ones — see checkDrift.
-func checkAppDrift(f *folder, remote, atBaseline, local map[string]string, metaAgrees, force bool, head headAgreement, targetID string, ask driftAsk) (driftVerdict, error) {
+// folder's current ones — see checkDrift. row is the app those files are of.
+func checkAppDrift(f *folder, row *api.DataApp, remote, atBaseline, local map[string]string, force bool, head headAgreement, ask driftAsk) (driftVerdict, error) {
+	targetID := row.ID
 	baseline := f.State.For(f.Baseline())
 	remoteHashes := make(map[string]string, len(remote))
 	for path, content := range remote {
@@ -969,15 +987,22 @@ func checkAppDrift(f *folder, remote, atBaseline, local map[string]string, metaA
 	// excusing them here would walk a fresh checkout past the head anchor on its
 	// files alone. That case has its own leg below, which asks the metadata too.
 	excused, proposed := 0, false
+	patch := appSettingsPatch(f.Manifest, row)
+	meta := appSettingsDriftOf(baseline, row, patch)
 	if baseline != nil {
 		drift, excused = excuseAgreedFiles(drift, remote, local)
-		if drift.Dirty() {
-			// No metadata leg here: the title has appTitleLeg, the allowlists
-			// the access diff.
-			drift, proposed = f.excuseOwnProposal(head, drift, remote, func(*wfdir.Manifest) bool { return true })
+		if drift.Dirty() || len(meta) > 0 {
+			// The settings are the metadata leg here: the title has
+			// appTitleLeg, the allowlists the access diff.
+			drift, proposed = f.excuseOwnProposal(head, drift, remote, func(m *wfdir.Manifest) bool {
+				return len(appSettingsDriftOf(baseline, row, withoutProposedAppSettings(patch, row, m))) == 0
+			})
+			if proposed {
+				meta = nil
+			}
 		}
 	}
-	if !drift.Dirty() {
+	if !drift.Dirty() && len(meta) == 0 {
 		// Bypassed still tracks --force here, even though nothing needed
 		// bypassing — see checkDrift's copy of this branch for why a clean
 		// baseline does not make the flag conditional.
@@ -985,11 +1010,11 @@ func checkAppDrift(f *folder, remote, atBaseline, local map[string]string, metaA
 			Preconditions: armedAfterProposals(baseline, remoteHashes, proposed)}, nil
 	}
 	if force {
-		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %d file(s) that changed on the server since your last sync.\n",
-			drift.Total())
+		fmt.Fprintf(os.Stderr, "  Note: --force — overwriting %s that changed on the server since your last sync.\n",
+			describeDrifted(drift, meta))
 		return driftVerdict{Bypassed: true}, nil
 	}
-	if baseline == nil && metaAgrees && filesAgree(remote, local) {
+	if baseline == nil && appMetaAgrees(f, row) && filesAgree(remote, local) {
 		// LIVE EQUALS DESIRED with no baseline: see checkDrift's copy.
 		noteLiveEqualsDesired(targetID)
 		return driftVerdict{HeadVouched: true, Preconditions: remoteHashes}, nil
@@ -1019,8 +1044,10 @@ func checkAppDrift(f *folder, remote, atBaseline, local map[string]string, metaA
 		return driftVerdict{}, fmt.Errorf("this folder has no sync baseline for %s, and the data app already has %d file(s) there — .ronja/ is local-only, so a copy cloned from git starts without one.\n  %s",
 			f.Resolved.URL, len(remote), noBaselineRemedy(f, ask, head, "Clone the app"))
 	}
-	ask.rebound = f.reboundUnrecorded(drift, remote, local)
-	return driftVerdict{}, baselineDriftRefusal(f, ask, driftSummary(drift, nil))
+	if len(meta) == 0 {
+		ask.rebound = f.reboundUnrecorded(drift, remote, local)
+	}
+	return driftVerdict{}, baselineDriftRefusal(f, ask, driftSummary(drift, meta))
 }
 
 // putAppFiles writes the folder's files into the target row.
@@ -1306,7 +1333,9 @@ func appBaselineDescribes(baseline *wfdir.InstanceState, row *api.DataApp) bool 
 		baseline.Entrypoint == row.Entrypoint &&
 		// An unrecorded allowlist (a baseline predating the guard) does not make
 		// the baseline stale on its own, and the next push records it.
-		(baseline.Access == nil || api.SameAccess(*baseline.Access, row.DataAppAccess))
+		(baseline.Access == nil || api.SameAccess(*baseline.Access, row.DataAppAccess)) &&
+		(baseline.Description == nil || *baseline.Description == row.Description) &&
+		(baseline.ServerDataOnly == nil || *baseline.ServerDataOnly == row.ServerDataOnly)
 }
 
 // saveAppBaseline records a baseline on the partial-push path, where the push
@@ -1347,6 +1376,9 @@ func printAppPushReport(r *appPushResult) {
 	}
 	if r.Rename != nil {
 		fmt.Fprintf(out, "    title    %q → %q (the live app takes it at publish)\n", r.Rename.From, r.Rename.To)
+	}
+	for _, s := range r.Settings {
+		fmt.Fprintf(out, "    setting  %s (the live app takes it at publish)\n", s)
 	}
 	for _, c := range r.AccessChanges {
 		for _, id := range c.Added {

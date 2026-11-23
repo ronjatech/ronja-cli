@@ -96,9 +96,14 @@ type InstanceState struct {
 	ReportingTimezone *string                  `json:"reportingTimezone,omitempty"`
 	// PipPackages is the row's list at the last sync, nil when unrecorded, for
 	// the drift guard Parameters has.
-	PipPackages *[]string            `json:"pipPackages,omitempty"`
-	Access      *api.DataAppAccess   `json:"access,omitempty"`
-	Files       map[string]FileState `json:"files"`
+	PipPackages *[]string `json:"pipPackages,omitempty"`
+	// Description, UseDedicatedCompute and ServerDataOnly are the row's
+	// settings at the last sync, nil when unrecorded, for the same guard.
+	Description         *string              `json:"description,omitempty"`
+	UseDedicatedCompute *bool                `json:"useDedicatedCompute,omitempty"`
+	ServerDataOnly      *bool                `json:"serverDataOnly,omitempty"`
+	Access              *api.DataAppAccess   `json:"access,omitempty"`
+	Files               map[string]FileState `json:"files"`
 	// Tables is a PIPELINE folder's per-file remote state: relative path →
 	// which row the baseline describes, and whether this checkout holds an open
 	// draft of it.

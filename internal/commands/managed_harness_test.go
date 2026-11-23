@@ -96,6 +96,9 @@ type fakeManaged struct {
 	// race, when set, runs once at the top of the next create's claim — a
 	// concurrent apply that committed the same address first.
 	race func(m *fakeManaged)
+	// failFeatureList makes every GET /managed with no folder answer 500: the
+	// feature-wide read a dry run makes for rows held elsewhere.
+	failFeatureList bool
 	// afterList, when set, runs once after the next GET /managed has answered —
 	// a concurrent apply committing between this one's read and its create.
 	afterList func(m *fakeManaged)
@@ -174,6 +177,17 @@ type fakeRowFacts struct {
 	Drafter string
 	// ModelKind is the models_v2 kind of a table or metric row.
 	ModelKind string
+	// Head is a workflow's, data app's or module's head version
+	// (rmanaged/takeover.go headVersionTx): its newest version, else its id.
+	Head string
+}
+
+// fakeHead is headVersionTx's fallback: the newest version when there is one.
+func fakeHead(id string, versioned bool, newest func() string) string {
+	if versioned {
+		return newest()
+	}
+	return id
 }
 
 // fakePrincipal is the attribution id every claim the fake inserts carries —
@@ -632,6 +646,10 @@ func (m *fakeManaged) serveList(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, http.StatusBadRequest, "", "feature is required", nil)
 		return
 	}
+	if folder == "" && m.failFeatureList {
+		writeCoded(w, http.StatusInternalServerError, "internal_error", "the database is unavailable", nil)
+		return
+	}
 	// FeatureRead (handler.go): a feature the caller cannot read is a 404.
 	if m.unreadableFeatures[feature] {
 		writeCoded(w, http.StatusNotFound, "", "feature not found", nil)
@@ -756,8 +774,36 @@ func (m *fakeManaged) serveClaim(w http.ResponseWriter, r *http.Request) {
 				refuse(code, why)
 				break
 			}
+			if item.Takeover != nil {
+				if msg := fakeValidateTakeover(item.ResourceKind, item.Takeover); msg != "" {
+					refuse("invalid", msg)
+					break
+				}
+			}
 			holder := m.byAddress(in.FeatureID, norm.FolderID, norm.Address)
 			owner := m.byResource(item.ResourceKind, item.ResourceID)
+			// rmanaged takeOverTx: release another folder's claim of the row,
+			// in the same transaction as the insert below.
+			if item.Takeover != nil && owner != nil && holder == nil && owner.FeatureID == in.FeatureID {
+				switch {
+				case strings.TrimSpace(owner.SourceLabel) == "":
+					refuse(api.ManagedCodeTakeoverSourceUnknown, fmt.Sprintf("this %s is managed from folder %s, whose source is unknown (its claim records no source label), so a takeover cannot tell it is not a git repository's folder: "+
+						"a person who may write the feature can release it with `ronja sync unmanage --force` in that folder, or with DELETE /managed/%s; a computer cannot", item.ResourceKind, owner.FolderID, owner.ID))
+				case fakeHeldInGit(owner.SourceLabel):
+					refuse(api.ManagedCodeTakeoverHeldInGit, fmt.Sprintf("this %s is managed from the git repository %q (folder %s), and a takeover never displaces a repository's folder: work in a checkout of that repository", item.ResourceKind, owner.SourceLabel, owner.FolderID))
+				case strings.TrimSpace(item.Takeover.BaseVersionID) != facts.Head:
+					refuse(api.ManagedCodeTakeoverStaleBase, fmt.Sprintf("this folder is based on version %s, and the row's live version is %s: a takeover needs a folder based on what is live", strings.TrimSpace(item.Takeover.BaseVersionID), facts.Head))
+				}
+				if res.Outcome == api.ManagedOutcomeRefused {
+					v := m.view(owner)
+					res.Claim = &v
+					break
+				}
+				v := m.view(owner)
+				res.Released = &v
+				delete(m.claims, owner.ID)
+				owner = nil
+			}
 			// The insert's unique indexes, address first: Postgres checks a
 			// table's unique indexes in creation (OID) order, and 000669
 			// creates the address index first (up.sql), so a row that
@@ -790,6 +836,24 @@ func (m *fakeManaged) serveClaim(w http.ResponseWriter, r *http.Request) {
 		results = append(results, res)
 	}
 	writeJSON(w, map[string]any{"results": results})
+}
+
+// fakeValidateTakeover is rmanaged validateTakeover.
+func fakeValidateTakeover(kind string, t *api.ManagedTakeover) string {
+	switch kind {
+	case "workflow", "dataapp", "module":
+	default:
+		return fmt.Sprintf("takeover is for a workflow, data app or module: a %s's folder holds other addresses a takeover cannot carry", kind)
+	}
+	if strings.TrimSpace(t.BaseVersionID) == "" {
+		return "takeover needs baseVersionID: the live version the folder is based on"
+	}
+	return ""
+}
+
+// fakeHeldInGit is rmanaged.HeldInGit.
+func fakeHeldInGit(label string) bool {
+	return label != "" && !strings.HasSuffix(label, localSourceSuffix)
 }
 
 // serveMove is handler.go move + rmanaged Move.

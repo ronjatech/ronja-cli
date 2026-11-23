@@ -298,8 +298,9 @@ func printAppInitReport(root, url, target, title, entrypoint, featureID, fromPat
 	// what goes INSIDE the entrypoint, and nothing else in the CLI says where
 	// that is written down. Printed as a live URL on THIS instance so it cannot
 	// drift from the instance being pushed to.
-	fmt.Fprintf(out, "\n  What goes inside an app — the @ronja/app SDK (query, charts, applyBrand)\n")
-	fmt.Fprintf(out, "  and the libraries you may import:\n")
+	fmt.Fprintf(out, "\n  What goes inside an app: the build flow, and the page for each part (the\n")
+	fmt.Fprintf(out, "  @ronja/app SDK, charts, the libraries you may import), where builtin:<slug>\n")
+	fmt.Fprintf(out, "  is /docs/api/skills/<slug>.md:\n")
 	fmt.Fprintf(out, "      %s/docs/api/skills/creating-data-apps.md\n", strings.TrimRight(url, "/"))
 	fmt.Fprintf(out, "\n  Commit %s with your code; .ronja/ is local-only and ignores itself.\n",
 		wfdir.ManifestName)

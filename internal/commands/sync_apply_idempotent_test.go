@@ -619,6 +619,34 @@ func TestSyncApplyDeploysAMetadataOnlyChange(t *testing.T) {
 			},
 			landed: func(fx idempotenceFixture) bool { return liveWorkflow(fx).RuntimeVersion == wfdir.RuntimeQuery },
 		},
+		"workflow/description": {
+			setup: workflowIdempotenceFixture,
+			change: func(t *testing.T, fx idempotenceFixture) {
+				editManifest(t, fx.root, wfdir.WorkflowKind, func(m *wfdir.Manifest) { m.Description = ptr("Sends the monthly report.") })
+			},
+			landed: func(fx idempotenceFixture) bool { return liveWorkflow(fx).Description == "Sends the monthly report." },
+		},
+		"workflow/dedicated compute": {
+			setup: workflowIdempotenceFixture,
+			change: func(t *testing.T, fx idempotenceFixture) {
+				editManifest(t, fx.root, wfdir.WorkflowKind, func(m *wfdir.Manifest) { m.SetDedicatedCompute(true) })
+			},
+			landed: func(fx idempotenceFixture) bool { return liveWorkflow(fx).UseDedicatedCompute },
+		},
+		"data app/description": {
+			setup: appIdempotenceFixture,
+			change: func(t *testing.T, fx idempotenceFixture) {
+				editManifest(t, fx.root, wfdir.DataAppKind, func(m *wfdir.Manifest) { m.Description = ptr("Tracks RFQs.") })
+			},
+			landed: func(fx idempotenceFixture) bool { return fx.app.apps["app-1"].Description == "Tracks RFQs." },
+		},
+		"data app/server-side data only": {
+			setup: appIdempotenceFixture,
+			change: func(t *testing.T, fx idempotenceFixture) {
+				editManifest(t, fx.root, wfdir.DataAppKind, func(m *wfdir.Manifest) { m.SetServerDataOnly(true) })
+			},
+			landed: func(fx idempotenceFixture) bool { return fx.app.apps["app-1"].ServerDataOnly },
+		},
 		"data app/title": {
 			setup:  appIdempotenceFixture,
 			change: func(t *testing.T, fx idempotenceFixture) { fx.draftKind.retitle(t, "Renamed in the repository") },

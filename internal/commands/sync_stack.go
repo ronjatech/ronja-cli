@@ -25,10 +25,14 @@ func newSyncStackCmd() *cobra.Command {
 	add := &cobra.Command{
 		Use:   "add [name] --feature <id>",
 		Short: "Declare a stack on a feature in every folder of the tree, and bind what it can",
-		Long: `Declare a stack on a feature in every folder of the tree, and bind what it can.
+		Long: `Declare a stack on a feature in every folder of the tree, and bind what it can:
 
-  ronja sync stack add main --feature col-…
-  ronja sync stack add --feature col-…        # named after the feature's Space (dev), or main in the default Space
+  ronja sync stack add --feature col-…
+
+Without a name the stack is named after the feature's Space (dev), or main in
+the organization's default Space; ` + "`ronja sync stack add main --feature col-…`" + `
+names it. ` + "`ronja propose`" + ` in a lone folder whose ronja.json names its feature
+adds that folder's stack itself the first time.
 
 Each folder gets the stack, with the feature (and, outside the organization's
 default Space, the Space it is in), and the same proposals

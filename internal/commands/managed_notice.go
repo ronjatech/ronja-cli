@@ -100,6 +100,10 @@ func describeManagedBy(kind wfdir.Kind, mb *api.ManagedBy, verb managedNoticeVer
 	if mb.StackLabel != "" {
 		where = append(where, fmt.Sprintf("stack %q", mb.StackLabel))
 	}
+	if verb == noticeForClone && isLocalSource(mb.SourceLabel) && takesOver(kind) {
+		return fmt.Sprintf("managed from a folder with no git remote (%s) — to continue it from this copy, clone it with --stack and propose with `ronja propose --take-over`, which refuses that folder's next deploy.",
+			strings.Join(where, ", "))
+	}
 	what := "this change will show as drift there"
 	if verb == noticeForClone {
 		what = "a change made from this copy will show as drift there"

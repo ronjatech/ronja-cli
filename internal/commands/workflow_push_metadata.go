@@ -10,7 +10,8 @@ import (
 )
 
 // The METADATA a push patches onto the row — the title, the entrypoint, the
-// parameters, the Python packages and the declared calendar — split out of
+// parameters, the Python packages, the declared calendar, the description and
+// dedicated compute — split out of
 // workflow_push.go alongside workflow_push_zone.go so the state machine there
 // reads as the sequence of phases it is rather than as a phase list with
 // field-level rules folded into the middle of it.
@@ -43,6 +44,12 @@ func withoutProposedFields(patch api.WorkflowPatch, codec aliasCodec, target *ap
 	}
 	if m.ManagesReportingTimezone() && held.ReportingTimezone == nil {
 		patch.ReportingTimezone = nil
+	}
+	if m.Description != nil && held.Description == nil {
+		patch.Description = nil
+	}
+	if m.UseDedicatedCompute != nil && held.UseDedicatedCompute == nil {
+		patch.UseDedicatedCompute = nil
 	}
 	return patch
 }
@@ -101,6 +108,14 @@ func metadataPatch(manifest *wfdir.Manifest, codec aliasCodec, target *api.Workf
 			zone := declared
 			patch.ReportingTimezone = &zone
 		}
+	}
+	if manifest.Description != nil && *manifest.Description != target.Description {
+		description := *manifest.Description
+		patch.Description = &description
+	}
+	if manifest.UseDedicatedCompute != nil && *manifest.UseDedicatedCompute != target.UseDedicatedCompute {
+		dedicated := *manifest.UseDedicatedCompute
+		patch.UseDedicatedCompute = &dedicated
 	}
 	// The runtime is NOT part of this patch: it is its own request, sent after
 	// the deletions (runtimeRaise).
@@ -286,6 +301,12 @@ func applyPatch(row *api.Workflow, patch api.WorkflowPatch) {
 	if patch.PipPackages != nil {
 		row.PipPackages = *patch.PipPackages
 	}
+	if patch.Description != nil {
+		row.Description = *patch.Description
+	}
+	if patch.UseDedicatedCompute != nil {
+		row.UseDedicatedCompute = *patch.UseDedicatedCompute
+	}
 }
 
 // baselineDescribes reports whether the recorded baseline already describes this
@@ -301,6 +322,8 @@ func baselineDescribes(baseline *wfdir.InstanceState, row *api.Workflow) bool {
 		// fields get, and the next push records it.
 		(baseline.Parameters == nil || sameParameters(*baseline.Parameters, row.Parameters)) &&
 		(baseline.PipPackages == nil || samePipPackages(*baseline.PipPackages, row.PipPackages)) &&
+		(baseline.Description == nil || *baseline.Description == row.Description) &&
+		(baseline.UseDedicatedCompute == nil || *baseline.UseDedicatedCompute == row.UseDedicatedCompute) &&
 		// Same treatment for an unrecorded declared zone: nil is a baseline
 		// written before it was part of one, not a row that lost its declaration.
 		(baseline.ReportingTimezone == nil || *baseline.ReportingTimezone == row.ReportingTimezone)

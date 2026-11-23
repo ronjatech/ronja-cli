@@ -259,6 +259,10 @@ type CreateWorkflowInput struct {
 	// Language is fixed at create and sent only for js: an absent key is python
 	// on every instance, including one that predates the field.
 	Language string `json:"language,omitempty"`
+	// Description and UseDedicatedCompute are omitempty because a create with
+	// neither makes the row the server's defaults make.
+	Description         string `json:"description,omitempty"`
+	UseDedicatedCompute bool   `json:"useDedicatedCompute,omitempty"`
 }
 
 // WorkflowPatch is the body of PUT /workflow/:id, mirroring the subset of
@@ -289,6 +293,8 @@ type CreateWorkflowInput struct {
 // with omitempty collapses them into the first, making the reset unexpressible.
 // PipPackages is a pointer for the reason Parameters is: an explicit [] clears
 // the row's list, an absent key leaves it alone.
+// Description and UseDedicatedCompute are pointers for the reason Parameters
+// is: an explicit "" or false is a value, an absent key leaves the row's alone.
 // RuntimeVersion is a plain int with omitempty, and the third state the
 // pointers carry has nothing to describe here: the field moves ONE WAY (to 3, as
 // runtime 1 and 2 are retired), so "the folder does not manage it" and "the
@@ -296,19 +302,22 @@ type CreateWorkflowInput struct {
 // server refuses a lowering and a move to 2 outright; the CLI refuses a lowering
 // earlier, before it has written anything.
 type WorkflowPatch struct {
-	Title             string               `json:"title,omitempty"`
-	Entrypoint        string               `json:"entrypoint,omitempty"`
-	Parameters        *[]WorkflowParameter `json:"parameters,omitempty"`
-	ReportingTimezone *string              `json:"reportingTimezone,omitempty"`
-	PipPackages       *[]string            `json:"pipPackages,omitempty"`
-	RuntimeVersion    int                  `json:"runtimeVersion,omitempty"`
+	Title               string               `json:"title,omitempty"`
+	Entrypoint          string               `json:"entrypoint,omitempty"`
+	Parameters          *[]WorkflowParameter `json:"parameters,omitempty"`
+	ReportingTimezone   *string              `json:"reportingTimezone,omitempty"`
+	PipPackages         *[]string            `json:"pipPackages,omitempty"`
+	Description         *string              `json:"description,omitempty"`
+	UseDedicatedCompute *bool                `json:"useDedicatedCompute,omitempty"`
+	RuntimeVersion      int                  `json:"runtimeVersion,omitempty"`
 }
 
 // Empty reports a patch that would change nothing, so the caller can skip the
 // round trip rather than send `{}`.
 func (p WorkflowPatch) Empty() bool {
 	return p.Title == "" && p.Entrypoint == "" && p.Parameters == nil &&
-		p.ReportingTimezone == nil && p.PipPackages == nil && p.RuntimeVersion == 0
+		p.ReportingTimezone == nil && p.PipPackages == nil && p.Description == nil &&
+		p.UseDedicatedCompute == nil && p.RuntimeVersion == 0
 }
 
 // ValidateWorkflowFiles dry-runs a candidate workflow. Findings are data: a

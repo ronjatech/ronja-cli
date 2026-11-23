@@ -45,6 +45,9 @@ type liveCompared struct {
 	refusal error
 	// draft is the open draft they were asked of, nil when none was.
 	draft *openDraft
+	// settings names each setting a push would change on the live row, as a
+	// card shows it; asked only of a live workflow or data app.
+	settings []string
 }
 
 // openDraft is an open draft of a bound row, as a draft_open refusal names it.
@@ -106,6 +109,7 @@ func compareWorkflowLive(ctx context.Context, f *folder, client *api.Client, loc
 		if files, err = client.ListWorkflowFiles(ctx, row.ID); err != nil {
 			return liveCompared{}, err
 		}
+		c.settings = workflowSettingsChanges(metadataPatch(f.Manifest, f.Codec, row), row)
 		if c.held = workflowRowHoldsFolder(f, row, contentByPath(f.Codec, files), local); c.held || !ask.guard {
 			return c, nil
 		}
@@ -169,6 +173,7 @@ func compareAppLive(ctx context.Context, f *folder, client *api.Client, local ma
 		if files, err = client.ListDataAppFiles(ctx, row.ID); err != nil {
 			return liveCompared{}, err
 		}
+		c.settings = appSettingsChanges(appSettingsPatch(f.Manifest, row), row)
 		if c.held = appRowHoldsFolder(f, row, appContentByPath(f.Codec, files), local); c.held || !ask.guard {
 			return c, nil
 		}
@@ -200,7 +205,7 @@ func compareAppLive(ctx context.Context, f *folder, client *api.Client, local ma
 		vouches = appTitleHeadVouches(row, targetID, head)
 	}
 	c.checked = true
-	_, c.refusal = checkAppDrift(f, appContentByPath(f.Codec, files), hashAppFiles(f.baselineCodec(), files), local, appMetaAgrees(f, target), false, head, target.ID,
+	_, c.refusal = checkAppDrift(f, target, appContentByPath(f.Codec, files), hashAppFiles(f.baselineCodec(), files), local, false, head,
 		driftAsk{draft: c.draft != nil, apply: true})
 	c.refusal = beyondDraftOpen(f, row, c.refusal)
 	if c.refusal == nil {

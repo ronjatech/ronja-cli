@@ -18,8 +18,9 @@ import (
 // its id (that is what the id is for), so its path changes while it is
 // still the same folder; reading the path as identity would refuse every
 // folder move as a foreign repository. The path is relabelled quietly on the
-// next anchor write instead, as is a label that was empty (a claim made from
-// outside git) — see putManagedAnchor. A claim with no anchor change pending
+// next anchor write instead, as is an empty label (only a raw POST
+// /managed/claim sends one) — see
+// putManagedAnchor. A claim with no anchor change pending
 // keeps its old label until one is.
 
 // sourceLabelOf answers a folder root's source label. A var so the tests can

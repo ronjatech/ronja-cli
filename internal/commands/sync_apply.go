@@ -925,6 +925,11 @@ func planOneFolder(ctx context.Context, folder discoveredFolder,
 		}
 	}
 	markManagedUnits(f, line.Units)
+	if flagSyncDryRun {
+		if r := backfillHeldElsewhere(ctx, f); r != nil {
+			return refuse(r.Reason, "%s", r.Detail)
+		}
+	}
 	// The loops' own LOCAL guards, BEFORE apply's gate — the order they really run
 	// in, and the reason they are here at all: each fires before the loop's first
 	// byte, so a dry-run that skipped them reported `applied` for a folder the
@@ -1371,10 +1376,38 @@ func describeAgainstLive(ctx context.Context, plan *plannedFolder) {
 		line.Detail = fmt.Sprintf("nothing to push or publish: the live %s already holds this folder", f.Kind.Label)
 	default:
 		line.Detail = fmt.Sprintf("would push and publish the %s: the live one differs from this folder", f.Kind.Label)
+		switch {
+		case c.neverPublished:
+			line.Units[0].Detail = firstPublishDetail(f)
+		case len(c.settings) > 0:
+			line.Units[0].Detail = "settings: " + strings.Join(c.settings, "; ")
+		}
 	}
 	if records := claimsRecorded(line.Claims); len(records) > 0 {
 		line.Detail += "; apply " + joinAnd(records)
 	}
+}
+
+// firstPublishDetail is the unit detail of a row no publish has made live
+// (`app init` and a push before the first propose): with no live settings to
+// compare with, it names each setting ronja.json declares, which the first
+// publish takes live.
+func firstPublishDetail(f *folder) string {
+	m := f.Manifest
+	var settings []string
+	if m.Description != nil {
+		settings = append(settings, "description")
+	}
+	if m.UseDedicatedCompute != nil && f.Kind.Name == wfdir.KindWorkflow {
+		settings = append(settings, "dedicated compute: "+onOff(*m.UseDedicatedCompute))
+	}
+	if m.ServerDataOnly != nil && f.Kind.Name == wfdir.KindDataApp {
+		settings = append(settings, "server-side data only: "+onOff(*m.ServerDataOnly))
+	}
+	if len(settings) == 0 {
+		return "first publish"
+	}
+	return "first publish; settings: " + strings.Join(settings, ", ")
 }
 
 // applyNothingToPush is a folder's line when its push had nothing to push and

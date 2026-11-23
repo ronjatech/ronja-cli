@@ -946,7 +946,7 @@ func discardUnwrittenCheckout(ctx context.Context, own bool, draftID, tool strin
 }
 
 // workflowDraftCopiesLive reports that a draft holds what the live row held when
-// the push read it: the same files, title and entrypoint — what a checkout
+// the push read it: the same files, title, entrypoint and settings — what a checkout
 // copies and what an edit made in the web app or by a second job would change.
 // False whenever either listing is missing, so a draft nobody could compare is
 // kept.
@@ -954,7 +954,8 @@ func workflowDraftCopiesLive(live, draft *api.Workflow, liveFiles, draftFiles ma
 	if live == nil || draft == nil || liveFiles == nil || draftFiles == nil {
 		return false
 	}
-	return filesAgree(liveFiles, draftFiles) && draft.Title == live.Title && draft.Entrypoint == live.Entrypoint
+	return filesAgree(liveFiles, draftFiles) && draft.Title == live.Title && draft.Entrypoint == live.Entrypoint &&
+		draft.Description == live.Description && draft.UseDedicatedCompute == live.UseDedicatedCompute
 }
 
 // workflowRowHoldsFolder reports that a push of this folder onto `row` — or
@@ -1107,6 +1108,12 @@ func describePatch(patch api.WorkflowPatch) string {
 	}
 	if patch.PipPackages != nil {
 		parts = append(parts, fmt.Sprintf("the Python packages to %s", describePipPackages(*patch.PipPackages)))
+	}
+	if patch.Description != nil {
+		parts = append(parts, "the description")
+	}
+	if patch.UseDedicatedCompute != nil {
+		parts = append(parts, fmt.Sprintf("dedicated compute to %s", onOff(*patch.UseDedicatedCompute)))
 	}
 	if patch.RuntimeVersion != 0 {
 		if label, _ := runtimeInfo(patch.RuntimeVersion); label != "" {
@@ -1329,8 +1336,10 @@ func createWorkflowRow(ctx context.Context, client *api.Client, f *folder, featu
 		// the literal "UTC" here. Empty for an unmanaged folder, where
 		// omitempty drops the key and the server stamps the organization
 		// default.
-		ReportingTimezone: declaredZoneForCreate(f.Manifest),
-		Language:          languageOnTheWire(f.Manifest),
+		ReportingTimezone:   declaredZoneForCreate(f.Manifest),
+		Language:            languageOnTheWire(f.Manifest),
+		Description:         derefOr(f.Manifest.Description, ""),
+		UseDedicatedCompute: derefOr(f.Manifest.UseDedicatedCompute, false),
 		// The address this folder claims, in the create's own transaction —
 		// nil (no key) for a folder with no id.
 		Managed: f.managedClaim(""),
@@ -1591,6 +1600,13 @@ func baselineDriftRefusal(f *folder, ask driftAsk, summary string) error {
 	if ask.apply {
 		how = fmt.Sprintf("`%s status` shows the detail; to overwrite it instead, run `%s push --force` in this folder, then apply again", f.Kind.Command, f.Kind.Command)
 	}
+	if ask.apply && planningProposal {
+		// push --force would deploy without the approval propose asks for.
+		how = fmt.Sprintf("`%s status` shows the detail. A change list never overwrites a change made in Ronja: pull rewrites this folder's files from the live version, so commit or copy your own edits first, then propose again", f.Kind.Command)
+		if ask.draft {
+			how = fmt.Sprintf("`%s status` shows the detail. A change list never overwrites it: copy what you want to keep from that draft into this folder, run `%s discard`, then propose again", f.Kind.Command, f.Kind.Command)
+		}
+	}
 	if len(ask.rebound) > 0 {
 		head = reboundRefusalHead(f, row, ask)
 	}
@@ -1801,6 +1817,12 @@ func metadataDriftOf(baseline *wfdir.InstanceState, target *api.Workflow, patch 
 			Remote:   describePipPackages(target.PipPackages),
 		})
 	}
+	if patch.Description != nil && baseline.Description != nil && target.Description != *baseline.Description {
+		out = append(out, metadataDrift{Field: "description", Baseline: *baseline.Description, Remote: target.Description})
+	}
+	if patch.UseDedicatedCompute != nil && baseline.UseDedicatedCompute != nil && target.UseDedicatedCompute != *baseline.UseDedicatedCompute {
+		out = append(out, metadataDrift{Field: "dedicated compute", Baseline: onOff(*baseline.UseDedicatedCompute), Remote: onOff(target.UseDedicatedCompute)})
+	}
 	if patch.ReportingTimezone != nil && baseline.ReportingTimezone != nil &&
 		target.ReportingTimezone != *baseline.ReportingTimezone {
 		out = append(out, metadataDrift{
@@ -1810,6 +1832,35 @@ func metadataDriftOf(baseline *wfdir.InstanceState, target *api.Workflow, patch 
 		})
 	}
 	return out
+}
+
+// workflowSettingsChanges names each setting patch changes on row, as a card
+// shows it.
+func workflowSettingsChanges(patch api.WorkflowPatch, row *api.Workflow) []string {
+	var out []string
+	if patch.Description != nil {
+		out = append(out, "description")
+	}
+	if patch.UseDedicatedCompute != nil {
+		out = append(out, fmt.Sprintf("dedicated compute: %s → %s", onOff(row.UseDedicatedCompute), onOff(*patch.UseDedicatedCompute)))
+	}
+	return out
+}
+
+// derefOr is *p, or zero for an unmanaged setting.
+func derefOr[T any](p *T, zero T) T {
+	if p == nil {
+		return zero
+	}
+	return *p
+}
+
+// onOff renders a setting the way a person reads it.
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 func describePipPackages(packages []string) string {

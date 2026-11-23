@@ -476,12 +476,12 @@ func (f *fakeInstance) probeRow(kind, id string) fakeRowFacts {
 	case "workflow":
 		if wf := f.workflows[id]; wf != nil {
 			return fakeRowFacts{Exists: true, FeatureID: wf.FeatureID, Root: wf.ParentWorkflowID == "", Name: wf.Title, Lifecycle: wf.Lifecycle,
-				Drafter: wf.DrafterUserID}
+				Drafter: wf.DrafterUserID, Head: fakeHead(id, len(f.versions[id]) > 0, func() string { return f.versions[id][0].ID })}
 		}
 	case "module":
 		if m := f.mod.rows[id]; m != nil {
 			return fakeRowFacts{Exists: true, FeatureID: m.FeatureID, Root: m.ParentModuleID == "", Name: m.Title, Lifecycle: m.Lifecycle,
-				Drafter: m.DrafterUserID}
+				Drafter: m.DrafterUserID, Head: fakeHead(id, len(f.mod.versions[id]) > 0, func() string { return f.mod.versions[id][0].ID })}
 		}
 	}
 	return fakeRowFacts{}
@@ -1112,16 +1112,18 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			ID:        id,
 			Lifecycle: api.LifecycleDraft,
 			// rworkflow.Add stamps the creator as the parentless draft's drafter.
-			DrafterUserID:     fakePrincipal,
-			Title:             in.Title,
-			RuntimeVersion:    in.RuntimeVersion,
-			Language:          in.Language,
-			Entrypoint:        entrypoint,
-			FeatureID:         in.FeatureID,
-			Parameters:        in.Parameters,
-			PipPackages:       wfdir.CleanPipPackages(in.PipPackages),
-			ReportingTimezone: zone,
-			Hidden:            true,
+			DrafterUserID:       fakePrincipal,
+			Title:               in.Title,
+			RuntimeVersion:      in.RuntimeVersion,
+			Language:            in.Language,
+			Entrypoint:          entrypoint,
+			FeatureID:           in.FeatureID,
+			Parameters:          in.Parameters,
+			PipPackages:         wfdir.CleanPipPackages(in.PipPackages),
+			ReportingTimezone:   zone,
+			Description:         in.Description,
+			UseDedicatedCompute: in.UseDedicatedCompute,
+			Hidden:              true,
 		}, api.WorkflowFile{
 			// Mirrors rworkflow.Add (store.go): the entrypoint file is SEEDED
 			// inside the create transaction, because the file-tree panel and
@@ -1328,6 +1330,12 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 		if patch.PipPackages != nil {
 			wf.PipPackages = wfdir.CleanPipPackages(*patch.PipPackages)
 		}
+		if patch.Description != nil {
+			wf.Description = *patch.Description
+		}
+		if patch.UseDedicatedCompute != nil {
+			wf.UseDedicatedCompute = *patch.UseDedicatedCompute
+		}
 		// Mirrors rworkflow.resolveDeclaredZonePatch: absent leaves the
 		// declaration alone, and an explicit "" is stored as the LITERAL "UTC"
 		// rather than as NULL — which is what keeps an empty column meaning
@@ -1440,6 +1448,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			// raises it there, and commit publishes the flip.
 			draft.RuntimeVersion = parent.RuntimeVersion
 			draft.PipPackages = append([]string{}, parent.PipPackages...)
+			draft.Description, draft.UseDedicatedCompute = parent.Description, parent.UseDedicatedCompute
 		}
 		f.writeRow(w, draft)
 		return true
@@ -1478,6 +1487,7 @@ func (f *fakeInstance) serveWrites(w http.ResponseWriter, r *http.Request) bool 
 			live.Parameters = draft.Parameters
 			live.ReportingTimezone = draft.ReportingTimezone
 			live.RuntimeVersion = draft.RuntimeVersion
+			live.Description, live.UseDedicatedCompute = draft.Description, draft.UseDedicatedCompute
 			// And every commit files a VERSION — even one changing nothing, which
 			// is the empty version an idempotent apply must never mint. Newest
 			// first, so the head moves to it: a fake whose head stood still on a

@@ -431,26 +431,37 @@ func runModulePushOnce(ctx context.Context, f *folder, opts modulePushOptions) (
 	// create" change would remove it without anything here looking wrong.
 	if existing.Module != nil && !patch.Empty() {
 		updated, err := client.UpdateModule(ctx, existing.Module.IdentityID(), patch)
-		if err != nil {
+		switch {
+		case api.WireCodeOf(err) == api.ComputerPublishRefusedCode:
+			// An agent computer's token: the live row is the person's to change.
+			// The proposed folder carries the manifest, and the approved deploy
+			// pushes it as the person, so the change waits rather than being lost.
+			result.MetadataDeferred = fmt.Sprintf(
+				"%s goes live with `ronja propose`: a computer cannot change a live module's metadata, so the person's approval applies it",
+				describeModulePatch(patch))
+			fmt.Fprintf(os.Stderr, "  Note: %s\n", result.MetadataDeferred)
+			patch = api.ModulePatch{}
+		case err != nil:
 			return stop(fmt.Errorf("update %s: %w", describeModulePatch(patch), err))
+		default:
+			// The identity row holds this now, and it is what the baseline recorded
+			// from here on describes — including the one stop() writes if the
+			// deletions below fail. Leaving it stale would record metadata the server
+			// stopped holding a request ago, and the next push would read its own
+			// change back as somebody else's.
+			//
+			// ⚠️ Mirrored onto `identity` ONLY. This request landed on the live row,
+			// and the draft's own copy of the name and title has not moved yet —
+			// step 6b is what moves it, and it mirrors its own patch onto `target`
+			// when the server accepts it. Mirroring here as well would claim a write
+			// that has not happened, and the baseline records both rows.
+			metadataLanded = true
+			applyModulePatch(identity, patch)
+			if updated != nil {
+				identity.Name, identity.Title = updated.Name, updated.Title
+			}
+			result.Metadata = describeModulePatch(patch)
 		}
-		// The identity row holds this now, and it is what the baseline recorded
-		// from here on describes — including the one stop() writes if the
-		// deletions below fail. Leaving it stale would record metadata the server
-		// stopped holding a request ago, and the next push would read its own
-		// change back as somebody else's.
-		//
-		// ⚠️ Mirrored onto `identity` ONLY. This request landed on the live row,
-		// and the draft's own copy of the name and title has not moved yet —
-		// step 6b is what moves it, and it mirrors its own patch onto `target`
-		// when the server accepts it. Mirroring here as well would claim a write
-		// that has not happened, and the baseline records both rows.
-		metadataLanded = true
-		applyModulePatch(identity, patch)
-		if updated != nil {
-			identity.Name, identity.Title = updated.Name, updated.Title
-		}
-		result.Metadata = describeModulePatch(patch)
 	}
 
 	// 6b. The DRAFT's own copy of the metadata, which is what the commit
