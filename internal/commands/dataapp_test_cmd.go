@@ -95,6 +95,7 @@ func newDataAppTestCmd() *cobra.Command {
 		timeout      time.Duration
 		outDir       string
 		failOnErrors bool
+		scratch      bool
 	)
 	cmd := &cobra.Command{
 		Use:   "test",
@@ -107,7 +108,17 @@ filmstrip, runtime errors with App.tsx:line:col frames, the queries the app ran
 and how many rows they returned, console errors, network failures, and a settle
 report saying why the harness stopped waiting.
 
+In a folder with no app yet, or with --scratch in one that has an app, it first
+sends the folder as it is on disk to Ronja as a TEST APP and renders that. No
+app is made and the folder's ronja.json is not touched: a test app is in no
+list, only you and admins can open it, and it is deleted a day after its last
+push (opening it does not count). Running it again in the same folder replaces
+the test app's files and keeps its link (.ronja/scratch.json remembers it). It
+reaches what the folder's access declares, as an app in your private area
+would. To keep the app, run "ronja app push" or "ronja propose".
+
   ronja app test
+  ronja app test --scratch              # this folder as a test app; its app and draft stay as they are
   ronja app test --route '#/orders' --viewport mobile
   ronja app test --viewport 1280x2400   # a tall frame, to see below the fold
   ronja app test --out-dir ./preview    # anywhere you like, this folder included
@@ -160,13 +171,20 @@ against the FIRST element in document order, so "Orders" can hit a heading
 before the tab you meant. Prefer an id ("#orders-tab"),
 "role=tab[name=\"Orders\"]", or the exact form "text=\"Orders\"".
 
-⚠️ --steps REQUIRES AN ADMINISTRATOR and EXECUTES FOR REAL, with the same
-authority a viewer of this app has. A click runs the app's own code: it can
-dispatch workflows and agents, upload files and call external systems. Nothing
-is mocked and nothing is rolled back.
+⚠️ --steps REQUIRES AN ADMINISTRATOR, except on your own test app (a folder
+with no app, or --scratch) when you are signed in with a token that can write
+apps. Steps EXECUTE FOR REAL, with the same authority a viewer of this app
+has. A click runs the app's own code: it can dispatch workflows and agents,
+upload files and call external systems. Nothing is mocked, nothing is rolled
+back, and nobody watches the run. On a test app a click reaches only what its
+own code already does when it opens. The screenshots, with any text a step
+typed, are kept a year: test with values you would not mind keeping. A run
+already under way can go on for a couple of minutes after the test app
+expires.
 
 With --json, the server's envelope plus the paths written, on stdout; every
-note and warning goes to stderr either way.`,
+note and warning goes to stderr either way. A test app adds
+scratch: {id, url, expiresAt}.`,
 		Args: folderNoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runAppTest(cmd.Context(), appTestOptions{
@@ -177,13 +195,14 @@ note and warning goes to stderr either way.`,
 				TimeoutChosen: cmd.Flags().Changed("timeout"),
 				OutDir:        outDir,
 				FailOnErrors:  failOnErrors,
+				Scratch:       scratch,
 			})
 		},
 	}
 	cmd.Flags().StringVar(&route, "route", "",
 		"in-app hash route to open, e.g. '#/orders' (default: the app's own default route)")
 	cmd.Flags().StringVar(&stepsFile, "steps", "",
-		"JSON file holding an interaction plan to run after the render: a steps array, or {\"steps\": [...]} (admin only; the steps really execute)")
+		"JSON file holding an interaction plan to run after the render: a steps array, or {\"steps\": [...]} (an administrator, or your own test app; the steps really execute)")
 	cmd.Flags().StringVar(&viewport, "viewport", viewportDesktop,
 		"render size: desktop, mobile, or WxH (each side 240-2560), e.g. 1280x2400")
 	durationFlag(cmd, &timeout, "timeout", 20*time.Second,
@@ -192,6 +211,8 @@ note and warning goes to stderr either way.`,
 		"directory to write report.json and the screenshots into (default: .ronja/test inside the app folder, which is never synced)")
 	cmd.Flags().BoolVar(&failOnErrors, "fail-on-errors", false,
 		"exit non-zero when the render reported runtime errors or the bundle did not build")
+	cmd.Flags().BoolVar(&scratch, "scratch", false,
+		"render this folder as a test app, leaving its app and draft as they are (a folder with no app always does)")
 	return cmd
 }
 
@@ -205,6 +226,8 @@ type appTestOptions struct {
 	TimeoutChosen bool
 	OutDir        string
 	FailOnErrors  bool
+	// Scratch sends the folder as a test app even where it has an app.
+	Scratch bool
 }
 
 // appTestResult is the --json surface.
@@ -216,6 +239,7 @@ type appTestOptions struct {
 // would leave a reader unable to tell which half came from where.
 type appTestResult struct {
 	DataAppID string          `json:"dataAppID"`
+	Scratch   *appTestScratch `json:"scratch,omitempty"`
 	OutDir    string          `json:"outDir"`
 	Files     []appTestFile   `json:"files"`
 	Preview   json.RawMessage `json:"preview"`
@@ -269,30 +293,39 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 	// renders exactly the row it is named (a draft is its own address; nothing
 	// substitutes the caller's draft for a live id), so rendering the open draft
 	// means naming it. inspectAppTarget reads the binding's row AND the caller's
-	// draft, and appTarget.Row picks the draft when there is one. An unbound
-	// folder, a deleted app and an unworkable lifecycle each still get their own
-	// message instead of a bare 404.
-	target, err := inspectAppTarget(ctx, client, f)
-	if err != nil {
-		return err
+	// draft, and appTarget.Row picks the draft when there is one. A deleted app
+	// and an unworkable lifecycle each still get their own message instead of a
+	// bare 404; a folder with no app here is sent as a test app.
+	var target appTarget
+	if !opts.Scratch {
+		if target, err = inspectAppTarget(ctx, client, f); err != nil {
+			return err
+		}
 	}
+	var scratch *api.ScratchApp
+	rowID := ""
 	if target.App == nil {
-		return fmt.Errorf("nothing to test — this folder has no data app on %s yet.\n  Run `ronja app push` first: it creates the app and the draft this would render",
-			resolved.URL)
-	}
-	// A dirty folder is a WARNING, not a refusal, for the same reason it is on
-	// `app validate`: rendering the draft as it stands is a reasonable thing to
-	// want, but it is also the only way to look at a picture of code you are not
-	// looking at.
-	if err := warnIfAppDirty(f); err != nil {
-		return err
-	}
-	// The WRITE GATE over the access of the row about to be rendered: a render
-	// runs with the row's grants, and with --steps its clicks write for real,
-	// so — as `wf test` is gated on the draft it runs — a codex the access
-	// grants outside the stack's feature is refused before anything renders.
-	if err := gateAppAccess(ctx, client, f, target.FilesRow().DataAppAccess); err != nil {
-		return err
+		if scratch, err = pushScratchApp(ctx, client, f); err != nil {
+			return err
+		}
+		rowID = scratch.ID
+	} else {
+		// A dirty folder is a WARNING, not a refusal, for the same reason it is
+		// on `app validate`: rendering the draft as it stands is a reasonable
+		// thing to want, but it is also the only way to look at a picture of
+		// code you are not looking at.
+		if err := warnIfAppDirty(f); err != nil {
+			return err
+		}
+		// The WRITE GATE over the access of the row about to be rendered: a
+		// render runs with the row's grants, and with --steps its clicks write
+		// for real, so — as `wf test` is gated on the draft it runs — a codex
+		// the access grants outside the stack's feature is refused before
+		// anything renders.
+		if err := gateAppAccess(ctx, client, f, target.FilesRow().DataAppAccess); err != nil {
+			return err
+		}
+		rowID = target.FilesRow().ID
 	}
 
 	req := api.PreviewRequest{
@@ -302,7 +335,7 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 		TimeoutMs:      int(timeout / time.Millisecond),
 		Steps:          steps,
 	}
-	outcome, err := previewWithOneRetry(ctx, client, target.FilesRow().ID, req)
+	outcome, err := previewWithOneRetry(ctx, client, rowID, req)
 	if err != nil {
 		return err
 	}
@@ -310,7 +343,7 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 
 	// Said off the server's answer rather than off our own choice: the id it
 	// reports is the only authority on what these pixels are a picture of.
-	if result.DataAppID != "" && result.DataAppID != target.App.ID {
+	if target.App != nil && result.DataAppID != "" && result.DataAppID != target.App.ID {
 		fmt.Fprintf(os.Stderr, "  Rendered your own draft %s of %s.\n", result.DataAppID, target.App.ID)
 	}
 
@@ -321,6 +354,7 @@ func runAppTest(ctx context.Context, opts appTestOptions) error {
 
 	report := &appTestResult{
 		DataAppID: result.DataAppID,
+		Scratch:   scratchResult(scratch),
 		OutDir:    out.Path,
 		Files:     files,
 		Preview:   json.RawMessage(outcome.Raw),

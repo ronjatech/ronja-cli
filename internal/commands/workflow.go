@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/config"
@@ -1471,7 +1472,9 @@ const maxFileBytes = 1 << 20
 //     rather than left to the filesystem to notice.
 //   - Files over maxFileBytes, or containing NUL bytes. `content` is a text
 //     column; binary content is either rejected with an opaque encoding error
-//     or stored as something nobody can read back.
+//     or stored as something nobody can read back. A data app's file must
+//     also be UTF-8: the wire replaces what is not, so the app would differ
+//     from its folder, and from the draft a change list showed of it.
 //
 // The KIND is a parameter for the message alone, and only because the message
 // was wrong: this runs for all three folder loops, and a data app refused for
@@ -1514,6 +1517,8 @@ func checkPushable(files map[string]string, kind wfdir.Kind, maxBytes int) error
 			rejected = append(rejected, fmt.Sprintf("%s (%d bytes, limit %d)", path, len(content), maxBytes))
 		case strings.ContainsRune(content, 0):
 			rejected = append(rejected, path+" (binary content: contains null bytes)")
+		case kind.Name == wfdir.KindDataApp && !utf8.ValidString(content):
+			rejected = append(rejected, path+" (not UTF-8 text)")
 		default:
 			continue
 		}

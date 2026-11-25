@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ronjatech/ronja-cli/internal/api"
 	"github.com/ronjatech/ronja-cli/internal/dbdir"
@@ -40,13 +41,104 @@ type fakeChangeLists struct {
 	spaces map[string]string
 	// migrationPaths is each migrations request's path as it was sent.
 	migrationPaths []string
+	// olderServer answers as a Ronja that predates drafts: it ignores the
+	// previews part and links no draft.
+	olderServer bool
+	// draftRefused, when set, is why every app has no draft, in place of its
+	// link.
+	draftRefused string
+	// list is changelist-1 as the server holds it once proposed: its status,
+	// its keys, what was written and the next step, as the describe, send and
+	// reject routes answer it.
+	list *fakeList
+	// rejectRefusal, when set, is the error body the reject route answers.
+	rejectRefusal string
+	// dropped is the droppedNotes the next unsent proposal answers.
+	dropped []string
+}
+
+type fakeList struct {
+	status       string
+	changes      []map[string]any
+	title, descr string
+	notes        map[string]string
+	sent         bool
 }
 
 type fakeProposal struct {
-	archive   []byte
+	archive []byte
+	// previews is the previews part, decoded; nil when none was sent.
+	previews  *appPreviews
 	plan      json.RawMessage
 	serverURL string
 	stack     string
+	unsent    bool
+}
+
+const fakeListURL = "https://app.example.com/change-lists/changelist-1?org=" + testTenantID
+
+// fakeChanges keys a plan's rows roughly as rchangelist does: each unit that
+// changes by its file's or folder's name, each migrated database by its id.
+func fakeChanges(plan json.RawMessage) []map[string]any {
+	var p struct {
+		Folders []struct {
+			Path, Kind string
+			Units      []struct{ Path, Action string }
+		}
+		Databases []struct {
+			DatabaseID string
+			Migrations []json.RawMessage
+		}
+	}
+	_ = json.Unmarshal(plan, &p)
+	out := []map[string]any{}
+	for _, f := range p.Folders {
+		for _, u := range f.Units {
+			if u.Action == "unchanged" {
+				continue
+			}
+			name := filepath.Base(f.Path)
+			if u.Path != "" {
+				name = strings.TrimSuffix(filepath.Base(u.Path), filepath.Ext(u.Path))
+			}
+			out = append(out, map[string]any{"key": name, "kind": f.Kind, "action": u.Action, "title": name, "note": ""})
+		}
+	}
+	for _, d := range p.Databases {
+		if len(d.Migrations) > 0 {
+			out = append(out, map[string]any{"key": d.DatabaseID, "kind": "database", "action": "migrate", "title": d.DatabaseID, "note": ""})
+		}
+	}
+	return out
+}
+
+// view is the list's answer as the server words it. computer answers as on a
+// chat's computer, whose next step is requestPublish.
+func (l *fakeList) view(computer bool) map[string]any {
+	notes := map[string]string{}
+	for _, c := range l.changes {
+		key := c["key"].(string)
+		notes[key] = l.notes[key]
+		c["note"] = l.notes[key]
+	}
+	next := ""
+	switch {
+	case l.status == "unsent" && (l.title == "" || l.descr == ""):
+		next = "ronja propose describe changelist-1"
+	case l.status == "unsent" && computer:
+		next = "call requestPublish with changelist-1"
+	case l.status == "unsent":
+		next = "ronja propose send changelist-1"
+	case l.status == "pending":
+		next = "ronja propose wait changelist-1"
+	}
+	var sentAt any
+	if l.sent {
+		sentAt = time.Date(2026, 11, 24, 9, 30, 0, 0, time.UTC).Format(time.RFC3339)
+	}
+	return map[string]any{"id": "changelist-1", "status": l.status, "url": fakeListURL, "changes": l.changes,
+		"expiresAt": time.Date(2026, 11, 25, 9, 30, 0, 0, time.UTC).Format(time.RFC3339), "sentAt": sentAt,
+		"skeleton": map[string]any{"title": l.title, "description": l.descr, "notes": notes}, "next": next}
 }
 
 func newFakeChangeLists() *fakeChangeLists {
@@ -72,12 +164,102 @@ func (c *fakeChangeLists) serve(w http.ResponseWriter, r *http.Request) bool {
 		}
 		archive, _ := io.ReadAll(file)
 		p := fakeProposal{archive: archive, plan: json.RawMessage(r.FormValue("plan")),
-			serverURL: r.FormValue("server_url"), stack: r.FormValue("stack")}
+			serverURL: r.FormValue("server_url"), stack: r.FormValue("stack"), unsent: r.FormValue("unsent") == "true"}
+		drafts := []map[string]string{}
+		if part, _, err := r.FormFile("previews"); err == nil && !c.olderServer {
+			gz, err := gzip.NewReader(part)
+			if err == nil {
+				p.previews = &appPreviews{}
+				err = json.NewDecoder(gz).Decode(p.previews)
+			}
+			if err != nil {
+				http.Error(w, `{"error":"the previews are not gzipped JSON"}`, http.StatusBadRequest)
+				return true
+			}
+			for _, app := range p.previews.Apps {
+				draft := map[string]string{"folderID": app.FolderID, "title": app.Title,
+					"url": "https://app.example.com/change-lists/changelist-1/draft/" + app.FolderID + "?org=" + testTenantID}
+				if c.draftRefused != "" {
+					draft = map[string]string{"folderID": app.FolderID, "title": app.Title, "refused": c.draftRefused}
+				}
+				drafts = append(drafts, draft)
+			}
+		}
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.proposals = append(c.proposals, p)
-		c.mu.Unlock()
-		writeJSON(w, map[string]any{"id": "changelist-1", "status": "pending",
-			"url": "https://app.example.com/change-lists/changelist-1?org=" + testTenantID})
+		if c.olderServer || !p.unsent {
+			writeJSON(w, map[string]any{"id": "changelist-1", "status": "pending", "url": fakeListURL, "drafts": drafts})
+			return true
+		}
+		c.list = &fakeList{status: "unsent", changes: fakeChanges(p.plan)}
+		answer := c.list.view(false)
+		answer["drafts"], answer["droppedNotes"] = drafts, c.dropped
+		writeJSON(w, answer)
+		return true
+	case strings.HasPrefix(r.URL.Path, "/api/v2/change-list/changelist-1"):
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.list == nil {
+			writeJSONStatus(w, http.StatusNotFound, map[string]any{"error": "change list not found"})
+			return true
+		}
+		switch strings.TrimPrefix(r.URL.Path, "/api/v2/change-list/changelist-1") {
+		case "":
+			writeJSON(w, c.list.view(false))
+		case "/description":
+			var in struct {
+				Title, Description *string
+				Notes              map[string]string
+			}
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+				writeJSONStatus(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return true
+			}
+			if c.list.status != "unsent" {
+				writeJSONStatus(w, http.StatusConflict, map[string]any{"error": "this change list was sent, so it can no longer be described: propose again to change it"})
+				return true
+			}
+			for key := range in.Notes {
+				if !slices.ContainsFunc(c.list.changes, func(ch map[string]any) bool { return ch["key"] == key }) {
+					writeJSONStatus(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("this change list has no change called %q, so nothing was saved", key)})
+					return true
+				}
+			}
+			if in.Title != nil {
+				c.list.title = *in.Title
+			}
+			if in.Description != nil {
+				c.list.descr = *in.Description
+			}
+			for key, note := range in.Notes {
+				if c.list.notes == nil {
+					c.list.notes = map[string]string{}
+				}
+				c.list.notes[key] = note
+			}
+			writeJSON(w, c.list.view(false))
+		case "/send":
+			if c.list.title == "" || c.list.descr == "" {
+				writeJSONStatus(w, http.StatusBadRequest, map[string]any{"error": "change list changelist-1 has no title or no description yet, so it was not sent. " +
+					"Print it with `ronja propose describe changelist-1`, write the title, the description and a note per change to `.change.json`, " +
+					"save it with `ronja propose describe changelist-1 .change.json`, then send it."})
+				return true
+			}
+			c.list.status, c.list.sent = "pending", true
+			writeJSON(w, c.list.view(false))
+		case "/reject":
+			if c.rejectRefusal != "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(c.rejectRefusal))
+				return true
+			}
+			c.list.status = "rejected"
+			writeJSON(w, c.list.view(false))
+		default:
+			return false
+		}
 		return true
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v2/database/") && !strings.Contains(strings.TrimPrefix(r.URL.Path, "/api/v2/database/"), "/"):
 		id := strings.TrimPrefix(r.URL.Path, "/api/v2/database/")
@@ -206,7 +388,7 @@ func TestProposeSendsOnlyReadsAndTheUpload(t *testing.T) {
 
 	var report proposeReport
 	decodeJSONInto(t, out, &report)
-	if report.ID != "changelist-1" || report.Status != "pending" || !strings.Contains(report.URL, "/change-lists/changelist-1") {
+	if report.ID != "changelist-1" || report.Status != changeListUnsent || !strings.Contains(report.URL, "/change-lists/changelist-1") {
 		t.Fatalf("report = %+v", report)
 	}
 	if report.Approver != "dev@example.com" {
@@ -513,22 +695,22 @@ func TestProposePacksOnlyWhatThePushReads(t *testing.T) {
 	}
 }
 
-// Planning may send the workflow validate and a database's migrations route,
-// which propose reaches only as a dry run, and no other write.
-func TestProposeReadAllowAdmitsOnlyThePlanningWrites(t *testing.T) {
+// Planning may send the workflow validate and no other write: a migration
+// status passes the guard by api.MigrationStatus's own mark, never by path.
+func TestDryRunReadAllowAdmitsOnlyThePlanningWrites(t *testing.T) {
 	for _, c := range []struct {
 		method, path string
 		want         bool
 	}{
 		{"POST", "workflow/validate", true},
-		{"POST", "database/mdb-1/migrations", true},
+		{"POST", "database/mdb-1/migrations", false},
 		{"PUT", "database/mdb-1/migrations", false},
 		{"POST", "database/mdb-1/migrations/x", false},
 		{"POST", "database//migrations", false},
 		{"POST", "workflow/wf-1/commit", false},
 		{"POST", "change-list", false},
 	} {
-		if got := proposeReadAllow(c.method, c.path); got != c.want {
+		if got := dryRunReadAllow(c.method, c.path); got != c.want {
 			t.Errorf("%s %s: %v, want %v", c.method, c.path, got, c.want)
 		}
 	}

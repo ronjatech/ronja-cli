@@ -21,6 +21,7 @@ func newProposeCmd() *cobra.Command {
 	var (
 		noBrowser bool
 		database  string
+		describe  string
 	)
 	cmd := &cobra.Command{
 		Use:   "propose [dir]",
@@ -29,9 +30,11 @@ func newProposeCmd() *cobra.Command {
 
   ronja propose            # in the app folder, or the tree, to deploy
 
-propose deploys nothing itself: it uploads a change list, and nothing is
-deployed until that person approves it in Ronja. Pass a directory to propose
-another one (` + "`ronja propose apps/`" + `).
+propose deploys nothing itself: it uploads a change list, unsent, and
+nothing is deployed until that person approves it in Ronja. You describe it,
+then send it (below). Pass a directory to propose another one
+(` + "`ronja propose apps/`" + `); a folder named like a subcommand (wait,
+describe, send, discard) as ` + "`ronja propose ./send`" + `.
 
 The first propose of a lone folder Ronja keeps no state for, whose ronja.json
 names its feature here (as ` + "`ronja app init`" + ` and ` + "`ronja app clone`" + ` write it),
@@ -64,8 +67,8 @@ It proposes the stack in ronja.json that points at the Ronja this credential
 signs in to; --stack <name> picks one when several do.
 
 "The person you work for" is the person whose token this is. They get a
-notification and open the link this prints; their Approve runs the deploy in
-Ronja, as them, on exactly the copy uploaded here.
+notification once you send the list, and open its link; their Approve runs the
+deploy in Ronja, as them, on exactly the copy uploaded here.
 
 What it does:
 
@@ -75,11 +78,31 @@ What it does:
      ` + "`ronja db migrate status`" + ` does. It sends only reads.
   2. Uploads that plan and a copy of the directory: every file sync reads
      there, ronja.json and ronja.lock.json included. Nothing under a dot-name
-     (.ronja/, .env, .git) and no credential is ever in the copy.
-  3. Prints what would be created and modified, the link to approve it, and
-     the ` + "`ronja propose wait <id>`" + ` that hears the outcome.
+     (.ronja/, .env, .git) and no credential is ever in the copy. With it go
+     the apps it creates or changes as the deploy will write them, so the
+     person can open each app's draft before approving; the deploy stops
+     before writing if what it would write differs from the draft.
+  3. Prints what would be created and modified, the link to approve it, each
+     change under the key its note is written with, one
+     ` + "`Draft <app>: <link>`" + ` line per app (the app as it will look once the list
+     deploys; --json: drafts), or why it has none, and the next step.
 
-After proposing, hand the person the link, then run
+Then describe it and send it. Nobody is told of the list until it is sent:
+
+  ronja propose describe <id> > .change.json  # every key, "" where nothing is written
+  ronja propose describe <id> .change.json    # once you wrote the title, the description and a note per change
+  ronja propose send <id>                     # tells the person, and opens the link on a terminal
+
+Write them for the person approving it, who may not read code: what it does
+for them and why. --describe <file> saves a description in the propose itself.
+On a chat's computer, call requestPublish instead of send: it sends the list.
+Proposing the same folders again replaces the open list, sent or not, with a
+new unsent one; its title, its description and each note whose change is still
+in it carry over, and propose names each note it drops.
+` + "`ronja propose discard <id>`" + ` ends a list you no longer mean to send.
+--json carries status, the skeleton and next.
+
+Once it is sent, run
 ` + "`ronja propose wait <id>`" + ` in the background: it ends when the list does, which
 wakes you with what happened, and you carry on. Pass no --timeout there: one
 only wakes you early to start it again. Without background commands,
@@ -140,6 +163,13 @@ migrations/, not from a repository root holding folders that are not adopted.`,
 					return err
 				}
 			}
+			var description json.RawMessage
+			if describe != "" {
+				var err error
+				if description, err = readChangeListDescription(describe, cmd.InOrStdin()); err != nil {
+					return err
+				}
+			}
 			resolved, err := resolveInstance()
 			if err != nil {
 				return err
@@ -148,14 +178,18 @@ migrations/, not from a repository root holding folders that are not adopted.`,
 			if err != nil {
 				return err
 			}
+			describeErr := describeProposed(cmd.Context(), api.New(resolved.URL, resolved.Token), report, describe, description)
 			if flagJSON {
-				return emitJSON(report)
+				if err := emitJSON(report); err != nil {
+					return err
+				}
+				return describeErr
 			}
 			printPropose(report)
-			if report.URL != "" && !noBrowser && isTerminal(os.Stdout) {
+			if report.Status == changeListPending && report.URL != "" && !noBrowser && isTerminal(os.Stdout) {
 				_ = openBrowser(report.URL)
 			}
-			return nil
+			return describeErr
 		},
 	}
 	cmd.Flags().StringVar(&flagStack, "stack", "",
@@ -165,7 +199,9 @@ migrations/, not from a repository root holding folders that are not adopted.`,
 	cmd.Flags().BoolVar(&flagTakeOver, "take-over", false,
 		"continue a row another folder holds: release that folder's claim and claim the row for this one (a lone app, workflow or module folder based on the live version, never a git repository's)")
 	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "print the link without opening it")
-	cmd.AddCommand(newProposeWaitCmd())
+	cmd.Flags().StringVar(&describe, "describe", "",
+		"save this description (a file `ronja propose describe` printed and you filled in, or - for stdin) on the new list in the same call")
+	cmd.AddCommand(newProposeWaitCmd(), newProposeDescribeCmd(), newProposeSendCmd(), newProposeDiscardCmd())
 	return cmd
 }
 
@@ -189,7 +225,18 @@ type proposeReport struct {
 	// did nothing.
 	Setup  *proposeSetup `json:"setup,omitempty"`
 	Counts proposeCounts `json:"counts"`
-	Notes  []string      `json:"notes,omitempty"`
+	// Drafts link each app Ronja stored a draft for: the app as it will look
+	// once the list deploys.
+	Drafts []api.ChangeListDraft `json:"drafts,omitempty"`
+	Notes  []string              `json:"notes,omitempty"`
+	// Title, Changes and Skeleton are the list as the server tells it, and
+	// DroppedNotes the replaced list's notes it did not carry over.
+	Title        string                  `json:"title,omitempty"`
+	Changes      []api.ChangeListChange  `json:"changes,omitempty"`
+	Skeleton     *api.ChangeListSkeleton `json:"skeleton,omitempty"`
+	DroppedNotes []string                `json:"droppedNotes,omitempty"`
+	// Next is the step to take next, as the server words it.
+	Next string `json:"next,omitempty"`
 }
 
 type proposeCounts struct {
@@ -305,12 +352,16 @@ func runPropose(ctx context.Context, dir, database string, resolved *config.Reso
 	if err != nil {
 		return nil, err
 	}
+	previews, err := proposedPreviews(plan.Folders)
+	if err != nil {
+		return nil, err
+	}
 	me, err := client.Me(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("ask %s who approves this: %w", resolved.URL, err)
 	}
 	list, err := client.ProposeChangeList(ctx, api.ChangeListProposal{
-		Archive: archive, Plan: planJSON, ServerURL: resolved.URL, Stack: flagStack,
+		Archive: archive, Previews: previews, Plan: planJSON, ServerURL: resolved.URL, Stack: flagStack, Unsent: true,
 	})
 	if err != nil {
 		switch api.StatusOf(err) {
@@ -321,7 +372,8 @@ func runPropose(ctx context.Context, dir, database string, resolved *config.Reso
 		}
 		return nil, fmt.Errorf("propose the change list: %w", err)
 	}
-	report.Status, report.ID, report.URL = list.Status, list.ID, list.URL
+	report.Status, report.ID, report.URL, report.Drafts = list.Status, list.ID, list.URL, list.Drafts
+	report.Title, report.Changes, report.Skeleton, report.DroppedNotes, report.Next = list.Title, list.Changes, list.Skeleton, list.DroppedNotes, list.Next
 	if !list.ExpiresAt.IsZero() {
 		report.ExpiresAt = &list.ExpiresAt
 	}
@@ -413,19 +465,12 @@ func adoptStackName(m *wfdir.Manifest) string {
 // before proposing again rather than a command that deploys directly.
 var planningProposal bool
 
-// proposeReadAllow admits the non-GETs planning sends, which save nothing:
-// the workflow validate, and a database's migrations route, which propose
-// reaches only through api.MigrationStatus (always a dry run).
-func proposeReadAllow(method, path string) bool {
-	if method != "POST" {
-		return false
-	}
-	if path == "workflow/validate" {
-		return true
-	}
-	id, ok := strings.CutPrefix(path, "database/")
-	id, ok2 := strings.CutSuffix(id, "/migrations")
-	return ok && ok2 && id != "" && !strings.Contains(id, "/")
+// dryRunReadAllow admits the one other non-GET planning sends, the workflow
+// validate, which saves nothing; the guard itself admits a migration status
+// (api.MigrationStatus). Every `sync apply --dry-run` and propose plan under
+// it.
+func dryRunReadAllow(method, path string) bool {
+	return method == "POST" && path == "workflow/validate"
 }
 
 // proposeGuardError is the refusal of a write planning tried to send, which
@@ -445,7 +490,7 @@ func planProposedFolders(ctx context.Context, base string, resolved *config.Reso
 	flagSyncDryRun, flagSyncAllowCreate, planningProposal = true, true, true
 	defer func() { flagSyncDryRun, flagSyncAllowCreate, planningProposal = savedDryRun, savedAllowCreate, false }()
 
-	guard := &api.ReadOnlyGuard{Allow: proposeReadAllow}
+	guard := &api.ReadOnlyGuard{Allow: dryRunReadAllow}
 	gctx := withAddressCopyRoot(api.WithReadOnlyGuard(ctx, guard))
 	report, err := syncApplyTree(gctx, base, resolved)
 	if err := proposeGuardError(guard, err); err != nil {
@@ -605,7 +650,7 @@ func planProposedMigrations(ctx context.Context, client *api.Client, resolved *c
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", rel, err)
 		}
-		guard := &api.ReadOnlyGuard{Allow: proposeReadAllow}
+		guard := &api.ReadOnlyGuard{Allow: dryRunReadAllow}
 		gctx := api.WithReadOnlyGuard(ctx, guard)
 		if err := proposeGuardError(guard, checkDatabaseSpace(gctx, client, resolved, key, dir, databaseID, "proposed", false)); err != nil {
 			return nil, err
@@ -697,10 +742,34 @@ func printPropose(r *proposeReport) {
 		fmt.Fprintln(out, "Nothing to propose: Ronja already holds everything in this directory.")
 		return
 	}
-	fmt.Fprintf(out, "Proposed change list %s: %s.\n", r.ID, r.Counts)
+	unsent := r.Status == changeListUnsent
+	if unsent {
+		fmt.Fprintf(out, "Proposed change list %s: %s. Not sent yet: nobody has been notified.\n", r.ID, r.Counts)
+	} else {
+		fmt.Fprintf(out, "Proposed change list %s: %s.\n", r.ID, r.Counts)
+	}
 	if r.URL != "" {
 		fmt.Fprintf(out, "  %s\n", r.URL)
 	}
-	fmt.Fprintf(out, "Nothing changes until %s approves it in Ronja.\n", r.Approver)
-	fmt.Fprintf(out, "To continue once it is decided, run: ronja propose wait %s   (agents: in the background)\n", r.ID)
+	if unsent {
+		printChanges(out, r.Changes)
+	}
+	for _, d := range r.Drafts {
+		switch {
+		case d.URL != "":
+			fmt.Fprintf(out, "  Draft %s: %s\n", terminalSafe(d.Title), d.URL)
+		case d.Refused != "":
+			fmt.Fprintf(out, "  Draft %s: none, because %s\n", terminalSafe(d.Title), d.Refused)
+		}
+	}
+	if !unsent {
+		fmt.Fprintf(out, "Nothing changes until %s approves it in Ronja.\n", r.Approver)
+		fmt.Fprintln(out, "This Ronja takes no description: it sent the list as proposed.")
+		fmt.Fprintf(out, "To continue once it is decided, run: %s   (agents: in the background)\n", carryCredential("ronja propose wait "+r.ID))
+		return
+	}
+	if len(r.DroppedNotes) > 0 {
+		fmt.Fprintf(out, "Notes dropped, since their change is no longer in this list: %s\n", terminalSafe(strings.Join(r.DroppedNotes, ", ")))
+	}
+	printNextStep(out, r.ID, r.Skeleton, r.Next)
 }

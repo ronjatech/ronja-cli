@@ -135,9 +135,10 @@ func (c *Client) ApplyMigrations(ctx context.Context, databaseID string, in Migr
 }
 
 // MigrationStatus asks what an apply of the set would do, applying nothing:
-// ApplyMigrations with DryRun, always.
+// ApplyMigrations with DryRun, always, and so the one migrations request a
+// ReadOnlyGuard lets through.
 func (c *Client) MigrationStatus(ctx context.Context, databaseID string, migrations []Migration, timeout time.Duration) (*MigrationSetResult, error) {
-	return c.ApplyMigrations(ctx, databaseID, MigrationSetInput{Migrations: migrations, DryRun: true}, timeout)
+	return c.ApplyMigrations(withPlanningRead(ctx), databaseID, MigrationSetInput{Migrations: migrations, DryRun: true}, timeout)
 }
 
 // DatabaseConnection mirrors only the GET :id/roles fields the CLI uses; the

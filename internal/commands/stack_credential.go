@@ -63,6 +63,9 @@ func resolveStackCredential(tree string, deploy, yes bool) (*config.Resolved, er
 		return nil, err
 	}
 	fmt.Fprintf(os.Stderr, "  Using profile %q, not %q: it is the one stored for stack %q's organization. Pass --profile to use another.\n", other, current, flagStack)
+	// As if typed, so each step this run prints (carryCredential) reaches the
+	// same organization: the step names no --stack to switch again.
+	flagProfile = other
 	return resolved, nil
 }
 

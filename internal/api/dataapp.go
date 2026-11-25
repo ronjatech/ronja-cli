@@ -137,6 +137,14 @@ type DataApp struct {
 	// single-row GET carries it; nil on every other route, on a row no
 	// repository manages, and on an instance older than the field.
 	ManagedBy *ManagedBy `json:"managedBy,omitempty"`
+	// Scratch is present only on a test app, which `ronja app test` makes and
+	// no folder can hold.
+	Scratch *DataAppScratch `json:"scratch,omitempty"`
+}
+
+// DataAppScratch is a test app's own part of its row.
+type DataAppScratch struct {
+	ExpiresAt time.Time `json:"expiresAt"`
 }
 
 // DataAppAccess is a data app's capability surface: what its bundle may reach.

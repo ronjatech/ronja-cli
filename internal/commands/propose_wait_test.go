@@ -534,17 +534,29 @@ func TestProposeWaitReadErrors(t *testing.T) {
 	})
 }
 
-// propose still takes a directory beside its wait subcommand.
+// propose still takes a directory beside its subcommands, and each bare
+// subcommand names the ./ form that proposes a folder of its name.
 func TestProposeStillTakesADirectory(t *testing.T) {
 	newFakeWaitedList(t, waitedList("pending", nil))
 	_, err := runCLI(t, t.TempDir(), "propose", "--no-browser", "no-such-dir")
 	if err == nil || strings.Contains(err.Error(), "unknown command") || !strings.Contains(err.Error(), "no-such-dir") {
 		t.Fatalf("propose no-such-dir: %v, want propose's own refusal naming the directory", err)
 	}
+	for _, verb := range []string{"wait", "describe", "send", "discard"} {
+		_, err := runCLI(t, t.TempDir(), "propose", verb)
+		if err == nil || !strings.Contains(err.Error(), "run: ronja propose ./"+verb) {
+			t.Errorf("propose %s with no id: %v, want it to name ronja propose ./%s", verb, err, verb)
+		}
+		_, err = runCLI(t, t.TempDir(), "propose", "--no-browser", "./"+verb)
+		if err == nil || strings.Contains(err.Error(), "change list's id") || !strings.Contains(err.Error(), verb) {
+			t.Errorf("propose ./%s: %v, want propose's own refusal naming the directory", verb, err)
+		}
+	}
 }
 
-// The negative control: propose prints the wait and returns at once, never
-// reading the list it just uploaded.
+// The negative control: propose prints its next step and returns at once,
+// never reading the list it just uploaded. An older Ronja's list is sent at
+// once, so its next step is the wait.
 func TestProposePrintsWaitAndDoesNotWait(t *testing.T) {
 	f, dir := proposeFixture(t)
 	start := time.Now()
@@ -555,7 +567,12 @@ func TestProposePrintsWaitAndDoesNotWait(t *testing.T) {
 	if took := time.Since(start); took > 30*time.Second {
 		t.Errorf("propose took %s", took)
 	}
-	wantAll(t, "propose", out, "Nothing changes until", "To continue once it is decided, run: ronja propose wait changelist-1")
+	wantAll(t, "propose", out, "ronja propose describe changelist-1 .change.json")
+	f.changeLists.olderServer = true
+	if out, err = runPropose_(t, dir, "--stack", "dev"); err != nil {
+		t.Fatalf("propose to an older Ronja: %v\n%s", err, out)
+	}
+	wantAll(t, "propose to an older Ronja", out, "Nothing changes until", "To continue once it is decided, run: ronja propose wait changelist-1")
 	f.mu.Lock()
 	requests := slices.Clone(f.requests)
 	f.mu.Unlock()

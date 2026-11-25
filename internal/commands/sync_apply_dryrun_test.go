@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ronjatech/ronja-cli/internal/api"
+	"github.com/ronjatech/ronja-cli/internal/config"
 	"github.com/ronjatech/ronja-cli/internal/wfdir"
 )
 
@@ -469,4 +472,78 @@ func countRequests(requests []string, want string) int {
 		}
 	}
 	return n
+}
+
+// Every dry run plans under the read-only guard propose plans under, so a
+// ronja whose dry run would send a write refuses it before it is sent and
+// says so, rather than writing while claiming to write nothing.
+func TestDryRunSendsNoWrite(t *testing.T) {
+	fx := workflowIdempotenceFixture(t)
+	adoptFixture(t, fx)
+	defer func(was func(context.Context, string, *config.Resolved) (*syncApplyReport, error)) {
+		runSyncApplyTree = was
+	}(runSyncApplyTree)
+	runSyncApplyTree = func(ctx context.Context, dir string, resolved *config.Resolved) (*syncApplyReport, error) {
+		report, err := syncApplyTree(ctx, dir, resolved)
+		_ = api.New(resolved.URL, resolved.Token).Do(ctx, "POST", "workflow/wf-1/publish", nil, nil)
+		return report, err
+	}
+
+	fx.resetRequests()
+	out, err := runCLI(t, fx.tree, "sync", "apply", "--stack", "prod", "--dry-run", "--json")
+	if w := writesBesidesGate(fx.requests()); len(w) != 0 {
+		t.Fatalf("the dry run sent %v\n%s", w, out)
+	}
+	if exitCodeOf(err) != syncExitUnknown || !strings.Contains(fmt.Sprint(err), "POST /api/v2/workflow/wf-1/publish") {
+		t.Fatalf("exit %d, %v; want exit %d naming the write it refused", exitCodeOf(err), err, syncExitUnknown)
+	}
+}
+
+// A copy of an adopted workflow whose code names its table, module and secret
+// by alias, as the deploy job plans it (no .ronja/ baseline, --allow-create),
+// plans as unchanged when live holds the same code with the ids resolved,
+// whether the aliases were written before or after the adopt.
+func TestAliasOnlyDriftPlansUnchangedAsACopy(t *testing.T) {
+	for name, adoptFirst := range map[string]bool{"adopt then alias": true, "alias then adopt": false} {
+		t.Run(name, func(t *testing.T) {
+			fx := workflowIdempotenceFixture(t)
+			resolved := "q = \"{{ ref('table-orders') }}\"\nimport x  # {{ module('module-kalkyl') }}\ns = \"{{ secret('secret-crm', 'token') }}\"\n"
+			fx.wf.putFile("wf-1", "main.py", resolved)
+			writeLocal(t, fx.root, "main.py", resolved)
+			alias := func() {
+				m, err := wfdir.LoadManifest(fx.root, wfdir.WorkflowKind)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m.Dependencies = map[string]wfdir.Dependency{"orders": {Kind: "table"}, "emab_kalkyl": {Kind: "module"}, "crm": {Kind: "secret"}}
+				s := m.Stacks["prod"]
+				s.Bind = map[string]string{"orders": "table-orders", "emab_kalkyl": "module-kalkyl", "crm": "secret-crm"}
+				m.Stacks["prod"] = s
+				if err := wfdir.SaveManifest(fx.root, m); err != nil {
+					t.Fatal(err)
+				}
+				writeLocal(t, fx.root, "main.py", "q = \"{{ ref('orders') }}\"\nimport x  # {{ module('emab_kalkyl') }}\ns = \"{{ secret('crm', 'token') }}\"\n")
+			}
+			if adoptFirst {
+				adoptFixture(t, fx)
+				alias()
+			} else {
+				alias()
+				adoptFixture(t, fx)
+			}
+			dropLocalState(t, fx.root)
+			fx.resetRequests()
+			out, err := runCLI(t, fx.tree, "sync", "apply", "--stack", "prod", "--dry-run", "--json", "--allow-create", "--dir", fx.tree)
+			if err != nil {
+				t.Fatalf("dry run: %v\n%s", err, out)
+			}
+			if w := writesBesidesGate(fx.requests()); len(w) != 0 {
+				t.Fatalf("dry run sent %v", w)
+			}
+			line := applyFolderLine(t, applyReportOf(t, out), filepath.Base(fx.root))
+			if line.Verdict != verdictApplied || len(line.Units) != 1 || line.Units[0].Action != string(applyActionUnchanged) {
+				t.Fatalf("the copy plans as %s %q, units %+v; want one unit, unchanged", line.Verdict, line.Detail, line.Units)
+			}
+		})
+	}
 }

@@ -3,7 +3,6 @@ package commands
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +28,7 @@ var (
 
 // Change list statuses (backend engine/echangelist).
 const (
+	changeListUnsent   = "unsent"
 	changeListPending  = "pending"
 	changeListApplying = "applying"
 	changeListApplied  = "applied"
@@ -57,8 +57,10 @@ It ends when the list does, and exits 0 only when it deployed:
   rejected   the note; nothing was deployed                            exit 1
   expired    not approved within a day, or replaced by a newer list    exit 1
 
+A list not sent yet ends the wait at once, exit 1, with the next step.
+
 Without --timeout it waits until the list ends, which Ronja guarantees within
-a day of proposing, plus the deploy. At --timeout it says "still waiting for approval" or "still deploying"
+a day of sending, plus the deploy. At --timeout it says "still waiting for approval" or "still deploying"
 and exits 1; run it again to keep waiting. Run in the background, it wakes the
 agent that started it when the list ends.
 
@@ -68,17 +70,9 @@ reads the list's status and outcome, never its SQL. A read Ronja does not
 answer is tried again for 5 minutes; Ctrl-C stops the wait and leaves the list
 as it is.
 
---json writes {id, status, reason, result, expiresAt, decidedAt, finishedAt},
+--json writes {id, status, reason, result, expiresAt, decidedAt, finishedAt, next},
 where result is the deploy's own report; keys with no value are left out.`,
-		Args: func(cmd *cobra.Command, args []string) error {
-			switch len(args) {
-			case 0:
-				return errors.New("ronja propose wait needs the change list's id, which `ronja propose` printed. To propose a directory named wait, run: ronja propose ./wait")
-			case 1:
-				return nil
-			}
-			return fmt.Errorf("ronja propose wait takes one change list id, not %d", len(args))
-		},
+		Args: changeListID("wait", 0),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if timeout < 0 {
 				return fmt.Errorf("--timeout %s is negative; 0 waits until the list ends", timeout)
@@ -102,6 +96,7 @@ type proposeWaitReport struct {
 	ExpiresAt  time.Time       `json:"expiresAt"`
 	DecidedAt  *time.Time      `json:"decidedAt,omitempty"`
 	FinishedAt *time.Time      `json:"finishedAt,omitempty"`
+	Next       string          `json:"next,omitempty"`
 }
 
 func runProposeWait(ctx context.Context, client *api.Client, id string, timeout time.Duration) error {
@@ -116,7 +111,7 @@ func runProposeWait(ctx context.Context, client *api.Client, id string, timeout 
 		readCtx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
-	again := fmt.Sprintf("run `ronja propose wait %s` again", id)
+	again := fmt.Sprintf("run `%s` again", carryCredential("ronja propose wait "+id))
 	approver := ""
 	var last *api.ChangeList
 	var lastErr error
@@ -127,9 +122,9 @@ func runProposeWait(ctx context.Context, client *api.Client, id string, timeout 
 		case last == nil:
 			return fmt.Errorf("change list %s could not be read within --timeout %s: %w — the list is unaffected; %s", id, timeout, lastErr, again)
 		case last.Status == changeListApplying:
-			return endWait(last, fmt.Sprintf("Change list %s is still deploying after %s. To hear when it ends, run: ronja propose wait %s", id, timeout, id))
+			return endWait(last, fmt.Sprintf("Change list %s is still deploying after %s. To hear when it ends, run: %s", id, timeout, carryCredential("ronja propose wait "+id)))
 		default:
-			return endWait(last, fmt.Sprintf("Change list %s is still waiting for approval after %s. To keep waiting, run: ronja propose wait %s", id, timeout, id))
+			return endWait(last, fmt.Sprintf("Change list %s is still waiting for approval after %s. To keep waiting, run: %s", id, timeout, carryCredential("ronja propose wait "+id)))
 		}
 	}
 	for {
@@ -162,6 +157,12 @@ func runProposeWait(ctx context.Context, client *api.Client, id string, timeout 
 			}
 			last = list
 			switch list.Status {
+			case changeListUnsent:
+				sentence := fmt.Sprintf("Change list %s is not sent yet: nobody has been asked to approve it, so there is nothing to wait for.", id)
+				if list.Next != "" {
+					sentence += " Next: " + carryCredential(list.Next)
+				}
+				return endWait(list, sentence)
 			case changeListApplied, changeListFailed, changeListRejected, changeListExpired:
 				return finishWait(list)
 			case changeListPending:
@@ -228,7 +229,7 @@ func waitTime(t time.Time) string { return t.Local().Format("2006-01-02 15:04 MS
 
 func waitReport(list *api.ChangeList) proposeWaitReport {
 	return proposeWaitReport{ID: list.ID, Status: list.Status, Reason: list.Reason, Result: list.Result,
-		ExpiresAt: list.ExpiresAt, DecidedAt: list.DecidedAt, FinishedAt: list.FinishedAt}
+		ExpiresAt: list.ExpiresAt, DecidedAt: list.DecidedAt, FinishedAt: list.FinishedAt, Next: list.Next}
 }
 
 // endWait ends a wait on a list that is still open: the sentence on stdout,
@@ -285,7 +286,7 @@ func printWaitOutcome(out io.Writer, list *api.ChangeList) {
 	case changeListRejected:
 		fmt.Fprintf(out, "Change list %s was rejected by the person it was proposed for or an admin; nothing was deployed.\n", id)
 		if list.Reason != "" {
-			fmt.Fprintf(out, "  Their note: %s\n", list.Reason)
+			fmt.Fprintf(out, "  Their note: %s\n", terminalSafe(list.Reason))
 		} else {
 			fmt.Fprintln(out, "  They left no note.")
 		}
@@ -293,7 +294,7 @@ func printWaitOutcome(out io.Writer, list *api.ChangeList) {
 	case changeListExpired:
 		fmt.Fprintf(out, "Change list %s expired: %s. Nothing was deployed.\n", id, orElse(list.Reason, "Ronja gave no reason"))
 		if m := replacedBy.FindStringSubmatch(list.Reason); m != nil {
-			fmt.Fprintf(out, "To hear what becomes of the newer list, run: ronja propose wait %s\n", m[1])
+			fmt.Fprintf(out, "To hear what becomes of the newer list, run: %s\n", carryCredential("ronja propose wait "+m[1]))
 		}
 		return
 	}

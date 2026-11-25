@@ -164,7 +164,7 @@ func TestProposeSetsUpAClonedFolderInOneCommand(t *testing.T) {
 			if !claimed {
 				t.Fatal("the cloned app was not claimed for the folder")
 			}
-			if report.Status != "pending" || report.Counts.Modified != 1 || len(f.changeLists.proposals) != 1 {
+			if report.Status != changeListUnsent || report.Counts.Modified != 1 || len(f.changeLists.proposals) != 1 {
 				t.Fatalf("report = %+v, %d proposals", report, len(f.changeLists.proposals))
 			}
 		})

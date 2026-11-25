@@ -24,12 +24,62 @@ type ChangeList struct {
 	ExpiresAt    time.Time  `json:"expiresAt"`
 	DecidedAt    *time.Time `json:"decidedAt"`
 	FinishedAt   *time.Time `json:"finishedAt"`
+	// SentAt is when the person was told of it; nil while it is unsent.
+	SentAt *time.Time `json:"sentAt"`
 	// URL is the page the person approves it on, empty when the instance has
 	// no frontend origin configured.
 	URL string `json:"url"`
 	// Result is the deploy job's report (echangelist.Result), absent until it
 	// reports.
 	Result json.RawMessage `json:"result"`
+	// Drafts are the apps the proposal stored a draft for, on the answer to a
+	// proposal only; an older Ronja, which ignores the previews, sends none.
+	Drafts []ChangeListDraft `json:"drafts,omitempty"`
+	// Title is the assistant's, else one Ronja derives from the changes.
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	// Changes are the rows the person reads, each under the key its note is
+	// written with; absent when the answer leaves the plan out.
+	Changes []ChangeListChange `json:"changes,omitempty"`
+	// Skeleton is what `ronja propose describe` prints and saves back.
+	Skeleton *ChangeListSkeleton `json:"skeleton,omitempty"`
+	// DroppedNotes are the replaced list's notes whose change this list no
+	// longer makes, on the answer to a proposal only.
+	DroppedNotes []string `json:"droppedNotes,omitempty"`
+	// Next is the step to take next, as the server words it.
+	Next string `json:"next,omitempty"`
+}
+
+// ChangeListChange is one row of a change list (rchangelist.Change).
+type ChangeListChange struct {
+	Key    string `json:"key"`
+	Kind   string `json:"kind"`
+	Action string `json:"action"`
+	Title  string `json:"title"`
+	Note   string `json:"note"`
+}
+
+// ChangeListSkeleton is a list's description with every key present, ""
+// where nothing is written yet (rchangelist.Skeleton).
+type ChangeListSkeleton struct {
+	Title       string            `json:"title"`
+	Description string            `json:"description"`
+	Notes       map[string]string `json:"notes"`
+}
+
+// Described is whether it has the title and the description a send needs.
+func (s *ChangeListSkeleton) Described() bool {
+	return s != nil && s.Title != "" && s.Description != ""
+}
+
+// ChangeListDraft is one app's draft: what it will look like once the list
+// deploys, opened from the change list.
+type ChangeListDraft struct {
+	FolderID string `json:"folderID"`
+	Title    string `json:"title"`
+	URL      string `json:"url,omitempty"`
+	// Refused is why the app has no draft, in place of URL.
+	Refused string `json:"refused,omitempty"`
 }
 
 // maxChangeListRead bounds a list's read: an older Ronja ignores omit=plan,
@@ -75,10 +125,16 @@ func (c *Client) ChangeList(ctx context.Context, id string) (*ChangeList, time.T
 type ChangeListProposal struct {
 	// Archive is the gzipped tar of the folder the plan was made on.
 	Archive []byte
+	// Previews is the gzipped JSON of each app the plan creates or updates,
+	// as the push would write it; nil when there is none.
+	Previews []byte
 	// Plan is the echangelist.Plan JSON.
 	Plan      json.RawMessage
 	ServerURL string
 	Stack     string
+	// Unsent asks for the list unsent: nobody is told of it until it is
+	// described and sent. An older Ronja ignores it and answers pending.
+	Unsent bool
 }
 
 // maxChangeListAnswer bounds the read of the answer, which echoes the plan.
@@ -96,6 +152,15 @@ func (c *Client) ProposeChangeList(ctx context.Context, p ChangeListProposal) (*
 	if _, err := archive.Write(p.Archive); err != nil {
 		return nil, err
 	}
+	if len(p.Previews) > 0 {
+		previews, err := w.CreateFormFile("previews", "previews.json.gz")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := previews.Write(p.Previews); err != nil {
+			return nil, err
+		}
+	}
 	for _, field := range []struct{ name, value string }{
 		{"plan", string(p.Plan)},
 		{"server_url", p.ServerURL},
@@ -105,6 +170,11 @@ func (c *Client) ProposeChangeList(ctx context.Context, p ChangeListProposal) (*
 			continue
 		}
 		if err := w.WriteField(field.name, field.value); err != nil {
+			return nil, err
+		}
+	}
+	if p.Unsent {
+		if err := w.WriteField("unsent", "true"); err != nil {
 			return nil, err
 		}
 	}
@@ -132,6 +202,35 @@ func (c *Client) ProposeChangeList(ctx context.Context, p ChangeListProposal) (*
 	}
 	if out.ID == "" {
 		return nil, fmt.Errorf("the server answered the proposal without a change list id")
+	}
+	return &out, nil
+}
+
+// DescribeChangeList saves description, a JSON object of title, description
+// and notes, over what the unsent list says.
+func (c *Client) DescribeChangeList(ctx context.Context, id string, description json.RawMessage) (*ChangeList, error) {
+	var out ChangeList
+	if err := c.Do(ctx, http.MethodPut, "change-list/"+url.PathEscape(id)+"/description", description, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SendChangeList tells the list's person it waits for their approval.
+func (c *Client) SendChangeList(ctx context.Context, id string) (*ChangeList, error) {
+	var out ChangeList
+	if err := c.Do(ctx, http.MethodPost, "change-list/"+url.PathEscape(id)+"/send", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// RejectChangeList ends an unsent or a waiting list: the reject route, which
+// discards an unsent one.
+func (c *Client) RejectChangeList(ctx context.Context, id string) (*ChangeList, error) {
+	var out ChangeList
+	if err := c.Do(ctx, http.MethodPost, "change-list/"+url.PathEscape(id)+"/reject", map[string]string{}, &out); err != nil {
+		return nil, err
 	}
 	return &out, nil
 }

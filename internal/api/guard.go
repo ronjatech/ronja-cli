@@ -70,6 +70,9 @@ func checkGuardAt(ctx context.Context, method, allowPath, shown string) error {
 	if g == nil || method == http.MethodGet || method == http.MethodHead {
 		return nil
 	}
+	if method == http.MethodPost && isMigrationsPath(allowPath) && ctx.Value(planningReadKey{}) != nil {
+		return nil
+	}
 	if allowPath != "" && g.Allow != nil && g.Allow(method, allowPath) {
 		return nil
 	}
@@ -77,4 +80,21 @@ func checkGuardAt(ctx context.Context, method, allowPath, shown string) error {
 	g.blocked = append(g.blocked, method+" "+shown)
 	g.mu.Unlock()
 	return fmt.Errorf("%s %s: %w", method, shown, ErrWriteRefused)
+}
+
+// planningReadKey marks a context whose POST to a database's migrations
+// route is MigrationStatus's dry run. An apply posts to the same route,
+// told apart only by a body field, so the guard admits that route by this
+// mark alone.
+type planningReadKey struct{}
+
+func withPlanningRead(ctx context.Context) context.Context {
+	return context.WithValue(ctx, planningReadKey{}, true)
+}
+
+// isMigrationsPath reports whether path is database/<id>/migrations.
+func isMigrationsPath(path string) bool {
+	id, ok := strings.CutPrefix(path, "database/")
+	id, ok2 := strings.CutSuffix(id, "/migrations")
+	return ok && ok2 && id != "" && !strings.Contains(id, "/")
 }

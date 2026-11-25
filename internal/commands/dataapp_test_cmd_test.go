@@ -590,22 +590,6 @@ func TestAppTestRefusesAnUnknownViewport(t *testing.T) {
 	}
 }
 
-// An unbound folder has nothing to render, and says which command creates it.
-func TestAppTestRefusesAnUnboundFolder(t *testing.T) {
-	f := newFakeAppInstance(t)
-	signInApp(t, f)
-	root := writeAppFolder(t, t.TempDir(), &wfdir.Manifest{Title: "Revenue explorer"},
-		map[string]string{"App.tsx": "SOURCE"})
-
-	_, err := runCLI(t, root, "app", "test", "--out-dir", t.TempDir())
-	if err == nil {
-		t.Fatal("an unbound folder has no app to render")
-	}
-	if !strings.Contains(err.Error(), "ronja app push") {
-		t.Errorf("the refusal should name the command that creates the app, got: %v", err)
-	}
-}
-
 // The render budget reaches the wire in milliseconds — the flag is a duration
 // because that is what a person types, and the endpoint takes an integer.
 func TestAppTestSendsTheRenderBudgetInMilliseconds(t *testing.T) {

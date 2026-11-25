@@ -90,7 +90,7 @@ func TestProposeTakeOverContinuesAnAppAnotherFolderHolds(t *testing.T) {
 	if report.Setup == nil || len(report.Setup.TookOverFrom) != 1 || !strings.Contains(report.Setup.TookOverFrom[0], firstID) {
 		t.Fatalf("the report does not name the folder taken over from: %+v", report.Setup)
 	}
-	if report.Status != "pending" || report.Counts.Modified != 1 || len(f.changeLists.proposals) != 2 {
+	if report.Status != changeListUnsent || report.Counts.Modified != 1 || len(f.changeLists.proposals) != 2 {
 		t.Fatalf("report = %+v, %d proposals", report, len(f.changeLists.proposals))
 	}
 

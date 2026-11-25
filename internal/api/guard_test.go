@@ -79,3 +79,32 @@ func TestReadOnlyGuardCoversDoRaw(t *testing.T) {
 		t.Fatalf("blocked = %v", b)
 	}
 }
+
+// A migration status and an apply post to the same route, told apart only by
+// the body's dry_run, so the guard admits the route only to MigrationStatus:
+// an apply under it is refused before it is sent, a dry run included.
+func TestReadOnlyGuardAdmitsAMigrationStatusAndNoApply(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		_, _ = w.Write([]byte(`{"databaseID":"mdb-1","results":[]}`))
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "tok")
+	g := &ReadOnlyGuard{Allow: func(method, path string) bool { return method == "POST" && path == "workflow/validate" }}
+	ctx := WithReadOnlyGuard(context.Background(), g)
+	if _, err := c.MigrationStatus(ctx, "mdb-1", nil, 0); err != nil {
+		t.Fatalf("a migration status under the guard: %v", err)
+	}
+	for _, dryRun := range []bool{false, true} {
+		if _, err := c.ApplyMigrations(ctx, "mdb-1", MigrationSetInput{DryRun: dryRun}, 0); !errors.Is(err, ErrWriteRefused) {
+			t.Errorf("an apply (dry_run %v) under the guard answered %v, want refused", dryRun, err)
+		}
+	}
+	if len(seen) != 1 || seen[0] != "POST /api/v2/database/mdb-1/migrations" {
+		t.Fatalf("the server saw %v, want the status alone", seen)
+	}
+	if b := g.Blocked(); len(b) != 2 {
+		t.Fatalf("blocked = %v, want both applies", b)
+	}
+}

@@ -338,7 +338,7 @@ func migrateNextStep(opts migrateOpts) string {
 		propose = append(propose, shellArg(positional))
 		push = append(push, "--dir", shellArg(opts.dir))
 	}
-	return fmt.Sprintf("Recommended for agents: %s — the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: %s",
+	return fmt.Sprintf("Recommended for agents: %s, then the step it names; the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: %s",
 		strings.Join(propose, " "), strings.Join(push, " "))
 }
 

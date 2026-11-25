@@ -1,0 +1,51 @@
+[
+  {
+    "name": "a created app: every setting, access in every slot, files out of order",
+    "preview": {
+      "folderID": "fld-board",
+      "title": "Orders board",
+      "description": "Late orders, by customer",
+      "serverDataOnly": true,
+      "access": {
+        "allowedTableIDs": ["table-orders", "late_orders"],
+        "allowedSecretIDs": ["secret-fortnox"],
+        "allowedAgentIDs": ["agent-triage"],
+        "allowedWorkflowIDs": ["workflow-reminder"],
+        "allowedCodexIDs": ["cdx-handbook"],
+        "allowedMetricIDs": ["table-aov"],
+        "capabilities": ["ai"]
+      },
+      "files": [
+        {"path": "kit/books.ts", "content": "export const books = \"{{ ref('table-orders') }}\";\n"},
+        {"path": "App.tsx", "content": "export default function App() {\n  return <h1>Orders ✓</h1>\n}\n"}
+      ]
+    },
+    "digest": "0163c41c93d80658bf442a2236b0cd95b17620e93599894341d81826c611d969"
+  },
+  {
+    "name": "an updated app that leaves its access and settings as live has them",
+    "preview": {
+      "folderID": "fld-board",
+      "title": "Orders board",
+      "files": [
+        {"path": "App.tsx", "content": "export default function App() {\n  return <h1>Orders ✓</h1>\n}\n"}
+      ]
+    },
+    "digest": "b731a516ac9db72f979e0116f730da3af7ea58b76a82398084d0fbc1915f2bcc"
+  },
+  {
+    "name": "empty description, server-side data off, empty access",
+    "preview": {
+      "folderID": "fld-board",
+      "title": "Orders board",
+      "description": "",
+      "serverDataOnly": false,
+      "access": {
+        "allowedTableIDs": [], "allowedSecretIDs": [], "allowedAgentIDs": [], "allowedWorkflowIDs": [],
+        "allowedCodexIDs": [], "allowedMetricIDs": [], "capabilities": []
+      },
+      "files": []
+    },
+    "digest": "ec5d42997ef3c615c3e45c307b4b2e4fcf4f3f0881ab3492829b496117e4d3cd"
+  }
+]

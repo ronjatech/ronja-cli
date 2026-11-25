@@ -1815,8 +1815,9 @@ perfectly well, so there is deliberately no `db list` / `db create` /
 
 **Agents: ship a migration with `ronja propose`, not `push`.** Run it in the
 folder that holds `migrations/`. It applies nothing: it uploads the pending
-migrations as a change list, the person whose sign-in this is sees the database
-and each migration's SQL in Ronja, and their **Approve and deploy** applies
+migrations as a change list, which you describe and send; the person whose
+sign-in this is sees the database and each migration's SQL in Ronja, and their
+**Approve and deploy** applies
 exactly that SQL as them, refusing one whose SQL changed since. `db migrate
 status` names the command, with the same `--database`, `--stack` and folder,
 whenever a migration is pending and no more than 40 are, the most one push
@@ -4130,6 +4131,7 @@ $EDITOR App.tsx
 ronja app push                         # syncs the folder into YOUR draft, then compiles it
 ronja app validate                     # recompile the draft on its own
 ronja app test                         # render the draft headless and report what the browser saw
+                                       # (a folder with no app yet: as a test app, no push needed)
 ronja app publish                      # commit, or submit for review, say which happened, and who can now use it
 ```
 
@@ -4164,6 +4166,11 @@ And nothing static can promise that `Compiles: yes` renders anyway — the
 compiler does not check types, so a mistyped prop, a hook called after an early
 return, a wrong table id, or a component that mounts and returns `null`
 publishes green too. `status` prints the app's URL; open it.
+
+**Your own CSS is a file you import.** `import "./styles.css"` (or a
+`.module.css` for scoped class names) works in any app; the compiler puts the
+CSS after the kit's theme, so your rules win. It is plain CSS: Tailwind
+directives such as `@apply` are refused, and resets belong in `@layer base`.
 
 **The app's spec version decides who styles it, and the folder does not own it.**
 An app carries a `specVersion`: 1 means styling is the author's job (the
@@ -4426,7 +4433,7 @@ place (the id never changes), and an abandoned first push leaves nothing behind.
 | `fork` | copies one built-in kit file into the folder at the same path, so it shadows the kit's. Local only — changes nothing server-side, and never overwrites an existing file | `--json` |
 | `push` | ensures a draft, syncs allowlists then files, then compiles. A `"title"` renamed in the web app since this folder last agreed with it is refused, not reverted (see **Names are declared attributes**) | `--no-validate`, `--force` |
 | `validate` | recompiles your draft and reports diagnostics | `--json` |
-| `test` | renders the draft in a headless browser and writes `report.json` + the frames into `.ronja/test/`; a report, never a verdict | `--route`, `--viewport`, `--timeout`, `--steps`, `--out-dir`, `--fail-on-errors`, `--json` |
+| `test` | renders the draft in a headless browser and writes `report.json` + the frames into `.ronja/test/`; a report, never a verdict. A folder with no app (or `--scratch`) is sent as a test app first | `--route`, `--viewport`, `--timeout`, `--steps`, `--out-dir`, `--fail-on-errors`, `--scratch`, `--json` |
 | `publish` | commits the draft, or submits it for review. Refuses a draft that does not compile | `--no-request-review` |
 | `discard` | deletes your draft; the live app and your local files are untouched | `--yes`, `--delete-app` |
 
@@ -4530,7 +4537,7 @@ Space, those are the live databases. To test without touching live data, use a
 ronja app test
 ronja app test --route '#/orders' --viewport mobile --out-dir ./preview
 ronja app test --viewport 1280x2400        # a tall frame, to see below the fold
-ronja app test --steps steps.json          # admin only; the steps really execute
+ronja app test --steps steps.json          # an administrator, or your own test app; the steps really execute
 ```
 
 `--viewport` is `desktop` (1280x800, the default), `mobile` (390x844) or `WxH`,
@@ -4551,6 +4558,59 @@ is carved out of the same budget the page settles in; a plain render keeps 20s.
 A step reported skipped `"budget"` never ran, and the CLI prints one hint: raise
 `--timeout`, or that step's `timeoutMs`. It names no number, since an older
 server clamps lower and says nothing about it.
+
+#### A test app: looking before the app exists
+
+In a folder with no app on this instance yet, `app test` needs no push: it
+sends the folder as it is on disk to `PUT /dataapp/scratch` as a **test app**
+and renders that. `--scratch` does the same in a folder that has an app,
+leaving its app and your draft as they are.
+
+```bash
+ronja app init --feature collection-abc --title 'Revenue explorer'
+ronja app test                             # no app is made; prints the test app's link
+ronja app test --scratch --viewport mobile # a bound folder's copy, its draft untouched
+```
+
+```
+Test app:  https://cloud.ronja.tech/apps/data_app-dc20…?org=…
+           Only you and admins can open it. Deleted 2026-11-25 09:41 unless you run `ronja app test` in this folder again.
+           No app was made. To make one, run `ronja app push`.
+```
+
+- **No app is made.** A test app is in your private area and in no list,
+  search or feature page; only you and admins can open the link. The manifest
+  is not touched: the body is built the way `ronja propose` builds an app's
+  draft (the folder as its push would write it, with its access block), and
+  `gateAppAccess` checks that access block before anything is sent. A bound
+  folder with no `access` block sends its app's access instead (your draft's
+  when you have one, else the live app's). It reaches what the access
+  declares, as an app in your private feature would, and uses live data.
+- **Again is the same app.** `.ronja/scratch.json` remembers the test app per
+  instance and organization, with the folder's absolute path, and the next run
+  sends its id: the files are replaced and the link stays. A copy of the folder
+  (`cp -r`) sits at another path and gets a test app of its own. When the old
+  one has gone, or was made in another Space, a new one is made and the run
+  says "Your earlier test app is gone or in another Space; this is a new link."
+- **It deletes itself a day after its last push**; opening it does not count.
+  You can hold 20 at once: the 21st is refused with the server's sentence, which
+  says when the next one is deleted (under `--json`, stdout carries `code:
+  scratch_app_limit` and `nextExpiresAt`).
+- **24 MiB at most**, the most a change list carries for an app: a larger
+  folder is refused before anything is sent ("it could never be proposed").
+- **A compile failure is not rendered**: the push already compiled it, so the
+  diagnostics print, `report.json` carries them, and `--fail-on-errors` exits
+  non-zero, exactly as for a render that found a bundle that did not build.
+- `--json` adds `scratch: {id, url, expiresAt}`.
+- **No folder holds a test app.** `ronja app clone`, `ronja import` and a
+  binding that names one refuse it as a test app: it changes only through
+  `ronja app test`.
+- An instance older than test apps answers the route 404 (or 413), so on
+  either the CLI prints the server's own sentence and adds that an older Ronja
+  "does not support test apps yet".
+
+A test app never becomes the app: to keep it, `ronja app push` or `ronja
+propose` the folder.
 
 Renders what is ON THE SERVER (your own open draft when you have one, the same
 substitution `/embed` makes) through `POST /dataapp/:id/preview`, and writes
@@ -4626,6 +4686,14 @@ retrying would add load to the thing it was just told is at capacity.
 narrowly scoped token, `admin:write` on top of the role — and executes for real,
 with the same authority a viewer of the app has: a click runs the app's own code
 and can dispatch workflows and Agents, upload files, and call external systems.
+**Your own test app is the exception** (a folder with no app, or `--scratch`):
+you may send it steps signed in as yourself, from your terminal or your chat's
+computer, on a token that can write apps; drafts and live apps still need an
+administrator. Nobody watches such a run, and a click reaches only what the
+app's own code already does when it opens. The screenshots, with any text a
+`fill` step typed, are kept a year: test with values you would not mind keeping.
+A run already under way can go on for a couple of minutes after the test app
+expires.
 The plan is a file you name — nothing is ever synthesised — holding either a
 bare JSON array of steps or the HTTP body's `{"steps": [...]}` object. In the
 object form `steps` must be the ONLY key: `route`, `viewportPreset`/`viewport`
@@ -6660,7 +6728,7 @@ this" and on "I could not look".
 |---|---|---|
 | 0 | `clean` | every folder was checked, and every one is clean |
 | 1 | `drifted` (`status`) / `broken` (`check`) | checked, and something is out of step — changed on the server, or never deployed at all / a reference does not resolve, or a folder is refused as a whole |
-| 2 | `unknown` | could not tell — a skipped folder, an unreadable manifest, a dead credential, or an **empty walk**; under `apply`, also a write the instance never answered (`api.Unanswered` / a timeout) and the folders an interrupt never reached |
+| 2 | `unknown` | could not tell — a skipped folder, an unreadable manifest, a dead credential, or an **empty walk**; under `apply`, also a write the instance never answered (`api.Unanswered` / a timeout) and the folders an interrupt never reached, and under `apply --dry-run` a write the read-only guard refused (a bug in ronja to report; see `--dry-run`) |
 
 **`unknown` wins over the middle answer.** The strongest true statement about a
 tree where one folder drifted and another could not be read is that not
@@ -7411,7 +7479,12 @@ the size cap), which a dry-run reports as `applied` and the apply refuses. That
 is the honest edge of the claim.
 
 **`--dry-run`** prints, per creation unit, what apply would attempt, off the same
-`applyDecision` values apply then executes. It counts **creates as well as
+`applyDecision` values apply then executes. It runs under the read-only guard
+`ronja propose` plans under: any request but a read, the workflow validate and
+a database's migration status is refused before it is sent. A dry run that
+would have sent a write exits 2 naming it ("the dry run would have sent …,
+which a dry run never sends, so it was refused before it was sent"): that is a
+bug in ronja worth reporting, not something to retry. It counts **creates as well as
 updates** — a folder is only previewed once every gate cleared, so a create it
 lists is one `--allow-create` let through and apply is about to make. ⚠️ It deliberately does **not**
 promise a clean remote: that is a network read whose answer can move between the
@@ -7501,17 +7574,21 @@ instance did not answer, since the write may have landed:
 ## Asking for approval: `ronja propose`
 
 ```bash
-ronja propose          # the app folder, or the tree, here
-ronja propose apps/    # another directory
-ronja propose --json   # the same report, as data
+ronja propose                                  # the app folder, or the tree, here: an unsent list
+ronja propose apps/                            # another directory
+ronja propose --json                           # the same report, as data
+ronja propose describe <id> > .change.json     # what it tells the person, every key, "" to fill in
+ronja propose describe <id> .change.json       # save it back (- reads stdin)
+ronja propose send <id>                        # tell the person; opens the link on a terminal
+ronja propose discard <id>                     # end a list you no longer mean to send
 ```
 
 `propose` asks the person you work for (the person whose token this is) to
 approve a deploy. **It deploys nothing itself.** It is **the recommended way
 for an agent to deploy**, migrations included, and the verb it runs where
 `sync apply`, a publish or `db migrate push` would be blocked: the agent
-proposes, the person approves in Ronja, and their click runs the deploy in
-Ronja, as them.
+proposes, describes and sends, the person approves in Ronja, and their click
+runs the deploy in Ronja, as them.
 
 **A new folder goes live in one command.** Proposing a lone folder that is
 not adopted, whose `ronja.json` names its feature on this instance (any folder
@@ -7618,9 +7695,10 @@ folders are not adopted.
 What it does:
 
 1. **Plans** the tree with the same code as `ronja sync apply --dry-run
-   --allow-create --json`, in process, under the same read-only guard `pull`
-   uses: any request but a read (and the workflow validate, which saves
-   nothing) is refused before it is sent. Under the same guard it asks each
+   --allow-create --json`, in process, under the read-only guard every dry
+   run plans under: any request but a read (and the workflow validate and a
+   database's migration status, which save nothing) is refused before it is
+   sent. Under the same guard it asks each
    migrations folder bound to a managed database on this instance and
    organization (its `.ronja/database.json`) what a push would apply, as
    `ronja db migrate status` does, always as a dry run. A folder with nothing
@@ -7681,23 +7759,132 @@ What it does:
    Sizes are checked against the caps before any file is read. Profiles and credentials live outside the tree, and a
    `RONJA_CONFIG_DIR` pointing inside it is refused. The server takes the
    upload only from a person's own sign-in (a plain API token is refused), and
-   refuses it while that person already has 20 lists waiting for other folders.
-4. **Prints** the counts ("2 modified, 1 created, 1 database migration"), the
-   link to the change list, "Nothing changes until <person> approves it in
-   Ronja.", and the next step, "To continue once it is decided, run: ronja
-   propose wait <id>   (agents: in the background)". It exits 0 at once,
-   without waiting. At a terminal it opens the link (`--no-browser` does
-   not). When nothing would change it uploads nothing and says so, with no
-   wait line. When the instance is busy receiving other change lists it
-   answers 429, and propose says nothing was proposed and to run it again in a
-   few seconds.
+   refuses it while that person already has 20 lists open (unsent or waiting)
+   for other folders, naming the unsent ones and `ronja propose discard <id>`.
+   Beside the tar it sends a `previews` part: each data app the list creates
+   or updates **as the push would write it** (its files with aliases turned
+   into this organization's ids, its resolved `access` block, title,
+   description and Server-side-data-only), so the person can open the app's
+   draft before approving. Ronja fingerprints each one, and the deploy stops
+   before writing anything if what it would write differs from the draft
+   ("…differs from its draft: something it names in Ronja resolves differently
+   than at propose… Propose again; if it repeats, update ronja first.").
+   An app's file that is not UTF-8 text is refused by name before anything
+   is sent, as `app push` refuses it: the wire would replace what is not
+   UTF-8, so the app would deploy unlike its folder and its draft.
+   `sync apply --dry-run --json` reports that fingerprint as each data-app
+   folder's `previewDigest`.
+4. **Waits for Ronja's deploy to check it**, up to a minute. Before the list
+   is stored, Ronja plans the uploaded copy with the `ronja` its deploy runs,
+   as your credential and writing nothing, and stores the list only when that
+   plan is exactly yours. Otherwise nothing is proposed, the person hears
+   nothing, an open list of the same folders stays as it was, and propose
+   prints why, by folder, with what to do:
+
+   ```
+   Not proposed: Ronja's deploy (ronja v0.37.5) plans this tree differently from your ronja (dev):
+     stage1/wf: planned as unchanged, and the deploy would now update it (settings: description)
+   Install ronja v0.37.5 (`go install github.com/ronjatech/ronja-cli/cmd/ronja@v0.37.5`, or the archive for this computer from https://github.com/ronjatech/ronja-cli/releases/tag/v0.37.5) and propose again.
+   ```
+
+   Your `ronja` plans differently from the deploy's when the two are
+   different versions and the rules changed between them. The deploy names
+   the release that published its `ronja`, and the exact command that
+   installs it (`ronja update` installs only the newest), whether yours is
+   older, newer or a development build. When both are the same release, the
+   refusal says "Your plan and the deploy's differ (above): live changed
+   since your plan, or this checkout's last push record does not match live.
+   Run `ronja sync status`, pull what changed, then propose again." When
+   Ronja's deploy runs a development build, it names that build, to propose
+   with `ronja` built from the same commit. When the check did not finish
+   within a minute, it asks for a smaller directory (`ronja propose
+   <folder>`), keeping together folders that refer to each other by address;
+   when it could not run for another reason, it says "Ronja's deploy could
+   not check this list (<why>); propose again.", and nothing is proposed
+   until it can. When you propose
+   the same folders again while one is being checked, the older proposal is
+   refused ("a newer proposal of this list's scope arrived while this one was
+   being checked") and the newer one stands.
+5. **Prints** the counts and that the list is not sent yet ("Proposed change
+   list <id>: 2 modified, 1 created, 1 database migration. Not sent yet:
+   nobody has been notified."), the link to the change list, one row per
+   change (its key, its kind, its action), one `Draft <app>: <link>` line per
+   app Ronja stored a draft of (the app as it will look once the list deploys,
+   which the person can open from the change list too), or `Draft <app>:
+   none, because <why>` for an app whose live row the person can open but not
+   change (`--json`: `drafts: [{folderID, title, url, refused}]`), and the
+   next step. While the list has no title or description that step is
+   describing it, printed as the two commands to paste:
+
+   ```
+   Describe it: print it to a file, write the title, the description and a note per change, then save it:
+   ronja propose describe changelist-… > .change.json
+   ronja propose describe changelist-… .change.json
+   ```
+
+   Otherwise it is the server's `next`, as given: `Next: ronja propose send
+   <id>`, or on a chat's computer `Next: call requestPublish with <id>`.
+   Each `ronja` step it prints carries the `--profile` and `--url` this run
+   used, the profile `--stack` switched to included. It
+   exits 0 at once, without waiting, and opens no browser. When nothing would
+   change it uploads nothing and says so. When the instance is busy receiving
+   other change lists it answers 429, and propose says nothing was proposed
+   and to run it again in a few seconds. `--json` carries `status`, `changes`,
+   `skeleton` and `next`.
+
+### Describing and sending
+
+The list is uploaded **unsent**: nobody is told of it, and it cannot be
+approved, until you describe it and send it. Write for the person approving
+it, who may not read code: a title saying what changes for them, a
+description saying why, and a note per change.
+
+- **`ronja propose describe <id>`** prints the list's JSON, `{"title",
+  "description", "notes"}`, with one note per change the person sees as a row
+  (an app, a workflow, an automation, a table or metric, a database), keyed by
+  the name they see, and `""` where nothing is written yet. With a file, or
+  `-` for stdin, it saves that JSON back: a field left out keeps its value,
+  notes merge per key, `""` clears one, and a key the list does not have saves
+  nothing. It prints "Saved the description of change list <id>.", what is
+  still missing, each change with no note, and the server's next step. The
+  file is `.change.json`, a dot-file, so it never ships with a folder; one
+  left in an app folder makes `app push` print its usual dot-file skip note.
+- **`ronja propose --describe <file|->`** saves a description on the new list
+  in the same call; a file whose keys the new list lacks is refused after the
+  list is proposed, saying so.
+- **`ronja propose send <id>`** tells the person, in their inbox, and starts
+  the day it waits for approval. It is refused until the list has a title and
+  a description; the refusal is the server's, naming the describe commands.
+  It names each change with no note ("No note for …: the person sees only
+  their names.") without refusing, then "Next: ronja propose wait <id>
+  (agents: in the background)". At a terminal it opens the link
+  (`--no-browser` does not). A list already sent is answered as it is. On a
+  chat's computer the send is requestPublish's, so this command is refused
+  there.
+- **`ronja propose discard <id>`** ends a list through the reject route:
+  nothing from it deploys. It prints "Discarded change list <id>." for an
+  unsent list and "Rejected change list <id>: nothing from it deploys." for a
+  sent one. On a chat's computer only an unsent list can be
+  discarded; a sent one is the person's to reject on its card. A refusal is
+  printed as the server words it.
+- **Proposing the same folders again** replaces the open list, sent or not,
+  with a new unsent one. Its title, its description and each note whose
+  change is still in it carry over; propose names each note it drops
+  ("Notes dropped, since their change is no longer in this list: …").
+
+Only an unsent list takes a description: once sent it is what the person was
+told, so propose again to change it. **Against an older Ronja**, which has no
+unsent lists, propose's list is sent at once: it prints the report as before
+("Nothing changes until <person> approves it in Ronja.", the `wait` line, the
+link opened at a terminal) and "This Ronja takes no description: it sent the
+list as proposed.", and a `--describe` file is not sent.
 
 ### Waiting for the outcome: `ronja propose wait`
 
 ```bash
 ronja propose wait changelist-…                # in the background: until the list ends
 ronja propose wait changelist-… --timeout 9m   # in the foreground, under a tool time limit
-ronja propose wait changelist-… --json         # {id, status, reason, result, expiresAt, decidedAt, finishedAt}
+ronja propose wait changelist-… --json         # {id, status, reason, result, expiresAt, decidedAt, finishedAt, next}
 ```
 
 `wait` reads the list (`GET /api/v2/change-list/:id?omit=plan`, so never its
@@ -7711,6 +7898,7 @@ approves, rejects or deploys, and stopping it leaves the list as it is.
 | rejected | the note; nothing was deployed (Ronja does not record who rejected it: the person it was proposed for, or an admin) | 1 |
 | expired | the reason: nobody approved it within a day, or it was replaced by a newer list, with the `wait` command for that list | 1 |
 | still open at `--timeout` | "still waiting for approval" or "still deploying", and the command to run again | 1 |
+| not sent yet | at once, on its first read: "not sent yet: nobody has been asked to approve it", and the server's next step | 1 |
 
 **An agent runs it in the background**, with no `--timeout`, so the command's
 end wakes it with the outcome (a timeout only wakes it early to start again). An agent that cannot run a command in the background asks the person
@@ -7722,7 +7910,7 @@ while the list waits for approval, and every 10 seconds while it deploys.
 Progress goes to stderr once per status change ("Waiting for <person> to
 approve change list <id> (expires <time>)…", "Approved; deploying…"); the
 outcome goes to stdout. Without `--timeout` it waits until the list ends,
-which Ronja guarantees within a day of proposing, plus the deploy. `--json`
+which Ronja guarantees within a day of sending, plus the deploy. `--json`
 leaves out a key with no value.
 
 It also ends, with exit 1:
@@ -7742,7 +7930,8 @@ It also ends, with exit 1:
 - on Ctrl-C or SIGTERM, saying it stopped waiting, the list is unaffected, and
   the command that picks it up again.
 
-A directory named `wait` is proposed as `ronja propose ./wait`.
+A directory named `wait`, `describe`, `send` or `discard` is proposed as
+`ronja propose ./wait`; each bare subcommand's refusal says so.
 
 **What the person sees** in Ronja: who proposed it, the stack, what is created
 (with the feature each create goes into), modified, and removed from a folder
@@ -7750,7 +7939,9 @@ A directory named `wait` is proposed as `ronja propose ./wait`.
 with its SQL. Their **Approve and deploy** starts a deploy job that runs `ronja db
 migrate push` and then `ronja sync apply --allow-create` on exactly the copy
 uploaded, with a token minted for them for that one list. The job re-plans
-first and refuses any write the person did not see. A list waits 24 hours.
+first and refuses any write the person did not see, saying why the deploy
+now plans each refused unit differently ("approved as unchanged, and apply
+would now update it (settings: description)"). A list waits 24 hours.
 
 **What a list deploys is never drift for the folder that proposed it.** The
 deploy runs on the copy, so a workflow, data app or module folder's local

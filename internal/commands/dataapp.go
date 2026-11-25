@@ -171,6 +171,10 @@ func noteAutoGrantedCapabilities(root string, raw *api.DataAppAccess, rewritten 
 // when it can. Only live and draft rows are workable: everything else is either
 // immutable or governed by a flow the CLI has no business half-implementing.
 func refuseUnworkableApp(app *api.DataApp) error {
+	if app.Scratch != nil {
+		return fmt.Errorf("data app %s is a test app, made by `ronja app test` from a folder; it changes only from there, so no folder can be bound to it",
+			app.ID)
+	}
 	switch app.Lifecycle {
 	case api.LifecycleLive, api.LifecycleDraft:
 		return nil

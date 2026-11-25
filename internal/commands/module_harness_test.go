@@ -329,7 +329,7 @@ func (f *fakeInstance) serveModulePatch(w http.ResponseWriter, r *http.Request, 
 	var patch api.ModulePatch
 	decodeBody(f.t, r, &patch)
 	if f.mod.asComputer {
-		http.Error(w, `{"error":"a computer cannot put changes live; run `+"`ronja propose`"+`, then call requestPublish","code":"computer_publish_refused"}`, http.StatusForbidden)
+		http.Error(w, `{"error":"a computer cannot put changes live; run `+"`ronja propose`"+`, describe it with `+"`ronja propose describe`"+`, then call requestPublish","code":"computer_publish_refused"}`, http.StatusForbidden)
 		return
 	}
 	if row.Lifecycle != api.LifecycleLive {

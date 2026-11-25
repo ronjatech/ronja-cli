@@ -55,7 +55,7 @@ func TestMigrateStatusNamesProposeWhenPending(t *testing.T) {
 		if err != nil || out != "" {
 			t.Fatalf("status: %v, stdout %q\n%s", err, out, stderr)
 		}
-		want := "  Recommended for agents: ronja propose --stack dev db/crm — the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: ronja db migrate push --stack dev --dir db/crm\n"
+		want := "  Recommended for agents: ronja propose --stack dev db/crm, then the step it names; the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: ronja db migrate push --stack dev --dir db/crm\n"
 		if !strings.HasSuffix(stderr, counts+"\n"+want) {
 			t.Fatalf("stderr does not end with the counts and the line:\n%s", stderr)
 		}
@@ -66,7 +66,7 @@ func TestMigrateStatusNamesProposeWhenPending(t *testing.T) {
 		if err != nil || out != "" {
 			t.Fatalf("status: %v, stdout %q\n%s", err, out, stderr)
 		}
-		want := "  Recommended for agents: ronja propose --database mdb-abc — the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: ronja db migrate push --database mdb-abc\n"
+		want := "  Recommended for agents: ronja propose --database mdb-abc, then the step it names; the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: ronja db migrate push --database mdb-abc\n"
 		if !strings.HasSuffix(stderr, counts+"\n"+want) {
 			t.Fatalf("stderr does not end with the counts and the line:\n%s", stderr)
 		}
@@ -79,7 +79,7 @@ func TestMigrateStatusNamesProposeWhenPending(t *testing.T) {
 			t.Fatal(err)
 		}
 		lines := strings.Split(strings.TrimSuffix(stderr, "\n"), "\n")
-		if !strings.HasPrefix(lines[len(lines)-1], "  Recommended for agents: ronja propose --database mdb-abc ") || !strings.Contains(stderr, "  Note: a note from the server\n") {
+		if !strings.HasPrefix(lines[len(lines)-1], "  Recommended for agents: ronja propose --database mdb-abc, then the step it names;") || !strings.Contains(stderr, "  Note: a note from the server\n") {
 			t.Fatalf("the line is not the last of stderr, after the note:\n%s", stderr)
 		}
 	})
@@ -191,7 +191,7 @@ func TestMigrateNextStep(t *testing.T) {
 		{"/abs/-x", "ronja propose /abs/-x", "ronja db migrate push --dir /abs/-x"},
 	} {
 		got := migrateNextStep(migrateOpts{dir: c.dir})
-		want := "Recommended for agents: " + c.propose + " — the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: " + c.push
+		want := "Recommended for agents: " + c.propose + ", then the step it names; the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: " + c.push
 		if got != want {
 			t.Errorf("dir %q:\n got %s\nwant %s", c.dir, got, want)
 		}
@@ -213,7 +213,7 @@ func TestMigrateNextStep(t *testing.T) {
 			t.Cleanup(func() { flagProfile, flagURL = savedProfile, savedURL })
 			flagProfile, flagURL = c.profile, c.url
 			got := migrateNextStep(migrateOpts{database: "mdb-abc"})
-			want := "Recommended for agents: " + c.propose + " — the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: " + c.push
+			want := "Recommended for agents: " + c.propose + ", then the step it names; the person this login belongs to approves the change list in Ronja, which then applies exactly the SQL it shows. To apply it yourself now: " + c.push
 			if got != want {
 				t.Errorf("\n got %s\nwant %s", got, want)
 			}

@@ -129,7 +129,8 @@ attempted and reported, and the exit code is the tree's answer:
   2   could not tell — a folder was skipped, a manifest would not load, the
       credential is dead, the walk found no folders at all, or a write went out
       and the instance never answered (a commit that timed out may well have
-      landed, so look before re-running)
+      landed, so look before re-running), or a dry run that would have sent a
+      write, which is a bug in ronja worth reporting; do not retry
 
 --DRY-RUN prints, per creation unit, what apply would ATTEMPT, off the same
 decision apply then executes, and sends no write; declared moves and removals
@@ -157,7 +158,15 @@ reads: the organization can move before the apply.`,
 			if err != nil {
 				return withExitCode(syncExitUnknown, err)
 			}
-			report, err := syncApplyTree(cmd.Context(), flagSyncDir, resolved)
+			ctx := cmd.Context()
+			guard := &api.ReadOnlyGuard{Allow: dryRunReadAllow}
+			if flagSyncDryRun {
+				ctx = api.WithReadOnlyGuard(ctx, guard)
+			}
+			report, err := runSyncApplyTree(ctx, flagSyncDir, resolved)
+			if blocked := guard.Blocked(); len(blocked) > 0 {
+				return withExitCode(syncExitUnknown, fmt.Errorf("the dry run would have sent %s, which a dry run never sends, so it was refused before it was sent. This is a bug in ronja worth reporting", strings.Join(blocked, ", ")))
+			}
 			if err != nil {
 				return err
 			}
@@ -260,6 +269,14 @@ type syncApplyFolderReport struct {
 	// no claim for — the records apply writes in Ronja before anything else
 	// (the lazy backfill), which change no row. In a dry run only.
 	Claims int `json:"claims,omitempty"`
+	// PreviewDigest fingerprints a data app as its push would write it: what
+	// a change list's deploy holds to the draft its person saw
+	// (propose_preview.go). In a dry run only.
+	PreviewDigest string `json:"previewDigest,omitempty"`
+	// preview is the app PreviewDigest fingerprints, which `ronja propose`
+	// uploads; previewErr is why it could not be read.
+	preview    *appPreview
+	previewErr error
 	// adopted reports that Ronja keeps this folder's state on the stack the
 	// run selected (folder.adoptedHere), which `ronja propose` requires.
 	adopted bool
@@ -384,6 +401,10 @@ func (r *syncApplyReport) details() []string {
 	}
 	return out
 }
+
+// runSyncApplyTree is what `ronja sync apply` runs; a test replaces it with
+// a dry run that sends a write.
+var runSyncApplyTree = syncApplyTree
 
 // syncApplyTree walks the tree and deploys every folder it can.
 //
@@ -985,6 +1006,7 @@ func runPlannedFolder(ctx context.Context, plan *plannedFolder) {
 		line.Claims = len(plan.f.managedBackfill())
 		line.Detail = describeAttempt(plan.f.Kind, plan.decisions)
 		describeAgainstLive(ctx, plan)
+		noteAppPreview(plan)
 		// What the plan-time gate admitted outside the stack's feature is
 		// said in a preview too: it is what the apply will do.
 		line.Notes = append(line.Notes, plan.f.gateNotes...)

@@ -215,6 +215,16 @@ type fakeAppInstance struct {
 	// the CLI makes both calls back to back.
 	beforeFileWrite func(method, path string)
 
+	// --- test apps (PUT /dataapp/scratch) ----------------------------------
+	// scratchApps holds each test app the fake made, true while unexpired.
+	scratchApps map[string]bool
+	// scratchSent is every push's body as decoded.
+	scratchSent []scratchBody
+	// scratchFail, when set, is the status every push answers with, carrying
+	// scratchFailBody verbatim.
+	scratchFail     int
+	scratchFailBody string
+
 	// --- what the fake was asked to do, for assertions ---------------------
 	created   []api.CreateDataAppInput
 	patches   []api.DataAppPatch
@@ -263,6 +273,7 @@ func newFakeAppInstance(t *testing.T) *fakeAppInstance {
 		blobs:          map[string]fakeBlob{},
 		versions:       map[string][]api.DataApp{},
 		versionFiles:   map[string][]api.DataAppFile{},
+		scratchApps:    map[string]bool{},
 		privilegeLevel: 50,
 
 		enforcePreconditions: true,
@@ -461,6 +472,11 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v2/dataapp")
 	path = strings.TrimPrefix(path, "/")
 
+	if path == "scratch" && r.Method == http.MethodPut {
+		f.serveScratch(w, r)
+		return
+	}
+
 	// POST /dataapp — create.
 	if path == "" && r.Method == http.MethodPost {
 		f.serveCreate(w, r)
@@ -585,6 +601,40 @@ func (f *fakeAppInstance) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}
+}
+
+// scratchExpiry is when every test app the fake makes is deleted.
+var scratchExpiry = time.Date(2026, 11, 25, 9, 41, 0, 0, time.UTC)
+
+// serveScratch is PUT /dataapp/scratch: the sent id is kept while it names an
+// unexpired test app of the fake's, and a new one is made otherwise.
+func (f *fakeAppInstance) serveScratch(w http.ResponseWriter, r *http.Request) {
+	var in scratchBody
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		f.t.Fatalf("decode scratch body: %v", err)
+	}
+	f.scratchSent = append(f.scratchSent, in)
+	if f.scratchFail != 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.scratchFail)
+		_, _ = io.WriteString(w, f.scratchFailBody)
+		return
+	}
+	id, previous := in.ID, ""
+	switch {
+	case id == "":
+	case f.scratchApps[id]:
+		previous = "kept"
+	default:
+		previous, id = "gone", ""
+	}
+	if id == "" {
+		f.nextID++
+		id = fmt.Sprintf("data_app-test-%d", f.nextID)
+		f.scratchApps[id] = true
+	}
+	writeJSON(w, api.ScratchApp{ID: id, URL: fakeFrontendOrigin + "/apps/" + id, ExpiresAt: scratchExpiry,
+		Previous: previous})
 }
 
 // fakePreviewAnswer is one canned answer to POST :id/preview.
